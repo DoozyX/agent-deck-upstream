@@ -58,7 +58,7 @@ For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses 
 | `!` | Filter: running only (toggle) |
 | `@` | Filter: waiting only (toggle) |
 | `#` | Filter: idle only (toggle) |
-| `$` | Filter: error only (toggle) |
+| `&` | Filter: error only (toggle) |
 | `^` | Filter: view archived sessions (toggle) |
 
 ### Global
@@ -69,6 +69,7 @@ For remote group headers, `Enter`/`Tab` toggles collapse and `h`/Left collapses 
 | `i` | Import existing tmux sessions |
 | `Ctrl+R` | Manual refresh |
 | `Ctrl+Q` | Detach (keep tmux running) |
+| `$` | Cost Dashboard |
 | `q` / `Ctrl+C` | Quit |
 
 ## Local Status Indicators
