@@ -134,6 +134,28 @@ func TestIssue1553_DeepPathEmitsIntermediateHeaders(t *testing.T) {
 	}
 }
 
+func TestRemoteSnapshotEmitsSavedEmptyGroups(t *testing.T) {
+	snapshot := session.RemoteSnapshot{
+		Sessions: []session.RemoteSessionInfo{},
+		Groups:   []session.GroupData{{Name: "empty", Path: "work/empty"}},
+	}
+	items := buildRemoteSnapshotFlatItems("dev", snapshot, nil, nil)
+
+	var paths []string
+	for _, item := range items {
+		if item.Type == session.ItemTypeRemoteGroup {
+			paths = append(paths, item.Path)
+		}
+		if item.Type == session.ItemTypeRemoteSession {
+			t.Fatalf("empty snapshot emitted a session row: %+v", item)
+		}
+	}
+	want := []string{"remotes/dev", "remotes/dev/work", "remotes/dev/work/empty"}
+	if strings.Join(paths, ",") != strings.Join(want, ",") {
+		t.Fatalf("remote group paths = %v, want %v", paths, want)
+	}
+}
+
 // TestIssue1553_IntegrationThroughRebuild drives the real rebuildFlatItems and
 // confirms the nested headers reach h.flatItems, and the header renderer shows
 // the sub-group segment name + subtree count.

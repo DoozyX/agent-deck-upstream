@@ -626,6 +626,7 @@ type Home struct {
 
 	// Remote sessions (Phase 2: Agent-Deck Remotes)
 	remoteSessions     map[string][]session.RemoteSessionInfo // remoteName -> sessions
+	remoteGroups       map[string][]session.GroupData         // remoteName -> saved groups, including empty groups
 	remoteFromCache    map[string]bool                        // remoteName -> data is a startup cache snapshot, not live yet
 	remoteFetchedAt    map[string]time.Time                   // remoteName -> when its sessions last came from a live fetch
 	remoteSessionsMu   sync.RWMutex
@@ -1362,6 +1363,7 @@ type sendOutputResultMsg struct {
 // remoteSessionsFetchedMsg is sent when async remote sessions fetch completes.
 type remoteSessionsFetchedMsg struct {
 	sessions map[string][]session.RemoteSessionInfo
+	groups   map[string][]session.GroupData
 	// #1101: per-remote cost summary collected on the same SSH fanout.
 	costs map[string]*costs.RemoteCostSummary
 	// failed marks remotes whose fetch errored this round (issue #1170).
@@ -2596,6 +2598,52 @@ func (h *Home) rebuildFlatItems() {
 		h.flatItems = scoped
 	}
 
+	// Build remote rows before partitioning. Populated-on-top includes them in
+	// the shared split; the other modes append them later, preserving their
+	// existing behavior.
+	remoteRows := make([]session.Item, 0)
+	remoteActivity := make(map[string]session.GroupActivity)
+	if h.statusFilter != FilterModeArchived {
+		h.remoteSessionsMu.RLock()
+		remoteNamesSet := make(map[string]bool, len(h.remoteSessions)+len(h.remoteGroups))
+		remoteSnapshots := make(map[string]session.RemoteSnapshot, len(h.remoteSessions)+len(h.remoteGroups))
+		for name, sessions := range h.remoteSessions {
+			remoteNamesSet[name] = true
+			snapshot := remoteSnapshots[name]
+			snapshot.Sessions = append([]session.RemoteSessionInfo(nil), sessions...)
+			remoteSnapshots[name] = snapshot
+		}
+		for name, groups := range h.remoteGroups {
+			remoteNamesSet[name] = true
+			snapshot := remoteSnapshots[name]
+			snapshot.Groups = append([]session.GroupData(nil), groups...)
+			remoteSnapshots[name] = snapshot
+		}
+		h.remoteSessionsMu.RUnlock()
+
+		remoteNames := make([]string, 0, len(remoteNamesSet))
+		for name := range remoteNamesSet {
+			remoteNames = append(remoteNames, name)
+		}
+		sort.Strings(remoteNames)
+		for _, remoteName := range remoteNames {
+			snapshot := remoteSnapshots[remoteName]
+			remoteRows = append(remoteRows, buildRemoteSnapshotFlatItems(remoteName, snapshot, h.remoteGroupsCollapsed, h.remoteSessionOrder.forRemote(remoteName))...)
+			for _, remoteSession := range snapshot.Sessions {
+				path := "remotes/" + remoteName + "/" + normalizeRemoteGroupPath(remoteSession.Group)
+				parts := strings.Split(path, "/")
+				for i := range parts {
+					ancestor := strings.Join(parts[:i+1], "/")
+					remoteActivity[ancestor] = session.GroupActivity{HasAny: true}
+				}
+			}
+		}
+	}
+	if h.groupViewMode == session.GroupViewPopulatedTop {
+		h.flatItems = append(h.flatItems, remoteRows...)
+		remoteRows = nil
+	}
+
 	// Partition into top/bottom sections by view mode (active-on-top / populated-on-top).
 	// Runs after filtering/scoping but before window injection so windows follow
 	// their parent session into whichever section it lands in.
@@ -2606,6 +2654,9 @@ func (h *Home) rebuildFlatItems() {
 		// archive view so a group whose sessions are all archived counts as empty
 		// in the active view and sinks below the divider.
 		activity := h.groupTree.GroupActivityMap(viewArchived)
+		for path, remote := range remoteActivity {
+			activity[path] = remote
+		}
 		h.flatItems = session.PartitionByViewMode(h.flatItems, h.groupViewMode, activity)
 	}
 
@@ -2678,24 +2729,8 @@ func (h *Home) rebuildFlatItems() {
 		h.flatItems = expanded
 	}
 
-	// Append remote sessions as selectable items
-	h.remoteSessionsMu.RLock()
-	remoteNames := make([]string, 0, len(h.remoteSessions))
-	remotes := make(map[string][]session.RemoteSessionInfo, len(h.remoteSessions))
-	for name, sessions := range h.remoteSessions {
-		remoteNames = append(remoteNames, name)
-		remotes[name] = append([]session.RemoteSessionInfo(nil), sessions...)
-	}
-	h.remoteSessionsMu.RUnlock()
-	sort.Strings(remoteNames)
-	if len(remotes) > 0 && h.statusFilter != FilterModeArchived {
-		for _, remoteName := range remoteNames {
-			// #1553: nest each remote's sessions under their Group paths
-			// instead of dumping them flat at Level 1.
-			// #1875: apply the user's manual row order for this remote.
-			h.flatItems = append(h.flatItems, buildRemoteFlatItemsOrdered(remoteName, remotes[remoteName], h.remoteGroupsCollapsed, h.remoteSessionOrder.forRemote(remoteName))...)
-		}
-	}
+	// Normal and active-on-top retain the historical remote placement.
+	h.flatItems = append(h.flatItems, remoteRows...)
 
 	// Pre-compute root group numbers for O(1) hotkey lookup (replaces O(n) loop in renderGroupItem).
 	// View-mode partitioning can duplicate root headers; every copy of the same
@@ -3386,6 +3421,7 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	session.CleanStaleSSHSockets()
 
 	results := make(map[string][]session.RemoteSessionInfo, len(config.Remotes))
+	groupResults := make(map[string][]session.GroupData, len(config.Remotes))
 	// #1101: remote cost summaries piggy-back on the existing remote-fetch
 	// channel so the status-line cost segment doesn't lag behind the session
 	// list. nil-valued entries indicate fetch failures (e.g., older remote
@@ -3414,13 +3450,14 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 			defer cancel()
 
 			runner := session.NewSSHRunner(name, rc)
-			sessions, err := runner.FetchSessions(ctx)
+			snapshot, err := runner.FetchSnapshot(ctx)
 			if err != nil {
 				mu.Lock()
 				failed[name] = true
 				mu.Unlock()
 				return
 			}
+			sessions := snapshot.Sessions
 			for i := range sessions {
 				sessions[i].RemoteName = name
 			}
@@ -3433,6 +3470,7 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 
 			mu.Lock()
 			results[name] = sessions
+			groupResults[name] = snapshot.Groups
 			if costErr == nil && summary != nil {
 				costResults[name] = summary
 			}
@@ -3441,7 +3479,7 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	}
 	wg.Wait()
 
-	return remoteSessionsFetchedMsg{sessions: results, costs: costResults, failed: failed}
+	return remoteSessionsFetchedMsg{sessions: results, groups: groupResults, costs: costResults, failed: failed}
 }
 
 // mergeRemoteSessions reconciles a freshly fetched remote-session map against
@@ -3456,7 +3494,11 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 // It is a pure function so the reconciliation logic is unit-testable without
 // SSH or the Bubble Tea event loop.
 func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, failed map[string]bool) map[string][]session.RemoteSessionInfo {
-	merged := make(map[string][]session.RemoteSessionInfo, len(fetched)+len(failed))
+	return mergeRemoteValues(prev, fetched, failed)
+}
+
+func mergeRemoteValues[T any](prev, fetched map[string][]T, failed map[string]bool) map[string][]T {
+	merged := make(map[string][]T, len(fetched)+len(failed))
 	for name, sess := range fetched {
 		merged[name] = sess
 	}
@@ -3470,6 +3512,10 @@ func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, f
 		}
 	}
 	return merged
+}
+
+func mergeRemoteGroups(prev, fetched map[string][]session.GroupData, failed map[string]bool) map[string][]session.GroupData {
+	return mergeRemoteValues(prev, fetched, failed)
 }
 
 // shouldFetchRemoteSessions reports whether the periodic tick should kick off
@@ -6446,6 +6492,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// #1170: merge rather than wholesale-replace so a remote that errored
 		// this round keeps its last-good sessions instead of flickering out.
 		h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
+		h.remoteGroups = mergeRemoteGroups(h.remoteGroups, msg.groups, msg.failed)
 		for name := range msg.sessions {
 			if !msg.failed[name] {
 				delete(h.remoteFromCache, name)

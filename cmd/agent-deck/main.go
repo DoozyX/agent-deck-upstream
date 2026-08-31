@@ -2222,6 +2222,7 @@ func resolveConfiguredDefaultPath(defaultPath string) string {
 func handleList(profile string, args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	includeGroups := fs.Bool("include-groups", false, "Include saved groups in a JSON snapshot")
 	allProfiles := fs.Bool("all", false, "List sessions from all profiles")
 	archivedOnly := fs.Bool("archived", false, "List archived sessions only")
 	includeArchived := fs.Bool("include-archived", false, "Include archived sessions")
@@ -2260,13 +2261,13 @@ func handleList(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	instances, _, err := loadInstancesForList(storage, *archivedOnly, *includeArchived)
+	instances, groups, err := loadInstancesForList(storage, *archivedOnly, *includeArchived)
 	if err != nil {
 		fmt.Printf("Error: failed to load sessions: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(instances) == 0 {
+	if len(instances) == 0 && !(*jsonOutput && *includeGroups) {
 		fmt.Printf("No sessions found in profile '%s'.\n", storage.Profile())
 		return
 	}
@@ -2350,7 +2351,14 @@ func handleList(profile string, args []string) {
 			}
 			sessions[i] = sj
 		}
-		output, err := json.MarshalIndent(sessions, "", "  ")
+		var payload any = sessions
+		if *includeGroups {
+			payload = struct {
+				Sessions []sessionJSON        `json:"sessions"`
+				Groups   []*session.GroupData `json:"groups"`
+			}{Sessions: sessions, Groups: groups}
+		}
+		output, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
 			os.Exit(1)
