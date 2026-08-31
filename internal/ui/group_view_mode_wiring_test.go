@@ -119,6 +119,43 @@ func TestPopulatedTopWiringSinksEmptyGroup(t *testing.T) {
 	}
 }
 
+func TestPopulatedTopWiringSinksEmptyRemoteGroup(t *testing.T) {
+	home := NewHome()
+	home.groupTree = session.NewGroupTreeWithGroups(nil, nil)
+	home.remoteSessions = map[string][]session.RemoteSessionInfo{
+		"dev": {{ID: "remote-1", Title: "build", Group: "work", Status: "idle", RemoteName: "dev"}},
+	}
+	home.remoteGroups = map[string][]session.GroupData{
+		"dev": {
+			{Name: "work", Path: "work"},
+			{Name: "empty", Path: "empty"},
+		},
+	}
+	home.groupViewMode = session.GroupViewPopulatedTop
+	home.rebuildFlatItems()
+
+	div := dividerIndex(home)
+	if div < 0 {
+		t.Fatalf("expected one shared empty-groups divider: %+v", home.flatItems)
+	}
+	remoteSessionAbove := false
+	emptyBelow := false
+	dividers := 0
+	for i, item := range home.flatItems {
+		switch {
+		case item.Type == session.ItemTypeDivider:
+			dividers++
+		case item.Type == session.ItemTypeRemoteSession && item.RemoteSession.ID == "remote-1" && i < div:
+			remoteSessionAbove = true
+		case item.Type == session.ItemTypeRemoteGroup && item.Path == "remotes/dev/empty" && i > div:
+			emptyBelow = true
+		}
+	}
+	if dividers != 1 || !remoteSessionAbove || !emptyBelow {
+		t.Fatalf("dividers=%d remote-above=%v empty-below=%v rows=%+v", dividers, remoteSessionAbove, emptyBelow, home.flatItems)
+	}
+}
+
 // Regression: once ANY session is archived, hasArchivedSessions() flips true and
 // the archive-partition pass in rebuildFlatItems engages. That pass previously
 // dropped every group not in archiveGroupsWithMatches — including empty groups and

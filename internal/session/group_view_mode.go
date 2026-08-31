@@ -151,6 +151,9 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 
 	// sessionGoesTop classifies a single session item.
 	sessionGoesTop := func(it Item) bool {
+		if it.Type == ItemTypeRemoteSession {
+			return true
+		}
 		if it.Session == nil {
 			return true
 		}
@@ -171,12 +174,18 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 		}
 		return true
 	}
+	isGroupRow := func(it Item) bool {
+		return it.Type == ItemTypeGroup || mode == GroupViewPopulatedTop && it.Type == ItemTypeRemoteGroup
+	}
+	isSessionRow := func(it Item) bool {
+		return it.Type == ItemTypeSession || mode == GroupViewPopulatedTop && it.Type == ItemTypeRemoteSession
+	}
 
 	// Pass 1: which group paths have a visible top/bottom *session row*.
 	hasTopRow := make(map[string]bool)
 	hasBottomRow := make(map[string]bool)
 	for _, it := range items {
-		if it.Type != ItemTypeSession || it.Session == nil {
+		if !isSessionRow(it) || it.Type == ItemTypeSession && it.Session == nil {
 			continue
 		}
 		if sessionGoesTop(it) {
@@ -197,7 +206,7 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 	if mode == GroupViewPopulatedTop {
 		var sink []string
 		for _, it := range items {
-			if it.Type != ItemTypeGroup {
+			if !isGroupRow(it) {
 				continue
 			}
 			if hasTopRow[it.Path] || hasBottomRow[it.Path] || activity[it.Path].HasAny {
@@ -216,8 +225,8 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 	top := make([]Item, 0, len(items))
 	bottom := make([]Item, 0, len(items))
 	for _, it := range items {
-		switch it.Type {
-		case ItemTypeGroup:
+		switch {
+		case isGroupRow(it):
 			inTop := hasTopRow[it.Path]
 			inBottom := hasBottomRow[it.Path]
 			if !inTop && !inBottom {
@@ -257,7 +266,7 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 			if inBottom {
 				bottom = append(bottom, it)
 			}
-		case ItemTypeSession:
+		case isSessionRow(it):
 			if sessionGoesTop(it) {
 				top = append(top, it)
 			} else {
@@ -302,7 +311,7 @@ func PartitionByViewMode(items []Item, mode GroupViewMode, activity map[string]G
 func ensureBottomAncestorsPresent(bottom, source []Item) []Item {
 	groupByPath := make(map[string]Item, len(source))
 	for _, it := range source {
-		if it.Type == ItemTypeGroup {
+		if it.Type == ItemTypeGroup || it.Type == ItemTypeRemoteGroup {
 			groupByPath[it.Path] = it
 		}
 	}

@@ -481,19 +481,47 @@ func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, err
 	if err != nil {
 		return nil, err
 	}
+	snapshot, err := parseRemoteSnapshot(output)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Sessions, nil
+}
 
+// FetchSnapshot retrieves sessions and saved groups from a remote instance.
+func (r *SSHRunner) FetchSnapshot(ctx context.Context) (RemoteSnapshot, error) {
+	output, err := r.Run(ctx, "list", "--json", "--include-groups")
+	if err != nil {
+		sessions, fallbackErr := r.FetchSessions(ctx)
+		if fallbackErr != nil {
+			return RemoteSnapshot{}, err
+		}
+		return RemoteSnapshot{Sessions: sessions}, nil
+	}
+	return parseRemoteSnapshot(output)
+}
+
+func parseRemoteSnapshot(output []byte) (RemoteSnapshot, error) {
 	// Handle empty/non-JSON output (e.g., "No sessions found" message)
 	trimmed := bytes.TrimSpace(output)
-	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return nil, nil
+	if len(trimmed) == 0 {
+		return RemoteSnapshot{}, nil
 	}
 
-	var sessions []RemoteSessionInfo
-	if err := json.Unmarshal(trimmed, &sessions); err != nil {
-		return nil, fmt.Errorf("failed to parse remote sessions: %w", err)
+	var snapshot RemoteSnapshot
+	switch trimmed[0] {
+	case '[':
+		if err := json.Unmarshal(trimmed, &snapshot.Sessions); err != nil {
+			return RemoteSnapshot{}, fmt.Errorf("failed to parse remote sessions: %w", err)
+		}
+	case '{':
+		if err := json.Unmarshal(trimmed, &snapshot); err != nil {
+			return RemoteSnapshot{}, fmt.Errorf("failed to parse remote snapshot: %w", err)
+		}
+	default:
+		return RemoteSnapshot{}, nil
 	}
-
-	return sessions, nil
+	return snapshot, nil
 }
 
 // FetchPendingRecords retrieves the remote host's completion and transition
@@ -1060,6 +1088,12 @@ type RemoteSessionInfo struct {
 
 	// Set locally, not from JSON
 	RemoteName string `json:"-"`
+}
+
+// RemoteSnapshot is the remote list response used by the TUI.
+type RemoteSnapshot struct {
+	Sessions []RemoteSessionInfo `json:"sessions"`
+	Groups   []GroupData         `json:"groups"`
 }
 
 // RemoteLatency is a live round-trip-time sample for a configured remote.

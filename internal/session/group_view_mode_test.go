@@ -131,6 +131,40 @@ func TestPartitionPopulatedTopSinksEmptyGroups(t *testing.T) {
 	}
 }
 
+func TestPartitionPopulatedTopSinksEmptyRemoteGroups(t *testing.T) {
+	items := []Item{
+		{Type: ItemTypeRemoteGroup, RemoteName: "dev", Path: "remotes/dev"},
+		{Type: ItemTypeRemoteGroup, RemoteName: "dev", Path: "remotes/dev/work", Level: 1},
+		{Type: ItemTypeRemoteSession, RemoteName: "dev", Path: "remotes/dev/work", Level: 2, RemoteSession: &RemoteSessionInfo{ID: "1"}},
+		{Type: ItemTypeRemoteGroup, RemoteName: "dev", Path: "remotes/dev/empty", Level: 1},
+	}
+	activity := map[string]GroupActivity{
+		"remotes/dev":      {HasAny: true},
+		"remotes/dev/work": {HasAny: true},
+	}
+
+	got := PartitionByViewMode(items, GroupViewPopulatedTop, activity)
+	want := []struct {
+		type_ ItemType
+		path  string
+	}{
+		{ItemTypeRemoteGroup, "remotes/dev"},
+		{ItemTypeRemoteGroup, "remotes/dev/work"},
+		{ItemTypeRemoteSession, "remotes/dev/work"},
+		{ItemTypeDivider, ""},
+		{ItemTypeRemoteGroup, "remotes/dev"},
+		{ItemTypeRemoteGroup, "remotes/dev/empty"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("partitioned rows = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i].Type != want[i].type_ || got[i].Path != want[i].path {
+			t.Errorf("row %d = (%v, %q), want (%v, %q)", i, got[i].Type, got[i].Path, want[i].type_, want[i].path)
+		}
+	}
+}
+
 func TestPartitionPopulatedTopParentOfPopulatedSubgroupStaysTop(t *testing.T) {
 	// "proj" has no direct sessions but a populated subgroup; "scratch" is empty.
 	items := []Item{

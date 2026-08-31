@@ -31,11 +31,19 @@ func buildRemoteFlatItems(remoteName string, sessions []session.RemoteSessionInf
 	return buildRemoteFlatItemsOrdered(remoteName, sessions, collapsed, nil)
 }
 
+func buildRemoteSnapshotFlatItems(remoteName string, snapshot session.RemoteSnapshot, collapsed map[string]bool, order map[string][]string) []session.Item {
+	return buildRemoteFlatItemsWithGroupsOrdered(remoteName, snapshot.Sessions, snapshot.Groups, collapsed, order)
+}
+
 // buildRemoteFlatItemsOrdered is buildRemoteFlatItems with the manual
 // row-order overlay (#1875) applied. order holds THIS remote's group path ->
 // session IDs (i.e. remoteOrder.forRemote(remoteName)) and may be nil, in
 // which case each bucket keeps the order the remote listed.
 func buildRemoteFlatItemsOrdered(remoteName string, sessions []session.RemoteSessionInfo, collapsed map[string]bool, order map[string][]string) []session.Item {
+	return buildRemoteFlatItemsWithGroupsOrdered(remoteName, sessions, nil, collapsed, order)
+}
+
+func buildRemoteFlatItemsWithGroupsOrdered(remoteName string, sessions []session.RemoteSessionInfo, groups []session.GroupData, collapsed map[string]bool, order map[string][]string) []session.Item {
 	items := make([]session.Item, 0, len(sessions)+2)
 
 	remoteRoot := "remotes/" + remoteName
@@ -59,6 +67,13 @@ func buildRemoteFlatItemsOrdered(remoteName string, sessions []session.RemoteSes
 	for i := range sessions {
 		g := normalizeRemoteGroupPath(sessions[i].Group)
 		buckets[g] = append(buckets[g], i)
+	}
+	for _, group := range groups {
+		if g := strings.Trim(strings.TrimSpace(group.Path), "/"); g != "" {
+			if _, ok := buckets[g]; !ok {
+				buckets[g] = nil
+			}
+		}
 	}
 
 	// Sort group paths lexicographically. Lexicographic order places a parent
