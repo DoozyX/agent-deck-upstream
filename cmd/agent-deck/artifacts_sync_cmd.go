@@ -370,7 +370,9 @@ func runArtifactsSync(stdout, stderr io.Writer, args []string, cwd string, open 
 	dryRun := flags.Bool("dry-run", false, "plan and report without transferring")
 	all := flags.Bool("all", false, "every project root in the session registry, not just this one")
 	asJSON := flags.Bool("json", false, "emit a machine-readable result")
-	if err := flags.Parse(args); err != nil {
+	// normalizeArgs so `sync m1 --dry-run` works: Go's flag package stops at the
+	// first non-flag argument, and the remote name is the natural first word.
+	if err := flags.Parse(normalizeArgs(flags, args)); err != nil {
 		return artifactsExitUsage
 	}
 	rest := flags.Args()
@@ -475,7 +477,17 @@ func artifactSyncRoots(cwd string, all bool) ([]string, error) {
 	}
 	seen := make(map[string]struct{}, len(candidates))
 	roots := make([]string, 0, len(candidates))
-	for _, c := range candidates {
+	for i, c := range candidates {
+		// The registry outlives the filesystem — it still names worktrees that
+		// have since been deleted. Such a root has nothing to sync and no main
+		// worktree to fold into, so it would only add a skip line. The cwd
+		// (i == 0) is kept regardless: the caller asked about it by standing
+		// there, and a bad path deserves the error, not silence.
+		if i > 0 {
+			if _, err := os.Stat(c); err != nil {
+				continue
+			}
+		}
 		root := c
 		if folded, err := git.GetMainWorktreePath(c); err == nil && folded != "" {
 			root = folded
@@ -662,7 +674,7 @@ func artifactsRootFlag(name string, stderr io.Writer, args []string) (string, bo
 	flags := flag.NewFlagSet("artifacts "+name, flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	root := flags.String("root", "", "project root whose .agent-deck tree to operate on")
-	if err := flags.Parse(args); err != nil {
+	if err := flags.Parse(normalizeArgs(flags, args)); err != nil {
 		return "", false
 	}
 	if *root == "" || !filepath.IsAbs(*root) {
