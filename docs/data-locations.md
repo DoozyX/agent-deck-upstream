@@ -35,6 +35,18 @@ A working directory that is not in a git repository is its own root.
 | `.agent-deck/tmp/<session-id>/` | Per-session `TMPDIR` (per checkout, so scratch stays next to the code it belongs to) |
 | `.agent-deck/worktree-setup.sh`, `.agent-deck/worktree-destruction.sh` | Authored by the user; run on worktree create/destroy |
 
+### Which of these crosses machines
+
+`agent-deck artifacts sync` moves the run artifacts — `<run-id>/` and
+`handoff/` — between hosts, and nothing else in the table above. The two
+exclusions are the same distinction one level down: `tmp/<session-id>/` is a
+running session's TMPDIR and `skills.toml` is *this checkout's* skill
+attachment list, so copying either onto another machine would not be the same
+artifact in two places, it would be machine-local state in the wrong place.
+
+Nothing under `$XDG_DATA_HOME/agent-deck/` is synced at all: it describes the
+machine.
+
 `.agent-deck/` is kept out of `git status` through the user's global git
 excludes file (`ensureRepositoryGitExclude`, `internal/session/session_temp.go`).
 Agent Deck never writes a repository's tracked `.gitignore` — those are the
