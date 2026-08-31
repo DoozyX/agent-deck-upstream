@@ -644,3 +644,49 @@ func TestArtifactsHomeSubcommand_PrintsHome(t *testing.T) {
 		t.Errorf("home = %q, want %q", strings.TrimSpace(out.String()), home)
 	}
 }
+
+// `artifacts sync m1 --dry-run` is how a person actually types it: the remote
+// is the subject, the flags are an afterthought. Go's flag package stops
+// parsing at the first non-flag argument, so without normalization --dry-run
+// arrives as a second positional and the command reports a usage error while
+// silently NOT being a dry run.
+func TestArtifactsSync_FlagsAfterTheRemoteName(t *testing.T) {
+	_, _, localRoot, remoteRoot, remote := syncFixture(t)
+	var out bytes.Buffer
+
+	code := runArtifactsSync(&out, &out, []string{"m1", "--dry-run"}, localRoot, stubOpen(remote))
+
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out.String())
+	}
+	if _, err := os.Stat(filepath.Join(remoteRoot, ".agent-deck", "run-local")); !errors.Is(err, os.ErrNotExist) {
+		t.Error("trailing --dry-run was ignored: a file was pushed")
+	}
+	if remote.packCalls != 0 || remote.pushCalls != 0 {
+		t.Errorf("trailing --dry-run was ignored: pack=%d push=%d", remote.packCalls, remote.pushCalls)
+	}
+}
+
+// The registry outlives the filesystem: it still names worktrees that have
+// since been deleted. Those roots have no artifacts to sync and no main
+// worktree to fold into, so carrying them into the report buries the roots that
+// do matter under skip lines. Observed live: 48 roots, most of them stale.
+func TestArtifactsSync_AllDropsRootsThatNoLongerExist(t *testing.T) {
+	_, _, localRoot, _, remote := syncFixture(t)
+	gone := filepath.Join(filepath.Dir(localRoot), ".worktrees", "deleted-long-ago")
+
+	oldRoots := artifactRegistryRoots
+	artifactRegistryRoots = func() ([]string, error) { return []string{localRoot, gone}, nil }
+	t.Cleanup(func() { artifactRegistryRoots = oldRoots })
+
+	var out bytes.Buffer
+	if code := runArtifactsSync(&out, &out, []string{"--all", "m1"}, localRoot, stubOpen(remote)); code != 0 {
+		t.Fatalf("exit = %d\n%s", code, out.String())
+	}
+	if strings.Contains(out.String(), "deleted-long-ago") {
+		t.Errorf("a root that does not exist reached the report:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "1 roots") {
+		t.Errorf("want 1 root after dropping the stale one:\n%s", out.String())
+	}
+}
