@@ -373,6 +373,8 @@ func main() {
 		case "openclaw", "oc":
 			handleOpenClaw(profile, args[1:])
 			return
+		case "artifacts":
+			os.Exit(runArtifacts(os.Stdout, os.Stderr, os.Stdin, args[1:]))
 		case "remote":
 			handleRemote(profile, args[1:])
 			return
@@ -1006,7 +1008,7 @@ var globalFlagSubcommands = map[string]bool{
 	"session": true, "mcp": true, "plugin": true, "skill": true, "mcp-proxy": true,
 	"group": true, "try": true, "launch": true, "conductor": true,
 	"telegram-doctor": true, "watcher": true, "openclaw": true, "oc": true,
-	"remote": true, "worktree": true, "wt": true, "costs": true, "web": true,
+	"remote": true, "artifacts": true, "worktree": true, "wt": true, "costs": true, "web": true,
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
