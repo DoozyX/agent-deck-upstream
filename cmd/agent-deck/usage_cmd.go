@@ -19,7 +19,7 @@ func configuredUsageAccounts(config *session.UserConfig) []usage.Account {
 	}
 	accounts := []usage.Account{}
 	add := func(provider usage.Provider, home, label string) {
-		home = usage.CanonicalHome(session.ExpandPath(home))
+		home = session.ExpandPath(home)
 		if home != "" {
 			accounts = append(accounts, usage.Account{Provider: provider, Home: home, Label: label})
 		}
@@ -64,7 +64,7 @@ func mergeUsageAccounts(accountSets ...[]usage.Account) []usage.Account {
 			if account.Home == "" {
 				continue
 			}
-			accounts = append(accounts, usage.Account{Provider: account.Provider, Home: usage.CanonicalHome(account.Home), Label: account.Label})
+			accounts = append(accounts, usage.Account{Provider: account.Provider, Home: account.Home, Label: account.Label})
 		}
 	}
 	return usage.DedupeAndSortAccounts(accounts)
