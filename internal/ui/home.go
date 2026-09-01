@@ -1334,7 +1334,7 @@ func mergeUsageSnapshots(previous, fresh []usage.Snapshot, accounts []usage.Acco
 	merged := make(map[string]usage.Snapshot, len(previous)+len(fresh))
 	discovered := make(map[string]struct{}, len(accounts))
 	for _, account := range accounts {
-		discovered[string(account.Provider)+"\x00"+usage.CanonicalHome(account.Home)] = struct{}{}
+		discovered[string(account.Provider)+"\x00"+account.Home] = struct{}{}
 	}
 	for _, snapshot := range previous {
 		if accounts != nil {
@@ -3234,7 +3234,7 @@ func (h *Home) fetchUsage() tea.Msg {
 	}
 	accounts := []usage.Account{}
 	add := func(provider usage.Provider, home, label string) {
-		home = usage.CanonicalHome(session.ExpandPath(home))
+		home = session.ExpandPath(home)
 		if home != "" {
 			accounts = append(accounts, usage.Account{Provider: provider, Home: home, Label: label})
 		}

@@ -43,6 +43,15 @@ func TestUsageFetchedRetainsPriorSnapshotAsStaleAfterFailure(t *testing.T) {
 	}
 }
 
+func TestUsageFetchedRetainsPriorSnapshotAfterDiscoveryFailure(t *testing.T) {
+	h := &Home{usageSnapshots: []usage.Snapshot{{Available: true, Provider: usage.Claude, Home: "/work", Account: "work", Windows: usage.Windows{Weekly: &usage.Window{RemainingPercent: 55}}}}}
+	model, _ := h.updateInner(usageFetchedMsg{})
+	got := model.(*Home).usageSnapshots
+	if len(got) != 1 || !got[0].Stale || got[0].Windows.Weekly == nil || got[0].Windows.Weekly.RemainingPercent != 55 {
+		t.Fatalf("snapshots = %#v, want prior snapshot retained and stale after discovery failure", got)
+	}
+}
+
 func TestUsageFetchedDropsSnapshotsForUndiscoveredAccounts(t *testing.T) {
 	h := &Home{usageSnapshots: []usage.Snapshot{
 		{Available: true, Provider: usage.Claude, Home: "/gone", Account: "gone"},
