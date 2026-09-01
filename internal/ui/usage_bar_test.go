@@ -12,10 +12,21 @@ import (
 func TestRenderUsageBarWrapsEveryAccount(t *testing.T) {
 	s := []usage.Snapshot{{Available: true, Provider: usage.Claude, Account: "Personal", Windows: usage.Windows{Session5H: &usage.Window{RemainingPercent: 82}, Weekly: &usage.Window{RemainingPercent: 61}}}, {Available: true, Provider: usage.Codex, Account: "Pro", Windows: usage.Windows{Weekly: &usage.Window{RemainingPercent: 98}}}}
 	got := renderUsageBar(s, 32)
-	if !strings.Contains(got, "Claude Personal 5h 82% W61%") || !strings.Contains(got, "Codex Pro W98%") || !strings.Contains(got, "\n") {
+	if !strings.Contains(got, "Claude Personal 5h 18% W39%") || !strings.Contains(got, "Codex Pro W2%") || !strings.Contains(got, "\n") {
 		t.Fatalf("bar=%q", got)
 	}
 	t.Logf("rendered usage bar:\n%s", got)
+}
+
+func TestUsagePercentUsedClampsProviderValues(t *testing.T) {
+	for _, test := range []struct {
+		remaining int
+		want      int
+	}{{remaining: -1, want: 100}, {remaining: 0, want: 100}, {remaining: 100, want: 0}, {remaining: 101, want: 0}} {
+		if got := usagePercentUsed(test.remaining); got != test.want {
+			t.Fatalf("usagePercentUsed(%d) = %d, want %d", test.remaining, got, test.want)
+		}
+	}
 }
 
 func TestRenderUsageBarHardWrapsSingleLongSegment(t *testing.T) {
@@ -29,7 +40,7 @@ func TestRenderUsageBarHardWrapsSingleLongSegment(t *testing.T) {
 
 func TestRenderUsageBarMarksStaleSnapshots(t *testing.T) {
 	bar := renderUsageBar([]usage.Snapshot{{Available: true, Stale: true, Provider: usage.Claude, Account: "work", Windows: usage.Windows{Weekly: &usage.Window{RemainingPercent: 55}}}}, 80)
-	if !strings.Contains(bar, "~Claude work W55%") {
+	if !strings.Contains(bar, "~Claude work W45%") {
 		t.Fatalf("stale marker missing from %q", bar)
 	}
 }

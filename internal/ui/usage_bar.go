@@ -15,6 +15,16 @@ func usageRefreshDue(last time.Time, inFlight bool, now time.Time) bool {
 	return !inFlight && (last.IsZero() || !now.Before(last.Add(usageRefreshInterval)))
 }
 
+func usagePercentUsed(remaining int) int {
+	if remaining < 0 {
+		return 100
+	}
+	if remaining > 100 {
+		return 0
+	}
+	return 100 - remaining
+}
+
 // renderUsageBar is deliberately presentation-only: collection happens away
 // from the render loop so cursor movement never waits on openusage.
 func renderUsageBar(snapshots []usage.Snapshot, width int) string {
@@ -34,10 +44,10 @@ func renderUsageBar(snapshots []usage.Snapshot, width int) string {
 		}
 		part := fmt.Sprintf("%s%s %s", prefix, provider, label)
 		if s.Provider == usage.Claude && s.Windows.Session5H != nil {
-			part += fmt.Sprintf(" 5h %d%%", s.Windows.Session5H.RemainingPercent)
+			part += fmt.Sprintf(" 5h %d%%", usagePercentUsed(s.Windows.Session5H.RemainingPercent))
 		}
 		if s.Windows.Weekly != nil {
-			part += fmt.Sprintf(" W%d%%", s.Windows.Weekly.RemainingPercent)
+			part += fmt.Sprintf(" W%d%%", usagePercentUsed(s.Windows.Weekly.RemainingPercent))
 		}
 		parts = append(parts, part)
 	}
