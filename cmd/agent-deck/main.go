@@ -1584,6 +1584,12 @@ func handleAdd(profile string, args []string) {
 	if sessionGroup != "" {
 		sessionGroup = resolveGroupPathForAdd(groupTree, sessionGroup)
 	}
+	addCfg, _ := session.LoadUserConfig()
+	storage.SetGroupCreationRestricted(managedSessionGroupCreationRestricted(addCfg))
+	if err := requireExistingGroupForManagedSession(addCfg, groupTree, sessionGroup); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 
 	if explicitPathProvided {
 		path, err = resolveAddPath(rawPathArg)
@@ -1666,6 +1672,13 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 	}
+	if sessionGroup == "" && wtBranch == "" {
+		derivedGroup := groupTree.CanonicalGroupPath(session.GroupPathForProject(path))
+		if err := requireExistingGroupForManagedSession(addCfg, groupTree, derivedGroup); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot, worktreeType string
@@ -1732,6 +1745,13 @@ func handleAdd(profile string, args []string) {
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
+		if sessionGroup == "" {
+			derivedGroup := groupTree.CanonicalGroupPath(session.GroupPathForProject(worktreePath))
+			if err := requireExistingGroupForManagedSession(addCfg, groupTree, derivedGroup); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 
 		// Check for an existing worktree for this branch before creating a new one
 		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {

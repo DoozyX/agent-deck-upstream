@@ -678,6 +678,12 @@ func handleGroupCreate(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	cfg, _ := session.LoadUserConfig()
+	if managedSessionGroupCreationRestricted(cfg) {
+		out.Error("group creation is restricted to the user; create the group outside an Agent Deck-managed session", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	// Load sessions and groups
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
@@ -696,7 +702,6 @@ func handleGroupCreate(profile string, args []string) {
 
 	// Seed the new-group default from [group_defaults].max_concurrent. An
 	// explicit --max-concurrent flag still wins (applied post-create below).
-	cfg, _ := session.LoadUserConfig()
 	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 
 	var newGroup *session.Group
@@ -1140,6 +1145,7 @@ func handleGroupMove(profile string, args []string) {
 
 	// Seed the new-group default in case the move target must be auto-created.
 	cfg, _ := session.LoadUserConfig()
+	storage.SetGroupCreationRestricted(managedSessionGroupCreationRestricted(cfg))
 	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 
 	// Try to match an existing group by exact name first, then case-insensitive
@@ -1165,6 +1171,10 @@ func handleGroupMove(profile string, args []string) {
 			}
 		}
 		if !matched {
+			if err := requireExistingGroupForManagedSession(cfg, groupTree, targetGroupPath); err != nil {
+				out.Error(err.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
 			// No existing group found - CreateGroup normalizes the path
 			created := groupTree.CreateGroup(targetGroupPath)
 			targetGroupPath = created.Path

@@ -402,6 +402,36 @@ func handleLaunch(profile string, args []string) {
 		}
 	}
 
+	launchPolicyCfg, _ := session.LoadUserConfig()
+	var launchPolicyTree *session.GroupTree
+	var launchPolicyInstances []*session.Instance
+	var launchPolicyGroups []*session.GroupData
+	if managedSessionGroupCreationRestricted(launchPolicyCfg) {
+		policyStorage, policyInstances, policyGroups, policyErr := loadSessionData(profile)
+		if policyErr != nil {
+			out.Error(policyErr.Error(), ErrCodeNotFound)
+			os.Exit(1)
+		}
+		launchPolicyInstances = policyInstances
+		launchPolicyGroups = policyGroups
+		launchPolicyTree = session.NewGroupTreeWithGroups(policyInstances, policyGroups)
+		if session.ReconcileDeclarativeGroups(launchPolicyTree, launchPolicyCfg) {
+			if policyErr := policyStorage.SaveGroupsOnly(launchPolicyTree); policyErr != nil {
+				_ = policyStorage.Close()
+				out.Error(fmt.Sprintf("failed to persist declarative groups: %v", policyErr), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
+		_ = policyStorage.Close()
+		if explicitGroupProvided {
+			resolvedGroup := resolveGroupPathForAdd(launchPolicyTree, sessionGroup)
+			if policyErr := requireExistingGroupForManagedSession(launchPolicyCfg, launchPolicyTree, resolvedGroup); policyErr != nil {
+				out.Error(policyErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
+	}
+
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot, worktreeType string
 	if wtBranch != "" {
@@ -439,6 +469,32 @@ func handleLaunch(profile string, args []string) {
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
+		if launchPolicyTree != nil && !explicitGroupProvided {
+			var policyParent *session.Instance
+			if sessionParent != "" {
+				var errMsg string
+				policyParent, errMsg, _ = ResolveSession(sessionParent, launchPolicyInstances)
+				if policyParent == nil {
+					out.Error(errMsg, ErrCodeNotFound)
+					os.Exit(1)
+				}
+			} else if !*noParent {
+				var unresolved string
+				policyParent, unresolved = resolveAutoParentInstanceChecked(launchPolicyInstances)
+				if policyParent == nil && unresolved != "" {
+					out.Error(fmt.Sprintf("automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session", unresolved), ErrCodeNotFound)
+					os.Exit(1)
+				}
+			}
+			candidateGroup := deriveLaunchGroup(worktreePath, launchPolicyInstances, launchPolicyGroups, launchPolicyCfg)
+			if policyParent != nil {
+				candidateGroup = policyParent.GroupPath
+			}
+			if policyErr := requireExistingGroupForManagedSession(launchPolicyCfg, launchPolicyTree, candidateGroup); policyErr != nil {
+				out.Error(policyErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
 
 		// Check for an existing worktree for this branch before creating a new one
 		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
