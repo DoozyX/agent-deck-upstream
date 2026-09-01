@@ -140,12 +140,23 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return Snapshot{}, fmt.Errorf("malformed openusage response: %w", err)
 	}
+	if rawProviders := data["providers"]; len(rawProviders) != 0 {
+		var providers map[string]json.RawMessage
+		if json.Unmarshal(rawProviders, &providers) == nil && len(providers[string(provider)]) != 0 {
+			if err := json.Unmarshal(providers[string(provider)], &data); err != nil {
+				return Snapshot{}, fmt.Errorf("malformed openusage provider response: %w", err)
+			}
+		}
+	}
 	s := Snapshot{Available: true, Provider: provider}
 	_ = json.Unmarshal(data["plan"], &s.Plan)
 	if stale, ok := boolField(data, "stale"); ok {
 		s.Stale = stale
 	}
-	limits := data["limits"]
+	limits := data["resources"]
+	if len(limits) == 0 {
+		limits = data["limits"]
+	}
 	if len(limits) == 0 {
 		limits = data["windows"]
 	}
@@ -154,7 +165,10 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("openusage response has no limits")
 	}
 	if provider == Claude {
-		s.Windows.Session5H = parseWindow(windows["five_hour"])
+		s.Windows.Session5H = parseWindow(windows["session"])
+		if s.Windows.Session5H == nil {
+			s.Windows.Session5H = parseWindow(windows["five_hour"])
+		}
 		if s.Windows.Session5H == nil {
 			s.Windows.Session5H = parseWindow(windows["session_5h"])
 		}
@@ -179,6 +193,7 @@ func parseWindow(raw json.RawMessage) *Window {
 		RemainingPercent *int      `json:"remaining_percent"`
 		Remaining        *int      `json:"remaining"`
 		ResetsAt         time.Time `json:"resets_at"`
+		ResetsAtV1       time.Time `json:"resetsAt"`
 	}
 	if json.Unmarshal(raw, &value) != nil {
 		return nil
@@ -190,7 +205,11 @@ func parseWindow(raw json.RawMessage) *Window {
 	if p == nil {
 		return nil
 	}
-	return &Window{RemainingPercent: *p, ResetsAt: value.ResetsAt}
+	resetsAt := value.ResetsAt
+	if resetsAt.IsZero() {
+		resetsAt = value.ResetsAtV1
+	}
+	return &Window{RemainingPercent: *p, ResetsAt: resetsAt}
 }
 
 func CanonicalHome(home string) string {
