@@ -47,6 +47,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/terminal"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/usage"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
@@ -562,6 +563,9 @@ type Home struct {
 	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
 	// it only changes WHAT the footer advertises, never a keybinding.
 	footerMode string
+	// usageSnapshots is populated by an optional background OpenUsage query.
+	// Empty means no bar, preserving the historic layout exactly.
+	usageSnapshots []usage.Snapshot
 
 	// attachOnCreate, when true, makes creating a session via the new-session
 	// dialog attach to the new session's pane immediately instead of only
@@ -1206,7 +1210,12 @@ func (h *Home) stackedPreviewTopY() int {
 	if h.debugMode {
 		debugBarHeight = 1
 	}
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	usageBar := renderUsageBar(h.usageSnapshots, h.width)
+	usageBarHeight := 0
+	if usageBar != "" {
+		usageBarHeight = lipgloss.Height(usageBar)
+	}
+	contentHeight := h.height - 1 - helpBarHeight - usageBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 	listHeight := h.stackedListHeight(contentHeight)
 	// content top + full list block (title + body) + the 1-row separator.
 	return h.contentChromeTop() + listHeight + 1
@@ -1301,6 +1310,8 @@ type openCodeDetectionCompleteMsg struct {
 type updateCheckMsg struct {
 	info *update.UpdateInfo
 }
+
+type usageFetchedMsg struct{ snapshots []usage.Snapshot }
 
 type (
 	tickMsg        time.Time
@@ -3171,6 +3182,7 @@ func (h *Home) Init() tea.Cmd {
 		h.tick(),
 		h.reviverTick(),
 		h.checkForUpdate(),
+		h.fetchUsage,
 		h.fetchRemoteSessions,
 	}
 
@@ -3188,6 +3200,50 @@ func (h *Home) Init() tea.Cmd {
 	cmds = append(cmds, h.startWatcherEngine())
 
 	return tea.Batch(cmds...)
+}
+
+// fetchUsage is outside the render loop. OpenUsage failures are intentionally
+// silent because the status bar is optional advisory information.
+func (h *Home) fetchUsage() tea.Msg {
+	config, err := session.LoadUserConfig()
+	if err != nil {
+		return usageFetchedMsg{}
+	}
+	accounts := []usage.Account{}
+	add := func(provider usage.Provider, home, label string) {
+		home = usage.CanonicalHome(session.ExpandPath(home))
+		if home != "" {
+			accounts = append(accounts, usage.Account{Provider: provider, Home: home, Label: label})
+		}
+	}
+	add(usage.Claude, config.Claude.ConfigDir, "Claude")
+	add(usage.Codex, config.Codex.ConfigDir, "Codex")
+	add(usage.Claude, usage.DefaultHome(usage.Claude), "Claude")
+	add(usage.Codex, usage.DefaultHome(usage.Codex), "Codex")
+	for name := range config.Profiles {
+		add(usage.Claude, config.GetProfileClaudeConfigDir(name), name)
+		add(usage.Codex, config.GetProfileCodexConfigDir(name), name)
+	}
+	seen := map[string]bool{}
+	snapshots := []usage.Snapshot{}
+	runner := usage.Runner{}
+	for _, account := range accounts {
+		key := string(account.Provider) + "\x00" + account.Home
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if snapshot, err := runner.Query(h.ctx, account); err == nil {
+			snapshots = append(snapshots, snapshot)
+		}
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].Provider != snapshots[j].Provider {
+			return snapshots[i].Provider == usage.Claude
+		}
+		return strings.ToLower(snapshots[i].Account) < strings.ToLower(snapshots[j].Account)
+	})
+	return usageFetchedMsg{snapshots: snapshots}
 }
 
 // checkForUpdate checks for updates asynchronously
@@ -5534,6 +5590,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case usageFetchedMsg:
+		h.usageSnapshots = msg.snapshots
+		return h, nil
+
 	case quitMsg:
 		// Execute final shutdown logic after splash delay. Two quit messages can
 		// be queued (e.g. 'q' pressed twice before the splash resolves); running
@@ -15195,8 +15255,13 @@ func (h *Home) renderFrame() string {
 	if h.debugMode {
 		debugBarHeight = 1
 	}
+	usageBar := renderUsageBar(h.usageSnapshots, h.width)
+	usageBarHeight := 0
+	if usageBar != "" {
+		usageBarHeight = lipgloss.Height(usageBar)
+	}
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help, -debugBarHeight debug
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	contentHeight := h.height - 1 - helpBarHeight - usageBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
 
 	// Route to appropriate layout based on terminal width
 	layoutMode := h.getLayoutMode()
@@ -15215,6 +15280,10 @@ func (h *Home) renderFrame() string {
 	mainContent = ensureExactHeight(mainContent, contentHeight)
 	b.WriteString(mainContent)
 	b.WriteString("\n")
+	if usageBar != "" {
+		b.WriteString(usageBar)
+		b.WriteString("\n")
+	}
 
 	// ═══════════════════════════════════════════════════════════════════
 	// HELP BAR (context-aware shortcuts) — replaced by the insert-mode
