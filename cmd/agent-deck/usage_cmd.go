@@ -37,36 +37,6 @@ func configuredUsageAccounts(config *session.UserConfig) []usage.Account {
 	add(usage.Codex, config.Codex.ConfigDir, "Codex")
 	add(usage.Claude, usage.DefaultHome(usage.Claude), "Claude")
 	add(usage.Codex, usage.DefaultHome(usage.Codex), "Codex")
-	if home := os.Getenv("CLAUDE_CONFIG_DIR"); home != "" {
-		add(usage.Claude, home, "Claude")
-	}
-	if home := os.Getenv("CODEX_HOME"); home != "" {
-		add(usage.Codex, home, "Codex")
-	}
-	return usage.DedupeAndSortAccounts(accounts)
-}
-
-func usageAccountsForInstances(instances []*session.Instance) []usage.Account {
-	accounts := make([]usage.Account, 0, len(instances))
-	for _, inst := range instances {
-		account, err := usageAccountForSession(inst)
-		if err == nil && account.Home != "" {
-			accounts = append(accounts, account)
-		}
-	}
-	return accounts
-}
-
-func mergeUsageAccounts(accountSets ...[]usage.Account) []usage.Account {
-	accounts := []usage.Account{}
-	for _, set := range accountSets {
-		for _, account := range set {
-			if account.Home == "" {
-				continue
-			}
-			accounts = append(accounts, usage.Account{Provider: account.Provider, Home: account.Home, Label: account.Label})
-		}
-	}
 	return usage.DedupeAndSortAccounts(accounts)
 }
 
@@ -137,9 +107,7 @@ func handleUsage(profile string, args []string) {
 		os.Exit(1)
 	}
 	accounts := configuredUsageAccounts(config)
-	if *all {
-		accounts = mergeUsageAccounts(accounts, usageAccountsForInstances(instances))
-	} else {
+	if !*all {
 		inst, errMsg, _ := ResolveSessionOrCurrent(fs.Arg(0), instances)
 		if inst == nil {
 			fmt.Fprintf(os.Stderr, "usage: %s (provide a session target or use --all)\n", errMsg)

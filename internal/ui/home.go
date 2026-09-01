@@ -3252,17 +3252,6 @@ func (h *Home) fetchUsage() tea.Msg {
 	add(usage.Codex, config.Codex.ConfigDir, "Codex")
 	add(usage.Claude, usage.DefaultHome(usage.Claude), "Claude")
 	add(usage.Codex, usage.DefaultHome(usage.Codex), "Codex")
-	if h.storage != nil {
-		if instances, _, err := h.storage.LoadWithGroups(); err == nil {
-			for _, inst := range instances {
-				if session.IsClaudeCompatible(inst.Tool) {
-					add(usage.Claude, session.GetClaudeConfigDirForInstance(inst), inst.Title)
-				} else if session.IsCodexCompatible(inst.Tool) {
-					add(usage.Codex, session.GetCodexConfigDirForInstance(inst), inst.Title)
-				}
-			}
-		}
-	}
 	accounts = usage.DedupeAndSortAccounts(accounts)
 	snapshots := []usage.Snapshot{}
 	runner := usage.Runner{}

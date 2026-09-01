@@ -46,12 +46,17 @@ func TestConfiguredUsageAccountsPrefersLexicographicallyFirstProfileLabel(t *tes
 	t.Fatalf("Claude account for %q missing: %#v", home, accounts)
 }
 
-func TestUsageAccountsForInstancesIncludesEffectiveProviderHome(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("CLAUDE_CONFIG_DIR", home)
-	accounts := usageAccountsForInstances([]*session.Instance{{Title: "session-only", Tool: "claude"}})
-	if len(accounts) != 1 || accounts[0].Home != usage.CanonicalHome(home) || accounts[0].Label != "session-only" {
-		t.Fatalf("accounts = %#v", accounts)
+func TestConfiguredUsageAccountsExcludesAmbientSessionHomes(t *testing.T) {
+	claudeSessionHome := t.TempDir()
+	codexSessionHome := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", claudeSessionHome)
+	t.Setenv("CODEX_HOME", codexSessionHome)
+
+	accounts := configuredUsageAccounts(&session.UserConfig{})
+	for _, account := range accounts {
+		if account.Home == usage.CanonicalHome(claudeSessionHome) || account.Home == usage.CanonicalHome(codexSessionHome) {
+			t.Fatalf("ambient session home leaked into global accounts: %#v", account)
+		}
 	}
 }
 
