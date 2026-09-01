@@ -18,6 +18,25 @@ func TestParseNormalizesClaudeWindowsAndIgnoresFutureFields(t *testing.T) {
 	}
 }
 
+func TestParseRejectsMalformedJSONAndResponsesWithoutWindows(t *testing.T) {
+	if _, err := Parse(Claude, []byte("{")); err == nil {
+		t.Fatal("malformed JSON was accepted")
+	}
+	if _, err := Parse(Codex, []byte(`{"plan":"Pro"}`)); err == nil {
+		t.Fatal("response without supported windows was accepted")
+	}
+}
+
+func TestParseCodexWeeklyOnlyAndStale(t *testing.T) {
+	s, err := Parse(Codex, []byte(`{"stale":true,"windows":{"weekly":{"remaining":44}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !s.Stale || s.Windows.Weekly == nil || s.Windows.Weekly.RemainingPercent != 44 || s.Windows.Session5H != nil {
+		t.Fatalf("snapshot = %#v", s)
+	}
+}
+
 func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
