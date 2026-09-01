@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,7 +38,7 @@ func TestParseOpenUsageLimitsV1ProviderResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if claude.Plan != "Max" || claude.Stale || claude.Windows.Session5H == nil || claude.Windows.Session5H.RemainingPercent != 76 || claude.Windows.Session5H.ResetsAt.IsZero() || claude.Windows.Weekly == nil || claude.Windows.Weekly.RemainingPercent != 75 || claude.Windows.Weekly.ResetsAt.IsZero() {
+	if claude.Plan != "Max" || claude.Stale || claude.Windows.Session5H == nil || claude.Windows.Session5H.RemainingPercent != 76 || !claude.Windows.Session5H.ResetsAt.Equal(time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)) || claude.Windows.Weekly == nil || claude.Windows.Weekly.RemainingPercent != 75 || !claude.Windows.Weekly.ResetsAt.Equal(time.Date(2026, 9, 3, 8, 0, 0, 0, time.UTC)) {
 		t.Fatalf("Claude snapshot = %#v", claude)
 	}
 
@@ -45,8 +46,47 @@ func TestParseOpenUsageLimitsV1ProviderResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if codex.Plan != "Pro" || codex.Windows.Session5H != nil || codex.Windows.Weekly == nil || codex.Windows.Weekly.RemainingPercent != 83 {
+	if codex.Plan != "Pro" || codex.Windows.Session5H != nil || codex.Windows.Weekly == nil || codex.Windows.Weekly.RemainingPercent != 83 || !codex.Windows.Weekly.ResetsAt.Equal(time.Date(2026, 9, 7, 6, 59, 5, 0, time.UTC)) {
 		t.Fatalf("Codex snapshot = %#v", codex)
+	}
+}
+
+func TestParseClaudeSessionTakesPrecedenceOverFiveHour(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":91},"five_hour":{"remaining":37},"weekly":{"remaining":64}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 91 {
+		t.Fatalf("session window = %#v, want session remaining to win over five_hour", s.Windows.Session5H)
+	}
+}
+
+func TestParseSelectsRequestedProvider(t *testing.T) {
+	raw := []byte(`{"providers":{"claude":{"resources":{"weekly":{"remaining":21}}},"codex":{"resources":{"weekly":{"remaining":82}}}}}`)
+	claude, err := Parse(Claude, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	codex, err := Parse(Codex, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Windows.Weekly == nil || claude.Windows.Weekly.RemainingPercent != 21 || codex.Windows.Weekly == nil || codex.Windows.Weekly.RemainingPercent != 82 {
+		t.Fatalf("provider snapshots = Claude %#v, Codex %#v", claude, codex)
+	}
+}
+
+func TestParseMissingRequestedProviderFallsBackToTopLevelEnvelope(t *testing.T) {
+	_, err := Parse(Claude, []byte(`{"providers":{"codex":{"resources":{"weekly":{"remaining":82}}}}}`))
+	if err == nil || err.Error() != "openusage response has no limits" {
+		t.Fatalf("error = %v, want missing limits error", err)
+	}
+}
+
+func TestParseRejectsMalformedProviderResponse(t *testing.T) {
+	_, err := Parse(Claude, []byte(`{"providers":{"claude":"malformed"}}`))
+	if err == nil || !strings.HasPrefix(err.Error(), "malformed openusage provider response:") {
+		t.Fatalf("error = %v, want malformed provider response error", err)
 	}
 }
 
