@@ -3,10 +3,17 @@ package ui
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/usage"
 	"github.com/charmbracelet/lipgloss"
 )
+
+const usageRefreshInterval = 30 * time.Second
+
+func usageRefreshDue(last time.Time, inFlight bool, now time.Time) bool {
+	return !inFlight && (last.IsZero() || !now.Before(last.Add(usageRefreshInterval)))
+}
 
 // renderUsageBar is deliberately presentation-only: collection happens away
 // from the render loop so cursor movement never waits on openusage.

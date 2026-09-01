@@ -60,7 +60,20 @@ func configuredUsageAccounts(config *session.UserConfig) []usage.Account {
 	return out
 }
 
-func handleUsage(args []string) {
+func usageAccountForSession(inst *session.Instance) (usage.Account, error) {
+	if inst == nil {
+		return usage.Account{}, fmt.Errorf("session is required")
+	}
+	if session.IsClaudeCompatible(inst.Tool) {
+		return usage.Account{Provider: usage.Claude, Home: usage.CanonicalHome(session.GetClaudeConfigDirForInstance(inst)), Label: inst.Title}, nil
+	}
+	if session.IsCodexCompatible(inst.Tool) {
+		return usage.Account{Provider: usage.Codex, Home: usage.CanonicalHome(session.GetCodexConfigDirForInstance(inst)), Label: inst.Title}, nil
+	}
+	return usage.Account{}, fmt.Errorf("usage is unsupported for %s sessions", inst.Tool)
+}
+
+func handleUsage(profile string, args []string) {
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	all := fs.Bool("all", false, "query all configured local accounts")
@@ -75,17 +88,13 @@ func handleUsage(args []string) {
 		}
 		return
 	}
-	if !*all && fs.NArg() == 0 {
-		fmt.Fprintln(os.Stderr, "usage needs a session target or --all")
-		os.Exit(2)
-	}
 	if *all && fs.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "usage --all does not accept a session target")
 		os.Exit(2)
 	}
-	if !*all {
-		fmt.Fprintln(os.Stderr, "usage session lookup is unavailable; use --all")
-		os.Exit(1)
+	if !*all && fs.NArg() > 1 {
+		fmt.Fprintln(os.Stderr, "usage accepts one session target")
+		os.Exit(2)
 	}
 	config, err := session.LoadUserConfig()
 	if err != nil {
@@ -93,6 +102,29 @@ func handleUsage(args []string) {
 		os.Exit(1)
 	}
 	accounts := configuredUsageAccounts(config)
+	if !*all {
+		storage, storageErr := session.NewStorageWithProfile(profile)
+		if storageErr != nil {
+			fmt.Fprintf(os.Stderr, "usage: initialize storage: %v\n", storageErr)
+			os.Exit(1)
+		}
+		instances, _, loadErr := storage.LoadWithGroups()
+		if loadErr != nil {
+			fmt.Fprintf(os.Stderr, "usage: load sessions: %v\n", loadErr)
+			os.Exit(1)
+		}
+		inst, errMsg, _ := ResolveSessionOrCurrent(fs.Arg(0), instances)
+		if inst == nil {
+			fmt.Fprintf(os.Stderr, "usage: %s (provide a session target or use --all)\n", errMsg)
+			os.Exit(2)
+		}
+		account, accountErr := usageAccountForSession(inst)
+		if accountErr != nil {
+			fmt.Fprintf(os.Stderr, "usage: %v\n", accountErr)
+			os.Exit(1)
+		}
+		accounts = []usage.Account{account}
+	}
 	results := make([]usage.Snapshot, 0, len(accounts))
 	runner := usage.Runner{}
 	for _, account := range accounts {
