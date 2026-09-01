@@ -47,6 +47,16 @@ func renderUsageBar(snapshots []usage.Snapshot, width int) string {
 	lines := []string{}
 	line := ""
 	for _, part := range parts {
+		if lipgloss.Width(part) > width {
+			if line != "" {
+				lines = append(lines, line)
+				line = ""
+			}
+			wrapped := hardWrapUsagePart(part, width)
+			lines = append(lines, wrapped[:len(wrapped)-1]...)
+			line = wrapped[len(wrapped)-1]
+			continue
+		}
 		candidate := part
 		if line != "" {
 			candidate = line + " | " + part
@@ -62,4 +72,22 @@ func renderUsageBar(snapshots []usage.Snapshot, width int) string {
 		lines = append(lines, line)
 	}
 	return lipgloss.NewStyle().Foreground(ColorTextDim).Render(strings.Join(lines, "\n"))
+}
+
+func hardWrapUsagePart(part string, width int) []string {
+	lines := []string{}
+	line := ""
+	for _, r := range part {
+		candidate := line + string(r)
+		if line != "" && lipgloss.Width(candidate) > width {
+			lines = append(lines, line)
+			line = string(r)
+		} else {
+			line = candidate
+		}
+	}
+	if line != "" {
+		lines = append(lines, line)
+	}
+	return lines
 }

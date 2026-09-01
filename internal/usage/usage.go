@@ -40,6 +40,7 @@ type Snapshot struct {
 	Stale     bool      `json:"stale"`
 	Windows   Windows   `json:"windows,omitempty"`
 	Error     string    `json:"error,omitempty"`
+	Home      string    `json:"-"`
 }
 
 type Account struct {
@@ -95,6 +96,7 @@ func (r Runner) Query(ctx context.Context, account Account) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	s.Account = account.Label
+	s.Home = CanonicalHome(account.Home)
 	s.FetchedAt = time.Now().UTC()
 	return s, nil
 }
