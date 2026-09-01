@@ -32,6 +32,24 @@ func TestParseNormalizesClaudeWindowsAndIgnoresFutureFields(t *testing.T) {
 	}
 }
 
+func TestParseOpenUsageLimitsV1ProviderResources(t *testing.T) {
+	claude, err := Parse(Claude, []byte(`{"schema":"openusage.limits.v1","providers":{"claude":{"plan":"Max","stale":false,"resources":{"session":{"kind":"consumption","remaining":76,"resetsAt":"2026-09-01T09:00:00Z"},"weekly":{"kind":"consumption","remaining":75,"resetsAt":"2026-09-03T08:00:00Z"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claude.Plan != "Max" || claude.Stale || claude.Windows.Session5H == nil || claude.Windows.Session5H.RemainingPercent != 76 || claude.Windows.Session5H.ResetsAt.IsZero() || claude.Windows.Weekly == nil || claude.Windows.Weekly.RemainingPercent != 75 || claude.Windows.Weekly.ResetsAt.IsZero() {
+		t.Fatalf("Claude snapshot = %#v", claude)
+	}
+
+	codex, err := Parse(Codex, []byte(`{"schema":"openusage.limits.v1","providers":{"codex":{"plan":"Pro","resources":{"weekly":{"kind":"consumption","remaining":83,"resetsAt":"2026-09-07T06:59:05Z"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if codex.Plan != "Pro" || codex.Windows.Session5H != nil || codex.Windows.Weekly == nil || codex.Windows.Weekly.RemainingPercent != 83 {
+		t.Fatalf("Codex snapshot = %#v", codex)
+	}
+}
+
 func TestParseRejectsMalformedJSONAndResponsesWithoutWindows(t *testing.T) {
 	if _, err := Parse(Claude, []byte("{")); err == nil {
 		t.Fatal("malformed JSON was accepted")
