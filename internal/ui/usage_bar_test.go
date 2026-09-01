@@ -35,11 +35,23 @@ func TestRenderUsageBarMarksStaleSnapshots(t *testing.T) {
 }
 
 func TestUsageFetchedRetainsPriorSnapshotAsStaleAfterFailure(t *testing.T) {
-	h := &Home{usageSnapshots: []usage.Snapshot{{Available: true, Provider: usage.Claude, Account: "work", Windows: usage.Windows{Weekly: &usage.Window{RemainingPercent: 55}}}}}
-	model, _ := h.updateInner(usageFetchedMsg{})
+	h := &Home{usageSnapshots: []usage.Snapshot{{Available: true, Provider: usage.Claude, Home: "/work", Account: "work", Windows: usage.Windows{Weekly: &usage.Window{RemainingPercent: 55}}}}}
+	model, _ := h.updateInner(usageFetchedMsg{accounts: []usage.Account{{Provider: usage.Claude, Home: "/work", Label: "work"}}})
 	got := model.(*Home).usageSnapshots
 	if len(got) != 1 || !got[0].Stale || got[0].Windows.Weekly == nil || got[0].Windows.Weekly.RemainingPercent != 55 {
 		t.Fatalf("snapshots = %#v, want prior snapshot retained and stale", got)
+	}
+}
+
+func TestUsageFetchedDropsSnapshotsForUndiscoveredAccounts(t *testing.T) {
+	h := &Home{usageSnapshots: []usage.Snapshot{
+		{Available: true, Provider: usage.Claude, Home: "/gone", Account: "gone"},
+		{Available: true, Provider: usage.Codex, Home: "/active", Account: "active"},
+	}}
+	model, _ := h.updateInner(usageFetchedMsg{accounts: []usage.Account{{Provider: usage.Codex, Home: "/active", Label: "active"}}})
+	got := model.(*Home).usageSnapshots
+	if len(got) != 1 || got[0].Home != "/active" || !got[0].Stale {
+		t.Fatalf("snapshots = %#v, want only stale active account", got)
 	}
 }
 

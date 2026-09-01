@@ -43,29 +43,7 @@ func configuredUsageAccounts(config *session.UserConfig) []usage.Account {
 	if home := os.Getenv("CODEX_HOME"); home != "" {
 		add(usage.Codex, home, "Codex")
 	}
-	byHome := map[string]usage.Account{}
-	for _, a := range accounts {
-		k := string(a.Provider) + "\x00" + a.Home
-		previous, exists := byHome[k]
-		if !exists || (a.Label != "" && (previous.Label == "" || strings.ToLower(a.Label) < strings.ToLower(previous.Label))) {
-			byHome[k] = a
-		}
-	}
-	out := make([]usage.Account, 0, len(byHome))
-	for _, a := range byHome {
-		out = append(out, a)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Provider != out[j].Provider {
-			return out[i].Provider == usage.Claude
-		}
-		li, lj := strings.ToLower(out[i].Label), strings.ToLower(out[j].Label)
-		if li != lj {
-			return li < lj
-		}
-		return out[i].Home < out[j].Home
-	})
-	return out
+	return usage.DedupeAndSortAccounts(accounts)
 }
 
 func usageAccountsForInstances(instances []*session.Instance) []usage.Account {
@@ -89,29 +67,7 @@ func mergeUsageAccounts(accountSets ...[]usage.Account) []usage.Account {
 			accounts = append(accounts, usage.Account{Provider: account.Provider, Home: usage.CanonicalHome(account.Home), Label: account.Label})
 		}
 	}
-	byHome := map[string]usage.Account{}
-	for _, a := range accounts {
-		k := string(a.Provider) + "\x00" + a.Home
-		previous, exists := byHome[k]
-		if !exists || (a.Label != "" && (previous.Label == "" || strings.ToLower(a.Label) < strings.ToLower(previous.Label))) {
-			byHome[k] = a
-		}
-	}
-	out := make([]usage.Account, 0, len(byHome))
-	for _, a := range byHome {
-		out = append(out, a)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Provider != out[j].Provider {
-			return out[i].Provider == usage.Claude
-		}
-		li, lj := strings.ToLower(out[i].Label), strings.ToLower(out[j].Label)
-		if li != lj {
-			return li < lj
-		}
-		return out[i].Home < out[j].Home
-	})
-	return out
+	return usage.DedupeAndSortAccounts(accounts)
 }
 
 func usageArgsWithFlagsFirst(args []string) []string {

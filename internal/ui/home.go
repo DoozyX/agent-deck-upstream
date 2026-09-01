@@ -1210,7 +1210,11 @@ func (h *Home) usageBarHeight() int {
 
 // mainContentHeight is shared by rendering, scrolling, and stacked mouse routing.
 func (h *Home) mainContentHeight() int {
-	height := h.height - 1 - 2 - 1 - h.usageBarHeight() // header, help, filter, usage
+	return h.mainContentHeightForUsageBar(h.usageBarHeight())
+}
+
+func (h *Home) mainContentHeightForUsageBar(usageBarHeight int) int {
+	height := h.height - 1 - 2 - 1 - usageBarHeight // header, help, filter, usage
 	if h.shouldRenderUpdateNudge() {
 		height--
 	}
@@ -1313,7 +1317,10 @@ type updateCheckMsg struct {
 	info *update.UpdateInfo
 }
 
-type usageFetchedMsg struct{ snapshots []usage.Snapshot }
+type usageFetchedMsg struct {
+	snapshots []usage.Snapshot
+	accounts  []usage.Account
+}
 
 func usageSnapshotKey(snapshot usage.Snapshot) string {
 	home := snapshot.Home
@@ -1323,9 +1330,18 @@ func usageSnapshotKey(snapshot usage.Snapshot) string {
 	return string(snapshot.Provider) + "\x00" + home
 }
 
-func mergeUsageSnapshots(previous, fresh []usage.Snapshot) []usage.Snapshot {
+func mergeUsageSnapshots(previous, fresh []usage.Snapshot, accounts []usage.Account) []usage.Snapshot {
 	merged := make(map[string]usage.Snapshot, len(previous)+len(fresh))
+	discovered := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		discovered[string(account.Provider)+"\x00"+usage.CanonicalHome(account.Home)] = struct{}{}
+	}
 	for _, snapshot := range previous {
+		if accounts != nil {
+			if _, ok := discovered[usageSnapshotKey(snapshot)]; !ok {
+				continue
+			}
+		}
 		snapshot.Stale = true
 		merged[usageSnapshotKey(snapshot)] = snapshot
 	}
@@ -3247,28 +3263,7 @@ func (h *Home) fetchUsage() tea.Msg {
 			}
 		}
 	}
-	byHome := map[string]usage.Account{}
-	for _, account := range accounts {
-		key := string(account.Provider) + "\x00" + account.Home
-		previous, exists := byHome[key]
-		if !exists || (account.Label != "" && (previous.Label == "" || strings.ToLower(account.Label) < strings.ToLower(previous.Label))) {
-			byHome[key] = account
-		}
-	}
-	accounts = accounts[:0]
-	for _, account := range byHome {
-		accounts = append(accounts, account)
-	}
-	sort.Slice(accounts, func(i, j int) bool {
-		if accounts[i].Provider != accounts[j].Provider {
-			return accounts[i].Provider == usage.Claude
-		}
-		li, lj := strings.ToLower(accounts[i].Label), strings.ToLower(accounts[j].Label)
-		if li != lj {
-			return li < lj
-		}
-		return accounts[i].Home < accounts[j].Home
-	})
+	accounts = usage.DedupeAndSortAccounts(accounts)
 	snapshots := []usage.Snapshot{}
 	runner := usage.Runner{}
 	for _, account := range accounts {
@@ -3286,7 +3281,7 @@ func (h *Home) fetchUsage() tea.Msg {
 		}
 		return snapshots[i].Home < snapshots[j].Home
 	})
-	return usageFetchedMsg{snapshots: snapshots}
+	return usageFetchedMsg{snapshots: snapshots, accounts: accounts}
 }
 
 // checkForUpdate checks for updates asynchronously
@@ -5634,7 +5629,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case usageFetchedMsg:
-		h.usageSnapshots = mergeUsageSnapshots(h.usageSnapshots, msg.snapshots)
+		h.usageSnapshots = mergeUsageSnapshots(h.usageSnapshots, msg.snapshots, msg.accounts)
 		h.lastUsageFetch = time.Now()
 		h.usageFetchInFlight = false
 		return h, nil
@@ -15297,7 +15292,7 @@ func (h *Home) renderFrame() string {
 	// ═══════════════════════════════════════════════════════════════════
 	usageBar := renderUsageBar(h.usageSnapshots, h.width)
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help, -debugBarHeight debug
-	contentHeight := h.mainContentHeight()
+	contentHeight := h.mainContentHeightForUsageBar(lipgloss.Height(usageBar))
 
 	// Route to appropriate layout based on terminal width
 	layoutMode := h.getLayoutMode()
