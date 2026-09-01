@@ -2433,6 +2433,14 @@ func (i *Instance) getCodexHomeDir() string {
 	return i.codexHomeForCommand(i.resolveCodexCommand(i.Command))
 }
 
+// GetCodexConfigDirForInstance returns the effective CODEX_HOME for a session.
+func GetCodexConfigDirForInstance(i *Instance) string {
+	if i == nil {
+		return getCodexHomeDir()
+	}
+	return i.getCodexHomeDir()
+}
+
 // Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
 // Resume: codex resume <session-id> or codex resume --last
 // Also sources .env files from [shell].env_files

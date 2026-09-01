@@ -565,7 +565,9 @@ type Home struct {
 	footerMode string
 	// usageSnapshots is populated by an optional background OpenUsage query.
 	// Empty means no bar, preserving the historic layout exactly.
-	usageSnapshots []usage.Snapshot
+	usageSnapshots     []usage.Snapshot
+	lastUsageFetch     time.Time
+	usageFetchInFlight bool
 
 	// attachOnCreate, when true, makes creating a session via the new-session
 	// dialog attach to the new session's pane immediately instead of only
@@ -3176,6 +3178,7 @@ func (h *Home) Init() tea.Cmd {
 		h.intervalHookRunner.Start()
 	}
 
+	h.usageFetchInFlight = true
 	cmds := []tea.Cmd{
 		h.loadSessions,
 
@@ -5592,6 +5595,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case usageFetchedMsg:
 		h.usageSnapshots = msg.snapshots
+		h.lastUsageFetch = time.Now()
+		h.usageFetchInFlight = false
 		return h, nil
 
 	case quitMsg:
@@ -7600,7 +7605,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd}
+		var usageCmd tea.Cmd
+		if usageRefreshDue(h.lastUsageFetch, h.usageFetchInFlight, time.Now()) {
+			h.usageFetchInFlight = true
+			usageCmd = h.fetchUsage
+		}
+		cmds := []tea.Cmd{h.tick(), previewCmd, remoteFetchCmd, remoteLatencyCmd, usageCmd}
 		if h.fullRepaint {
 			cmds = append(cmds, tea.ClearScreen)
 		}

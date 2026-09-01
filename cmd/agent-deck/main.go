@@ -353,7 +353,7 @@ func main() {
 			handleAccounts(args[1:])
 			return
 		case "usage":
-			handleUsage(args[1:])
+			handleUsage(profile, args[1:])
 			return
 		case "conductor":
 			handleConductor(profile, args[1:])
