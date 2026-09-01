@@ -8,6 +8,20 @@ import (
 	"time"
 )
 
+func TestDedupeAndSortAccountsNormalizesAndUsesFirstLabel(t *testing.T) {
+	accounts := DedupeAndSortAccounts([]Account{
+		{Provider: Codex, Home: "/tmp/z/../work", Label: "Zeta"},
+		{Provider: Claude, Home: "/tmp/claude", Label: "work"},
+		{Provider: Codex, Home: "/tmp/work", Label: "alpha"},
+	})
+	if len(accounts) != 2 {
+		t.Fatalf("accounts = %#v", accounts)
+	}
+	if accounts[0].Provider != Claude || accounts[1].Provider != Codex || accounts[1].Label != "alpha" || accounts[1].Home != "/tmp/work" {
+		t.Fatalf("accounts = %#v, want normalized provider/label order", accounts)
+	}
+}
+
 func TestParseNormalizesClaudeWindowsAndIgnoresFutureFields(t *testing.T) {
 	s, err := Parse("claude", []byte(`{"plan":"Max","limits":{"five_hour":{"remaining_percent":82,"resets_at":"2026-08-31T15:45:00Z"},"weekly":{"remaining_percent":61,"resets_at":"2026-09-07T10:45:00Z"}},"future":true}`))
 	if err != nil {

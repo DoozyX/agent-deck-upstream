@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -46,6 +47,39 @@ type Snapshot struct {
 type Account struct {
 	Provider    Provider
 	Home, Label string
+}
+
+// DedupeAndSortAccounts normalizes account homes, keeps the first
+// lexicographical label for each provider/home pair, and presents Claude before
+// Codex. Both the CLI and TUI use this contract when discovering accounts.
+func DedupeAndSortAccounts(accounts []Account) []Account {
+	byHome := make(map[string]Account, len(accounts))
+	for _, account := range accounts {
+		account.Home = CanonicalHome(account.Home)
+		if account.Home == "" {
+			continue
+		}
+		key := string(account.Provider) + "\x00" + account.Home
+		previous, exists := byHome[key]
+		if !exists || (account.Label != "" && (previous.Label == "" || strings.ToLower(account.Label) < strings.ToLower(previous.Label))) {
+			byHome[key] = account
+		}
+	}
+	out := make([]Account, 0, len(byHome))
+	for _, account := range byHome {
+		out = append(out, account)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider == Claude
+		}
+		left, right := strings.ToLower(out[i].Label), strings.ToLower(out[j].Label)
+		if left != right {
+			return left < right
+		}
+		return out[i].Home < out[j].Home
+	})
+	return out
 }
 
 type Runner struct {

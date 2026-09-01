@@ -57,8 +57,13 @@ func TestUsageAccountsForInstancesIncludesEffectiveProviderHome(t *testing.T) {
 
 func runUsageHelperProcess(t *testing.T, args ...string) (stdout, stderr string, exitCode int) {
 	t.Helper()
+	fakeDir := t.TempDir()
+	fakeOpenUsage := fakeDir + "/openusage"
+	if err := os.WriteFile(fakeOpenUsage, []byte("#!/bin/sh\nprintf '%s\\n' '{\"limits\":{\"weekly\":{\"remaining\":77}}}'\n"), 0o755); err != nil {
+		t.Fatalf("write fake openusage: %v", err)
+	}
 	cmd := exec.Command(os.Args[0], append([]string{"-test.run=TestUsageHelperProcess", "--"}, args...)...)
-	cmd.Env = append(os.Environ(), "AGENT_DECK_USAGE_HELPER=1", "HOME="+t.TempDir())
+	cmd.Env = append(os.Environ(), "AGENT_DECK_USAGE_HELPER=1", "HOME="+t.TempDir(), "PATH="+fakeDir+":"+os.Getenv("PATH"))
 	var out, errOut bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errOut
 	err := cmd.Run()
@@ -99,7 +104,7 @@ func TestHandleUsageAcceptsJSONAfterSessionTarget(t *testing.T) {
 
 func TestHandleUsageAllJSON(t *testing.T) {
 	stdout, stderr, code := runUsageHelperProcess(t, "--all", "--json")
-	if code != 0 || !strings.HasPrefix(stdout, "[") {
+	if code != 0 || !strings.Contains(stdout, "77") {
 		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }
