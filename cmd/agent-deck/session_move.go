@@ -127,6 +127,20 @@ func handleSessionMove(profile string, args []string) {
 		newPath = resolved
 	}
 
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	moveCfg, _ := session.LoadUserConfig()
+	groupTree.DefaultMaxConcurrent = moveCfg.GroupDefaults.MaxConcurrent
+	if *group != "" {
+		targetGroupPath := *group
+		if targetGroupPath == "root" {
+			targetGroupPath = session.DefaultGroupPath
+		}
+		if err := requireExistingGroupForManagedSession(moveCfg, groupTree, targetGroupPath); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+
 	oldPath := inst.ProjectPath
 	oldGroup := inst.GroupPath
 
@@ -142,9 +156,6 @@ func handleSessionMove(profile string, args []string) {
 
 	inst.ProjectPath = newPath
 
-	groupTree := session.NewGroupTreeWithGroups(instances, groups)
-	moveCfg, _ := session.LoadUserConfig()
-	groupTree.DefaultMaxConcurrent = moveCfg.GroupDefaults.MaxConcurrent
 	if *group != "" {
 		targetGroupPath := *group
 		if targetGroupPath == "root" {

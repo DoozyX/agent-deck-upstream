@@ -197,11 +197,14 @@ type GroupData struct {
 // Thread-safe with mutex protection for concurrent access within a single process.
 // Multiple processes share data via SQLite WAL mode.
 type Storage struct {
-	db      *statedb.StateDB
-	dbPath  string     // Path to state.db (for change detection)
-	profile string     // The profile this storage is for
-	mu      sync.Mutex // Protects operations during transition
+	db                    *statedb.StateDB
+	dbPath                string     // Path to state.db (for change detection)
+	profile               string     // The profile this storage is for
+	restrictGroupCreation bool       // Managed-session manual_creation_only guard.
+	mu                    sync.Mutex // Protects operations during transition
 }
+
+var ErrManualGroupCreationOnly = errors.New("group creation is restricted to the user")
 
 // NewStorageWithProfile creates a storage instance for a specific profile.
 // If profile is empty, uses the effective profile (from env var or config).
@@ -277,10 +280,17 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		}
 	}
 
+	restrictGroupCreation := false
+	if cfg, cfgErr := LoadUserConfig(); cfgErr == nil && cfg != nil && cfg.GroupDefaults.ManualCreationOnly {
+		restrictGroupCreation = strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")) != "" ||
+			strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")) != ""
+	}
+
 	return &Storage{
-		db:      db,
-		dbPath:  dbPath,
-		profile: effectiveProfile,
+		db:                    db,
+		dbPath:                dbPath,
+		profile:               effectiveProfile,
+		restrictGroupCreation: restrictGroupCreation,
 	}, nil
 }
 
@@ -316,6 +326,12 @@ func (s *Storage) Path() string {
 // GetDB returns the underlying StateDB for direct access (status writes, heartbeat, etc.)
 func (s *Storage) GetDB() *statedb.StateDB {
 	return s.db
+}
+
+// SetGroupCreationRestricted lets command-layer tmux detection enable the
+// persistence backstop when a managed child scrubbed its injected identity.
+func (s *Storage) SetGroupCreationRestricted(restricted bool) {
+	s.restrictGroupCreation = restricted
 }
 
 // Close closes the underlying database connection.
@@ -372,6 +388,9 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 
 	if s.db == nil {
 		return fmt.Errorf("storage database not initialized")
+	}
+	if err := s.rejectNewGroups(instances, groupTree); err != nil {
+		return err
 	}
 
 	// Enforce one Claude conversation owner across persisted sessions.
@@ -672,6 +691,9 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	if newInstance == nil {
 		return fmt.Errorf("nil instance")
 	}
+	if err := s.rejectNewGroups([]*Instance{newInstance}, groupTree); err != nil {
+		return err
+	}
 	row, err := instanceToRow(newInstance)
 	if err != nil {
 		return err
@@ -730,6 +752,56 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 		return nil
 	}
 	return fmt.Errorf("%w: %s", ErrInsertNotPersistent, newInstance.ID)
+}
+
+func (s *Storage) rejectNewGroups(candidateInstances []*Instance, groupTree *GroupTree) error {
+	if !s.restrictGroupCreation || s.db == nil {
+		return nil
+	}
+
+	existing := make(map[string]struct{})
+	groups, err := s.db.LoadGroups()
+	if err != nil {
+		return fmt.Errorf("load groups for creation policy: %w", err)
+	}
+	for _, group := range groups {
+		existing[group.Path] = struct{}{}
+	}
+	instances, err := s.db.LoadInstances()
+	if err != nil {
+		return fmt.Errorf("load sessions for creation policy: %w", err)
+	}
+	for _, inst := range instances {
+		path := inst.GroupPath
+		if path == "" {
+			path = DefaultGroupPath
+		}
+		existing[path] = struct{}{}
+	}
+
+	candidates := make(map[string]struct{})
+	for _, inst := range candidateInstances {
+		if inst == nil {
+			continue
+		}
+		path := inst.GroupPath
+		if path == "" {
+			path = DefaultGroupPath
+		}
+		candidates[path] = struct{}{}
+	}
+	if groupTree != nil {
+		for path := range groupTree.Groups {
+			candidates[path] = struct{}{}
+		}
+	}
+
+	for path := range candidates {
+		if _, ok := existing[path]; !ok {
+			return fmt.Errorf("%w; group %q must be created outside an Agent Deck-managed session", ErrManualGroupCreationOnly, path)
+		}
+	}
+	return nil
 }
 
 // SyncInstanceCwd swaps the persisted project_path for id to newCwd, but ONLY

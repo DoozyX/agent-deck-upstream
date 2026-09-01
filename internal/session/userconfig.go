@@ -123,8 +123,7 @@ type UserConfig struct {
 	// config_dir = "~/.claude-my-group"
 	Groups map[string]GroupSettings `toml:"groups,omitempty"`
 
-	// GroupDefaults holds defaults applied to NEWLY-created groups only.
-	// Existing groups (loaded from state.db) are never affected.
+	// GroupDefaults holds new-group defaults and group-creation policy.
 	GroupDefaults GroupDefaultsSettings `toml:"group_defaults,omitempty"`
 
 	// Conductors defines optional per-conductor overrides.
@@ -831,9 +830,12 @@ type GroupSettings struct {
 	DeepSeek GroupDeepSeekSettings `toml:"deepseek,omitempty"`
 }
 
-// GroupDefaultsSettings carries [group_defaults] — defaults stamped onto new
-// groups at creation time. Distinct from per-group [groups."<path>"] overrides.
+// GroupDefaultsSettings carries [group_defaults] creation defaults and policy.
+// Distinct from per-group [groups."<path>"] overrides.
 type GroupDefaultsSettings struct {
+	// ManualCreationOnly prevents commands run inside managed Agent Deck
+	// sessions from creating groups, explicitly or as a side effect.
+	ManualCreationOnly bool `toml:"manual_creation_only,omitempty"`
 	// MaxConcurrent is the max_concurrent value assigned to new groups created
 	// via `group create`, the TUI dialog, the web API, and the launch/session
 	// auto-create paths. Pointer to distinguish:

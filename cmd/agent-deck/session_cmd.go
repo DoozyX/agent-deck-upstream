@@ -2163,6 +2163,9 @@ func loadSessionData(profile string) (*session.Storage, []*session.Instance, []*
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to initialize storage: %w", err)
 	}
+	if cfg, cfgErr := session.LoadUserConfig(); cfgErr == nil {
+		storage.SetGroupCreationRestricted(managedSessionGroupCreationRestricted(cfg))
+	}
 
 	instances, groupsData, err := storage.LoadWithGroups()
 	if err != nil {

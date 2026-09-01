@@ -104,6 +104,15 @@ func runAgentDeck(
 	home string,
 	args ...string,
 ) (stdout, stderr string, exitCode int) {
+	return runAgentDeckWithEnv(t, home, nil, args...)
+}
+
+func runAgentDeckWithEnv(
+	t *testing.T,
+	home string,
+	extraEnv []string,
+	args ...string,
+) (stdout, stderr string, exitCode int) {
 	t.Helper()
 
 	bin := channelsCLIBinary(t)
@@ -154,6 +163,7 @@ func runAgentDeck(
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
+	env = append(env, extraEnv...)
 	cmd.Env = env
 
 	var outBuf, errBuf strings.Builder

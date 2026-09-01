@@ -861,6 +861,33 @@ func GetCurrentSessionID() string {
 	return parseInstanceIDFromTmuxEnv(string(envOut))
 }
 
+// isManagedSessionInvocation reports whether this command originated inside an
+// Agent Deck-managed session. The injected environment IDs are authoritative;
+// the tmux lookup recovers the identity when a child process scrubbed them.
+func isManagedSessionInvocation() bool {
+	if strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")) != "" ||
+		strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")) != "" {
+		return true
+	}
+	return strings.TrimSpace(GetCurrentSessionID()) != ""
+}
+
+func managedSessionGroupCreationRestricted(cfg *session.UserConfig) bool {
+	return cfg != nil && cfg.GroupDefaults.ManualCreationOnly && isManagedSessionInvocation()
+}
+
+func requireExistingGroupForManagedSession(cfg *session.UserConfig, tree *session.GroupTree, groupPath string) error {
+	if !managedSessionGroupCreationRestricted(cfg) || strings.TrimSpace(groupPath) == "" {
+		return nil
+	}
+	if tree != nil {
+		if _, exists := tree.Groups[groupPath]; exists {
+			return nil
+		}
+	}
+	return fmt.Errorf("group %q does not exist; group creation is restricted to the user, so create it outside an Agent Deck-managed session", groupPath)
+}
+
 // parseInstanceIDFromTmuxEnv extracts the AGENTDECK_INSTANCE_ID value from the
 // output of `tmux show-environment AGENTDECK_INSTANCE_ID`. tmux prints
 // "AGENTDECK_INSTANCE_ID=<id>" when the var is set in the session env, and

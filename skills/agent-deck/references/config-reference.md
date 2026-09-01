@@ -358,16 +358,19 @@ info never fail the run.
 
 ## [group_defaults] Section
 
-Defaults stamped onto **newly-created** groups. Existing groups are unaffected.
+Defaults for **newly-created** groups plus policy controlling who may create
+them. Existing groups are unaffected by creation defaults.
 
 ```toml
 [group_defaults]
-max_concurrent = 3   # new groups cap at 3 concurrent sessions
+max_concurrent = 3          # new groups cap at 3 concurrent sessions
+manual_creation_only = true # managed agent sessions may use existing groups only
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_concurrent` | int | `1` (serial) | `max_concurrent` for new groups created via `group create`, the TUI/web create dialogs, and the launch/session auto-create paths. `0` = unlimited, `1` = serial, `N` = cap. Unset keeps the built-in serial default. An explicit `group create --max-concurrent N` flag overrides this per group; existing groups keep their stored value. |
+| `manual_creation_only` | bool | `false` | When `true`, CLI commands run inside an Agent Deck-managed session may target existing groups but fail if they would create a group explicitly or automatically. Create groups from the main TUI, web UI, declarative `[groups]` config, or a normal terminal outside Agent Deck. |
 
 ## [gemini] Section
 

@@ -2311,6 +2311,23 @@ func TestUserConfig_GroupDefaults_RoundTripZeroSurvives(t *testing.T) {
 	}
 }
 
+func TestUserConfig_GroupDefaults_ManualCreationOnlyRoundTrip(t *testing.T) {
+	const input = "[group_defaults]\nmanual_creation_only = true\n"
+
+	var cfg UserConfig
+	if _, err := toml.Decode(input, &cfg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(&cfg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(buf.String(), "manual_creation_only = true") {
+		t.Fatalf("encoded TOML missing manual_creation_only = true:\n%s", buf.String())
+	}
+}
+
 func TestSaveUserConfig_OmitsZeroValueFields(t *testing.T) {
 	tempDir := t.TempDir()
 	originalHome := os.Getenv("HOME")
