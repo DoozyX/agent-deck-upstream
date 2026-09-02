@@ -309,7 +309,9 @@ decision recorded as a deviation, not a silent per-task improvisation.
 
 Maintain a run manifest at `$RUN_DIR/manifest.md` and update it after every
 stage transition. Start it with one shared `## Verification contract` block:
-the exact baseline, full-suite, lint/format, build/vet and E2E commands; each
+the exact baseline, full-suite, lint/format, build/vet and E2E commands, plus
+the focused-test command shape (how to test only the packages or paths a
+diff touches — incremental review rounds render it as `FOCUSED_TESTS=`); each
 command's required services, credentials and fixtures; who owns that
 infrastructure; and the known environment-dependent failures. Children cite
 that block instead of rediscovering or paraphrasing the same constraints. A
@@ -319,7 +321,9 @@ shared contract.
 Then record per task: slug, base ref and resolved base sha, branch, worktree
 path, verified launch HEAD and merge base, session ids with each session's
 connector + model (and any escalation), current stage, review round, the HEAD
-sha each review round saw, PR url. If
+sha each review round saw, per review round `launched=<unix> done=<unix>
+span=<s>` (from `session children --json`, so the next run can be compared
+against this one's round times), PR url. If
 the conductor session dies, a fresh session can resume the run from the
 manifest plus `session children <old-conductor-id>` — but the surviving
 children are still parented to the dead session, so first re-parent them
@@ -916,8 +920,13 @@ agent-deck launch <worktree-path> -c "$REVIEWER_TOOL" -t "review-<task-slug>-r1"
 Record the worktree's current HEAD sha in the manifest when you launch each
 reviewer — incremental rounds and the full-branch gate need it.
 
-The rendered prompt makes the reviewer read-only with exactly one permitted
-write (the verdict file, outside the repo), forbids every working-tree-rewriting
+The rendered prompt starts the full suite detached into
+`<verdict-file>.suite.log` before the reviewer reads anything and runs the
+layers as parallel subagents while it runs — measured over six rounds, the
+suite (2–6 min) and the serial in-context layers (2.5–6 min) were the whole
+cost of an 8-minute round, and overlapping them is what brings a round to
+~4 min. It makes the reviewer read-only with exactly two permitted
+writes (the verdict file and that log, both outside the repo), forbids every working-tree-rewriting
 command in a worktree it may share with a live implementer, runs the review
 layers with `adversarial` **first and spec-blind**, threads spec compliance
 through the other layers, hands over the implementer's baseline as
@@ -976,7 +985,15 @@ path into every reviewer prompt.
   Save. Regrade upward and send it back. Regrading *downward* is a different
   act — it needs a reason you can write in one line, and it goes in the final
   report.
-- On findings → render the fix-round prompt and `session send` it to
+- On findings → first confirm `impl-<task-slug>` is still registered
+  (`agent-deck session children "$AGENTDECK_INSTANCE_ID" --json` lists it).
+  The implementer is deleted at task-done cleanup, never after round 1: it
+  holds why the code took its shape, and a fresh fix session re-reads the
+  branch before it can start (one run launched four of them). If it is gone,
+  record `deviation: implementer deleted before task-done` in the manifest and
+  launch the replacement in the same worktree with the fix prompt prefixed by
+  the rotation instruction (read `git log`, the branch diff and any
+  `handoff.md` first). Then render the fix-round prompt and `session send` it to
   `impl-<task-slug>` with `--message-file` (findings lists are full of
   backticks too). Pipe the findings **file to file**: they were written by the
   reviewer and never need to pass through you a second time.
@@ -1027,12 +1044,14 @@ bash "$RUN_DIR/prompts/render.sh" review-incremental "$RUN_DIR/<slug>/review-r<n
   SPEC_BLOCK@="$RUN_DIR/<slug>/spec-block.md" \
   REVIEWED_SHA=<reviewed-sha> PREVIOUS_FINDINGS@="$RUN_DIR/<slug>/findings-r<n>.md" \
   BASELINE="<shared manifest baseline plus task-specific delta, or none>" \
+  FOCUSED_TESTS="<the contract's focused-test command for the paths in git diff <reviewed-sha>...HEAD>" \
   AGENT_DECK_REPO=<agent-deck-repo>
 ```
 
   It carries the same read-only contract and verdict format as the full
-  review, but scopes the layers to `git diff <reviewed-sha>...HEAD` and makes
-  every unfixed prior finding a new finding.
+  review, but scopes the layers to `git diff <reviewed-sha>...HEAD`, runs only
+  the focused tests (the full suite belongs to the fix round and to the
+  full-branch gate) and makes every unfixed prior finding a new finding.
 
   Once you have read the previous round's findings, **delete the
   superseded reviewer** (see "Deleting finished sessions").

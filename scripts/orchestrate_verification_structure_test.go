@@ -163,6 +163,7 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 			args: []string{
 				"AGENT_DECK_REPO=/tmp/agent-deck",
 				"BASELINE=baseline: none",
+				"FOCUSED_TESTS=go test ./internal/usage",
 				"PREVIOUS_FINDINGS=One previous finding",
 				"REVIEWED_SHA=0123456789abcdef",
 				"SPEC_BLOCK=Review requirements block",
@@ -284,4 +285,83 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 	if !strings.Contains(string(out), "PRIMARY MOVED: HEAD") {
 		t.Errorf("guard must name what moved; got:\n%s", out)
 	}
+}
+
+// The review round overlaps its test run with its layers, runs focused tests
+// on incremental rounds, keeps the implementer alive for fix rounds, and
+// records per-round timing (design 2026-09-02-review-round-overlap).
+func TestOrchestrationReviewRoundOverlap(t *testing.T) {
+	repoRoot := filepath.Clean("..")
+	promptDir := filepath.Join(repoRoot, "skills", "orchestrate", "references", "prompts")
+	renderScript := filepath.Join(promptDir, "render.sh")
+
+	render := func(t *testing.T, name string, inputs ...string) string {
+		t.Helper()
+		outputPath := filepath.Join(t.TempDir(), name+".md")
+		args := append([]string{renderScript, name, outputPath}, inputs...)
+		if output, err := exec.Command("bash", args...).CombinedOutput(); err != nil {
+			t.Fatalf("render %s: %v\n%s", name, err, output)
+		}
+		rendered, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("read rendered %s: %v", name, err)
+		}
+		return strings.Join(strings.Fields(string(rendered)), " ")
+	}
+	requireAll := func(t *testing.T, label, text string, rules []string) {
+		t.Helper()
+		for _, rule := range rules {
+			if !strings.Contains(text, strings.Join(strings.Fields(rule), " ")) {
+				t.Errorf("%s missing %q", label, rule)
+			}
+		}
+	}
+
+	full := render(t, "review-full",
+		"AGENT_DECK_REPO=/tmp/agent-deck", "BASE_BRANCH=main", "BASELINE=baseline: none",
+		"SPEC_BLOCK=Review requirements block", "VERDICT_FILE=/tmp/orchestrate/review-r1.md")
+	requireAll(t, "review-full", full, []string{
+		// D1: the suite starts first, detached, into the sibling log.
+		"Start the full suite FIRST, detached",
+		"/tmp/orchestrate/review-r1.md.suite.log",
+		"SUITE_EXIT=",
+		"Never run the suite twice in a round",
+		// D2: layers are parallel subagents and the turn waits for them.
+		"Dispatch every layer in ONE message",
+		"Do not end your turn while any layer subagent is still running",
+		// D5: timing evidence.
+		"Checked: tests full cmd=",
+	})
+
+	incremental := render(t, "review-incremental",
+		"AGENT_DECK_REPO=/tmp/agent-deck", "BASELINE=baseline: none",
+		"FOCUSED_TESTS=go test ./internal/usage", "PREVIOUS_FINDINGS=One previous finding",
+		"REVIEWED_SHA=0123456789abcdef", "SPEC_BLOCK=Review requirements block",
+		"VERDICT_FILE=/tmp/orchestrate/review-r2.md")
+	requireAll(t, "review-incremental", incremental, []string{
+		// D3: focused tests replace the suite on incremental rounds.
+		"go test ./internal/usage",
+		"Do NOT run the full suite",
+		"Dispatch every layer in ONE message",
+		"Checked: tests focused cmd=",
+	})
+	if strings.Contains(incremental, "Run the test suite") {
+		t.Error("review-incremental still asks for the full test suite")
+	}
+
+	skillBytes, err := os.ReadFile(filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"))
+	if err != nil {
+		t.Fatalf("read orchestration skill: %v", err)
+	}
+	skill := strings.Join(strings.Fields(string(skillBytes)), " ")
+	requireAll(t, "orchestrate skill", skill, []string{
+		// D3: the contract carries a focused-test command for incremental rounds.
+		"the focused-test command",
+		"FOCUSED_TESTS=",
+		// D4: fix rounds go to the live implementer; deletion is a deviation.
+		"confirm `impl-<task-slug>` is still registered",
+		"deviation: implementer deleted before task-done",
+		// D5: per-round timing in the manifest.
+		"launched=<unix> done=<unix> span=<s>",
+	})
 }

@@ -18,7 +18,24 @@ working tree: no `git stash`, `git checkout`, `git restore`, `git reset`,
 `git clean`, no branch switching. A tree that looks dirty or wrong is a
 finding to report, never a thing for you to tidy up.
 
-Your ONE permitted write is the verdict file at {{VERDICT_FILE}}. It sits
-outside the repository and outside this worktree, so writing it cannot touch
-the branch under review. Create it with a shell redirect (the editing tools
-are disabled for you by flag); create nothing else, anywhere.
+Your permitted writes are exactly two: the verdict file at {{VERDICT_FILE}}
+and the test-run log beside it, {{VERDICT_FILE}}.suite.log. Both sit outside
+the repository and outside this worktree, so writing them cannot touch the
+branch under review. Create them with shell redirects (the editing tools are
+disabled for you by flag); create nothing else, anywhere.
+
+Test-run rules. Never run the suite twice in a round: to recheck one failing
+test, run that test alone. Read a test log only through `tail -n 40` and a
+grep for `FAIL`/`SUITE_EXIT=` lines; never `cat` it whole. Only failures new
+against the recorded baseline are findings.
+
+Layer dispatch. Dispatch every layer in ONE message, one subagent per layer,
+exactly as skills/review/SKILL.md §3 describes: the adversarial subagent gets
+the diff only (no spec, no repo reads); the others get the diff, the spec
+block and repo access. Do not end your turn while any layer subagent is still
+running: wait for each with the harness's blocking task wait (Claude:
+TaskOutput with block on the task id), then merge. A turn that ends with
+layers pending fires the Stop hook, shows `done` to the conductor, and idles
+the round until someone nudges you. If your connector has no subagent tool,
+run the layers sequentially in-context with adversarial FIRST, before you
+read the spec or any repo file.
