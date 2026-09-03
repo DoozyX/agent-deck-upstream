@@ -323,9 +323,26 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Start the session (with or without initial message)
+	//
+	// startDelivery mirrors `session send --json`'s contract on the spawn
+	// path: an initial message that was never confirmed accepted is a
+	// delivery FAILURE, not a successful start with a footnote. Exiting here
+	// also leaves any queued message on disk (the discard below never runs),
+	// so a redelivery has something to redeliver.
+	startDelivery := ""
 	if initialMessage != "" {
-		if err := inst.StartWithMessage(initialMessage); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		delivery, err := inst.StartWithMessageDelivery(initialMessage)
+		startDelivery = delivery
+		if err != nil {
+			out.ErrorWithData(
+				launchDeliveryFailureMessage(inst.Title, delivery, err),
+				ErrCodeDeliveryFailed,
+				map[string]interface{}{
+					"session_id": inst.ID,
+					"title":      inst.Title,
+					"delivery":   delivery,
+					"submitted":  send.DeliveryMeansSubmitted(delivery),
+				})
 			os.Exit(1)
 		}
 	} else {
@@ -384,7 +401,15 @@ func handleSessionStart(profile string, args []string) {
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
 		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", inst.Title), jsonData)
+		if startDelivery != "" {
+			jsonData["delivery"] = startDelivery
+			jsonData["submitted"] = send.DeliveryMeansSubmitted(startDelivery)
+		}
+		sentNote := "(message sent)"
+		if startDelivery == send.DeliveryUnverified {
+			sentNote = "(message sent, submission unverified)"
+		}
+		out.Success(fmt.Sprintf("Started session: %s %s", inst.Title, sentNote), jsonData)
 	} else {
 		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
 	}
@@ -3303,7 +3328,7 @@ func shouldSkipConductorHeartbeatSend(inst *session.Instance, message string) bo
 const (
 	// deliverySubmitted: positive evidence the agent accepted the message
 	// (an "active" transition, or the composer cleared after holding it).
-	deliverySubmitted = "submitted"
+	deliverySubmitted = send.DeliverySubmitted
 	// deliveryUnverified: the message was sent but neither Claude-shaped
 	// submission signals nor a content-arrival check could reach a verdict,
 	// so submission is genuinely unknown. Since issue #1793 this is the
@@ -3311,7 +3336,7 @@ const (
 	// a send only lands here when the payload is small enough that the
 	// canonical-overflow failure mode cannot apply and it carries no token
 	// distinctive enough to look for in the pane.
-	deliveryUnverified = "unverified"
+	deliveryUnverified = send.DeliveryUnverified
 	// deliveryTyped: the message body was observed reaching the target pane,
 	// but nothing proved the agent accepted it as a turn. Content sitting in
 	// a composer is not an accepted turn, and calling it one is how issue
@@ -3320,20 +3345,20 @@ const (
 	// deliveryTypedNotSubmitted, which is the stronger claim that the
 	// composer was still positively holding the message at the end of the
 	// bounded Enter retries.
-	deliveryTyped = "typed"
+	deliveryTyped = send.DeliveryTyped
 	// deliveryLineTooLong: refused before typing anything because the pane's
 	// reader is in canonical mode and a payload line exceeds its line buffer
 	// (issue #1793). The kernel would discard the overflow and the
 	// submitting Enter with it, so this can never be reported as success.
-	deliveryLineTooLong = "line_too_long"
+	deliveryLineTooLong = send.DeliveryLineTooLong
 	// deliveryTypedNotSubmitted: the message body is still sitting unsent in
 	// the composer after the bounded Enter-retry budget (issue #1413).
-	deliveryTypedNotSubmitted = "typed_not_submitted"
+	deliveryTypedNotSubmitted = send.DeliveryTypedNotSubmitted
 	// deliveryNoEvidence: no positive delivery signal was ever observed
 	// (issue #876 silent-drop classification).
-	deliveryNoEvidence = "no_evidence"
+	deliveryNoEvidence = send.DeliveryNoEvidence
 	// deliverySendFailed: the initial tmux send-keys itself failed.
-	deliverySendFailed = "send_failed"
+	deliverySendFailed = send.DeliverySendFailed
 )
 
 // sendDeliveryResult is the prompt-state-aware outcome of executeSend.
@@ -3369,7 +3394,7 @@ func (r sendDeliveryResult) jsonFields() map[string]interface{} {
 		// delivery strings imply an accepted turn. Only deliverySubmitted
 		// does; `typed` in particular means the bytes arrived and nothing
 		// confirmed the agent took them up (issue #1793).
-		fields["submitted"] = r.delivery == deliverySubmitted
+		fields["submitted"] = send.DeliveryMeansSubmitted(r.delivery)
 	}
 	if ms := r.held.Milliseconds(); ms > 0 {
 		fields["held_for_composer_ms"] = ms
