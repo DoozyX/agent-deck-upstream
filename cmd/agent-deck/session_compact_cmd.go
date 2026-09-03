@@ -18,6 +18,16 @@ import (
 // measured on an 82k conversation), so a tight poll buys nothing.
 const compactVerifyPoll = 2 * time.Second
 
+// noVerifyReadinessBudget is how long `session compact --no-verify` waits for
+// a target to look ready before submitting anyway.
+//
+// Short on purpose. --no-verify is reached for when the target is known to be
+// mid-turn, so the wait is a courtesy that lets an almost-ready pane settle,
+// not a gate. The old behaviour spent the full --timeout (5m by default) and
+// then refused, which made the flag useless in the one situation it existed
+// for.
+const noVerifyReadinessBudget = 10 * time.Second
+
 // handleSessionCompact implements `agent-deck session compact`.
 //
 // Why this is a command and not a line in a runbook: `/compact` is the one
@@ -42,7 +52,7 @@ func handleSessionCompact(profile string, args []string) {
 	quiet := fs.Bool("q", false, "Quiet mode")
 	instructions := fs.String("instructions", "", "Custom compaction instructions passed to /compact (e.g. what must survive)")
 	resume := fs.String("resume", "", "Message to deliver once the compaction has finished, so the session keeps working instead of going idle")
-	noVerify := fs.Bool("no-verify", false, "Return as soon as the command is submitted, without waiting for the compaction to land")
+	noVerify := fs.Bool("no-verify", false, "Return as soon as the command is submitted, without waiting for the compaction to land; also bypasses the readiness wait, so a target wedged in one long turn can still be compacted (the command queues for its turn end)")
 	timeout := durationFlag(fs, "timeout", 5*time.Minute, "Max time to wait for the compaction to be recorded in the transcript")
 
 	fs.Usage = func() {
@@ -143,31 +153,70 @@ func handleSessionCompact(profile string, args []string) {
 	// A self-compact must never wait for readiness: the wait is for the target's
 	// composer to be free, and the target is the caller, mid-turn. It would time
 	// out at best and hang for the full timeout at worst.
+	//
+	// --no-verify is the same shape aimed at someone else. The readiness wait
+	// used to run regardless of it, so `session compact --no-verify` against a
+	// child wedged in one long turn spent the full budget and returned
+	// "agent not ready after 5m0s" — the flag skipped only the POST-submit
+	// verification, while the one state it was reached for was the one it
+	// could not get past. A child in a single huge turn is precisely the
+	// child that most needs compacting, and the only other lever (a commit-now
+	// instruction) has to have landed before the turn got long.
+	//
+	// Submitting into a busy composer is not a workaround: Claude queues a
+	// slash command typed mid-turn and runs it when the turn ends. So the
+	// readiness gate is kept, given a short bounded budget, and treated as
+	// ADVISORY under --no-verify — a timeout warns and submits rather than
+	// refusing. Same for the #966 slash-registration gate, which still runs
+	// (it is what stops a bare /foo being eaten right after a restart) but no
+	// longer turns a deliberate mid-turn compact into a failure.
+	bypassedReadiness := false
 	if !isSelf {
-		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, *timeout, send.PromptGates{
+		readyTimeout := *timeout
+		if *noVerify {
+			readyTimeout = noVerifyReadinessBudget
+		}
+		if err := send.WaitForAgentReady(tmuxSess, inst.Tool, readyTimeout, send.PromptGates{
 			ClaudeComposer: true,
 		}); err != nil {
-			out.Error(fmt.Sprintf("timeout waiting for agent: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+			if !*noVerify {
+				out.Error(fmt.Sprintf("timeout waiting for agent: %v", err), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+			bypassedReadiness = true
+			fmt.Fprintf(os.Stderr,
+				"agent-deck: '%s' was not ready within %s; submitting /compact anyway (--no-verify). "+
+					"It will run when the current turn ends.\n", inst.Title, readyTimeout)
 		}
 		// Issue #966: after a restart Claude shows a composer before its
 		// slash-command parser is armed, and a bare /foo in that window is
 		// dropped with no error anywhere.
-		slashTimeout := *timeout
-		if slashTimeout <= 0 || slashTimeout > 10*time.Second {
-			slashTimeout = 10 * time.Second
-		}
-		if err := waitForSlashCommandReady(tmuxSess, inst.Tool, slashTimeout); err != nil {
-			out.Error(fmt.Sprintf("timeout waiting for slash-command registration: %v", err), ErrCodeInvalidOperation)
-			os.Exit(1)
+		if !bypassedReadiness {
+			slashTimeout := *timeout
+			if slashTimeout <= 0 || slashTimeout > 10*time.Second {
+				slashTimeout = 10 * time.Second
+			}
+			if err := waitForSlashCommandReady(tmuxSess, inst.Tool, slashTimeout); err != nil {
+				if !*noVerify {
+					out.Error(fmt.Sprintf("timeout waiting for slash-command registration: %v", err), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				bypassedReadiness = true
+				fmt.Fprintf(os.Stderr,
+					"agent-deck: '%s' has not armed its slash-command parser; submitting /compact anyway (--no-verify).\n",
+					inst.Title)
+			}
 		}
 	}
 
+	// A target we could not confirm ready gets the same send tuning a
+	// self-compact gets: the composer-draft guard's hold-and-clear phase is
+	// written for a free composer, and a mid-turn pane is not one.
 	tun := defaultSendTuning()
-	if isSelf {
+	if isSelf || bypassedReadiness {
 		tun = noWaitSendTuning()
 	}
-	sendRes, sendErr := executeSend(tmuxSess, inst.Tool, message, isSelf, tun)
+	sendRes, sendErr := executeSend(tmuxSess, inst.Tool, message, isSelf || bypassedReadiness, tun)
 	if sendErr != nil {
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
@@ -229,7 +278,12 @@ func handleSessionCompact(profile string, args []string) {
 
 	if *noVerify {
 		data["verified"] = false
-		out.Success(fmt.Sprintf("Submitted /compact to '%s' (not verified)", inst.Title), data)
+		data["readiness_bypassed"] = bypassedReadiness
+		note := fmt.Sprintf("Submitted /compact to '%s' (not verified)", inst.Title)
+		if bypassedReadiness {
+			note = fmt.Sprintf("Submitted /compact to '%s' mid-turn (not verified; it runs when the turn ends)", inst.Title)
+		}
+		out.Success(note, data)
 		return
 	}
 
