@@ -242,7 +242,7 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 		"**No child of this run works in a primary checkout",
 		"sh \"$GUARD\" snapshot --repo <repo> --run-dir \"$RUN_DIR\" --label deploy-<repo>",
 		"sh \"$GUARD\" verify --repo <repo> --run-dir \"$RUN_DIR\" --label deploy-<repo>",
-		"Verify **before archiving the child**",
+		"Verify **before deleting the child**",
 	}
 	for _, rule := range rules {
 		if !strings.Contains(skill, strings.Join(strings.Fields(rule), " ")) {
