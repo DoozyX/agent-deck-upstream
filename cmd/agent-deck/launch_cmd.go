@@ -1060,7 +1060,10 @@ func handleLaunch(profile string, args []string) {
 			// provenance or its attribution gate withholds it forever.
 			pasteFreeBeforeSend := composerPasteFree(tmuxSess)
 			noWaitDelivery, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
-				maxRetries:                  8,
+				// Scaled with the payload for the same reason executeSend
+				// scales its budget: a launch brief is almost always one of
+				// the large bodies, and 8 looks at 150ms is 1.2 seconds.
+				maxRetries:                  send.VerifyRetriesForPayload(8, initialMessage),
 				checkDelay:                  150 * time.Millisecond,
 				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
 			})

@@ -99,10 +99,12 @@ func deferOrQueue(
 		out.Error(fmt.Sprintf("%s, and the runtime queue could not be locked to hold it: %v", timeoutErr.Error(), beginErr), ErrCodeDeliveryFailed)
 		os.Exit(1)
 	}
-	defer tx.Release()
-
+	// Released explicitly on every path below, not with defer: each of them
+	// ends in os.Exit, which does not run deferred calls — the lock would
+	// outlive the process and the next sender would block on it.
 	depth, enqueueErr := sessionSendQueueTxEnqueue(tx, message)
 	if enqueueErr != nil {
+		tx.Release()
 		if errors.Is(enqueueErr, session.ErrRuntimeQueueFull) {
 			out.Error(fmt.Sprintf("%s, and its runtime message queue is full", timeoutErr.Error()), ErrCodeQueueFull)
 		} else {
@@ -110,6 +112,7 @@ func deferOrQueue(
 		}
 		os.Exit(1)
 	}
+	tx.Release()
 
 	out.Success(
 		fmt.Sprintf("Queued message for '%s' after waiting %s for it to finish its turn", inst.Title, timeout),
