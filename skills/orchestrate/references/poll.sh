@@ -103,6 +103,52 @@ fi
 # single warning scrolls away behind the next four heartbeats.
 [ -n "$banner" ] && printf '%s\n' "$banner"
 
+# ---------------------------------------------------------------------------
+# Child thresholds get the same treatment the conductor's own do.
+#
+# They did not, and it cost the most expensive state of the run this was
+# written from. A child over soft used to append twelve characters to the tail
+# line (" · ctx impl-task-05=soft") while the conductor's own soft got a
+# multi-line banner and its hard got a failing exit. So the 200k commit-now
+# instruction was a rule the conductor had to REMEMBER, and the retro is blunt
+# about what that bought: one child was told to commit at 242k instead of 200k
+# with seven dirty files and zero commits; the very next task's child then
+# reached 259.8k with +513/-83 across ten dirty files, zero commits and a
+# stranded composer, and the auto-compacted handoff it wrote afterwards was
+# actively wrong about whether the round was even finished. A child that got
+# the same nudge BEFORE its turn got long committed cleanly and wrote an honest
+# handoff. Same instruction, same threshold, opposite outcome — the only
+# variable was whether the nudge arrived in time.
+#
+# So the nudge is rendered here, as a command with the id already substituted,
+# every beat the child is over. Nothing is left for the conductor to compose,
+# and at hard the heartbeat fails the same way a self-hard does.
+child_banner="$(jq -r --argjson soft "$SOFT" --argjson hard "$HARD" '
+  [ .children[]
+    | select((.archived // false) | not)
+    | select((.context_tokens // 0) >= $soft) ]
+  | sort_by(-(.context_tokens // 0))
+  | map(
+      ((.context_tokens // 0) / 1000 | floor) as $k
+      | if (.context_tokens // 0) >= $hard then
+          "   \(.title) \($k)k >= HARD \($hard / 1000 | floor)k — stop feeding it work. Retire it and relaunch fresh in the SAME worktree, told to read git log, the branch diff and the handoff before continuing:\n     agent-deck session remove \(.id) --cascade"
+        else
+          "   \(.title) \($k)k >= soft \($soft / 1000 | floor)k — send this now, this turn:\n     agent-deck session send \(.id) \"Your context is at \($k)k. Before anything else, in this turn: commit what is done with a focused commit, then write a handoff to the run dir covering decisions made, files touched, commands run and what remains. Reply with the commit sha and the handoff path. Do not start new work first.\""
+        end)
+  | if length == 0 then "" else "!! CHILD CONTEXT — act on every line, this turn:\n" + join("\n") end
+' "$RAW")"
+[ -n "$child_banner" ] && printf '%s\n' "$child_banner"
+
+# Exit 4 for a child over hard, for the reason self-hard exits 3: a banner
+# printed into an already-busy conductor is the thing that gets skimmed. Self
+# wins when both are over — the conductor cannot supervise a rotation it is
+# about to lose its own state to.
+if [ "$poll_rc" -eq 0 ] && \
+   [ "$(jq --argjson hard "$HARD" '[ .children[] | select((.archived // false) | not)
+        | select((.context_tokens // 0) >= $hard) ] | length' "$RAW")" -gt 0 ]; then
+  poll_rc=4
+fi
+
 [ -f "$D/.poll-prev.json" ] || echo '[]' > "$D/.poll-prev.json"
 
 jq -rn --slurpfile a "$D/.poll-prev.json" --slurpfile b "$D/.poll-now.json" \
