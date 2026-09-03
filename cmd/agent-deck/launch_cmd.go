@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
@@ -980,9 +981,32 @@ func handleLaunch(profile string, args []string) {
 	// --no-wait loses nothing.
 	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
 
+	// startDelivery is how this launch actually delivered the initial prompt,
+	// in the `session send` vocabulary. It rides into the JSON payload below so
+	// a caller can tell "the child is working on my brief" from "the child
+	// exists and the brief went nowhere" — the distinction `success: true`
+	// alone never made, and the reason a lost brief could sit undetected for
+	// four heartbeats while `session list` reported `running`.
+	startDelivery := ""
 	if initialMessage != "" && (!*noWait || promptRidesArgv) {
-		if err := newInstance.StartWithMessage(initialMessage); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		delivery, err := newInstance.StartWithMessageDelivery(initialMessage)
+		startDelivery = delivery
+		if err != nil {
+			// The session may well be up — the failure is the message, not
+			// the spawn — so report the id and the classification, not just
+			// "failed to start". A caller that gets a session id back can
+			// redeliver with `session send`; one that gets a bare error
+			// cannot.
+			out.ErrorWithData(
+				launchDeliveryFailureMessageFor(newInstance.Title, delivery, initialMessage, err),
+				ErrCodeDeliveryFailed,
+				map[string]interface{}{
+					"session_id": newInstance.ID,
+					"id":         newInstance.ID,
+					"title":      newInstance.Title,
+					"delivery":   delivery,
+					"submitted":  send.DeliveryMeansSubmitted(delivery),
+				})
 			os.Exit(1)
 		}
 	} else {
@@ -1035,12 +1059,26 @@ func handleLaunch(profile string, args []string) {
 			// delivered form (#1855), so the recovery retry needs the same
 			// provenance or its attribution gate withholds it forever.
 			pasteFreeBeforeSend := composerPasteFree(tmuxSess)
-			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
-				maxRetries:                  8,
+			noWaitDelivery, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
+				// Scaled with the payload for the same reason executeSend
+				// scales its budget: a launch brief is almost always one of
+				// the large bodies, and 8 looks at 150ms is 1.2 seconds.
+				maxRetries:                  send.VerifyRetriesForPayload(8, initialMessage),
 				checkDelay:                  150 * time.Millisecond,
 				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
-			}); err != nil {
-				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
+			})
+			startDelivery = noWaitDelivery
+			if err != nil {
+				out.ErrorWithData(
+					launchDeliveryFailureMessageFor(newInstance.Title, noWaitDelivery, initialMessage, err),
+					ErrCodeDeliveryFailed,
+					map[string]interface{}{
+						"session_id": newInstance.ID,
+						"id":         newInstance.ID,
+						"title":      newInstance.Title,
+						"delivery":   noWaitDelivery,
+						"submitted":  send.DeliveryMeansSubmitted(noWaitDelivery),
+					})
 				os.Exit(1)
 			}
 			verifyPromptConsumedAfterLaunchAttributed(
@@ -1080,6 +1118,14 @@ func handleLaunch(profile string, args []string) {
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
 		jsonData["message_pending"] = *noWait
+		// Same two keys `session send --json` publishes, with the same
+		// meaning: `submitted` is true only for a confirmed accepted turn.
+		// A launch that could not verify submission reports `unverified`
+		// here rather than letting `success: true` imply more than was seen.
+		if startDelivery != "" {
+			jsonData["delivery"] = startDelivery
+			jsonData["submitted"] = send.DeliveryMeansSubmitted(startDelivery)
+		}
 	}
 	if len(mcpFlags) > 0 {
 		jsonData["mcps"] = mcpFlags
@@ -1095,9 +1141,15 @@ func handleLaunch(profile string, args []string) {
 
 	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
 	if initialMessage != "" {
-		if *noWait {
+		// "(message sent)" was the human-readable half of the same
+		// overclaim: it was printed whether or not anything confirmed the
+		// agent took the message up. Say what was actually observed.
+		switch {
+		case startDelivery == send.DeliveryUnverified:
+			msg += " (message sent, submission unverified)"
+		case *noWait:
 			msg += " (message sent with --no-wait)"
-		} else {
+		default:
 			msg += " (message sent)"
 		}
 	}

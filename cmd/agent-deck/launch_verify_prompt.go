@@ -129,3 +129,27 @@ func pollPromptConsumed(target sendRetryTarget, message string, maxWait, pollInt
 		}
 	}
 }
+
+// launchDeliveryFailureMessageFor renders a spawn-time delivery failure in terms
+// of what to do about it. The classifications differ in remedy, not just in
+// wording: a message still sitting in the composer needs an Enter, one that
+// never arrived needs a resend, and one refused for length needs a shorter
+// body — so collapsing them into "failed to send initial message" throws away
+// the only part a caller can act on.
+func launchDeliveryFailureMessageFor(title, delivery, message string, err error) string {
+	if hint := send.LargePayloadHint(message); hint != "" {
+		err = fmt.Errorf("%w (%s)", err, hint)
+	}
+	switch delivery {
+	case send.DeliveryTypedNotSubmitted:
+		return fmt.Sprintf("session '%s' started but its initial message is still unsent in the composer: %v", title, err)
+	case send.DeliveryTyped:
+		return fmt.Sprintf("session '%s' started but its initial message was never confirmed submitted: %v", title, err)
+	case send.DeliveryLineTooLong:
+		return fmt.Sprintf("session '%s' started but its initial message is too long for the pane to receive as one line: %v", title, err)
+	case send.DeliveryNoEvidence:
+		return fmt.Sprintf("session '%s' started but its initial message was not delivered: %v", title, err)
+	default:
+		return fmt.Sprintf("failed to deliver initial message to '%s': %v", title, err)
+	}
+}

@@ -339,8 +339,18 @@ func (h *Home) registerContinuation(source, next *session.Instance, seed string,
 
 	// Persist the successor's generation before it can ever fork itself, so a
 	// crash between here and its own handoff cannot reset the chain bound.
+	//
+	// Its lineage goes down in the same write. The fork above passes
+	// source.ParentSessionID as the successor's parent, which makes a
+	// "(cont.)" a SIBLING of the session it replaced — so without this key
+	// nothing on disk connects the two, and retiring the source leaves the
+	// continuation running with no trace of where it came from. That is not
+	// hypothetical: a "(cont.) (cont.)" reviewer holding write authority
+	// outlived its retired parent in a shared worktree while an implementer
+	// was committing from the same tree. `session remove` reads this key.
 	if db := statedb.GetGlobal(); db != nil {
 		_ = db.WriteHandoffGeneration(next.ID, generation)
+		_ = db.WriteContinuationOf(next.ID, source.ID)
 	}
 
 	// Seed the continuation prompt once the new pane is live.

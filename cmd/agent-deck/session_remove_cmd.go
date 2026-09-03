@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -25,6 +26,7 @@ func handleSessionRemove(profile string, args []string) {
 	force := fs.Bool("force", false, "Remove even when the session is running/waiting/idle; with --all-errored, also include pinned sessions (destructive)")
 	allErrored := fs.Bool("all-errored", false, "Remove every unpinned session currently in the 'error' state (bulk); pinned sessions are skipped unless --force is given")
 	pruneWorktree := fs.Bool("prune-worktree", false, "Also kill the process and remove any git worktree (destructive)")
+	cascade := fs.Bool("cascade", false, "Also remove every live autonomous continuation ('(cont.)') descended from this session, transitively")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session remove <id|title> [options]")
@@ -32,6 +34,10 @@ func handleSessionRemove(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Remove a session from the registry. By default only stopped or")
 		fmt.Println("errored sessions may be removed; use --force to bypass.")
+		fmt.Println()
+		fmt.Println("A session that handed off to an autonomous continuation cannot be")
+		fmt.Println("removed on its own: removal would leave the '(cont.)' running with")
+		fmt.Println("nothing pointing at it. Pass --cascade to retire the whole chain.")
 		fmt.Println()
 		fmt.Println("This is registry-only by default: Claude transcripts under")
 		fmt.Println("~/.claude/projects/ are preserved. Pass --prune-worktree to also")
@@ -83,6 +89,30 @@ func handleSessionRemove(profile string, args []string) {
 			),
 			ErrCodeInvalidOperation,
 		)
+		os.Exit(1)
+	}
+
+	// A retired session's continuations must not outlive it. The autonomous
+	// context-budget handoff forks a "(cont.)" that inherits the SOURCE's
+	// parent, so it is a sibling of the session it replaced and disappears
+	// from any "what did I just retire" check made by title or by parent.
+	// Twice in one run that left a continuation running loose in a shared
+	// worktree — once a reviewer holding write authority, alongside a live
+	// implementer committing from the same tree.
+	//
+	// Refusing is the default rather than cascading silently: removing more
+	// sessions than the operator named is the kind of surprise that has to be
+	// asked for, while leaving one running is the failure actually observed.
+	live := liveContinuationClosure(removeContinuationStateDB(storage), inst.ID, instancesByID(instances))
+	if len(live) > 0 && !*cascade {
+		out.ErrorWithData(
+			continuationBlockMessage(inst.Title, live),
+			ErrCodeInvalidOperation,
+			map[string]interface{}{
+				"id":            inst.ID,
+				"title":         inst.Title,
+				"continuations": continuationRows(live),
+			})
 		os.Exit(1)
 	}
 
@@ -140,11 +170,102 @@ func handleSessionRemove(profile string, args []string) {
 	// to a later session that happens to reuse the id.
 	session.DiscardQueuedMessage(inst.ID)
 
-	out.Success(fmt.Sprintf("Removed session: %s", inst.Title), map[string]interface{}{
+	payload := map[string]interface{}{
 		"success": true,
 		"id":      inst.ID,
 		"title":   inst.Title,
-	})
+	}
+	summary := fmt.Sprintf("Removed session: %s", inst.Title)
+
+	// Cascade after the source is gone. Order matters: if a continuation
+	// removal fails, the source is already retired and the failure names
+	// exactly which sessions are still live, so the operator is never left
+	// guessing which half of the chain went.
+	if len(live) > 0 {
+		removed, failures := removeContinuationChain(storage, live, *pruneWorktree)
+		payload["continuations_removed"] = removed
+		if len(failures) > 0 {
+			payload["continuations_failed"] = failures
+			out.ErrorWithData(
+				fmt.Sprintf("removed session '%s' but %d of its %d continuations could not be removed: %s",
+					inst.Title, len(failures), len(live), strings.Join(failures, "; ")),
+				ErrCodeInvalidOperation, payload)
+			os.Exit(1)
+		}
+		summary = fmt.Sprintf("Removed session: %s (+%d continuation(s))", inst.Title, len(removed))
+	}
+
+	out.Success(summary, payload)
+}
+
+// removeContinuationChain retires each live continuation of an
+// already-removed source, returning the rows that went and a description of
+// each that did not.
+//
+// Each removal reloads the session list. A cascade kills panes as it goes and
+// the chain can be several links long, so reusing the pre-cascade snapshot
+// would hand RemoveSessionAndVerify a stale instance set — the same
+// resurrect-the-row hazard #909 closed for the single-session path.
+func removeContinuationChain(storage *session.Storage, live []*session.Instance, pruneWorktree bool) ([]map[string]interface{}, []string) {
+	var removed []map[string]interface{}
+	var failures []string
+
+	for _, cont := range live {
+		row := map[string]interface{}{"id": cont.ID, "title": cont.Title}
+		if err := removeOneContinuation(storage, cont, pruneWorktree); err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%s): %v", cont.ID, cont.Title, err))
+			continue
+		}
+		removed = append(removed, row)
+	}
+	return removed, failures
+}
+
+// removeOneContinuation performs the same registry removal the single-session
+// path performs, for one continuation. --force is implied: a continuation is
+// running by definition (that is why it must not be orphaned), so the
+// stopped/error status gate would reject every one of them.
+func removeOneContinuation(storage *session.Storage, cont *session.Instance, pruneWorktree bool) error {
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		return fmt.Errorf("reload sessions: %w", err)
+	}
+
+	queueTx, err := session.BeginRuntimeQueueTransaction(cont.ID)
+	if err != nil {
+		return fmt.Errorf("lock runtime queue: %w", err)
+	}
+	defer queueTx.Release()
+
+	instances = dropInstance(instances, cont.ID)
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	payload := session.LifecycleIntentPayload(cont, cont.WorktreePath, "")
+	intent, err := session.PrepareLifecycleIntent(storage, cont.ID, session.LifecycleIntentRemove, payload)
+	if err != nil {
+		return fmt.Errorf("prepare removal: %w", err)
+	}
+	if err := commitRuntimeQueueRemoval(queueTx, func() error {
+		return sessionRemovePersist(storage, cont.ID, instances, groupTree, intent.Token)
+	}); err != nil {
+		return fmt.Errorf("remove: %w", err)
+	}
+	if err := session.AdvanceLifecycleIntent(storage, intent, "row-deleted", payload); err != nil {
+		return fmt.Errorf("advance removal: %w", err)
+	}
+	if err := cont.KillAndWait(); err != nil && cont.Exists() {
+		return fmt.Errorf("process teardown: %w", err)
+	}
+	if err := session.CompleteLifecycleIntent(storage, intent); err != nil {
+		return fmt.Errorf("complete removal: %w", err)
+	}
+	if pruneWorktree {
+		pruneSessionWorktree(cont)
+	}
+
+	_, _ = session.SweepInboxesForChildSession(cont.ID)
+	_, _ = session.RemoveNotifyStateRecord(cont.ID)
+	session.DiscardQueuedMessage(cont.ID)
+	return nil
 }
 
 // isRemovableStatus returns true for states where a session can be removed
