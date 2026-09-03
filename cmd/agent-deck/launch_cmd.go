@@ -998,7 +998,7 @@ func handleLaunch(profile string, args []string) {
 			// redeliver with `session send`; one that gets a bare error
 			// cannot.
 			out.ErrorWithData(
-				launchDeliveryFailureMessage(newInstance.Title, delivery, err),
+				launchDeliveryFailureMessageFor(newInstance.Title, delivery, initialMessage, err),
 				ErrCodeDeliveryFailed,
 				map[string]interface{}{
 					"session_id": newInstance.ID,
@@ -1067,7 +1067,7 @@ func handleLaunch(profile string, args []string) {
 			startDelivery = noWaitDelivery
 			if err != nil {
 				out.ErrorWithData(
-					launchDeliveryFailureMessage(newInstance.Title, noWaitDelivery, err),
+					launchDeliveryFailureMessageFor(newInstance.Title, noWaitDelivery, initialMessage, err),
 					ErrCodeDeliveryFailed,
 					map[string]interface{}{
 						"session_id": newInstance.ID,

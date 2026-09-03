@@ -335,7 +335,7 @@ func handleSessionStart(profile string, args []string) {
 		startDelivery = delivery
 		if err != nil {
 			out.ErrorWithData(
-				launchDeliveryFailureMessage(inst.Title, delivery, err),
+				launchDeliveryFailureMessageFor(inst.Title, delivery, initialMessage, err),
 				ErrCodeDeliveryFailed,
 				map[string]interface{}{
 					"session_id": inst.ID,
@@ -3160,6 +3160,9 @@ func handleSessionSend(profile string, args []string) {
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
 		extra["session_title"] = inst.Title
+		if hint := send.LargePayloadHint(message); hint != "" {
+			sendErr = fmt.Errorf("%w (%s)", sendErr, hint)
+		}
 		switch sendRes.delivery {
 		case deliveryTypedNotSubmitted:
 			out.ErrorWithData(fmt.Sprintf("message typed but not submitted to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
@@ -3380,6 +3383,8 @@ type sendDeliveryResult struct {
 	// the type-back failed (SendKeysChunked errored) — the draft is held in
 	// draftSaved for recovery and must be surfaced, not silently dropped.
 	draftRestoreFailed bool
+	// shape is the size of the message this result describes.
+	shape send.PayloadShape
 }
 
 // jsonFields returns the delivery-status fields added to `session send`
@@ -3387,6 +3392,13 @@ type sendDeliveryResult struct {
 // contract; #1409 draft-guard observability).
 func (r sendDeliveryResult) jsonFields() map[string]interface{} {
 	fields := map[string]interface{}{}
+	// Payload shape rides along on success and failure alike. When a large
+	// prompt fails to submit, the first question is how large it was, and
+	// that was previously unanswerable from the tool's own output.
+	if r.shape.Bytes > 0 {
+		fields["message_bytes"] = r.shape.Bytes
+		fields["message_lines"] = r.shape.Lines
+	}
 	if r.delivery != "" {
 		fields["delivery"] = r.delivery
 		// Explicit, machine-checkable: a caller must not have to know which
@@ -3476,7 +3488,7 @@ func noWaitSendTuning() sendExecTuning {
 // Steps 1, 2 and 4 are Claude-only: composer introspection is Claude-shaped
 // and non-Claude tools gate readiness upstream.
 func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun sendExecTuning) (sendDeliveryResult, error) {
-	res := sendDeliveryResult{}
+	res := sendDeliveryResult{shape: send.ShapeOf(message)}
 	claudeLike := session.IsClaudeCompatible(tool)
 
 	if noWait && claudeLike {
@@ -3488,6 +3500,12 @@ func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun 
 			}
 		}
 	}
+
+	// A large body gets a longer verification budget. The flat 50 retries were
+	// the same fifteen seconds for a one-line nudge and a 13k-character brief,
+	// which gave the biggest payloads the least slack at exactly the size where
+	// submission failures were reported. See send.VerifyRetriesForPayload.
+	tun.retry.maxRetries = send.VerifyRetriesForPayload(tun.retry.maxRetries, message)
 
 	if claudeLike {
 		guard := send.GuardComposerDraft(target, send.ComposerGuardOptions{
