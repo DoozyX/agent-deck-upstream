@@ -748,6 +748,16 @@ func drainGroupQueue(groupPath string, instances []*session.Instance, groups []*
 		start = func() error { return next.StartWithMessage(pending) }
 	}
 	if err := start(); err != nil {
+		// A delivery failure is not a start failure: the pane is up, only the
+		// prompt did not land. Marking the session errored would misreport a
+		// live session, and returning nil here leaves the message pending (the
+		// discard below is skipped), so the next start retries delivery.
+		if delivery := send.DeliveryOf(err); delivery != send.DeliverySendFailed {
+			fmt.Fprintf(os.Stderr,
+				"queue drain started %s but its queued prompt was not delivered (%s); it stays queued for the next start: %v\n",
+				next.Title, delivery, err)
+			return next
+		}
 		// Drain is best-effort. Surface as queued + log; don't fail the stop.
 		next.Status = session.StatusError
 		fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", next.Title, err)
