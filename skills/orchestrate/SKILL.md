@@ -213,6 +213,20 @@ launching another. Merge children push with
 `git push HEAD:refs/heads/<branch>` from a detached merge worktree for the
 same reason — nothing needs a primary checkout checked out to land work.
 
+**Establish the environment's hazards once, here, before the first child.**
+Write `$RUN_DIR/environment-hazards.md` and pass it **by path** into every
+child prompt from then on. What belongs in it is anything a child could only
+learn by hitting the wrong wall: which container/cluster context is
+production and which one it may build on (named explicitly on every command,
+because the *active* context has been production); tunnels and services
+already up, so a child does not go looking for a daemon it does not need;
+credentials that must not be echoed; hosts that are not this machine. Two
+such facts cost real time on the run this rule came from, and both were
+established mid-run by the conductor only *after* a child had already skipped
+a mandatory test suite believing it needed a Docker daemon it did not have.
+An hour of recon at run start is cheaper than one child discovering
+production the hard way.
+
 Populate the run directory:
 
 ```bash
@@ -884,6 +898,27 @@ agent-deck launch "$WT" -c "$IMPLEMENTER_TOOL" -t "impl-<task-slug>" "${IMPLEMEN
   --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"
 ```
 
+**The spec block carries the binding rules distilled, with paths only as
+backup — it is not a reading list.** An implementer pointed at the design doc,
+the task file, a 28-item deferred list and two forward-constraint blocks, told
+to read all of it before writing code, burned 208.9k of context and 13 minutes
+reading 46.1k tokens and produced zero files. That brief was handed to a
+mid-tier model, where a reading load is a strong-tier cost. The next two
+tasks restated the binding rules inside the spec block itself and their
+implementers wrote code on turn one. Every path you include should be
+something the child consults to check a detail, never something it must read
+to start.
+
+**Confirm the brief actually arrived.** A launch's `success: true` reports
+that the session started; since the delivery contract landed it also reports
+`delivery` and `submitted`, and only `submitted: true` means the agent took
+the brief up as a turn. Check the child's context is climbing ~20s after
+launch — not the launch line. A child whose brief was never delivered sits at
+`ctx=0` with an empty composer while `session list` reports `running`, and
+that went unnoticed for four consecutive heartbeats. The rendered prompt stays
+on disk, so redelivery is free:
+`agent-deck session send <id> --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"`.
+
 Run the same launch verification used for planner worktrees: print and record
 the worktree path, branch, HEAD, resolved base sha and merge base before the
 child starts changing files. A mismatch is a launch failure, not a baseline
@@ -927,6 +962,25 @@ agent-deck launch <worktree-path> -c "$REVIEWER_TOOL" -t "review-<task-slug>-r1"
 
 Record the worktree's current HEAD sha in the manifest when you launch each
 reviewer — incremental rounds and the full-branch gate need it.
+
+**Never grant a reviewer write authority without sole occupancy, in the same
+sentence.** If a proof you want genuinely needs a mutation — flipping a guard,
+adding a union member — the reviewer must be the only session in that worktree
+at the time, and your brief must say both things together: "you have write
+authority; you are the sole occupant of this worktree." Granting the first
+without arranging the second produced this pipeline's two worst incidents in
+one task: a reviewer left an uncommitted edit dropping an organization-scope
+predicate from a query — a live cross-org leak in a tree an implementer was
+committing from — and the round after, a fix report claimed a fix that had not
+been made. Both were caught by a successor that checked, not by the process
+that made the claim.
+
+Prefer a static proof and grant nothing. An exhaustiveness claim is settled by
+adding a union member, reading the exact `tsc` error and removing it; the
+opposite direction by an unused `@ts-expect-error` throwing TS2578 under
+`tsc --noEmit`. If you ask for a mutation proof while citing the read-only
+stance, the reviewer is instructed to name the contradiction rather than pick
+a side — that is correct behaviour, and the fix is your brief, not the child.
 
 **A UI task's reviewer launches without `LEAN`.** The prompt makes it
 reproduce every user-visible acceptance criterion with its own eyes — build,
@@ -1358,11 +1412,33 @@ every heartbeat and act on two thresholds:
   branch diff, and the handoff summary before continuing. Record the rotation
   in the manifest (it counts as the same role, not a new review round).
 
+You do not have to remember either threshold. `poll.sh` renders both every
+beat a child is over, with the id already substituted into the command, and
+exits non-zero at hard the way it does for your own context. Send what it
+prints. Knowing the rule was measured to be insufficient: a child was told to
+commit at 242k instead of 200k with seven dirty files and zero commits, and
+the very next task's child then reached 259.8k with ten dirty files, zero
+commits and a stranded composer. **The only variable between a clean stop and
+a lost one was whether the nudge reached the child before its turn got long.**
+
 Never let a child run to auto-compaction mid-task: a lossy summary of its own
 half-finished work is strictly worse than a deliberate handoff. Reviewers
 rarely trip this (each round starts fresh); implementers on big tasks do —
 and a task whose implementer needs rotating twice was mis-sized, which is
 worth a line in the retro.
+
+**A child's self-written handoff is a claim, not a record.** Before you act on
+one — and always before you brief a successor from it — check it against
+physical facts: `git log --oneline`, `git show --stat` for each commit it
+mentions, `git status --porcelain`, and the presence of any file it says it
+did or did not create. An auto-compacted handoff in this pipeline described
+its round as still in progress when it was finished, claimed "there is no
+remaining implementation" when there was, and claimed a spec file "was
+deliberately NOT added" when it existed at HEAD — three claims, all confidently
+wrong, all in exactly the places that decided what to do next. The diff was
+the only thing that recovered the true state. A handoff written by a child
+that committed cleanly, on the other hand, has been reliable; the tell is
+whether the tree was clean when it wrote.
 
 ### The conductor
 

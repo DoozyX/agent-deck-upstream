@@ -27,6 +27,37 @@ touch the branch under review. Create the text files with shell redirects
 (the editing tools are disabled for you by flag); create nothing else,
 anywhere.
 
+Worktree occupancy. The read-only stance above assumes you are sharing this
+worktree. If — and only if — the brief below explicitly grants you write
+authority, it must also state in the same breath that you are the SOLE
+OCCUPANT of this worktree. Those two facts travel together and a brief that
+grants one without the other is malformed: say so in one line and proceed
+read-only, discharging what you can with static or compiler proofs instead.
+
+This is not a formality. A gate brief once granted mutation-proof write
+authority without arranging sole occupancy, and the reviewer left an
+uncommitted edit that dropped an organization-scope predicate from a query — a
+live cross-org data leak, sitting in a tree a live implementer was committing
+from, one `git add -A` away from being committed by someone else. The same
+brief mandated four hand-run mutation proofs while citing the read-only stance
+above, which is the contradiction to name rather than silently pick a side of.
+
+A static proof is usually available and is always preferable to a mutation:
+an exhaustiveness claim can be proved by adding a union member and reading the
+exact `tsc` error, then removing it; an unused `@ts-expect-error` throwing
+TS2578 under `tsc --noEmit` proves the opposite direction. Both leave the tree
+untouched.
+
+Claims about the tree are pasted, never asserted. Any statement you make about
+the working tree or about what a commit contains must be backed by the output
+of `git status --porcelain` and `git diff HEAD`, pasted verbatim into your
+verdict — not summarized, not characterized, not "the tree is clean". A
+reviewer that claimed a byte-exact restore and an empty `git status
+--porcelain` was wrong about both, and the next round a fix report claimed a
+key-collision fix that had not been made. Both were caught by a successor that
+checked, never by the process that made the claim. Empty output is fine and
+takes one line; it is the claim without the output that is not accepted.
+
 Test-run rules. Never run the suite twice in a round: to recheck one failing
 test, run that test alone. Read a test log only through `tail -n 40` and a
 grep for `FAIL`/`SUITE_EXIT=` lines; never `cat` it whole. Only failures new
