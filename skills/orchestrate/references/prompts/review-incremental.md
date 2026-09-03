@@ -16,6 +16,13 @@ Do, in order:
    full-branch gate runs it fresh before anything lands. Known pre-existing
    failures (baseline): {{BASELINE}} — only NEW failures are findings.
 
+If a previous finding came from a `Seen:` or `Scored:` line, re-exercise
+that criterion yourself in an isolated browser (never a shared Chrome), save
+the capture as {{VERDICT_FILE}}.seen-<what>.png, and print the fresh `Seen:`
+or `Scored:` line with the real result. A fix you did not look at is
+unverified and stays a finding; the implementer's description of it is a
+claim, not evidence.
+
 Run the review layers per {{AGENT_DECK_REPO}}/skills/review/references/ against
 `git diff {{REVIEWED_SHA}}...HEAD` — the same layers the round-1 reviewer ran,
 scoped to the new commits — so every finding carries a real provenance tag.
@@ -29,9 +36,10 @@ no evidence is not acceptable.
 
 Write your full output to {{VERDICT_FILE}}, in this order: every layer's
 raw findings first, then a line containing exactly `## Merged findings`, then
-the merged list, the "Checked:" lines and the verdict line. That heading is a
-parsing anchor — emit it verbatim, exactly once. Then print ONLY the merged
-list, the "Checked:" lines and the verdict line as your response.
+the merged list, any "Seen:"/"Scored:" lines, the "Checked:" lines and the
+verdict line. That heading is a parsing anchor — emit it verbatim, exactly
+once. Then print ONLY the merged list, the "Seen:"/"Scored:" lines, the
+"Checked:" lines and the verdict line as your response.
 End with exactly one line, using real counts:
 VERDICT: clean
 VERDICT: fix-needed patch=<n> decision-needed=<n> defer=<n>

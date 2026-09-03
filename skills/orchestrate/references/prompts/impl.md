@@ -30,10 +30,14 @@ Work strictly in this worktree on the current branch. Do, in order:
    a shared Chrome — other tasks may be driving browsers in parallel.
 6. Only if the change affects UI: capture before/after screenshots into
    {{RUN_DIR}}/{{TASK_SLUG}}/ using descriptive names (before-<what>.png,
-   after-<what>.png). Never commit them, never mention them or that
-   directory in any commit message, and take a screenshot of the final
+   after-<what>.png). Capture each before/after pair at the same route,
+   viewport and state so the two are comparable: a judge who knows nothing
+   about the task will compare them blind, and a reviewer will reproduce
+   the result with its own eyes. Never commit them, never mention them or
+   that directory in any commit message, and take a screenshot of the final
    working state. Describe in words what each screenshot shows — the
-   conductor supervising you never opens them.
+   conductor supervising you never opens them, and your description is a
+   claim the reviewer verifies, not evidence.
 7. Commit your work in clear logical commits — stage paths explicitly, never
    `git add -A`. Do NOT push yet.
 

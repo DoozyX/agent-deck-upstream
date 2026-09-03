@@ -156,7 +156,7 @@ AVAILABLE_TOOLS=$(jq -r '.available_tools | join(", ")' "$RUN_DIR/tool-policy.js
 - Connector flags move with the connector. `LEAN` is Claude-only. Build a
   role-specific argument array for another connector rather than passing
   Claude flags to it. Set the recipe's role variable (`PLANNER_TOOL`,
-  `IMPLEMENTER_TOOL`, or `REVIEWER_TOOL`) and its matching `*_ARGS` array
+  `IMPLEMENTER_TOOL`, `REVIEWER_TOOL` or `JUDGE_TOOL`) and its matching `*_ARGS` array
   immediately before the launch. For a Claude reviewer, `REVIEWER_ARGS`
   includes the lean flags plus `--disallowedTools`; for a Codex reviewer it
   uses `--sandbox read-only` instead, as shown under connector tiering.
@@ -323,7 +323,8 @@ path, verified launch HEAD and merge base, session ids with each session's
 connector + model (and any escalation), current stage, review round, the HEAD
 sha each review round saw, per review round `launched=<unix> done=<unix>
 span=<s>` (from `session children --json`, so the next run can be compared
-against this one's round times), PR url. If
+against this one's round times), the `AB_SUMMARY:` line of each blind A/B
+judge run on a UI task, PR url. If
 the conductor session dies, a fresh session can resume the run from the
 manifest plus `session children <old-conductor-id>` — but the surviving
 children are still parented to the dead session, so first re-parent them
@@ -459,7 +460,12 @@ planner. At least one of these must be concrete and true:
   product design was approved.
 
 If none applies, skip planning and render one `impl` prompt whose spec block
-points at the approved design. Destructive work that otherwise fits one worker
+points at the approved design. If that design states a qualitative acceptance
+criterion (visual polish, UX, "feels fast" — anything a test cannot assert),
+have the `inspect` child first append a `## Quality bar` block to
+`spec-block.md` in the planner prompt's format — a 0–10 scale per criterion
+with written anchors at 10, 8 and 5 and a pass threshold — so the reviewer has
+something to score instead of "looks good". Destructive work that otherwise fits one worker
 gets a concise execution checklist (target guard, snapshot or rollback, dry
 run where supported, apply, and verification); it does not automatically need
 a multi-task plan.
@@ -542,6 +548,7 @@ so a half-rendered prompt never reaches a child.
 | `cleanup-execute` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` |
 | `cleanup-verify` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` `VERDICT_FILE` |
 | `retrospective` | `RUN_DIR` `RETRO_PATH` |
+| `ab-judge` | `PAIRS_DIR` `VERDICT_FILE` |
 
 Use `inspect` for every bounded audit, fetch, repository-policy read, overlap
 check, or other extraction task that would otherwise make the conductor
@@ -747,6 +754,7 @@ Baseline tier per session:
 | Implementer, freeform — designs its own approach | strong |
 | Reviewer, default | mid (e.g. sonnet) |
 | Reviewer, freeform or design-heavy task | strong |
+| Blind A/B judge (UI tasks) | mid — it must read images; cheap only when the provider's cheap model does |
 
 For planned tasks the planner's `tier:` tags (see the planner prompt) are
 authoritative — the planner read the codebase; you'd be guessing from
@@ -920,6 +928,57 @@ agent-deck launch <worktree-path> -c "$REVIEWER_TOOL" -t "review-<task-slug>-r1"
 Record the worktree's current HEAD sha in the manifest when you launch each
 reviewer — incremental rounds and the full-branch gate need it.
 
+**A UI task's reviewer launches without `LEAN`.** The prompt makes it
+reproduce every user-visible acceptance criterion with its own eyes — build,
+start, drive the app in an isolated browser, look — and report a `Seen:` line
+per criterion; the implementer's screenshot descriptions are claims it never
+accepts as evidence. Stripping the browser MCPs from that reviewer turns each
+`Seen:` into a `[decision-needed]` "could not exercise" finding, which is the
+prompt working as designed against a launch mistake. Reviewers of non-UI work
+keep `LEAN`.
+
+**Blind A/B judge (UI tasks only).** Nobody in the pipeline except the
+implementer has looked at its before/after captures, and you never will. So
+launch a judge that sees nothing but the two images per pair, in shuffled
+order, with no task context — the only reviewer that cannot flatter the home
+team. Launch it alongside the round-1 reviewer, right after the implementer
+reports done:
+
+```bash
+PAIRS=$(bash "<agent-deck-repo>/skills/orchestrate/references/ab-pair.sh" "$RUN_DIR/<task-slug>")
+bash "$RUN_DIR/prompts/render.sh" ab-judge "$RUN_DIR/<task-slug>/ab-judge-prompt.md" \
+  PAIRS_DIR="$PAIRS" VERDICT_FILE="$RUN_DIR/<task-slug>/ab-judge.md"
+agent-deck launch "$PAIRS" -c "$JUDGE_TOOL" -t "ab-judge-<task-slug>" "${JUDGE_ARGS[@]}" \
+  --message-file "$RUN_DIR/<task-slug>/ab-judge-prompt.md"
+# when session children shows it done:
+bash "<agent-deck-repo>/skills/orchestrate/references/ab-reveal.sh" \
+  "$RUN_DIR/<task-slug>" "$RUN_DIR/<task-slug>/ab-judge.md" | tail -n 1
+```
+
+`ab-pair.sh` copies every `before-<what>.png`/`after-<what>.png` pair to
+`ab/<what>/A.png` and `B.png` in coin-flip order and writes the mapping to
+`ab/<what>/key`; it exits non-zero when a UI implementer captured no pair,
+which is itself a finding for the fix round ("no before/after capture"). The
+judge's cwd is the pairs directory, not the worktree, so it has no repository,
+no `CLAUDE.md` and no task file to anchor on. `JUDGE_ARGS` is the reviewer's
+read-only flags plus `LEAN` — it reads images with the file tool, not a
+browser. Never open `key`, `A.png` or `B.png` yourself. `ab-reveal.sh` decodes
+the judge's `A`/`B` back to `before`/`after` and its last line,
+`AB_SUMMARY: pairs=<n> regressions=<n> unchanged=<n>`, is the only line you
+read; record it in the manifest. A non-zero reveal means the judge died or
+ignored the format — relaunch it, never read the round as clean. Delete the
+judge once the reveal is read.
+
+`regressions>0` (the judge preferred the *before* state at med or high
+confidence) is a fix-round finding even when the reviewer's verdict is clean:
+append it to the round's findings file before rendering the fix prompt, as
+`N. <pair> — major — [decision-needed] — [AB-Judge] — blind judge preferred
+the before state: <reason>`. `unchanged>0` on a task whose point was a
+visible change is the same finding with "no visible difference". After any
+fix round that touched the screen the implementer recaptures the pair and the
+judge runs again; a UI task's loop ends only on a clean full-branch verdict
+**and** a reveal with `regressions=0`.
+
 The rendered prompt starts the full suite detached into
 `<verdict-file>.suite.log` before the reviewer reads anything and runs the
 layers as parallel subagents while it runs — measured over six rounds, the
@@ -930,8 +989,10 @@ writes (the verdict file and that log, both outside the repo), forbids every wor
 command in a worktree it may share with a live implementer, runs the review
 layers with `adversarial` **first and spec-blind**, threads spec compliance
 through the other layers, hands over the implementer's baseline as
-not-a-finding, and demands the `## Merged findings` anchor plus a
-machine-readable `VERDICT:` line.
+not-a-finding, makes the reviewer reproduce user-visible criteria itself
+(`Seen:` lines) and score any `## Quality bar` anchors (`Scored:` lines,
+below-threshold = `major`), and demands the `## Merged findings` anchor plus
+a machine-readable `VERDICT:` line.
 
 **The verdict-file interface (the conductor owns the path).** `VERDICT_FILE` is
 always `$RUN_DIR/<task-slug>/review-r<n>.md` — the same run
@@ -1069,6 +1130,9 @@ bash "$RUN_DIR/prompts/render.sh" review-incremental "$RUN_DIR/<slug>/review-r<n
   is reviewer oscillation and escalates the reviewer tier; preventive or
   adjacent scope is never smuggled into the branch merely because a final gate
   mentioned it.
+- **A blind A/B regression consumes a fix round like any other finding**
+  (see "Blind A/B judge" in stage 2), and a UI task's end gate is a clean
+  full-branch verdict plus a reveal with `regressions=0`.
 - **Caps: maximum 3 fix rounds** (rounds whose findings go back to the
   implementer — a gate-findings round consumes one like any other) **and 2
   full-branch gate reviews.** Budget exhausted with `patch` or
@@ -1274,8 +1338,9 @@ Three components, in the order worth attacking:
 use that connector's equivalent flags when supported or an empty array.
 `--strict-mcp-config` takes playwright and chrome-devtools with it. A UI
 implementer or a reviewer that reproduces UI behaviour launches without it;
-planners, reviewers of non-UI work, fix children, merge and integration
-children never need the browser MCPs at all.
+planners, reviewers of non-UI work, the blind A/B judge (it reads images with
+the file tool), fix children, merge and integration children never need the
+browser MCPs at all.
 
 ### Children
 
@@ -1515,7 +1580,8 @@ Delete:
   been applied — or, when the plan review is skipped as a single-implementer
   plan, as soon as the plan and its task files are in the task directory;
 - the **implementer** at task-done cleanup (below);
-- the **cleanup** and **verify-cleanup** children once their verdict is read.
+- the **cleanup** and **verify-cleanup** children once their verdict is read;
+- the **A/B judge** once its reveal line is read.
 
 **Never delete a needs-attention task's sessions** — those stay live and fully
 intact for inspection (see "Failure handling"). The rotating **conductor** is
@@ -1657,6 +1723,7 @@ referenced. Per task:
 - Screenshots: <run-dir>/<task-slug>/ (UI tasks only)
   Nominated pair worth attaching to the PR manually, if you like:
   before-<what>.png + after-<what>.png
+- Blind A/B: <final AB_SUMMARY line> — <per pair: prefer=<before|after|neither>, reason> (UI tasks only)
 - Needs attention: <anything left, or omit>
 ```
 
