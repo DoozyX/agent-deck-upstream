@@ -2860,7 +2860,7 @@ func handleSessionSend(profile string, args []string) {
 	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
 	deferIfBusy := fs.Bool("defer-if-busy", false, "Hold delivery until the target is idle (turn-finished, hook-driven) instead of interrupting a mid-generation turn (incompatible with --no-wait)")
 	queueIfBusy := fs.Bool("queue-if-busy", false, "Queue delivery when a hook-capable target is busy; otherwise send immediately")
-	deferTimeout := durationFlag(fs, "defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
+	deferTimeout := durationFlag(fs, "defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before queueing the message for its next turn")
 	timeout := durationFlag(fs, "timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := durationFlag(fs, "stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -3060,13 +3060,12 @@ func handleSessionSend(profile string, args []string) {
 	// mid-generation target is never interrupted. Keys off the hook-driven
 	// status (the same turn-finished signal `list --json` reports), not the
 	// pane-diff readiness heuristic that false-positives idle mid-turn.
+	//
+	// The status is corroborated against the pane while it claims to be busy,
+	// and a timeout queues the message instead of discarding it — see
+	// deferOrQueue for why both.
 	if *deferIfBusy {
-		if err := send.WaitUntilNotBusy(func() (string, error) {
-			return fetchHookDrivenStatus(profile, sessionRef)
-		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
-			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
+		deferOrQueue(out, profile, sessionRef, inst, tmuxSess, message, *deferTimeout)
 	}
 
 	// Wait for agent to be ready (unless --no-wait is specified).
