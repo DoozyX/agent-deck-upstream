@@ -5339,23 +5339,36 @@ func (i *Instance) Start() error {
 // Issue #1040: same per-instance spawn lock as Start() — a concurrent
 // `launch -m "..."` racing with a poller-triggered Start() must not
 // produce two parallel tmux sessions.
+// StartWithMessage starts the session and delivers an initial message,
+// returning an error when the message was not confirmed accepted. It is the
+// error-only face of StartWithMessageDelivery for callers that do not need to
+// report the classification; the failure semantics are identical, so no caller
+// can silently inherit the old "exhausted the budget, returned nil" behaviour
+// by using this form.
 func (i *Instance) StartWithMessage(message string) error {
+	_, err := i.StartWithMessageDelivery(message)
+	return err
+}
+
+func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	// Clear the per-spawn resume marker before this start decides between a
 	// fresh and a resuming command (see shouldAutoConfirmResumePicker).
 	i.resetResumeMarker()
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
 	if lockErr != nil {
-		return lockErr
+		return send.DeliverySendFailed, lockErr
 	}
 	defer release()
 	if spawnedSince(i.ID, beforeLock) {
-		return nil
+		// A sibling launch already spawned this instance and delivered its
+		// own message; this call typed nothing, so it claims nothing.
+		return send.DeliveryUnverified, nil
 	}
 	defer recordInstanceSpawn(i.ID)
 
 	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
+		return send.DeliverySendFailed, fmt.Errorf("tmux session not initialized")
 	}
 
 	// Refuse a message this session has no way to receive, BEFORE spawning
@@ -5369,7 +5382,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// failure while leaving a running server behind is its own trap.
 	if message != "" {
 		if err := i.PromptDeliveryError(); err != nil {
-			return err
+			return send.DeliverySendFailed, err
 		}
 	}
 
@@ -5482,7 +5495,7 @@ func (i *Instance) StartWithMessage(message string) error {
 		// prompt represents — otherwise a fresh session has no status icon
 		// until the user types.
 		if _, err := i.seedHermesHookGeneration("running", true); err != nil {
-			return err
+			return send.DeliverySendFailed, err
 		}
 		command = i.buildHermesCommand(i.Command)
 	case i.Tool == "deepseek":
@@ -5495,7 +5508,7 @@ func (i *Instance) StartWithMessage(message string) error {
 			// headless still needs its recorded task.
 			dsCommand, dsErr := i.deepSeekStartCommand()
 			if dsErr != nil {
-				return dsErr
+				return send.DeliverySendFailed, dsErr
 			}
 			command = dsCommand
 			break
@@ -5517,7 +5530,7 @@ func (i *Instance) StartWithMessage(message string) error {
 		// #1924: leave a reason behind. Without this the session sits on
 		// StatusError with no tmux session and nothing to diagnose from.
 		i.recordPrepareFailure(command, err)
-		return err
+		return send.DeliverySendFailed, err
 	}
 	if containerName != "" {
 		i.SandboxContainer = containerName
@@ -5542,7 +5555,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	if err := i.tmuxSession.Start(command); err != nil {
 		// #1580: persist the tmux-level failure (sister path to Start()).
 		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("failed to start tmux session: %w", err)
+		return send.DeliverySendFailed, fmt.Errorf("failed to start tmux session: %w", err)
 	}
 
 	// #1580: fast-death watcher (sister path to Start()).
@@ -5618,21 +5631,40 @@ func (i *Instance) StartWithMessage(message string) error {
 		return i.sendMessageWhenReady(message)
 	}
 
-	return nil
+	// Nothing was typed into a pane: either there was no message, or it rode
+	// the command line (codex, the DeepSeek headless profile) and IS the
+	// invocation. Both are as delivered as they can get.
+	return send.DeliverySubmitted, nil
 }
 
-// sendMessageWhenReady waits for the agent to be ready and sends the message.
-// Uses the shared WaitForAgentReady helper (same semantics as `session send`).
-func (i *Instance) sendMessageWhenReady(message string) error {
+// sendMessageWhenReady waits for the agent to be ready and sends the message,
+// returning the delivery classification (a send.Delivery* constant) alongside
+// any error. Uses the shared WaitForAgentReady helper (same semantics as
+// `session send`).
+//
+// The classification is the point. This function used to return a bare `error`
+// and, critically, `return nil` when its verification loop exhausted every
+// retry without ever seeing the agent accept the message — so a brief that was
+// never delivered was reported to the CLI as an unqualified success. That is
+// the "`success: true` is not evidence work started" failure: a child sitting
+// at ctx=0 with an empty composer while `session list` says `running`, paid
+// for independently across four orchestrated runs. `session send` has reported
+// this honestly since issue #1413; the spawn path now uses the same vocabulary
+// so a launch cannot claim more than it observed.
+func (i *Instance) sendMessageWhenReady(message string) (string, error) {
 	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
+		return send.DeliverySendFailed, fmt.Errorf("tmux session not initialized")
 	}
 
 	if err := send.WaitForAgentReady(i.tmuxSession, i.Tool, send.DefaultAgentReadyTimeout, send.PromptGates{
 		ClaudeComposer: IsClaudeCompatible(i.Tool),
 		CodexPrompt:    IsCodexCompatible(i.Tool),
 	}); err != nil {
-		return fmt.Errorf("timeout waiting for agent to be ready")
+		// Nothing was typed: the pane never became ready to receive it.
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "timeout waiting for agent to be ready",
+		}
 	}
 
 	// Pre-send provenance probe for the #1777 attribution gate: Claude
@@ -5648,7 +5680,11 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 	}
 
 	if err := i.tmuxSession.SendKeysAndEnter(message); err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
+		return send.DeliverySendFailed, &send.DeliveryError{
+			Delivery: send.DeliverySendFailed,
+			Err:      err,
+			Detail:   "failed to send message",
+		}
 	}
 
 	// The verify loop below keys off Claude-specific signals (an
@@ -5656,18 +5692,44 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 	// Claude tools never surface those, so the loop false-negatives a
 	// delivered message and Enter-spams the composer; skip it for every
 	// non-Claude tool (#1238 — generalizes #1228's codex-only skip).
+	//
+	// Skipping verification is not the same as verifying success: the bytes
+	// went to the pane and nothing here can say whether the agent took them
+	// up. That is exactly DeliveryUnverified, and it is reported as such
+	// rather than as a confirmed submit. It is not an error — there is no
+	// evidence of failure either — so the launch still succeeds, but a
+	// caller reading `delivery` is told the truth.
 	if !UsesClaudeDeliveryVerify(i.Tool) {
-		return nil
+		return send.DeliveryUnverified, nil
 	}
 
 	// Verify the agent accepted Enter and began processing.
-	const verifyRetries = 50
+	//
+	// The budget scales with payload size: the flat 50 retries were the same
+	// fifteen seconds for a one-line nudge and a 13k-character brief, giving
+	// the largest bodies the least slack at exactly the size where submission
+	// failures were reported. A launch brief is almost always one of the large
+	// ones. See send.VerifyRetriesForPayload.
+	verifyRetries := send.VerifyRetriesForPayload(50, message)
 	const verifyDelay = 300 * time.Millisecond
 	const activeSuccessThreshold = 2
 	const waitingAfterActiveThreshold = 2
 	waitingNoMarkerChecks := 0
 	activeChecks := 0
 	sawActiveAfterSend := false
+	// sawBodyInPane records that the message was observed reaching the
+	// composer at least once. It separates "typed but never confirmed
+	// submitted" from "no evidence the bytes ever arrived" when the budget
+	// runs out — two different problems with two different remedies.
+	sawBodyInPane := false
+	// composerHoldingAtLastLook is the most recent observation of whether
+	// the composer was still holding our message. On exhaustion it is the
+	// difference between the strong claim (it is still sitting there
+	// unsent) and the weaker one (it arrived, then we lost track of it).
+	composerHoldingAtLastLook := false
+	// everCaptured guards against reporting a confident verdict when every
+	// single pane capture failed: that is a blind loop, not evidence.
+	everCaptured := false
 	// attrib is the #1777 attribution gate. EVERY bare Enter below —
 	// including the unsent-prompt branch, which used to press unconditionally
 	// whenever a "[Pasted text …]" marker appeared anywhere in the pane —
@@ -5687,8 +5749,13 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		captured, captureErr := i.tmuxSession.CapturePaneFresh()
 		paneNow := send.CaptureOutcome(captured, captureErr)
 		if paneNow.OK {
+			everCaptured = true
 			content := tmux.StripANSI(captured)
 			unsentPromptDetected = send.ComposerHoldsPasteMarker(captured, tmux.StripANSI) || send.HasUnsentComposerPrompt(content, message)
+			composerHoldingAtLastLook = unsentPromptDetected
+			if unsentPromptDetected {
+				sawBodyInPane = true
+			}
 		}
 		verifiedStatus, statusErr := i.tmuxSession.GetStatus()
 
@@ -5704,7 +5771,7 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 			waitingNoMarkerChecks = 0
 			activeChecks++
 			if activeChecks >= activeSuccessThreshold {
-				return nil
+				return send.DeliverySubmitted, nil
 			}
 			continue
 		}
@@ -5714,7 +5781,7 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 			if sawActiveAfterSend {
 				waitingNoMarkerChecks++
 				if waitingNoMarkerChecks >= waitingAfterActiveThreshold {
-					return nil
+					return send.DeliverySubmitted, nil
 				}
 			} else {
 				waitingNoMarkerChecks = 0
@@ -5731,7 +5798,43 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		}
 	}
 
-	return nil
+	// Budget exhausted with no accepted turn. Every branch below is a
+	// FAILURE — this is where the old code returned nil and let a launch
+	// report "(message sent)" over an undelivered brief.
+	return classifyExhaustedSpawnSend(everCaptured, composerHoldingAtLastLook, sawBodyInPane)
+}
+
+// classifyExhaustedSpawnSend names what the spawn-time verification loop
+// actually observed once its retry budget ran out, in the same vocabulary
+// `session send` uses. Split out so the classification is testable without
+// driving a real pane for 15 seconds.
+func classifyExhaustedSpawnSend(everCaptured, composerHoldingAtLastLook, sawBodyInPane bool) (string, error) {
+	switch {
+	case !everCaptured:
+		// Every capture failed. We have no observation at all, so the
+		// honest report is that nothing was ever confirmed — not a guess
+		// about where the bytes went.
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "message sent but the pane could not be read to confirm delivery",
+		}
+	case composerHoldingAtLastLook:
+		// The strongest claim: it is still sitting there, unsent.
+		return send.DeliveryTypedNotSubmitted, &send.DeliveryError{
+			Delivery: send.DeliveryTypedNotSubmitted,
+			Detail:   "message is still unsent in the composer after the Enter-retry budget",
+		}
+	case sawBodyInPane:
+		return send.DeliveryTyped, &send.DeliveryError{
+			Delivery: send.DeliveryTyped,
+			Detail:   "message reached the pane but the agent was never observed accepting it",
+		}
+	default:
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "no evidence the message was delivered or accepted",
+		}
+	}
 }
 
 // errorRecheckInterval - how often to recheck sessions that don't exist

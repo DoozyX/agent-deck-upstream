@@ -323,9 +323,26 @@ func handleSessionStart(profile string, args []string) {
 	}
 
 	// Start the session (with or without initial message)
+	//
+	// startDelivery mirrors `session send --json`'s contract on the spawn
+	// path: an initial message that was never confirmed accepted is a
+	// delivery FAILURE, not a successful start with a footnote. Exiting here
+	// also leaves any queued message on disk (the discard below never runs),
+	// so a redelivery has something to redeliver.
+	startDelivery := ""
 	if initialMessage != "" {
-		if err := inst.StartWithMessage(initialMessage); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		delivery, err := inst.StartWithMessageDelivery(initialMessage)
+		startDelivery = delivery
+		if err != nil {
+			out.ErrorWithData(
+				launchDeliveryFailureMessageFor(inst.Title, delivery, initialMessage, err),
+				ErrCodeDeliveryFailed,
+				map[string]interface{}{
+					"session_id": inst.ID,
+					"title":      inst.Title,
+					"delivery":   delivery,
+					"submitted":  send.DeliveryMeansSubmitted(delivery),
+				})
 			os.Exit(1)
 		}
 	} else {
@@ -384,7 +401,15 @@ func handleSessionStart(profile string, args []string) {
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
 		jsonData["message_pending"] = false
-		out.Success(fmt.Sprintf("Started session: %s (message sent)", inst.Title), jsonData)
+		if startDelivery != "" {
+			jsonData["delivery"] = startDelivery
+			jsonData["submitted"] = send.DeliveryMeansSubmitted(startDelivery)
+		}
+		sentNote := "(message sent)"
+		if startDelivery == send.DeliveryUnverified {
+			sentNote = "(message sent, submission unverified)"
+		}
+		out.Success(fmt.Sprintf("Started session: %s %s", inst.Title, sentNote), jsonData)
 	} else {
 		out.Success(fmt.Sprintf("Started session: %s", inst.Title), jsonData)
 	}
@@ -723,6 +748,16 @@ func drainGroupQueue(groupPath string, instances []*session.Instance, groups []*
 		start = func() error { return next.StartWithMessage(pending) }
 	}
 	if err := start(); err != nil {
+		// A delivery failure is not a start failure: the pane is up, only the
+		// prompt did not land. Marking the session errored would misreport a
+		// live session, and returning nil here leaves the message pending (the
+		// discard below is skipped), so the next start retries delivery.
+		if delivery := send.DeliveryOf(err); delivery != send.DeliverySendFailed {
+			fmt.Fprintf(os.Stderr,
+				"queue drain started %s but its queued prompt was not delivered (%s); it stays queued for the next start: %v\n",
+				next.Title, delivery, err)
+			return next
+		}
 		// Drain is best-effort. Surface as queued + log; don't fail the stop.
 		next.Status = session.StatusError
 		fmt.Fprintf(os.Stderr, "queue drain failed to start %s: %v\n", next.Title, err)
@@ -2835,7 +2870,7 @@ func handleSessionSend(profile string, args []string) {
 	messageFile := fs.String("message-file", "", "Read the message from a file ('-' for stdin) instead of a positional argument; avoids shell quoting of long prompts")
 	deferIfBusy := fs.Bool("defer-if-busy", false, "Hold delivery until the target is idle (turn-finished, hook-driven) instead of interrupting a mid-generation turn (incompatible with --no-wait)")
 	queueIfBusy := fs.Bool("queue-if-busy", false, "Queue delivery when a hook-capable target is busy; otherwise send immediately")
-	deferTimeout := durationFlag(fs, "defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before dropping the message with a non-zero exit")
+	deferTimeout := durationFlag(fs, "defer-timeout", 30*time.Minute, "Max time --defer-if-busy holds a busy target before queueing the message for its next turn")
 	timeout := durationFlag(fs, "timeout", 10*time.Minute, "Max time to wait for the agent to become ready and (with --wait) to finish processing")
 	streamIdle := durationFlag(fs, "stream-idle", 10*time.Second, "Max idle time before --stream aborts with error")
 	streamCharBudget := fs.Int("stream-char-budget", 4000, "Char budget for text flush in --stream mode")
@@ -3035,13 +3070,12 @@ func handleSessionSend(profile string, args []string) {
 	// mid-generation target is never interrupted. Keys off the hook-driven
 	// status (the same turn-finished signal `list --json` reports), not the
 	// pane-diff readiness heuristic that false-positives idle mid-turn.
+	//
+	// The status is corroborated against the pane while it claims to be busy,
+	// and a timeout queues the message instead of discarding it — see
+	// deferOrQueue for why both.
 	if *deferIfBusy {
-		if err := send.WaitUntilNotBusy(func() (string, error) {
-			return fetchHookDrivenStatus(profile, sessionRef)
-		}, *deferTimeout, send.DeferPollInterval, time.Sleep); err != nil {
-			out.Error(err.Error(), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
+		deferOrQueue(out, profile, sessionRef, inst, tmuxSess, message, *deferTimeout)
 	}
 
 	// Wait for agent to be ready (unless --no-wait is specified).
@@ -3136,6 +3170,9 @@ func handleSessionSend(profile string, args []string) {
 		extra := sendRes.jsonFields()
 		extra["session_id"] = inst.ID
 		extra["session_title"] = inst.Title
+		if hint := send.LargePayloadHint(message); hint != "" {
+			sendErr = fmt.Errorf("%w (%s)", sendErr, hint)
+		}
 		switch sendRes.delivery {
 		case deliveryTypedNotSubmitted:
 			out.ErrorWithData(fmt.Sprintf("message typed but not submitted to '%s': %v", inst.Title, sendErr), ErrCodeDeliveryFailed, extra)
@@ -3303,7 +3340,7 @@ func shouldSkipConductorHeartbeatSend(inst *session.Instance, message string) bo
 const (
 	// deliverySubmitted: positive evidence the agent accepted the message
 	// (an "active" transition, or the composer cleared after holding it).
-	deliverySubmitted = "submitted"
+	deliverySubmitted = send.DeliverySubmitted
 	// deliveryUnverified: the message was sent but neither Claude-shaped
 	// submission signals nor a content-arrival check could reach a verdict,
 	// so submission is genuinely unknown. Since issue #1793 this is the
@@ -3311,7 +3348,7 @@ const (
 	// a send only lands here when the payload is small enough that the
 	// canonical-overflow failure mode cannot apply and it carries no token
 	// distinctive enough to look for in the pane.
-	deliveryUnverified = "unverified"
+	deliveryUnverified = send.DeliveryUnverified
 	// deliveryTyped: the message body was observed reaching the target pane,
 	// but nothing proved the agent accepted it as a turn. Content sitting in
 	// a composer is not an accepted turn, and calling it one is how issue
@@ -3320,20 +3357,20 @@ const (
 	// deliveryTypedNotSubmitted, which is the stronger claim that the
 	// composer was still positively holding the message at the end of the
 	// bounded Enter retries.
-	deliveryTyped = "typed"
+	deliveryTyped = send.DeliveryTyped
 	// deliveryLineTooLong: refused before typing anything because the pane's
 	// reader is in canonical mode and a payload line exceeds its line buffer
 	// (issue #1793). The kernel would discard the overflow and the
 	// submitting Enter with it, so this can never be reported as success.
-	deliveryLineTooLong = "line_too_long"
+	deliveryLineTooLong = send.DeliveryLineTooLong
 	// deliveryTypedNotSubmitted: the message body is still sitting unsent in
 	// the composer after the bounded Enter-retry budget (issue #1413).
-	deliveryTypedNotSubmitted = "typed_not_submitted"
+	deliveryTypedNotSubmitted = send.DeliveryTypedNotSubmitted
 	// deliveryNoEvidence: no positive delivery signal was ever observed
 	// (issue #876 silent-drop classification).
-	deliveryNoEvidence = "no_evidence"
+	deliveryNoEvidence = send.DeliveryNoEvidence
 	// deliverySendFailed: the initial tmux send-keys itself failed.
-	deliverySendFailed = "send_failed"
+	deliverySendFailed = send.DeliverySendFailed
 )
 
 // sendDeliveryResult is the prompt-state-aware outcome of executeSend.
@@ -3356,6 +3393,8 @@ type sendDeliveryResult struct {
 	// the type-back failed (SendKeysChunked errored) — the draft is held in
 	// draftSaved for recovery and must be surfaced, not silently dropped.
 	draftRestoreFailed bool
+	// shape is the size of the message this result describes.
+	shape send.PayloadShape
 }
 
 // jsonFields returns the delivery-status fields added to `session send`
@@ -3363,13 +3402,20 @@ type sendDeliveryResult struct {
 // contract; #1409 draft-guard observability).
 func (r sendDeliveryResult) jsonFields() map[string]interface{} {
 	fields := map[string]interface{}{}
+	// Payload shape rides along on success and failure alike. When a large
+	// prompt fails to submit, the first question is how large it was, and
+	// that was previously unanswerable from the tool's own output.
+	if r.shape.Bytes > 0 {
+		fields["message_bytes"] = r.shape.Bytes
+		fields["message_lines"] = r.shape.Lines
+	}
 	if r.delivery != "" {
 		fields["delivery"] = r.delivery
 		// Explicit, machine-checkable: a caller must not have to know which
 		// delivery strings imply an accepted turn. Only deliverySubmitted
 		// does; `typed` in particular means the bytes arrived and nothing
 		// confirmed the agent took them up (issue #1793).
-		fields["submitted"] = r.delivery == deliverySubmitted
+		fields["submitted"] = send.DeliveryMeansSubmitted(r.delivery)
 	}
 	if ms := r.held.Milliseconds(); ms > 0 {
 		fields["held_for_composer_ms"] = ms
@@ -3452,7 +3498,7 @@ func noWaitSendTuning() sendExecTuning {
 // Steps 1, 2 and 4 are Claude-only: composer introspection is Claude-shaped
 // and non-Claude tools gate readiness upstream.
 func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun sendExecTuning) (sendDeliveryResult, error) {
-	res := sendDeliveryResult{}
+	res := sendDeliveryResult{shape: send.ShapeOf(message)}
 	claudeLike := session.IsClaudeCompatible(tool)
 
 	if noWait && claudeLike {
@@ -3464,6 +3510,12 @@ func executeSend(target sendRetryTarget, tool, message string, noWait bool, tun 
 			}
 		}
 	}
+
+	// A large body gets a longer verification budget. The flat 50 retries were
+	// the same fifteen seconds for a one-line nudge and a 13k-character brief,
+	// which gave the biggest payloads the least slack at exactly the size where
+	// submission failures were reported. See send.VerifyRetriesForPayload.
+	tun.retry.maxRetries = send.VerifyRetriesForPayload(tun.retry.maxRetries, message)
 
 	if claudeLike {
 		guard := send.GuardComposerDraft(target, send.ComposerGuardOptions{

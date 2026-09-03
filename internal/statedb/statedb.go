@@ -2394,6 +2394,85 @@ func (s *StateDB) ReadHandoffGeneration(id string) (int, error) {
 	return int(gen.Int64), nil
 }
 
+// WriteContinuationOf records that `id` is the autonomous continuation of
+// `sourceID` — the "(cont.)" session spawned when a source hit its context
+// budget. Same tool_data blob and same targeted json_set as the generation
+// counter beside it.
+//
+// Why this exists at all: the continuation fork inherits the SOURCE's parent
+// id, not the source, so a "(cont.)" is a sibling of the session it replaced
+// and nothing on disk connected the two. Retiring the source therefore left
+// the continuation running loose — twice in one orchestrated run, once for a
+// reviewer holding write authority in a worktree a live implementer was
+// committing from. The generation counter was never enough: it says how many
+// handoffs deep a session is, never which session it came from.
+func (s *StateDB) WriteContinuationOf(id, sourceID string) error {
+	return withBusyRetry(func() error {
+		_, err := s.db.Exec(
+			`UPDATE instances
+			   SET tool_data = json_set(
+			         COALESCE(tool_data, '{}'),
+			         '$.continuation_of', ?)
+			 WHERE id = ?`,
+			sourceID, id,
+		)
+		return err
+	})
+}
+
+// ReadContinuationOf returns the id of the session `id` continues, or "" when
+// it is not a continuation. A missing row reads as "" rather than an error:
+// "this is not a continuation" is the right answer for a session that no
+// longer exists.
+func (s *StateDB) ReadContinuationOf(id string) (string, error) {
+	var source sql.NullString
+	err := s.db.QueryRow(
+		`SELECT json_extract(tool_data, '$.continuation_of')
+		   FROM instances WHERE id = ?`,
+		id,
+	).Scan(&source)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return "", nil
+		}
+		return "", err
+	}
+	if !source.Valid {
+		return "", nil
+	}
+	return source.String, nil
+}
+
+// ContinuationsOf returns the ids of every session recorded as a continuation
+// of sourceID, newest rows last. It is the lookup `session remove` needs: the
+// question at retirement time is "what did this session hand off to", and
+// answering it by scanning every instance's tool_data in Go would mean loading
+// every row to ask one question of each.
+func (s *StateDB) ContinuationsOf(sourceID string) ([]string, error) {
+	if sourceID == "" {
+		return nil, nil
+	}
+	rows, err := s.db.Query(
+		`SELECT id FROM instances
+		  WHERE json_extract(tool_data, '$.continuation_of') = ?`,
+		sourceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // ReadHandoffState returns the persisted handoff state and trigger time for an
 // instance. An unset key yields ("", zero time, nil) so a fresh session reads
 // as HandoffNormal. Missing row also returns ("", zero time, nil).
