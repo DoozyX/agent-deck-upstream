@@ -179,6 +179,14 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 			},
 			required: []string{"Review round 2", "Fix this concrete finding"},
 		},
+		{
+			name: "ab-judge",
+			args: []string{
+				"PAIRS_DIR=/tmp/orchestrate/run/task/ab",
+				"VERDICT_FILE=/tmp/orchestrate/run/task/ab-judge.md",
+			},
+			required: []string{"/tmp/orchestrate/run/task/ab", "AB_VERDICT: pair=", "not what the task was"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -331,6 +339,11 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"Do not end your turn while any layer subagent is still running",
 		// D5: timing evidence.
 		"Checked: tests full cmd=",
+		// Critic gates: the reviewer looks for itself and scores anchored criteria.
+		"Own-eyes verification",
+		"Seen: <criterion>",
+		"Scored: <criterion> <n>/10 (threshold <t>)",
+		"claims, not evidence",
 	})
 
 	incremental := render(t, "review-incremental",
@@ -363,5 +376,17 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"deviation: implementer deleted before task-done",
 		// D5: per-round timing in the manifest.
 		"launched=<unix> done=<unix> span=<s>",
+		// Critic gates: blind A/B judge and its reveal are part of the UI end gate.
+		"references/ab-pair.sh",
+		"references/ab-reveal.sh",
+		"AB_SUMMARY: pairs=<n> regressions=<n> unchanged=<n>",
+		"reveal with `regressions=0`",
+	})
+
+	plan := render(t, "plan", "SPEC_PATH=/tmp/approved-design.md", "TASK_DIR=/tmp/orchestrate/task")
+	requireAll(t, "plan", plan, []string{
+		"## Quality bar",
+		"anchors at 10, 8 and 5",
+		"pass threshold",
 	})
 }

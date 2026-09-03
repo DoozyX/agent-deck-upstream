@@ -38,6 +38,13 @@ stand alone alongside the approved design:
 - acceptance criteria;
 - relevant file or subsystem paths and the intended responsibility;
 - verification commands and required evidence;
+- a `## Quality bar` block, only when an acceptance criterion is qualitative
+  (visual polish, layout, UX, readability, perceived speed — anything a test
+  cannot assert). Rewrite each such criterion as a 0–10 scale with written
+  anchors at 10, 8 and 5 that describe, concretely for this task, what each
+  level looks like on screen, plus a pass threshold. "Looks good",
+  "polished" or "feels fast" never survive as a criterion. Omit the block
+  when every criterion is mechanically checkable;
 - an `## Interfaces` block with `consumes:` and `produces:` — the exact
   names, signatures, and paths this task relies on and hands over, so a
   child that sees only its own file knows its neighbours' names;
