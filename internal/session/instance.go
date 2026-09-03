@@ -5704,7 +5704,13 @@ func (i *Instance) sendMessageWhenReady(message string) (string, error) {
 	}
 
 	// Verify the agent accepted Enter and began processing.
-	const verifyRetries = 50
+	//
+	// The budget scales with payload size: the flat 50 retries were the same
+	// fifteen seconds for a one-line nudge and a 13k-character brief, giving
+	// the largest bodies the least slack at exactly the size where submission
+	// failures were reported. A launch brief is almost always one of the large
+	// ones. See send.VerifyRetriesForPayload.
+	verifyRetries := send.VerifyRetriesForPayload(50, message)
 	const verifyDelay = 300 * time.Millisecond
 	const activeSuccessThreshold = 2
 	const waitingAfterActiveThreshold = 2
