@@ -12,18 +12,28 @@ import (
 //	✻ Churned for 6m 24s · 2 shells still running
 //	✻ Waiting for 1 background agent to finish
 //	⏵⏵ bypass permissions on · 2 shells · ← for agents   (footer; segment present iff shells>0)
-//	⏵⏵ bypass permissions on · ← 2 agents               (main + active team agent)
 //
 // run_in_background shells and a background agent the turn awaits are the two
 // "still working after Stop" cases. Without recognizing them, agent-deck maps
 // Claude's Stop hook to "waiting" (yellow) and fires a premature "finished"
 // notification while work is still running. See the background-work-stop-signal
 // investigation (issue: bg-only sessions flagged yellow + notified).
+//
+// DELIBERATELY NOT MATCHED: the footer's `← N agents` team counter. It was read
+// as "main + an active team agent", but it is a ROSTER count — under agent teams
+// (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) it stays in the footer for the life of
+// the session once teammates exist, whether or not any of them is working. Every
+// poll then reported pending background work, which pinned a session that had
+// finished its turn at "running" forever: the Stop hook fired and was ingested,
+// but the bg-work override converted it straight back to running, so the session
+// never reached waiting/idle, no completion notification was emitted, and
+// `session send --wait` timed out against a permanently-busy agent. The two
+// completion-line phrases above are Claude's explicit statements that work
+// outlives the turn; a bare roster count is not.
 var claudeBackgroundWorkRe = regexp.MustCompile(`(?i)` +
 	`\d+\s+shells?\s+still\s+running` + // completion line: shells
 	`|waiting\s+for\s+\d+\s+background\s+agents?\s+to\s+finish` + // completion line: background agent
-	`|·\s*\d+\s+shells?\s*·` + // footer shell counter
-	`|←\s*(?:[2-9]|\d{2,})\s+agents?`) // footer team count (includes main)
+	`|·\s*\d+\s+shells?\s*·`) // footer shell counter
 
 // backgroundWorkScanLines bounds the scan to the pane tail (completion line +
 // input box + footer) so a transcript that merely mentions "shells" in prose
