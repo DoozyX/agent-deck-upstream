@@ -289,4 +289,36 @@ test.describe('fleet pane', () => {
     await expect(page.locator('.work-head .cur')).toHaveText('frontend')
     await expect(page.locator('.work-head .path')).not.toContainText('REMOTE')
   })
+
+  // App.js's popstate handler wrote selectedIdSignal directly, so Back out of
+  // a remote selection restored the URL and the sidebar highlight while
+  // selectedRemoteSignal stayed set — and WorkHead/RightRail/TerminalPanel all
+  // give the remote priority, so the URL and the rendered session disagreed
+  // with both signals set at once.
+  test('browser Back out of a remote selection restores the local session', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    // Deep-link the local selection rather than clicking the sidebar row: a
+    // sidebar click also switches the tab to 'terminal', which unmounts the
+    // fleet pane and the remote tile this test needs next (same reason
+    // url-routing.spec.js deep-links).
+    await page.goto('/s/sess-002')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await expect(page.locator('.sess.sel .tt')).toHaveText('frontend')
+
+    // History: /s/sess-002 -> / (the remote tile pushes '/').
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/')
+
+    await page.goBack()
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/s/sess-002')
+    // The URL, the rail and the work head must agree: local frontend, no
+    // leftover remote selection.
+    await expect(page.locator('.work-head .cur')).toHaveText('frontend')
+    await expect(page.locator('.work-head .path')).not.toContainText('REMOTE')
+    await expect(page.locator('[data-testid="right-rail"]')).not.toHaveAttribute('data-remote-name')
+    await expect(page.locator('.sess.sel .tt')).toHaveText('frontend')
+  })
 })
