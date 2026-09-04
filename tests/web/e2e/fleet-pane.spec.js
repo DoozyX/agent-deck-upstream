@@ -174,4 +174,60 @@ test.describe('fleet pane', () => {
     await expect(page.locator('.work-head .cur')).toHaveText('release')
     await expect(page.locator('.work-head .actions')).toHaveCount(0)
   })
+
+  // Regression guard for AppShell.js focusedSession()'s
+  // `if (selectedRemoteSignal.value) return null` line. selectRemoteSession()
+  // clears selectedIdSignal (state.js, mutually exclusive), so without that
+  // guard every local-session shortcut falls through to `sessions[0]` and acts
+  // on an unrelated LOCAL session while the user is looking at a remote one —
+  // 'D' would pop a close-session confirm for fixture sess-001 "agent-deck".
+  // The unit suite only covers the signal mutual-exclusivity; this covers the
+  // handler.
+  test('local-session shortcuts no-op while a remote session is selected', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+    await tile.click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
+    // Attaching hands keyboard focus to xterm.js, whose helper <textarea>
+    // trips AppShell's `inField` guard and would swallow every key below,
+    // making this test vacuous (Escape does not help — xterm re-focuses it).
+    // Clicking the inert work-head text moves focus off the terminal the way
+    // a user reaching for a global shortcut would, and the '?' toggle then
+    // proves keys really do reach the window-level shortcut handler before
+    // the no-op assertions run.
+    await page.locator('.work-head .path').click()
+    await expect(page.locator('.xterm-helper-textarea')).not.toBeFocused()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toBeVisible()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toHaveCount(0)
+
+    // Shift+D: must not open the close-session confirm for a local session.
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('D')
+    await page.keyboard.up('Shift')
+    // Round-trip the overlay again so the would-be dialog gets real time to
+    // render before the negative assertion — cheaper and less flaky than a
+    // fixed sleep.
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toBeVisible()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toHaveCount(0)
+    await expect(page.locator('.dialog', { hasText: /close session/i })).toHaveCount(0)
+
+    // Enter: must not swap the terminal over to sessions[0].
+    await page.keyboard.press('Enter')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
+    // 'r' (rename) reads through the same focusedSession(); no toast either.
+    await page.keyboard.press('r')
+    await expect(page.locator('.toast')).toHaveCount(0)
+  })
 })

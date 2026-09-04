@@ -62,13 +62,14 @@ type tmuxPTYBridge struct {
 	closeOnce sync.Once
 	done      chan struct{}
 
-	// startedAt and mapErr back the quick-exit signal in streamOutput: if the
-	// attach command dies within quickExitGrace of starting, that is treated
-	// as an attach failure (bad host, rejected auth, missing remote binary)
-	// rather than a normal detach, and mapErr's code/message/hint — the same
-	// contract used for a synchronous attach() failure — is sent as an error
-	// frame instead of the silent/session_closed handling a long-lived
-	// session's eventual exit gets.
+	// startedAt and mapErr back the quick-exit signal in streamOutput: if a
+	// REMOTE attach command dies within quickExitGrace of starting, that is
+	// treated as an attach failure (bad host, rejected auth, missing remote
+	// binary) rather than a normal detach, and mapErr's code/message/hint —
+	// the same contract used for a synchronous attach() failure — is sent as
+	// an error frame instead of the silent/session_closed handling a
+	// long-lived session's eventual exit gets. Local tmux attaches are
+	// excluded; see isRemote.
 	startedAt time.Time
 	mapErr    wsAttachErrorFunc
 }
@@ -136,6 +137,15 @@ func (b *tmuxPTYBridge) snapshotPtmx() *os.File {
 	return b.ptmx
 }
 
+// isRemote reports whether this bridge attaches to a session on another host
+// over ssh rather than to a local tmux session. tmuxSession is the signal:
+// newTmuxPTYBridge rejects an empty tmux session name outright, so every local
+// bridge carries one, and handleRemoteSessionWS — the only caller that builds
+// a bridge with no local tmux session behind it — is the only source of "".
+func (b *tmuxPTYBridge) isRemote() bool {
+	return b.tmuxSession == ""
+}
+
 func (b *tmuxPTYBridge) streamOutput() {
 	defer close(b.done)
 
@@ -157,13 +167,20 @@ func (b *tmuxPTYBridge) streamOutput() {
 
 		if err != nil {
 			switch {
-			case time.Since(b.startedAt) < quickExitGrace:
-				// The attach command died shortly after connecting — e.g. ssh
-				// reached the host but auth was rejected, or the remote
-				// agent-deck binary is missing. terminal_attached already
-				// fired, so without this the terminal looks attached and
-				// alive but is silently dead. Reuse the same code/message/
+			case b.isRemote() && time.Since(b.startedAt) < quickExitGrace:
+				// The remote attach command died shortly after connecting —
+				// e.g. ssh reached the host but auth was rejected, or the
+				// remote agent-deck binary is missing. terminal_attached
+				// already fired, so without this the terminal looks attached
+				// and alive but is silently dead. Reuse the same code/message/
 				// hint an attach() failure would have produced.
+				//
+				// Deliberately remote-only: a LOCAL tmux attach that exits
+				// this fast is an ordinary detach/close, and TerminalPanel.js
+				// does not disable reconnect on TERMINAL_ATTACH_FAILED, so
+				// promoting it to a fatal frame would only print a stray
+				// `[error:TERMINAL_ATTACH_FAILED]` line where the user
+				// previously got a clean session_closed.
 				code, message, hint := "TERMINAL_ATTACH_FAILED", "attach process exited shortly after connecting", "Check the server logs for details."
 				if b.mapErr != nil {
 					code, message, hint = b.mapErr(err)
@@ -190,8 +207,8 @@ func (b *tmuxPTYBridge) streamOutput() {
 	}
 }
 
-// quickExitGrace bounds how soon after start an attach command's exit is
-// treated as an attach failure (see streamOutput) rather than a normal
+// quickExitGrace bounds how soon after start a REMOTE attach command's exit
+// is treated as an attach failure (see streamOutput) rather than a normal
 // detach of a session that ran for a while.
 const quickExitGrace = 3 * time.Second
 
