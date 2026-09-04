@@ -37,7 +37,7 @@ func TestSSHConnOpts_SafeHostKeyStance(t *testing.T) {
 
 func TestAttachArgs_ConsistentWithRunPath(t *testing.T) {
 	r := &SSHRunner{Host: "user@host", AgentDeckPath: "agent-deck"}
-	args := r.buildAttachArgs("sess123")
+	args := r.AttachArgs("sess123")
 	joined := strings.Join(args, " ")
 
 	// #1206 regression: Attach() used to omit BatchMode + ConnectTimeout.

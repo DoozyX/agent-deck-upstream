@@ -67,9 +67,6 @@ func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsC
 	if tmuxSession == "" {
 		return nil, fmt.Errorf("tmux session name is required")
 	}
-	if writer == nil {
-		return nil, fmt.Errorf("writer is required")
-	}
 	exists, err := tmuxSessionExists(tmuxSession, tmuxSocketName)
 	if err != nil {
 		return nil, fmt.Errorf("check tmux session %q: %w", tmuxSession, err)
@@ -78,21 +75,39 @@ func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsC
 		return nil, fmt.Errorf("%w: %s", ErrTmuxSessionNotFound, tmuxSession)
 	}
 
-	cmd := tmuxAttachCommand(tmuxSession, tmuxSocketName)
+	b, err := newPTYBridge(tmuxAttachCommand(tmuxSession, tmuxSocketName), sessionID, writer)
+	if err != nil {
+		return nil, err
+	}
+	b.tmuxSession = tmuxSession
+	b.tmuxSocketName = tmuxSocketName
+	return b, nil
+}
+
+// newPTYBridge starts cmd in a local PTY and streams its output over writer.
+// It is the shared foundation for both the local tmux attach bridge (via
+// newTmuxPTYBridge, which existence-checks the tmux session first) and the
+// remote SSH attach bridge (handleRemoteSessionWS, which has no local tmux
+// session to check — the remote side owns that).
+func newPTYBridge(cmd *exec.Cmd, sessionID string, writer *wsConnWriter) (*tmuxPTYBridge, error) {
+	if cmd == nil {
+		return nil, fmt.Errorf("command is required")
+	}
+	if writer == nil {
+		return nil, fmt.Errorf("writer is required")
+	}
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("start tmux pty: %w", err)
+		return nil, fmt.Errorf("start pty: %w", err)
 	}
 
 	b := &tmuxPTYBridge{
-		tmuxSession:    tmuxSession,
-		tmuxSocketName: tmuxSocketName,
-		sessionID:      sessionID,
-		writer:         writer,
-		cmd:            cmd,
-		ptmx:           ptmx,
-		done:           make(chan struct{}),
+		sessionID: sessionID,
+		writer:    writer,
+		cmd:       cmd,
+		ptmx:      ptmx,
+		done:      make(chan struct{}),
 	}
 
 	go b.streamOutput()
