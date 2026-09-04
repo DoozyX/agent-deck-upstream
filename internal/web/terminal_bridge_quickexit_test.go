@@ -144,7 +144,7 @@ func TestRemoteQuickExitSkippedWhenWeClosed(t *testing.T) {
 			t.Errorf("newPTYBridge: %v", err)
 			return
 		}
-		// Well inside quickExitGrace (3s), and the command is still alive.
+		// Well inside quickExitGrace, and the command is still alive.
 		time.Sleep(200 * time.Millisecond)
 		bridge.Close()
 

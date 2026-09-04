@@ -16,6 +16,7 @@ import (
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmuxutf8"
 )
 
@@ -221,7 +222,25 @@ func (b *tmuxPTYBridge) streamOutput() {
 // quickExitGrace bounds how soon after start a REMOTE attach command's exit
 // is treated as an attach failure (see streamOutput) rather than a normal
 // detach of a session that ran for a while.
-const quickExitGrace = 3 * time.Second
+//
+// It is derived from session.SSHConnectTimeout rather than picked by feel,
+// because the window has to cover the ssh dial itself. defaultRemoteAttachCommand
+// runs ssh with `-o ConnectTimeout=<session.SSHConnectTimeout>` (see
+// sessionSSHConnOpts, reached via SSHRunner.AttachArgs), so the single most
+// likely real failure — the remote host down or unreachable, exactly what the
+// REMOTE_ATTACH_FAILED hint tells the user to check — has ssh block for the
+// whole connect timeout and only *then* exit. With a grace shorter than that,
+// the read error fell through to the session_closed branch: the client sets
+// terminalAttached = false but leaves wsReconnectEnabled true, so the terminal
+// reconnects forever, paying another full dial each time, with no banner and no
+// `[error:CODE]` line. The margin covers ssh's own startup plus the PTY read
+// waking up after the process exits.
+var quickExitGrace = session.SSHConnectTimeout + quickExitGraceMargin
+
+// quickExitGraceMargin is the headroom added on top of the ssh connect timeout
+// so a dial that times out at exactly ConnectTimeout still lands inside the
+// grace window.
+const quickExitGraceMargin = 5 * time.Second
 
 func (b *tmuxPTYBridge) WriteInput(data string) error {
 	if b == nil {

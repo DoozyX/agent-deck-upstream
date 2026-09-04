@@ -441,12 +441,22 @@ export function TerminalPanel() {
     return html`<${EmptyStateDashboard} />`
   }
 
-  // #782: actionable banner for terminal-fatal errors (currently only
-  // TMUX_SESSION_NOT_FOUND). The xterm canvas stays mounted underneath so
-  // the banner can be dismissed without losing terminal state, and the
-  // user gets a one-click Restart action that calls the same endpoint as
-  // the sidebar Restart icon.
+  // #782: actionable banner for terminal-fatal errors — TMUX_SESSION_NOT_FOUND
+  // for local sessions, REMOTE_ATTACH_FAILED for remote ones. The xterm canvas
+  // stays mounted underneath so the banner can be dismissed without losing
+  // terminal state.
+  //
+  // The Restart action is LOCAL-ONLY. Remote sessions are attach-only by design
+  // (design.md, first decision: "No restart/send/archive/create/fork for remote
+  // sessions"), and /api/sessions/{id}/restart addresses the LOCAL session
+  // store: with a remote selected, sessionId above is remoteSel.session.id,
+  // which — per the terminalKey comment — can collide with a local id. Offering
+  // Restart there would either restart an unrelated local session (and then
+  // bump reconnectKey, making the remote look recovered) or silently 404/403
+  // into the empty catch below. So the button is not rendered for a remote, and
+  // this handler hard-stops as well in case it ever is.
   async function handleFatalRestart() {
+    if (remoteName) return
     try {
       await apiFetch('POST', '/api/sessions/' + sessionId + '/restart')
       setFatalError(null)
@@ -476,7 +486,7 @@ export function TerminalPanel() {
         <div ref=${containerRef} style="height: 100%; width: 100%; overflow: hidden;"/>
       </div>
       ${fatalError && html`
-        <div role="alert"
+        <div role="alert" data-testid="terminal-fatal-banner"
              style=${{
                position: 'absolute', inset: '12px 12px auto 12px',
                border: '1px solid rgba(247,118,142,0.4)',
@@ -484,6 +494,11 @@ export function TerminalPanel() {
                borderRadius: 'var(--radius-lg)',
                boxShadow: '0 30px 60px -20px rgba(0,0,0,0.55)',
                padding: '14px 16px',
+               // xterm paints its own absolutely-positioned canvas layers over
+               // the frame; without an explicit stacking order the link layer
+               // swallows pointer events for the banner's buttons, leaving a
+               // remote banner (whose sole action is Dismiss) unusable.
+               zIndex: 5,
              }}>
           <div style="display: flex; align-items: flex-start; gap: 12px;">
             <span style="color: var(--tn-red); font-size: 18px; line-height: 1;">⚠</span>
@@ -492,8 +507,8 @@ export function TerminalPanel() {
               <div style="font-size: 12.5px; color: var(--text); margin-top: 4px;">${fatalError.message}</div>
               ${fatalError.hint && html`<div style="font-size: 11.5px; color: var(--muted); margin-top: 6px;">${fatalError.hint}</div>`}
               <div style="display: flex; gap: 8px; margin-top: 10px;">
-                <button type="button" class="btn primary" onClick=${handleFatalRestart}>Restart session</button>
-                <button type="button" class="btn ghost" onClick=${() => setFatalError(null)}>Dismiss</button>
+                ${!remoteName && html`<button type="button" class="btn primary" data-testid="terminal-fatal-restart" onClick=${handleFatalRestart}>Restart session</button>`}
+                <button type="button" class="btn ghost" data-testid="terminal-fatal-dismiss" onClick=${() => setFatalError(null)}>Dismiss</button>
               </div>
             </div>
           </div>
