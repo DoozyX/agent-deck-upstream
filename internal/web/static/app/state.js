@@ -13,6 +13,21 @@ export const archivedSessionsSignal = signal([])
 // Currently selected session ID
 export const selectedIdSignal = signal(null)
 
+// Currently selected remote session: null, or { remote: 'm5', session: {id,title,tool,status,path} }.
+// Mutually exclusive with selectedIdSignal — use selectLocalSession /
+// selectRemoteSession below rather than setting either signal directly.
+export const selectedRemoteSignal = signal(null)
+
+export function selectLocalSession(id) {
+  selectedRemoteSignal.value = null
+  selectedIdSignal.value = id
+}
+
+export function selectRemoteSession(remote, session) {
+  selectedIdSignal.value = null
+  selectedRemoteSignal.value = { remote, session }
+}
+
 // SSE connection state: 'connecting' | 'connected' | 'disconnected'
 export const connectionSignal = signal('connecting')
 

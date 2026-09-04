@@ -6,7 +6,7 @@ import { html } from 'htm/preact'
 import { useEffect, useMemo, useState } from 'preact/hooks'
 import { apiFetch } from '../api.js'
 import { menuModelSignal } from '../dataModel.js'
-import { selectedIdSignal } from '../state.js'
+import { selectLocalSession, selectRemoteSession } from '../state.js'
 import { activeTabSignal } from '../uiState.js'
 
 const EMPTY_REMOTE_COUNTS = {
@@ -56,13 +56,14 @@ function RemoteCard({ remote }) {
           ? html`<div class="fleet-remote-empty">Online · no sessions</div>`
           : html`<div class="gc-tiles">
               ${sessions.map(s => html`
-                <div key=${s.id} class="tile fleet-remote-session-tile"
+                <button key=${s.id} class="tile fleet-remote-session-tile"
                   data-testid="fleet-remote-session-tile" data-session-id=${s.id}
-                  title=${s.path || s.id}>
+                  title=${s.path || s.id}
+                  onClick=${() => { selectRemoteSession(remote.name, s); activeTabSignal.value = 'terminal' }}>
                   <span class=${`tdot ${s.status}`}/>
                   <span class="tn">${s.title || s.id}</span>
                   ${s.tool && html`<span class="ttool">${s.tool}</span>`}
-                </div>
+                </button>
               `)}
             </div>`}
       <div class="gc-foot">
@@ -161,7 +162,7 @@ export function FleetPane() {
   const totalCost = sessions.reduce((n, s) => n + (s.cost || 0), 0)
 
   const onSelect = (id) => {
-    selectedIdSignal.value = id
+    selectLocalSession(id)
     activeTabSignal.value = 'terminal'
   }
 

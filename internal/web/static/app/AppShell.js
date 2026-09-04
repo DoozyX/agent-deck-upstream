@@ -27,7 +27,7 @@ import { SkillsPane } from './panes/SkillsPane.js'
 import { Icon, ICONS } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
 import {
-  selectedIdSignal, createSessionDialogSignal, confirmDialogSignal,
+  selectedIdSignal, selectedRemoteSignal, selectLocalSession, createSessionDialogSignal, confirmDialogSignal,
   groupNameDialogSignal, mutationsEnabledSignal, infoDrawerOpenSignal,
   profilesSignal, systemStatsSignal,
   toolFilterSignal, visibleToolsSignal, toolFilterFallbackSignal,
@@ -50,6 +50,22 @@ import { apiFetch, authHeaders } from './api.js'
 import { shortcutsOverlaySignal } from './state.js'
 
 function WorkHead() {
+  const remote = selectedRemoteSignal.value
+  if (remote) {
+    const s = remote.session
+    return html`
+      <div class="work-head">
+        <div class="path">
+          <span class="kind">REMOTE</span>
+          <span class="seg">${remote.remote} /</span>
+          <span class="cur">${s.title}</span>
+        </div>
+        <span class=${`status-chip ${s.status}`}><span class="d"/>${s.status}</span>
+        <span class="spacer"/>
+      </div>
+    `
+  }
+
   const { sessions } = menuModelSignal.value
   const selected = selectedIdSignal.value
   const session = sessions.find(s => s.id === selected) || sessions[0]
@@ -221,7 +237,7 @@ export function AppShell() {
         // j/k navigation. Activating the terminal hands focus to xterm.js,
         // which swallows subsequent keypresses (issue #780 review).
         // The TUI's `enter` key is what opens; j/k just moves focus.
-        selectedIdSignal.value = next.id
+        selectLocalSession(next.id)
       }
     }
     const focusedSession = () => {
@@ -281,7 +297,7 @@ export function AppShell() {
         const s = focusedSession()
         if (s) {
           e.preventDefault()
-          selectedIdSignal.value = s.id
+          selectLocalSession(s.id)
           activeTabSignal.value = 'terminal'
         }
       } else if (e.key === 'n' && mutationsEnabledSignal.value) {
