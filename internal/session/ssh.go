@@ -273,7 +273,7 @@ func (r *SSHRunner) Attach(sessionID string) error {
 	}
 	_ = os.MkdirAll(sshControlDir, 0700)
 
-	sshArgs := r.buildAttachArgs(sessionID)
+	sshArgs := r.AttachArgs(sessionID)
 
 	cmd := exec.Command("ssh", sshArgs...)
 
@@ -964,12 +964,15 @@ func (r *SSHRunner) sshBaseArgs(remoteCmd string) []string {
 	return append(r.sshConnOpts(), r.Host, remoteCmd)
 }
 
-// buildAttachArgs builds the ssh argv for an interactive attach. It shares
+// AttachArgs builds the ssh argv for an interactive attach. It shares
 // sshConnOpts() with every other path so the host-key/BatchMode stance is
 // identical (#1206 regression: Attach() previously omitted BatchMode and
 // ConnectTimeout, so an unknown host key could hang on a prompt instead of
-// failing fast). "-tt" forces a remote PTY.
-func (r *SSHRunner) buildAttachArgs(sessionID string) []string {
+// failing fast). "-tt" forces a remote PTY. Exported so the web terminal
+// bridge (internal/web) can build the same ssh command Attach() runs, in a
+// local PTY instead of the TUI's os.Stdin one.
+func (r *SSHRunner) AttachArgs(sessionID string) []string {
+	_ = os.MkdirAll(sshControlDir, 0700)
 	remoteCmd := r.buildRemoteCommand("session", "attach", sessionID)
 	args := append([]string{"-tt"}, r.sshConnOpts()...)
 	return append(args, r.Host, remoteCmd)
