@@ -127,4 +127,51 @@ test.describe('fleet pane', () => {
     await expect(page.locator('[data-testid="fleet-stat-sessions"] .num')).toHaveText('7')
     await expect(page.locator('[data-testid="fleet-group-card"]')).toHaveCount(3)
   })
+
+  test('clicking a remote session tile attaches a terminal over the SSH bridge', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+    await expect(tile).toBeVisible()
+
+    // selectRemoteSession(remote, session) + activeTabSignal='terminal': the
+    // fleet pane unmounts and TerminalPanel opens a
+    // /ws/remote/build/session/remote-1 connection to the fixture's
+    // RemoteAttachCommand (`sh -c 'printf "remote-shell\r\n"; cat'`), not the
+    // local /ws/session/ path. xterm.js's accessibility tree is off by
+    // default (no screenReaderMode), so the rendered bytes aren't queryable
+    // DOM text; assert on the WS frame the server actually streamed instead
+    // — that's the thing this design item adds.
+    const wsPromise = page.waitForEvent('websocket', ws => ws.url().includes('/ws/remote/build/session/remote-1'))
+    await tile.click()
+    const ws = await wsPromise
+
+    // Register the frame listener BEFORE any other awaits: the connect /
+    // terminal_attached / first data frames can all land before the next
+    // line of this test runs, and a listener attached later would miss them.
+    const sawRemoteShellPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out waiting for "remote-shell" over /ws/remote/')), 5000)
+      ws.on('framereceived', (frame) => {
+        const text = Buffer.isBuffer(frame.payload) ? frame.payload.toString('utf8') : String(frame.payload)
+        if (text.includes('remote-shell')) {
+          clearTimeout(timer)
+          resolve(true)
+        }
+      })
+    })
+
+    await expect(page.locator('[data-testid="fleet-pane"]')).toHaveCount(0)
+    await expect(page.locator('.term-wrap')).toBeVisible()
+    expect(await sawRemoteShellPromise).toBe(true)
+
+    // Remote attach is view-only: the work head shows "REMOTE <remote> /
+    // <title>" and hides Start/Restart/New/Fork (design: attach-only scope).
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .path')).toContainText('build')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+    await expect(page.locator('.work-head .actions')).toHaveCount(0)
+  })
 })
