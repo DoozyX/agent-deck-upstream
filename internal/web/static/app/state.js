@@ -23,9 +23,20 @@ export function selectLocalSession(id) {
   selectedIdSignal.value = id
 }
 
+// `attempt` makes re-clicking the ALREADY-selected remote tile a retry gesture
+// instead of a no-op (round 7 #1). TerminalPanel keys its terminal + WebSocket
+// effect on `remote:<name>:<id>`, which does not change on a re-click, and the
+// pane is only ever CSS-hidden, never unmounted — so a remote terminal parked
+// on a fatal REMOTE_ATTACH_FAILED banner (reconnect disabled) had no way back
+// short of selecting a different session or reloading the page. Selecting a
+// DIFFERENT remote or session already changes that key, so the counter only has
+// to move for the same one.
 export function selectRemoteSession(remote, session) {
+  const cur = selectedRemoteSignal.value
+  const sameTile = !!cur && cur.remote === remote && !!cur.session && cur.session.id === session.id
+  const attempt = sameTile ? (cur.attempt || 0) + 1 : 0
   selectedIdSignal.value = null
-  selectedRemoteSignal.value = { remote, session }
+  selectedRemoteSignal.value = { remote, session, attempt }
 }
 
 // SSE connection state: 'connecting' | 'connected' | 'disconnected'

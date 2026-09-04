@@ -91,7 +91,18 @@ export function TerminalPanel() {
   // down and rebuilds the terminal exactly as a local session switch does —
   // two remotes can share a session id, and a remote id can collide with a
   // local one.
-  const terminalKey = remoteName ? `remote:${remoteName}:${sessionId}` : sessionId
+  //
+  // The `#<attempt>` suffix carries state.js's per-selection counter, which
+  // only advances when the user re-selects the tile that is ALREADY selected.
+  // That is what makes clicking the same Fleet tile a retry: remote attach has
+  // no Restart action (it must not touch the local mutation endpoints), so
+  // after a fatal REMOTE_ATTACH_FAILED disables reconnect, re-clicking the tile
+  // is the only retry gesture the UI offers, and without this the key was
+  // unchanged, the effect never re-ran, and the double-init guard below would
+  // have short-circuited anyway (round 7 #1).
+  const terminalKey = remoteName
+    ? `remote:${remoteName}:${sessionId}#${remoteSel.attempt || 0}`
+    : sessionId
   // #782: terminal-fatal errors (e.g. TMUX_SESSION_NOT_FOUND) render as a
   // banner overlay rather than a `[error:CODE]` line on every WS reconnect.
   // null when there's no fatal error; an object { code, message, hint }

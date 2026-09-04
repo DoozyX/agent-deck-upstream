@@ -13,12 +13,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// quickExitFrame starts a bridge over an attach command that exits
-// immediately — well inside quickExitGrace — and returns the first text
-// (JSON) frame the bridge writes, or the zero value if it writes none before
-// the timeout. tmuxSession is what distinguishes a local tmux attach bridge
-// from a remote ssh one (only handleRemoteSessionWS passes "").
-func quickExitFrame(t *testing.T, tmuxSession string, mapErr wsAttachErrorFunc, wait time.Duration) wsServerMessage {
+// quickExitFrame starts a bridge over cmd — an attach command that exits well
+// inside quickExitGrace — and returns the first text (JSON) frame the bridge
+// writes, or the zero value if it writes none before the timeout. tmuxSession
+// is what distinguishes a local tmux attach bridge from a remote ssh one (only
+// handleRemoteSessionWS passes "").
+func quickExitFrame(t *testing.T, cmd *exec.Cmd, tmuxSession string, mapErr wsAttachErrorFunc, wait time.Duration) wsServerMessage {
 	t.Helper()
 
 	mux := http.NewServeMux()
@@ -31,7 +31,7 @@ func quickExitFrame(t *testing.T, tmuxSession string, mapErr wsAttachErrorFunc, 
 		defer conn.Close()
 
 		writer := newWSConnWriter(conn)
-		bridge, err := newPTYBridge(exec.Command("sh", "-c", "exit 0"), "sess-quick", tmuxSession, "", writer, mapErr)
+		bridge, err := newPTYBridge(cmd, "sess-quick", tmuxSession, "", writer, mapErr)
 		if err != nil {
 			t.Errorf("newPTYBridge: %v", err)
 			return
@@ -87,7 +87,7 @@ func TestQuickExitIsFatalOnlyForRemote(t *testing.T) {
 		// that differs by platform (darwin surfaces io.EOF here, so no frame
 		// at all; an EIO-style error yields session_closed). Both are the
 		// pre-existing behavior; a fatal error frame is not.
-		msg := quickExitFrame(t, "web-test-local", mapLocalAttachError, 1500*time.Millisecond)
+		msg := quickExitFrame(t, exec.Command("sh", "-c", "exit 0"), "web-test-local", mapLocalAttachError, 1500*time.Millisecond)
 		if msg.Type == "error" {
 			t.Fatalf("local quick exit sent a fatal error frame (code=%s message=%s); want the non-fatal exit path",
 				msg.Code, msg.Message)
@@ -101,7 +101,7 @@ func TestQuickExitIsFatalOnlyForRemote(t *testing.T) {
 		mapErr := func(error) (string, string, string) {
 			return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal", "Check ssh."
 		}
-		msg := quickExitFrame(t, "", mapErr, 4*time.Second)
+		msg := quickExitFrame(t, exec.Command("sh", "-c", "exit 0"), "", mapErr, 4*time.Second)
 		if msg.Type != "error" {
 			t.Fatalf("remote quick exit sent type=%q event=%q; want a fatal error frame", msg.Type, msg.Event)
 		}
@@ -183,5 +183,66 @@ func TestRemoteQuickExitSkippedWhenWeClosed(t *testing.T) {
 			t.Fatalf("bridge closed by us produced a fatal frame (code=%s message=%s); want none",
 				msg.Code, msg.Message)
 		}
+	}
+}
+
+// TestRemoteSessionThatRanAndExitedIsNotFatal is the round-7 (#2) regression
+// guard. Round 6 widened quickExitGrace from 3s to
+// session.SSHConnectTimeout+5s = 15s to cover the ssh dial, but the quick-exit
+// case was still gated on elapsed time alone. That made a remote session which
+// simply ENDED inside the window — the agent finished, the user typed `exit`,
+// the remote pane died — report a fatal REMOTE_ATTACH_FAILED whose hint reads
+// "Check that ssh can reach <host> from the web server host." The diagnosis is
+// false, and TerminalPanel.js disables reconnect on that code, so for the one
+// feature whose whole purpose is watching a remote agent work, finishing the
+// work froze the pane.
+//
+// The command here does what a real attached session does: emits output, then
+// exits cleanly, all well inside the grace. That must land on the ordinary
+// exit path (silence on a clean io.EOF, session_closed otherwise), never a
+// fatal frame.
+func TestRemoteSessionThatRanAndExitedIsNotFatal(t *testing.T) {
+	mapErr := func(error) (string, string, string) {
+		return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal", "Check ssh."
+	}
+
+	// tmuxSession "" is the remote shape — the only one the quick-exit branch
+	// applies to at all.
+	cmd := exec.Command("sh", "-c", `printf "remote-shell\r\n"; exit 0`)
+	msg := quickExitFrame(t, cmd, "", mapErr, 4*time.Second)
+
+	if msg.Type == "error" {
+		t.Fatalf("a remote session that ran and exited sent a fatal error frame (code=%s message=%s hint has the ssh diagnosis); want the ordinary exit path",
+			msg.Code, msg.Message)
+	}
+	if msg.Type != "" && (msg.Type != "status" || msg.Event != "session_closed") {
+		t.Fatalf("remote run-then-exit sent type=%q event=%q; want no frame or status/session_closed", msg.Type, msg.Event)
+	}
+}
+
+// TestRemoteAttachFailureStaysFatalWhenSSHPrints is the other half of the
+// round-7 (#2) fix, and the reason attachFailed does not key on "wrote no
+// bytes" alone.
+//
+// A real failed ssh dial is NOT silent: pty.Start points the child's stderr at
+// the same pts, so ssh's own "Could not resolve hostname …" / "Operation timed
+// out" line is read by streamOutput as ordinary output. A no-output-only test
+// would therefore classify every real unreachable host as a session that ran
+// and ended, silently undoing round 6. This stands in for that shape: output
+// on the way out, then ssh's 255.
+func TestRemoteAttachFailureStaysFatalWhenSSHPrints(t *testing.T) {
+	mapErr := func(error) (string, string, string) {
+		return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal", "Check ssh."
+	}
+
+	cmd := exec.Command("sh", "-c",
+		`printf "ssh: connect to host build port 22: Operation timed out\r\n"; exit 255`)
+	msg := quickExitFrame(t, cmd, "", mapErr, 4*time.Second)
+
+	if msg.Type != "error" {
+		t.Fatalf("ssh dial failure that printed a diagnostic sent type=%q event=%q; want a fatal error frame", msg.Type, msg.Event)
+	}
+	if msg.Code != "REMOTE_ATTACH_FAILED" {
+		t.Fatalf("code = %q, want REMOTE_ATTACH_FAILED", msg.Code)
 	}
 }
