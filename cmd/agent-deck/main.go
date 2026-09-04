@@ -989,8 +989,14 @@ func main() {
 		p.Send(ui.MaintenanceCompleteMsg{Result: result})
 	})
 
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v\n", err)
+	_, runErr := p.Run()
+	// The TUI pins terminal autowrap off for the whole session (#607 drift
+	// class, see internal/ui/autowrap.go). DECAWM is a global terminal mode and
+	// is NOT restored by leaving the alternate screen, so hand the shell back a
+	// wrapping terminal on every exit path, error included.
+	ui.RestoreAutowrap(os.Stdout)
+	if runErr != nil {
+		fmt.Printf("Error: %v\n", runErr)
 		os.Exit(1)
 	}
 }
