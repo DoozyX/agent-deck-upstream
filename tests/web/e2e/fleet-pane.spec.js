@@ -194,6 +194,16 @@ test.describe('fleet pane', () => {
     await expect(page.locator('.work-head .path')).toContainText('REMOTE')
     await expect(page.locator('.work-head .cur')).toHaveText('release')
 
+    // The right rail must describe the REMOTE session, not fall back to
+    // sessions[0] (fixture sess-001 "agent-deck"/claude/work) the way it did
+    // while selectedIdSignal was null.
+    const rail = page.locator('[data-testid="right-rail"]')
+    await expect(rail).toHaveAttribute('data-remote-name', 'build')
+    await expect(rail).toContainText('release')
+    await expect(rail.locator('[data-testid="rail-card-overview"]')).toContainText('codex')
+    await expect(rail.locator('[data-testid="rail-card-overview"]')).toContainText('/srv/release')
+    await expect(rail).not.toContainText('agent-deck')
+
     // Attaching hands keyboard focus to xterm.js, whose helper <textarea>
     // trips AppShell's `inField` guard and would swallow every key below,
     // making this test vacuous (Escape does not help — xterm re-focuses it).
@@ -234,8 +244,49 @@ test.describe('fleet pane', () => {
     await expect(page.locator('.work-head .path')).toContainText('REMOTE')
     await expect(page.locator('.work-head .cur')).toHaveText('release')
 
+    // j/k list navigation does not read focusedSession() — it calls
+    // selectLocalSession() directly — so it needs its own guard, and its own
+    // assertion: without one, j silently swaps the remote terminal for a
+    // local session.
+    await page.keyboard.press('j')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await page.keyboard.press('k')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
     // 'r' (rename) reads through the same focusedSession(); no toast either.
     await page.keyboard.press('r')
     await expect(page.locator('.toast')).toHaveCount(0)
+  })
+
+  // The mirror image of the test above: shortcuts must not act PAST a remote
+  // selection, but the affordances that deliberately switch to a local session
+  // must actually get there. SearchPane.onSelect wrote selectedIdSignal
+  // directly, leaving selectedRemoteSignal set, and TerminalPanel's
+  // `remote ? ... : id` priority then kept the remote terminal on screen — the
+  // click did nothing visible.
+  test('a search result click switches away from a selected remote session', async ({ page, request, viewport }) => {
+    // desktop/tablet-only: .top-tabs is hidden at ≤720px and MobileTabs has no
+    // Search entry, so there is no in-app Search affordance on phone (same
+    // scoping as search-pane.spec.js's Topbar navigation test). Reaching it by
+    // localStorage preseed would need a reload, which clears the remote
+    // selection this test is about.
+    test.skip((viewport?.width || 1280) < 768, 'phone viewport: Topbar tabs hidden; no Search affordance')
+
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+
+    await page.locator('.top-tab', { hasText: 'Search' }).click()
+    await expect(page.locator('[data-testid="search-pane"]')).toBeVisible()
+    await page.locator('[data-testid="search-result"][data-session-id="sess-002"]').click()
+
+    // Local session wins: no REMOTE kicker, and the work head names it.
+    await expect(page.locator('.work-head .cur')).toHaveText('frontend')
+    await expect(page.locator('.work-head .path')).not.toContainText('REMOTE')
   })
 })

@@ -226,6 +226,10 @@ export function AppShell() {
     // session list from menuModelSignal. Stable across SSE updates because
     // we resolve by ID, not by array index in a possibly-stale snapshot.
     const moveFocus = (delta) => {
+      // Same guard as focusedSession(): while a remote session is attached,
+      // j/k must not walk into the local list — selectLocalSession would clear
+      // selectedRemoteSignal and silently tear the remote terminal down.
+      if (selectedRemoteSignal.value) return
       const sessions = (menuModelSignal.value?.sessions) || []
       if (sessions.length === 0) return
       const curId = selectedIdSignal.value
