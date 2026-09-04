@@ -14,6 +14,7 @@ const (
 	ErrCodeInternalError    = "INTERNAL_ERROR"
 	ErrCodeNotImplemented   = "NOT_IMPLEMENTED"
 	ErrCodeReadOnly         = "READ_ONLY"
+	ErrCodeRemoteNotFound   = "REMOTE_NOT_FOUND"
 )
 
 // CreateSessionRequest is the body for POST /api/sessions.

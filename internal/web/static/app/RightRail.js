@@ -14,7 +14,7 @@
 import { html } from 'htm/preact'
 import { signal } from '@preact/signals'
 import { menuModelSignal } from './dataModel.js'
-import { selectedIdSignal } from './state.js'
+import { selectedIdSignal, selectedRemoteSignal } from './state.js'
 import { rightRailPanelsSignal } from './uiState.js'
 
 // Module-scope signal so collapsed state survives RightRail re-mounts
@@ -117,7 +117,46 @@ function ChildrenTree({ rootId, sessions }) {
   `
 }
 
+// RemoteRail renders the rail for a selected REMOTE session. Without it the
+// rail below falls back to `sessions[0]` whenever selectedIdSignal is null —
+// which is exactly the state selectRemoteSession() leaves behind — and shows
+// an unrelated LOCAL session's kind/tool/group/path/usage the whole time a
+// remote terminal is attached. Same guard shape as WorkHead's remote branch
+// in AppShell.js.
+//
+// The fields are whatever session.RemoteSessionInfo carries over the wire
+// (id/title/path/group/tool/status); everything else the local rail shows —
+// cost, tokens, MCPs, skills, children, events — has no remote source, and
+// remote attach is view-only by design, so it is stated rather than faked.
+function RemoteRail({ remote }) {
+  const s = remote.session
+  return html`
+    <div class="rightrail" data-testid="right-rail" data-remote-name=${remote.remote}>
+      <div class="rail-head">
+        <span class="t">REMOTE SESSION</span>
+        <div class="spacer"/>
+        <span class="t" style="color: var(--text-hi);">${s.title || s.id}</span>
+      </div>
+      <div class="rail-body">
+        <${Card} title="OVERVIEW" badge=${s.status} testid="rail-card-overview">
+          <div class="kv"><span class="k">remote</span><span class="v">${remote.remote}</span></div>
+          <div class="kv"><span class="k">tool</span><span class="v">${s.tool || '—'}</span></div>
+          <div class="kv"><span class="k">group</span><span class="v">${s.group || '—'}</span></div>
+          ${s.path && html`
+            <div class="kv"><span class="k">path</span><span class="v" title=${s.path}>${s.path}</span></div>`}
+        </${Card}>
+        <${Card} title="USAGE" testid="rail-card-usage">
+          <${NoData} msg="not available for remote sessions — attach is view-only"/>
+        </${Card}>
+      </div>
+    </div>
+  `
+}
+
 export function RightRail() {
+  const remote = selectedRemoteSignal.value
+  if (remote) return html`<${RemoteRail} remote=${remote}/>`
+
   const { sessions } = menuModelSignal.value
   const selected = selectedIdSignal.value
   const session = sessions.find(s => s.id === selected) || sessions[0]

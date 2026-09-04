@@ -823,8 +823,6 @@ body[data-rail="hidden"] .rightrail { display: none; }
   font-family: var(--mono); font-size: 10.5px; color: var(--muted);
 }
 .fleet-remote-error { color: var(--tn-red); }
-.fleet-remote-session-tile { cursor: default; }
-.fleet-remote-session-tile:hover { border-color: var(--border); background: var(--card); }
 .gc-head { display: flex; align-items: center; gap: 10px; }
 .gc-head .t { font-family: var(--sans); font-weight: 600; color: var(--text-hi); font-size: 13px; letter-spacing: 0.02em; }
 .gc-head .health .d { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }

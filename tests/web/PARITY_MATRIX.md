@@ -76,6 +76,8 @@ Every keyboard action in the TUI that mutates state or navigates must have a web
 | Subscribe to push | `internal/ui/home.go` (TUI none) | POST `/api/push/subscribe` | N/A | `handlers_push_test.go` | Web browser push only. **e2e parity: degraded-only** — fixture has no push service (no VAPID keys + subscription db), so the probe asserts 503 `PUSH_NOT_CONFIGURED`. Happy-path `parity-test-deferred` to PR-B. |
 | Unsubscribe push | `internal/ui/home.go` (TUI none) | POST `/api/push/unsubscribe` | N/A | `handlers_push_test.go` | Web browser push only. **e2e parity: degraded-only** (503 without push service). Happy-path `parity-test-deferred` to PR-B. |
 | Update push presence | `internal/ui/home.go` (TUI none) | POST `/api/push/presence` | N/A | `handlers_push_test.go` | Web browser focus tracking. **e2e parity: degraded-only** (503 without push service). Happy-path `parity-test-deferred` to PR-B. |
+| **REMOTE FLEET** |
+| Attach remote session | `internal/session/ssh.go:972` (`SSHRunner.buildAttachArgs`, TUI reuses the same `ssh -tt … session attach` path) | GET `/ws/remote/{remote}/session/{id}` | `newPTYBridge` (via `Config.RemoteAttachCommand`, default `defaultRemoteAttachCommand`) | `handlers_remote_ws_test.go`, `tests/web/e2e/fleet-pane.spec.js` | Attach only (view + keystrokes + resize); no restart/send/archive/create/fork for remote sessions. 404s `REMOTE_NOT_FOUND`/`NOT_FOUND` outside `[remotes.*]` config or the fleet poll's last-seen snapshot. |
 
 ---
 

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"os/exec"
 	"sync"
 	"time"
 
@@ -42,6 +43,12 @@ type Config struct {
 	PushVAPIDSubject    string
 	PushTestInterval    time.Duration
 	RemoteFleet         RemoteFleetLoader
+	// RemoteAttachCommand builds the ssh argv for GET /ws/remote/{remote}/session/{id}.
+	// nil (the production default) shells out to real ssh via
+	// defaultRemoteAttachCommand. Tests and the JS e2e fixture (a separate
+	// `main` package with no access to unexported seams) swap this in to
+	// avoid spawning real ssh — mirrors SSHRunner's own openStreamFn seam.
+	RemoteAttachCommand func(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd
 }
 
 // confirmLinkOpen resolves Config.ConfirmLinkOpen, defaulting to true so an
@@ -262,6 +269,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/push/presence", s.handlePushPresence)
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
+	mux.HandleFunc("/ws/remote/", s.handleRemoteSessionWS)
 
 	// Command Center (the embedded live fleet god-view — see
 	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and

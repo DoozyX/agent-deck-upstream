@@ -9,12 +9,14 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmuxutf8"
 )
 
@@ -61,14 +63,84 @@ type tmuxPTYBridge struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+
+	// closing is set by Close before it tears the PTY down, so streamOutput's
+	// read error can distinguish "the attach process died on us" from "we
+	// closed it ourselves" (the WS client went away — user closed the tab —
+	// and serveTerminalWS's deferred Close ran). Without it the quick-exit
+	// branch below treats our own teardown inside quickExitGrace as an attach
+	// failure and writes a fatal frame; that is invisible today only because
+	// the write lands on an already-dead connection, which is write-ordering
+	// luck rather than a guarantee.
+	closing atomic.Bool
+
+	// startedAt and mapErr back the quick-exit signal in streamOutput: if a
+	// REMOTE attach command dies within quickExitGrace of starting, that is
+	// treated as an attach failure (bad host, rejected auth, missing remote
+	// binary) rather than a normal detach, and mapErr's code/message/hint —
+	// the same contract used for a synchronous attach() failure — is sent as
+	// an error frame instead of the silent/session_closed handling a
+	// long-lived session's eventual exit gets. Local tmux attaches are
+	// excluded; see isRemote.
+	startedAt time.Time
+	mapErr    wsAttachErrorFunc
+
+	// wroteOutput records whether the attach command ever put a byte on the
+	// PTY. See attachFailed for why that matters.
+	wroteOutput atomic.Bool
+
+	// waitOnce/exitCode memoise the single permitted cmd.Wait. Both Close
+	// (which reaps after killing) and attachFailed (which needs the status to
+	// classify a quick exit) need the process reaped, and calling cmd.Wait
+	// from two goroutines is a data race.
+	waitOnce sync.Once
+	exitCode atomic.Int32
+
+	// reaped is set once cmd.Wait has RETURNED, i.e. the child is no longer a
+	// zombie and its PID is free for the OS to hand to somebody else. Close
+	// must not signal after that point.
+	//
+	// Round 8 (#1): before this branch, cmd.Wait only ever ran inside Close,
+	// AFTER the kill, so b.cmd.Process.Pid was always still a (reaped-later)
+	// zombie and syscall.Getpgid on it was always safe. attachFailed's
+	// waitExitCode now reaps at the moment of a quick exit, and on that path
+	// the server does not close the WebSocket — the client keeps the socket
+	// open with reconnect disabled (TerminalPanel.js's fatal branch) — so
+	// serveTerminalWS's deferred Close can run minutes or hours later. If the
+	// host recycled the PID in between, Getpgid would succeed for an unrelated
+	// process and Kill(-pgid, SIGTERM) would take down that whole process
+	// group, which on a deck host means other agent-deck panes.
+	//
+	// Reading b.cmd.ProcessState instead would race with an in-flight Wait.
+	reaped atomic.Bool
+
+	// terminateProcessGroup indirects Close's signal step so the reaped-PID
+	// regression test can observe whether Close signalled at all. nil selects
+	// the production behavior (defaultTerminateProcessGroup); nothing outside
+	// tests sets it.
+	terminateProcessGroup func(*os.Process)
 }
 
-func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsConnWriter) (*tmuxPTYBridge, error) {
+// sshFailureExitCode is the status ssh itself exits with when it could not
+// establish the session at all: unreachable host, connection refused, rejected
+// auth, host-key failure. Once ssh HAS connected, `ssh -tt` exits with the
+// REMOTE command's status instead, so 255 is the one code that distinguishes
+// "the dial failed" from "the thing you attached to ended".
+const sshFailureExitCode = 255
+
+// exitCodeUnknown marks a process whose status we never learned (no command, or
+// the bounded wait in attachFailed timed out).
+const exitCodeUnknown = -2
+
+// reapWaitTimeout bounds attachFailed's wait for the exit status. On the path
+// that calls it the child is already gone — that is why the PTY read failed —
+// so this only exists so an exotic case (a grandchild still holding the pts)
+// can never wedge streamOutput and leave b.done unclosed.
+const reapWaitTimeout = 2 * time.Second
+
+func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsConnWriter, mapErr wsAttachErrorFunc) (*tmuxPTYBridge, error) {
 	if tmuxSession == "" {
 		return nil, fmt.Errorf("tmux session name is required")
-	}
-	if writer == nil {
-		return nil, fmt.Errorf("writer is required")
 	}
 	exists, err := tmuxSessionExists(tmuxSession, tmuxSocketName)
 	if err != nil {
@@ -78,21 +150,38 @@ func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsC
 		return nil, fmt.Errorf("%w: %s", ErrTmuxSessionNotFound, tmuxSession)
 	}
 
-	cmd := tmuxAttachCommand(tmuxSession, tmuxSocketName)
+	return newPTYBridge(tmuxAttachCommand(tmuxSession, tmuxSocketName), sessionID, tmuxSession, tmuxSocketName, writer, mapErr)
+}
+
+// newPTYBridge starts cmd in a local PTY and streams its output over writer.
+// It is the shared foundation for both the local tmux attach bridge (via
+// newTmuxPTYBridge, which existence-checks the tmux session first) and the
+// remote SSH attach bridge (handleRemoteSessionWS, which has no local tmux
+// session to check — the remote side owns that). tmuxSession/tmuxSocketName
+// are empty for the remote (non-tmux) caller.
+func newPTYBridge(cmd *exec.Cmd, sessionID, tmuxSession, tmuxSocketName string, writer *wsConnWriter, mapErr wsAttachErrorFunc) (*tmuxPTYBridge, error) {
+	if cmd == nil {
+		return nil, fmt.Errorf("command is required")
+	}
+	if writer == nil {
+		return nil, fmt.Errorf("writer is required")
+	}
 
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return nil, fmt.Errorf("start tmux pty: %w", err)
+		return nil, fmt.Errorf("start pty: %w", err)
 	}
 
 	b := &tmuxPTYBridge{
+		sessionID:      sessionID,
 		tmuxSession:    tmuxSession,
 		tmuxSocketName: tmuxSocketName,
-		sessionID:      sessionID,
 		writer:         writer,
 		cmd:            cmd,
 		ptmx:           ptmx,
 		done:           make(chan struct{}),
+		startedAt:      time.Now(),
+		mapErr:         mapErr,
 	}
 
 	go b.streamOutput()
@@ -112,6 +201,15 @@ func (b *tmuxPTYBridge) snapshotPtmx() *os.File {
 	return b.ptmx
 }
 
+// isRemote reports whether this bridge attaches to a session on another host
+// over ssh rather than to a local tmux session. tmuxSession is the signal:
+// newTmuxPTYBridge rejects an empty tmux session name outright, so every local
+// bridge carries one, and handleRemoteSessionWS — the only caller that builds
+// a bridge with no local tmux session behind it — is the only source of "".
+func (b *tmuxPTYBridge) isRemote() bool {
+	return b.tmuxSession == ""
+}
+
 func (b *tmuxPTYBridge) streamOutput() {
 	defer close(b.done)
 
@@ -123,6 +221,7 @@ func (b *tmuxPTYBridge) streamOutput() {
 		}
 		n, err := ptmx.Read(buf)
 		if n > 0 {
+			b.wroteOutput.Store(true)
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			if writeErr := b.writer.WriteBinary(chunk); writeErr != nil {
@@ -132,7 +231,38 @@ func (b *tmuxPTYBridge) streamOutput() {
 		}
 
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			switch {
+			case b.isRemote() && !b.closing.Load() && time.Since(b.startedAt) < quickExitGrace && b.attachFailed():
+				// The remote attach command died without ever giving the user
+				// a session — ssh could not reach the host, auth was rejected,
+				// or the remote agent-deck binary is missing. terminal_attached
+				// already fired, so without this the terminal looks attached
+				// and alive but is silently dead. Reuse the same code/message/
+				// hint an attach() failure would have produced.
+				//
+				// attachFailed is what separates that from a remote session
+				// that genuinely ran and ended inside the grace window; see
+				// its doc comment.
+				//
+				// Deliberately remote-only: a LOCAL tmux attach that exits
+				// this fast is an ordinary detach/close, and TerminalPanel.js
+				// does not disable reconnect on TERMINAL_ATTACH_FAILED, so
+				// promoting it to a fatal frame would only print a stray
+				// `[error:TERMINAL_ATTACH_FAILED]` line where the user
+				// previously got a clean session_closed.
+				code, message, hint := "TERMINAL_ATTACH_FAILED", "attach process exited shortly after connecting", "Check the server logs for details."
+				if b.mapErr != nil {
+					code, message, hint = b.mapErr(err)
+				}
+				_ = b.writer.WriteJSON(wsServerMessage{
+					Type:      "error",
+					Code:      code,
+					Message:   message,
+					Hint:      hint,
+					SessionID: b.sessionID,
+					Time:      time.Now().UTC(),
+				})
+			case !errors.Is(err, io.EOF):
 				_ = b.writer.WriteJSON(wsServerMessage{
 					Type:      "status",
 					Event:     "session_closed",
@@ -144,6 +274,100 @@ func (b *tmuxPTYBridge) streamOutput() {
 			return
 		}
 	}
+}
+
+// quickExitGrace bounds how soon after start a REMOTE attach command's exit
+// is treated as an attach failure (see streamOutput) rather than a normal
+// detach of a session that ran for a while.
+//
+// It is derived from session.SSHConnectTimeout rather than picked by feel,
+// because the window has to cover the ssh dial itself. defaultRemoteAttachCommand
+// runs ssh with `-o ConnectTimeout=<session.SSHConnectTimeout>` (see
+// sessionSSHConnOpts, reached via SSHRunner.AttachArgs), so the single most
+// likely real failure — the remote host down or unreachable, exactly what the
+// REMOTE_ATTACH_FAILED hint tells the user to check — has ssh block for the
+// whole connect timeout and only *then* exit. With a grace shorter than that,
+// the read error fell through to the session_closed branch: the client sets
+// terminalAttached = false but leaves wsReconnectEnabled true, so the terminal
+// reconnects forever, paying another full dial each time, with no banner and no
+// `[error:CODE]` line. The margin covers ssh's own startup plus the PTY read
+// waking up after the process exits.
+var quickExitGrace = session.SSHConnectTimeout + quickExitGraceMargin
+
+// quickExitGraceMargin is the headroom added on top of the ssh connect timeout
+// so a dial that times out at exactly ConnectTimeout still lands inside the
+// grace window.
+const quickExitGraceMargin = 5 * time.Second
+
+// attachFailed decides whether a remote attach command's death inside
+// quickExitGrace was a failure to attach at all, or a remote session that
+// genuinely ran and then ended.
+//
+// Round 7 (#2): elapsed time cannot tell those apart, and round 6 widened the
+// window to 15s to cover the ssh dial. That made "attach, watch the agent
+// finish, get told to check your ssh" a normal path rather than a corner: the
+// user got a fatal REMOTE_ATTACH_FAILED banner with a false diagnosis, and the
+// client disables reconnect on that code.
+//
+// Two independent signals mean "never attached", and either is enough:
+//
+//   - Exit status 255 (sshFailureExitCode). `ssh -tt` reserves 255 for its own
+//     errors and otherwise passes the remote command's status through, so this
+//     is the definitive "the dial failed" signal, and it stays true no matter
+//     how much ssh printed on its way out.
+//   - No output at all. NOTE: this is deliberately not the only test, because
+//     the intuitive form of it is wrong. A failed dial DOES write to the PTY —
+//     pty.Start points the child's stderr at the same pts, so
+//     "ssh: connect to host … Operation timed out" is read here as ordinary
+//     output (verified in-tree against a real ssh against an unresolvable
+//     host). Keying solely on "wrote nothing" would therefore have silently
+//     un-fixed round 6's unreachable-host case. It stays as a second clause
+//     because a command that died without emitting a single byte never showed
+//     the user a session either.
+//
+// Anything else — output was produced and the process exited with the remote
+// side's own status — is a session that ran, and falls through to the ordinary
+// EOF/session_closed handling.
+func (b *tmuxPTYBridge) attachFailed() bool {
+	if !b.wroteOutput.Load() {
+		return true
+	}
+	return b.waitExitCode() == sshFailureExitCode
+}
+
+// waitExitCode reaps the attach process and returns its exit status, or
+// exitCodeUnknown if it could not be determined within reapWaitTimeout.
+func (b *tmuxPTYBridge) waitExitCode() int {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.reap()
+	}()
+	select {
+	case <-done:
+		return int(b.exitCode.Load())
+	case <-time.After(reapWaitTimeout):
+		return exitCodeUnknown
+	}
+}
+
+// reap runs the one permitted cmd.Wait and records the exit status. Safe to
+// call from several goroutines and any number of times; only the first call
+// waits, the rest block until it finishes.
+func (b *tmuxPTYBridge) reap() {
+	b.waitOnce.Do(func() {
+		code := exitCodeUnknown
+		if b.cmd != nil {
+			_ = b.cmd.Wait()
+			// Set before exitCode so any observer that sees a status has also
+			// seen the PID become unsafe to signal.
+			b.reaped.Store(true)
+			if b.cmd.ProcessState != nil {
+				code = b.cmd.ProcessState.ExitCode()
+			}
+		}
+		b.exitCode.Store(int32(code))
+	})
 }
 
 func (b *tmuxPTYBridge) WriteInput(data string) error {
@@ -205,24 +429,41 @@ func (b *tmuxPTYBridge) Close() {
 		return
 	}
 	b.closeOnce.Do(func() {
+		// Set before the fd goes away: streamOutput's blocked Read wakes with
+		// an error the moment ptmx closes, and it must already be able to see
+		// that we are the cause (see the closing field).
+		b.closing.Store(true)
 		b.ptmxMu.Lock()
 		if b.ptmx != nil {
 			_ = b.ptmx.Close()
 			b.ptmx = nil
 		}
 		b.ptmxMu.Unlock()
-		if b.cmd != nil && b.cmd.Process != nil {
-			pgid, err := syscall.Getpgid(b.cmd.Process.Pid)
-			if err == nil {
-				_ = syscall.Kill(-pgid, syscall.SIGTERM)
-			} else {
-				_ = b.cmd.Process.Kill()
+		// !b.reaped: never signal a PID that cmd.Wait has already returned
+		// for — the kernel may have handed it to an unrelated process by now
+		// (round 8 #1, see the reaped field).
+		if !b.reaped.Load() && b.cmd != nil && b.cmd.Process != nil {
+			terminate := b.terminateProcessGroup
+			if terminate == nil {
+				terminate = defaultTerminateProcessGroup
 			}
+			terminate(b.cmd.Process)
 		}
-		if b.cmd != nil {
-			_ = b.cmd.Wait()
-		}
+		b.reap()
 	})
+}
+
+// defaultTerminateProcessGroup SIGTERMs the attach process's whole group so
+// the tmux/ssh client and anything it spawned go down together, falling back
+// to signalling the process alone when it has no group of its own. Callers
+// must have established that the process has not been reaped yet.
+func defaultTerminateProcessGroup(proc *os.Process) {
+	pgid, err := syscall.Getpgid(proc.Pid)
+	if err == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		return
+	}
+	_ = proc.Kill()
 }
 
 // tmuxHasSessionProbeTimeout bounds the has-session existence probe. The web
