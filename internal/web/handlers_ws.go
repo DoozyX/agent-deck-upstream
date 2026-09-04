@@ -175,7 +175,13 @@ func (s *Server) handleRemoteSessionWS(w http.ResponseWriter, r *http.Request) {
 // the JS e2e fixture so neither has to spawn real ssh.
 func defaultRemoteAttachCommand(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd {
 	runner := session.NewSSHRunner(name, cfg)
-	cmd := exec.Command("ssh", runner.AttachArgs(sessionID)...)
+	sshArgs := runner.AttachArgs(sessionID)
+	// #nosec G204 G702 -- "ssh" is a fixed binary; sshArgs is built by
+	// SSHRunner.AttachArgs from a [remotes.*] config entry that
+	// handleRemoteSessionWS already ran through session.ValidateSSHHost
+	// before ever calling this function (same validate-then-exec.Command
+	// shape as SSHRunner.Attach's own identical call, internal/session/ssh.go).
+	cmd := exec.Command("ssh", sshArgs...)
 	cmd.Env = ensureTERM(cmd.Env)
 	return cmd
 }
