@@ -58,6 +58,63 @@ const operatorDraftPane = `  Done — commit 532cdd95.
 ─────────────────────────────────────────────────────────────────────────────────
    Model: Sonnet 5  Ctx: 166.5k  ⎇ main  (+0,-0)  𖠰 main`
 
+// A watchdog that QUOTED another session's decision menu into its own
+// transcript to escalate it, then finished and went back to its composer.
+// Observed 2026-09-04 on watchdog-2026-09-04-dooday-home-assistant-connection:
+// the quoted menu never scrolls away (the watchdog is done, nothing else
+// prints), so the pane stayed classified awaiting-choice — a permanent phantom
+// "a human must answer" on a session whose own prompt is empty, and one that
+// `session nudge` then refuses with SESSION_AWAITING_CHOICE, so no supervisor
+// can wake it.
+//
+// The tell is structural: a live modal REPLACES the composer and nothing renders
+// below it, so an assistant turn AND a composer line below the menu prove the
+// menu is history.
+const quotedMenuInScrollbackPane = `     │ without a PR, and a push to main runs CI then auto-deploys Dooday to
+     prod.
+
+     ❯ 1. Direct merge to main (Recommended)
+          Repo policy. After a clean review and green checks the branch is
+     merged
+          into main, CI deploys Dooday to prod.
+       2. Open a PR, you merge
+          Branch pushed and a PR opened with CI green; you merge when ready.
+       3. Type something.
+       4. Chat about this
+
+     Enter to select · ↑/↓ to navigate · Esc to cancel
+
+⏺ Escalating to user. Conductor is asking a decision prompt (how to land work):
+  direct merge vs PR. This is a user choice, not approvable by watchdog.
+
+⏺ Conductor awaiting your decision on landing method (merge vs PR). Menu is on
+  screen.
+
+  ===AGENTDECK_DONE=== status=ok summary=escalated user decision prompt
+
+✻ Cooked for 15s · done 1:23 PM
+                                                                  48620 tokens
+──────── watchdog-2026-09-04-dooday-home-assistant-connection-866a94ad ─
+❯
+
+─────────────────────────────
+   Model: Haiku 4.5  Ctx: 48.5k  ⎇ main  (+1,-1)
+  ⏵⏵ bypass permissions on (shift+tab to cycle)`
+
+// The same quoted menu WITHOUT the conversation resuming below it. A live modal
+// can render a free-text field ("Type something.") that also draws a "❯"
+// prompt, so a composer line alone must NOT be enough to call the menu stale:
+// this one stays true, honouring the file's asymmetry (a false positive only
+// escalates to a human; a false negative destroys the question).
+const quotedMenuNoTurnBelowPane = `     ❯ 1. Direct merge to main (Recommended)
+       2. Open a PR, you merge
+       3. Type something.
+
+     Enter to select · ↑/↓ to navigate · Esc to cancel
+──────── some-session-866a94ad ─
+❯
+   Model: Haiku 4.5  Ctx: 48.5k`
+
 func TestPaneAwaitsChoice(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -81,6 +138,19 @@ func TestPaneAwaitsChoice(t *testing.T) {
 			name:    "single numbered option",
 			content: "─────────────\n❯ 1. do the thing\n─────────────",
 			want:    false,
+		},
+		{
+			// A menu another agent quoted into its transcript, with its own
+			// turn and composer rendered below it: history, not a live modal.
+			name:    "quoted menu in scrollback",
+			content: quotedMenuInScrollbackPane,
+			want:    false,
+		},
+		{
+			// No turn below the menu: stay conservative and keep escalating.
+			name:    "quoted menu with no turn below",
+			content: quotedMenuNoTurnBelowPane,
+			want:    true,
 		},
 	}
 	for _, tc := range tests {
@@ -115,5 +185,14 @@ func TestClassifySubstate_AwaitingChoiceBeatsIdle(t *testing.T) {
 
 	if got := d.ClassifySubstate(idleAfterNumberedMessagePane); got != SubstateIdleAtEmptyPrompt {
 		t.Errorf("dismissed prompt: ClassifySubstate = %q, want %q", got, SubstateIdleAtEmptyPrompt)
+	}
+}
+
+// The stuck-❓ regression end to end: a watchdog quoting a menu must classify as
+// idle-at-empty-prompt, not awaiting-choice.
+func TestClassifySubstate_QuotedMenuIsIdleNotAwaitingChoice(t *testing.T) {
+	d := NewPromptDetector("claude")
+	if got := d.ClassifySubstate(quotedMenuInScrollbackPane); got != SubstateIdleAtEmptyPrompt {
+		t.Errorf("ClassifySubstate = %q, want %q", got, SubstateIdleAtEmptyPrompt)
 	}
 }
