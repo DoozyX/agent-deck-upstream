@@ -43,6 +43,29 @@ describe('clampSidebarWidth', () => {
   })
 })
 
+describe('selectLocalSession / selectRemoteSession', () => {
+  it('selectLocalSession clears any selected remote session', async () => {
+    const { selectLocalSession, selectRemoteSession, selectedIdSignal, selectedRemoteSignal } = await import(stateModulePath)
+    selectRemoteSession('m5', { id: 'sess-1', title: 'work' })
+    expect(selectedRemoteSignal.value).toEqual({ remote: 'm5', session: { id: 'sess-1', title: 'work' } })
+    expect(selectedIdSignal.value).toBe(null)
+
+    selectLocalSession('local-1')
+    expect(selectedIdSignal.value).toBe('local-1')
+    expect(selectedRemoteSignal.value).toBe(null)
+  })
+
+  it('selectRemoteSession clears any selected local session', async () => {
+    const { selectLocalSession, selectRemoteSession, selectedIdSignal, selectedRemoteSignal } = await import(stateModulePath)
+    selectLocalSession('local-1')
+    expect(selectedIdSignal.value).toBe('local-1')
+
+    selectRemoteSession('m5', { id: 'sess-1', title: 'work' })
+    expect(selectedRemoteSignal.value).toEqual({ remote: 'm5', session: { id: 'sess-1', title: 'work' } })
+    expect(selectedIdSignal.value).toBe(null)
+  })
+})
+
 describe('module signals export', () => {
   it('exposes the signals that SSE updates and components share', async () => {
     const state = await import(stateModulePath)
@@ -51,6 +74,7 @@ describe('module signals export', () => {
     const required = [
       'sessionsSignal',
       'selectedIdSignal',
+      'selectedRemoteSignal',
       'connectionSignal',
       'themeSignal',
       'settingsSignal',
