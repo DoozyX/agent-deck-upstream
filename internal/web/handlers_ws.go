@@ -3,14 +3,17 @@ package web
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strings"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/gorilla/websocket"
 )
 
@@ -79,11 +82,6 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusBadRequest, "INVALID_REQUEST", "session id is required")
 		return
 	}
-	// sessionID is attacker-controlled (raw URL path segment); every log call
-	// below must use this sanitized copy, never sessionID itself, so a crafted
-	// CRLF/control-char id can't forge fake log lines (go/log-injection).
-	logSessionID := logging.SanitizeValue(sessionID)
-
 	snapshot, err := s.menuData.LoadMenuSnapshot()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to load session data")
@@ -95,6 +93,154 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "NOT_FOUND", "session not found")
 		return
 	}
+
+	attach := func(writer *wsConnWriter) (*tmuxPTYBridge, error) {
+		if menuSession.TmuxSession == "" {
+			return nil, nil
+		}
+		return newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer, mapLocalAttachError)
+	}
+	s.serveTerminalWS(w, r, sessionID, snapshot.Profile, attach, mapLocalAttachError)
+}
+
+// handleRemoteSessionWS attaches a web terminal to a session on a configured
+// `[remotes.<name>]` SSH host, the same way TUI's SSHRunner.Attach does but
+// piping through a local PTY instead of os.Stdin (design doc:
+// .agent-deck/2026-09-04-web-remote-terminal/design/design.md). Attach only —
+// there is no remote mutation surface (start/stop/fork/etc.).
+func (s *Server) handleRemoteSessionWS(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeAPIError(w, http.StatusMethodNotAllowed, ErrCodeMethodNotAllowed, "method not allowed")
+		return
+	}
+	if !s.authorizeWSRequest(r) {
+		writeAPIError(w, http.StatusUnauthorized, ErrCodeUnauthorized, "unauthorized")
+		return
+	}
+
+	const prefix = "/ws/remote/"
+	rest := strings.TrimPrefix(r.URL.Path, prefix)
+	parts := strings.SplitN(rest, "/session/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" || strings.Contains(parts[1], "/") {
+		writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, "remote name and session id are required")
+		return
+	}
+	remoteName, sessionID := parts[0], parts[1]
+
+	cfg, err := session.LoadUserConfig()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, ErrCodeInternalError, "failed to load user config")
+		return
+	}
+	remoteCfg, ok := cfg.Remotes[remoteName]
+	if !ok {
+		writeAPIError(w, http.StatusNotFound, ErrCodeRemoteNotFound, "remote not found")
+		return
+	}
+	if err := session.ValidateSSHHost(remoteCfg.Host); err != nil {
+		writeAPIError(w, http.StatusBadRequest, ErrCodeBadRequest, err.Error())
+		return
+	}
+
+	if s.remoteFleet == nil {
+		writeAPIError(w, http.StatusServiceUnavailable, ErrCodeNotImplemented, "remote fleet is unavailable")
+		return
+	}
+	// Stale/offline remotes still count here: their last-known sessions stay
+	// in the snapshot, and the attach below fails at ssh with the error
+	// streamed to the terminal rather than a 404 for a session that may well
+	// still be running.
+	if !remoteFleetHasSession(s.remoteFleet.Snapshot(), remoteName, sessionID) {
+		writeAPIError(w, http.StatusNotFound, ErrCodeNotFound, "session not found")
+		return
+	}
+
+	attachCmdFn := s.cfg.RemoteAttachCommand
+	if attachCmdFn == nil {
+		attachCmdFn = defaultRemoteAttachCommand
+	}
+	mapErr := func(error) (code, message, hint string) {
+		return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal",
+			fmt.Sprintf("Check that ssh can reach %s from the web server host.", remoteCfg.Host)
+	}
+	attach := func(writer *wsConnWriter) (*tmuxPTYBridge, error) {
+		return newPTYBridge(attachCmdFn(remoteName, remoteCfg, sessionID), sessionID, "", "", writer, mapErr)
+	}
+	s.serveTerminalWS(w, r, sessionID, "", attach, mapErr)
+}
+
+// defaultRemoteAttachCommand builds the real `ssh ... agent-deck session
+// attach <id>` command TUI's SSHRunner.Attach runs, wired through a local PTY
+// instead of os.Stdin. Overridden by Config.RemoteAttachCommand in tests and
+// the JS e2e fixture so neither has to spawn real ssh.
+func defaultRemoteAttachCommand(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd {
+	runner := session.NewSSHRunner(name, cfg)
+	sshArgs := runner.AttachArgs(sessionID)
+	// #nosec G204 G702 -- "ssh" is a fixed binary. sshArgs is built by
+	// SSHRunner.AttachArgs from a [remotes.*] config entry (host validated by
+	// handleRemoteSessionWS's session.ValidateSSHHost call before this
+	// function ever runs, closing ssh-option injection via the host) and the
+	// attacker-controlled sessionID, which AttachArgs embeds into the remote
+	// command string via buildRemoteCommand's shellQuote (internal/session/
+	// ssh.go) — that's what makes a crafted sessionID safe to pass through
+	// here, not ValidateSSHHost, which only ever sees the host. Same
+	// validate-then-exec.Command shape as SSHRunner.Attach's own identical
+	// call.
+	cmd := exec.Command("ssh", sshArgs...)
+	cmd.Env = ensureTERM(cmd.Env)
+	return cmd
+}
+
+func remoteFleetHasSession(snapshot session.RemoteFleetSnapshot, remoteName, sessionID string) bool {
+	for _, remote := range snapshot.Remotes {
+		if remote.Name != remoteName {
+			continue
+		}
+		for _, sess := range remote.Sessions {
+			if sess.ID == sessionID {
+				return true
+			}
+		}
+		return false
+	}
+	return false
+}
+
+// wsAttachFunc opens the terminal bridge for an already-upgraded connection.
+// Returning (nil, nil) means "no bridge for this session" (mirrors local's
+// menuSession.TmuxSession == "" case: connected, but nothing to attach to
+// yet) — distinct from a non-nil error, which is a failed attach attempt.
+type wsAttachFunc func(writer *wsConnWriter) (*tmuxPTYBridge, error)
+
+// wsAttachErrorFunc maps a failed attach into the code/message/hint the
+// client renders. Local and remote report different codes for "the thing on
+// the other end doesn't exist" (TMUX_SESSION_NOT_FOUND vs REMOTE_ATTACH_FAILED).
+type wsAttachErrorFunc func(err error) (code, message, hint string)
+
+func mapLocalAttachError(err error) (code, message, hint string) {
+	code, message, hint = "TERMINAL_ATTACH_FAILED", "failed to attach terminal bridge", "Check the server logs for details."
+	// #782: terminal-fatal errors get an actionable hint so the WebUI can
+	// render guidance instead of repeating an opaque `[error:CODE]` line on
+	// every reconnect attempt.
+	if errors.Is(err, ErrTmuxSessionNotFound) {
+		code = "TMUX_SESSION_NOT_FOUND"
+		message = "tmux session is not available"
+		hint = "The tmux session for this entry no longer exists. Restart it from the sidebar (Restart icon, or press 'r' with the row focused) to create a fresh tmux session."
+	}
+	return code, message, hint
+}
+
+// serveTerminalWS is the shared body of handleSessionWS and
+// handleRemoteSessionWS from the upgrade onward: keepalive ping/pong,
+// connected/ready/terminal_attached status frames, and the input/resize/ping
+// message loop. attach opens the terminal bridge (tmux existence-check +
+// local attach, or ssh attach — the two handlers differ only in how); mapErr
+// translates an attach failure into the error frame's code/message/hint.
+func (s *Server) serveTerminalWS(w http.ResponseWriter, r *http.Request, sessionID, profile string, attach wsAttachFunc, mapErr wsAttachErrorFunc) {
+	// sessionID is attacker-controlled (raw URL path segment); every log call
+	// below must use this sanitized copy, never sessionID itself, so a crafted
+	// CRLF/control-char id can't forge fake log lines (go/log-injection).
+	logSessionID := logging.SanitizeValue(sessionID)
 
 	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -144,7 +290,7 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		Type:      "status",
 		Event:     "connected",
 		SessionID: sessionID,
-		Profile:   snapshot.Profile,
+		Profile:   profile,
 		ReadOnly:  s.cfg.ReadOnly,
 		Time:      time.Now().UTC(),
 	})
@@ -155,42 +301,30 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		Time:      time.Now().UTC(),
 	})
 
-	var bridge *tmuxPTYBridge
-	if menuSession.TmuxSession != "" {
-		bridge, err = newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
-		if err != nil {
-			logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
-				slog.String("session_id", logSessionID),
-				slog.String("tmux_session", menuSession.TmuxSession),
-				slog.String("error", err.Error()))
-			code := "TERMINAL_ATTACH_FAILED"
-			message := "failed to attach terminal bridge"
-			// #782: terminal-fatal errors get an actionable hint so the
-			// WebUI can render guidance instead of repeating an opaque
-			// `[error:CODE]` line on every reconnect attempt.
-			hint := "Check the server logs for details."
-			if errors.Is(err, ErrTmuxSessionNotFound) {
-				code = "TMUX_SESSION_NOT_FOUND"
-				message = "tmux session is not available"
-				hint = "The tmux session for this entry no longer exists. Restart it from the sidebar (Restart icon, or press 'r' with the row focused) to create a fresh tmux session."
-			}
-			_ = writer.WriteJSON(wsServerMessage{
-				Type:      "error",
-				Code:      code,
-				Message:   message,
-				Hint:      hint,
-				SessionID: sessionID,
-				Time:      time.Now().UTC(),
-			})
-		} else {
-			defer bridge.Close()
-			_ = writer.WriteJSON(wsServerMessage{
-				Type:      "status",
-				Event:     "terminal_attached",
-				SessionID: sessionID,
-				Time:      time.Now().UTC(),
-			})
-		}
+	// attach is always a non-nil closure at both call sites (handleSessionWS,
+	// handleRemoteSessionWS); no nil-guard needed here.
+	bridge, err := attach(writer)
+	if err != nil {
+		logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
+			slog.String("session_id", logSessionID),
+			slog.String("error", err.Error()))
+		code, message, hint := mapErr(err)
+		_ = writer.WriteJSON(wsServerMessage{
+			Type:      "error",
+			Code:      code,
+			Message:   message,
+			Hint:      hint,
+			SessionID: sessionID,
+			Time:      time.Now().UTC(),
+		})
+	} else if bridge != nil {
+		defer bridge.Close()
+		_ = writer.WriteJSON(wsServerMessage{
+			Type:      "status",
+			Event:     "terminal_attached",
+			SessionID: sessionID,
+			Time:      time.Now().UTC(),
+		})
 	}
 
 	for {

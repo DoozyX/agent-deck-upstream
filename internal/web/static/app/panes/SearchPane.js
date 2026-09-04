@@ -7,7 +7,7 @@
 import { html } from 'htm/preact'
 import { useState, useMemo } from 'preact/hooks'
 import { menuModelSignal } from '../dataModel.js'
-import { selectedIdSignal } from '../state.js'
+import { selectLocalSession } from '../state.js'
 import { activeTabSignal } from '../uiState.js'
 
 export function SearchPane() {
@@ -24,7 +24,10 @@ export function SearchPane() {
   }, [sessions, q])
 
   const onSelect = (id) => {
-    selectedIdSignal.value = id
+    // selectLocalSession, not a bare selectedIdSignal write: it also clears
+    // selectedRemoteSignal, which otherwise keeps winning in TerminalPanel's
+    // `remote ? ... : id` priority and makes the click do nothing visible.
+    selectLocalSession(id)
     activeTabSignal.value = 'terminal'
   }
 

@@ -21,6 +21,18 @@
 
 import { test, expect } from '@playwright/test'
 
+// The Fleet tab is reachable from the desktop/tablet top-tab bar and from the
+// phone's bottom MobileTabs; each is hidden on the other layout, and these
+// specs run on all three projects.
+async function openFleetTab(page) {
+  const mobileTab = page.locator('[data-testid="mobile-tab-fleet"]')
+  if (await mobileTab.isVisible()) {
+    await mobileTab.click()
+    return
+  }
+  await page.locator('.top-tab', { hasText: 'Fleet' }).click()
+}
+
 test.describe('fleet pane', () => {
   test.beforeEach(async ({ request }) => {
     await request.post('/__fixture/reset')
@@ -126,5 +138,350 @@ test.describe('fleet pane', () => {
     await expect(page.locator('[data-testid="fleet-stat-remotes"]')).toHaveText('1/2 remotes online')
     await expect(page.locator('[data-testid="fleet-stat-sessions"] .num')).toHaveText('7')
     await expect(page.locator('[data-testid="fleet-group-card"]')).toHaveCount(3)
+  })
+
+  test('clicking a remote session tile attaches a terminal over the SSH bridge', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+    await expect(tile).toBeVisible()
+
+    // selectRemoteSession(remote, session) + activeTabSignal='terminal': the
+    // fleet pane unmounts and TerminalPanel opens a
+    // /ws/remote/build/session/remote-1 connection to the fixture's
+    // RemoteAttachCommand (`sh -c 'printf "remote-shell\r\n"; cat'`), not the
+    // local /ws/session/ path. xterm.js's accessibility tree is off by
+    // default (no screenReaderMode), so the rendered bytes aren't queryable
+    // DOM text; assert on the WS frame the server actually streamed instead
+    // — that's the thing this design item adds.
+    const wsPromise = page.waitForEvent('websocket', ws => ws.url().includes('/ws/remote/build/session/remote-1'))
+    await tile.click()
+    const ws = await wsPromise
+
+    // Register the frame listener BEFORE any other awaits: the connect /
+    // terminal_attached / first data frames can all land before the next
+    // line of this test runs, and a listener attached later would miss them.
+    const sawRemoteShellPromise = new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('timed out waiting for "remote-shell" over /ws/remote/')), 5000)
+      ws.on('framereceived', (frame) => {
+        const text = Buffer.isBuffer(frame.payload) ? frame.payload.toString('utf8') : String(frame.payload)
+        if (text.includes('remote-shell')) {
+          clearTimeout(timer)
+          resolve(true)
+        }
+      })
+    })
+
+    await expect(page.locator('[data-testid="fleet-pane"]')).toHaveCount(0)
+    await expect(page.locator('.term-wrap')).toBeVisible()
+    expect(await sawRemoteShellPromise).toBe(true)
+
+    // Remote attach is view-only: the work head shows "REMOTE <remote> /
+    // <title>" and hides Start/Restart/New/Fork (design: attach-only scope).
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .path')).toContainText('build')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+    await expect(page.locator('.work-head .actions')).toHaveCount(0)
+  })
+
+  // Regression guard for AppShell.js focusedSession()'s
+  // `if (selectedRemoteSignal.value) return null` line. selectRemoteSession()
+  // clears selectedIdSignal (state.js, mutually exclusive), so without that
+  // guard every local-session shortcut falls through to `sessions[0]` and acts
+  // on an unrelated LOCAL session while the user is looking at a remote one —
+  // 'D' would pop a close-session confirm for fixture sess-001 "agent-deck".
+  // The unit suite only covers the signal mutual-exclusivity; this covers the
+  // handler.
+  test('local-session shortcuts no-op while a remote session is selected', async ({ page, context, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+    await tile.click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
+    // The right rail must describe the REMOTE session, not fall back to
+    // sessions[0] (fixture sess-001 "agent-deck"/claude/work) the way it did
+    // while selectedIdSignal was null.
+    const rail = page.locator('[data-testid="right-rail"]')
+    await expect(rail).toHaveAttribute('data-remote-name', 'build')
+    await expect(rail).toContainText('release')
+    await expect(rail.locator('[data-testid="rail-card-overview"]')).toContainText('codex')
+    await expect(rail.locator('[data-testid="rail-card-overview"]')).toContainText('/srv/release')
+    await expect(rail).not.toContainText('agent-deck')
+
+    // Attaching hands keyboard focus to xterm.js, whose helper <textarea>
+    // trips AppShell's `inField` guard and would swallow every key below,
+    // making this test vacuous (Escape does not help — xterm re-focuses it).
+    // Clicking the inert work-head text moves focus off the terminal the way
+    // a user reaching for a global shortcut would, and the '?' toggle then
+    // proves keys really do reach the window-level shortcut handler before
+    // the no-op assertions run.
+    await page.locator('.work-head .path').click()
+    await expect(page.locator('.xterm-helper-textarea')).not.toBeFocused()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toBeVisible()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toHaveCount(0)
+
+    // Shift+D: must not open the close-session confirm for a local session.
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('D')
+    await page.keyboard.up('Shift')
+    // Round-trip the overlay again so the would-be dialog gets real time to
+    // render before the negative assertion — cheaper and less flaky than a
+    // fixed sleep.
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toBeVisible()
+    await page.keyboard.press('?')
+    await expect(page.locator('[data-testid="shortcuts-overlay"]')).toHaveCount(0)
+    await expect(page.locator('.dialog', { hasText: /close session/i })).toHaveCount(0)
+
+    // Shift+Enter: reads the same guard to window.open a session in a new
+    // browser tab (AppShell.js, checked BEFORE bare Enter). Must open nothing.
+    const strayTabPromise = context.waitForEvent('page', { timeout: 2000 }).catch(() => null)
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('Enter')
+    await page.keyboard.up('Shift')
+    expect(await strayTabPromise).toBeNull()
+
+    // Enter: must not swap the terminal over to sessions[0].
+    await page.keyboard.press('Enter')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
+    // j/k list navigation does not read focusedSession() — it calls
+    // selectLocalSession() directly — so it needs its own guard, and its own
+    // assertion: without one, j silently swaps the remote terminal for a
+    // local session.
+    await page.keyboard.press('j')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await page.keyboard.press('k')
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('.work-head .cur')).toHaveText('release')
+
+    // 'r' (rename) reads through the same focusedSession(); no toast either.
+    await page.keyboard.press('r')
+    await expect(page.locator('.toast')).toHaveCount(0)
+  })
+
+  // The mirror image of the test above: shortcuts must not act PAST a remote
+  // selection, but the affordances that deliberately switch to a local session
+  // must actually get there. SearchPane.onSelect wrote selectedIdSignal
+  // directly, leaving selectedRemoteSignal set, and TerminalPanel's
+  // `remote ? ... : id` priority then kept the remote terminal on screen — the
+  // click did nothing visible.
+  test('a search result click switches away from a selected remote session', async ({ page, request, viewport }) => {
+    // desktop/tablet-only: .top-tabs is hidden at ≤720px and MobileTabs has no
+    // Search entry, so there is no in-app Search affordance on phone (same
+    // scoping as search-pane.spec.js's Topbar navigation test). Reaching it by
+    // localStorage preseed would need a reload, which clears the remote
+    // selection this test is about.
+    test.skip((viewport?.width || 1280) < 768, 'phone viewport: Topbar tabs hidden; no Search affordance')
+
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+
+    await page.locator('.top-tab', { hasText: 'Search' }).click()
+    await expect(page.locator('[data-testid="search-pane"]')).toBeVisible()
+    await page.locator('[data-testid="search-result"][data-session-id="sess-002"]').click()
+
+    // Local session wins: no REMOTE kicker, and the work head names it.
+    await expect(page.locator('.work-head .cur')).toHaveText('frontend')
+    await expect(page.locator('.work-head .path')).not.toContainText('REMOTE')
+  })
+
+  // App.js's popstate handler wrote selectedIdSignal directly, so Back out of
+  // a remote selection restored the URL and the sidebar highlight while
+  // selectedRemoteSignal stayed set — and WorkHead/RightRail/TerminalPanel all
+  // give the remote priority, so the URL and the rendered session disagreed
+  // with both signals set at once.
+  test('browser Back out of a remote selection restores the local session', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    // Deep-link the local selection rather than clicking the sidebar row: a
+    // sidebar click also switches the tab to 'terminal', which unmounts the
+    // fleet pane and the remote tile this test needs next (same reason
+    // url-routing.spec.js deep-links).
+    await page.goto('/s/sess-002')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await expect(page.locator('.sess.sel .tt')).toHaveText('frontend')
+
+    // History: /s/sess-002 -> / (the remote tile pushes '/').
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/')
+
+    await page.goBack()
+    await expect.poll(() => new URL(page.url()).pathname).toBe('/s/sess-002')
+    // The URL, the rail and the work head must agree: local frontend, no
+    // leftover remote selection.
+    await expect(page.locator('.work-head .cur')).toHaveText('frontend')
+    await expect(page.locator('.work-head .path')).not.toContainText('REMOTE')
+    await expect(page.locator('[data-testid="right-rail"]')).not.toHaveAttribute('data-remote-name')
+    await expect(page.locator('.sess.sel .tt')).toHaveText('frontend')
+  })
+
+  // Review round 6 (#1): the fatal banner became reachable for remote sessions
+  // when REMOTE_ATTACH_FAILED joined TerminalPanel.js's fatal-code set, and it
+  // unconditionally offered a "Restart session" button wired to
+  // POST /api/sessions/{id}/restart — the LOCAL mutation endpoint, called with
+  // the REMOTE session's id. That breaks the design's attach-only scope, and
+  // because a remote id can collide with a local one it could restart an
+  // unrelated local session and then look like the remote had recovered.
+  // `?attach=fail` makes the fixture's attach command exit immediately, which
+  // is the shape of an unreachable host.
+  test('remote attach failure banner offers no local Restart action', async ({ page, request }) => {
+    await request.post('/__fixture/remotes?attach=fail')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    // Any POST to the local restart endpoint while a remote is selected is the
+    // bug itself, so fail loudly rather than asserting only on the DOM.
+    const restartCalls = []
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && /\/api\/sessions\/.*\/restart/.test(req.url())) {
+        restartCalls.push(req.url())
+      }
+    })
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+
+    const banner = page.locator('[data-testid="terminal-fatal-banner"]')
+    await expect(banner).toBeVisible({ timeout: 10000 })
+    // The ssh hint is the whole point of the banner for a remote.
+    await expect(banner).toContainText('ssh')
+    await expect(banner.locator('[data-testid="terminal-fatal-restart"]')).toHaveCount(0)
+    // Dismiss stays as the sole remote action and still clears the banner.
+    // The banner sits above the xterm canvas (z-index on the overlay), so this
+    // is a plain user click, not a forced one.
+    await banner.locator('[data-testid="terminal-fatal-dismiss"]').click()
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    expect(restartCalls).toEqual([])
+  })
+
+  // The same banner on a LOCAL session must keep its Restart button: gating it
+  // on remoteName is only allowed to remove the remote case.
+  test('local fatal banner keeps its Restart action', async ({ page, request }) => {
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    // sess-002 is the one seeded session carrying a TmuxSession name
+    // ("agentdeck-fixture-sess-002"), and no such tmux session exists on the
+    // test host, so the local WS attach reports TMUX_SESSION_NOT_FOUND — the
+    // original #782 fatal path. (Sessions with an empty TmuxSession get the
+    // "connected, nothing to attach to" path and never raise a banner.)
+    // Click the tile rather than deep-linking: the terminal pane is mounted
+    // but CSS-hidden while the Fleet tab is active, so the banner would render
+    // hidden. onSelect flips activeTabSignal to 'terminal'.
+    await page.locator('[data-testid="fleet-session-tile"][data-session-id="sess-002"]').click()
+    const banner = page.locator('[data-testid="terminal-fatal-banner"]')
+    await expect(banner).toBeVisible({ timeout: 10000 })
+    await expect(banner.locator('[data-testid="terminal-fatal-restart"]')).toHaveCount(1)
+  })
+
+  // Review round 7 (#1): after REMOTE_ATTACH_FAILED the client disables
+  // reconnect, and round 6 (correctly) removed the banner's Restart button for
+  // remotes — leaving re-clicking the Fleet tile as the only retry gesture the
+  // UI offers. It was a no-op: terminalKey was the identical
+  // `remote:build:remote-1` string, reconnectKey only moved via the (now
+  // absent) Restart button, and the terminal pane is CSS-hidden rather than
+  // unmounted, so tab switching did not help either. Only picking a different
+  // session or reloading recovered. state.js's per-selection `attempt` counter
+  // is what makes the re-click re-run the effect.
+  test('re-clicking a failed remote tile retries the attach', async ({ page, request }) => {
+    await request.post('/__fixture/remotes?attach=fail')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = () => page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+
+    await tile().click()
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toBeVisible({ timeout: 10000 })
+
+    // The remote is reachable again; the user's retry gesture is re-clicking
+    // the same tile. Count WS opens from here so the assertion is about the
+    // RE-CLICK, not the first (failed) attach.
+    await request.post('/__fixture/remotes')
+    const opened = []
+    page.on('websocket', ws => {
+      if (ws.url().includes('/ws/remote/build/session/remote-1')) opened.push(ws.url())
+    })
+
+    await openFleetTab(page)
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await tile().click()
+
+    // A fresh WebSocket to the same remote session is the whole fix: without
+    // it the effect never re-runs and the pane stays frozen on the banner.
+    await expect.poll(() => opened.length, { timeout: 10000 }).toBeGreaterThan(0)
+    // And the dead-end state is actually gone, not merely re-rendered.
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+  })
+
+  // Review round 8 (#2): the round-7 retry counter bumped on EVERY re-click of
+  // the already-selected tile, not only after a failure. So the ordinary
+  // gesture in the test above — attach, switch to Fleet to glance at the
+  // fleet, click the same tile to come back — changed terminalKey, defeated
+  // TerminalPanel's double-init guard, disposed the xterm instance, closed the
+  // WebSocket and made the server tear the ssh child down: scrollback gone,
+  // remote tmux client detached and reattached. The local tile is idempotent,
+  // so this was remote-only. The counter now moves only for an attachment that
+  // reported REMOTE_ATTACH_FAILED.
+  test('re-clicking a HEALTHY remote tile leaves the live terminal attached', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = () => page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+
+    const sockets = []
+    page.on('websocket', ws => {
+      if (ws.url().includes('/ws/remote/build/session/remote-1')) sockets.push(ws)
+    })
+
+    await tile().click()
+    // The fixture's healthy attach command holds the PTY open with `cat`, so
+    // this attachment stays live for the rest of the test.
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    await expect.poll(() => sockets.length, { timeout: 10000 }).toBe(1)
+    const first = sockets[0]
+
+    // Stamp the live xterm element. cleanup() calls terminal.dispose(), which
+    // removes this node, and a rebuilt terminal creates a fresh unstamped one —
+    // so the stamp surviving is direct evidence that the xterm instance (and
+    // with it the scrollback) was never torn down. This does not depend on the
+    // xterm renderer exposing its rows in the DOM.
+    const xterm = page.locator('.term-frame .xterm')
+    await expect(xterm).toHaveCount(1)
+    await xterm.evaluate((el) => el.setAttribute('data-e2e-stamp', 'attach-1'))
+
+    await openFleetTab(page)
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await tile().click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+
+    // Give a teardown+rebuild every chance to show up before asserting it did
+    // not: the round-7 behavior opened the replacement socket immediately.
+    await page.waitForTimeout(1500)
+    expect(sockets.length).toBe(1)
+    expect(first.isClosed()).toBe(false)
+    await expect(page.locator('.term-frame .xterm[data-e2e-stamp="attach-1"]')).toHaveCount(1)
   })
 })

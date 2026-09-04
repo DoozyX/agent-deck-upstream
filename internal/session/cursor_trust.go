@@ -269,13 +269,21 @@ func PreAcceptCursorTrustInContainer(containerName, workspacePath string) error 
 	return runCursorTrustContainerScript(containerName, script)
 }
 
+// SSHConnectTimeout is the ConnectTimeout every SSH invocation built here
+// (run and attach alike) hands to ssh. It is exported because callers that
+// wrap one of these commands have to budget for it: internal/web's remote
+// attach bridge sizes its quick-exit grace off this value, since an
+// unreachable host makes ssh sit on the dial for the whole timeout before
+// exiting.
+const SSHConnectTimeout = 10 * time.Second
+
 // sessionSSHConnOpts returns SSH connection options shared with SSHRunner paths.
 func sessionSSHConnOpts() []string {
 	return []string{
 		"-o", "ControlMaster=auto",
 		"-o", "ControlPath=" + sshControlDir + "/%r@%h:%p",
 		"-o", "ControlPersist=600",
-		"-o", "ConnectTimeout=10",
+		"-o", fmt.Sprintf("ConnectTimeout=%d", int(SSHConnectTimeout.Seconds())),
 		"-o", "BatchMode=yes",
 	}
 }

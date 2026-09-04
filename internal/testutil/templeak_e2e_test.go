@@ -41,6 +41,10 @@ var leakPrefixes = []string{
 	// Shared build dirs released from TestMain after m.Run.
 	"agent-deck-channels-bin-", // cmd/agent-deck channelsCLIBinary
 	"agent-deck-eval-bin-",     // tests/eval/harness buildAgentDeck
+	// Playwright fixture server: isolateFixtureRemoteConfig writes a throwaway
+	// [remotes.*] user config so the e2e run never reads the developer's real
+	// one (tests/web/fixtures/cmd/web-fixture/main.go).
+	"agent-deck-web-fixture-config-",
 	// Production, not test isolation: internal/git's mergeback checks out a
 	// temporary worktree here and removes it in a defer. Listed because a test
 	// that exercises mergeback and leaves one behind is a genuine leak, and the

@@ -11,7 +11,7 @@ import { Icon, ICONS, Dot, kindSigil } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
 import {
   selectedIdSignal, mutationsEnabledSignal, confirmDialogSignal,
-  createSessionDialogSignal, editSessionDialogSignal,
+  createSessionDialogSignal, editSessionDialogSignal, selectLocalSession,
 } from './state.js'
 import { statusFiltersSignal, showColsSignal, activeTabSignal } from './uiState.js'
 import { apiFetch } from './api.js'
@@ -164,7 +164,7 @@ export function Sidebar() {
   // "open", making the first click on a never-toggled group a silent no-op.
   const toggleGroup = (p) => setExpanded(s => ({ ...s, [p]: s[p] === false }))
   const onSelect = (id) => {
-    selectedIdSignal.value = id
+    selectLocalSession(id)
     activeTabSignal.value = 'terminal'
   }
   const setShowCol = (id) => {
