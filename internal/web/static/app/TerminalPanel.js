@@ -2,7 +2,7 @@
 // Ports createTerminalUI, connectWS, installTerminalTouchScroll from app.js
 import { html } from 'htm/preact'
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks'
-import { selectedIdSignal, selectedRemoteSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
+import { selectedIdSignal, selectedRemoteSignal, authTokenSignal, wsStateSignal, readOnlySignal, remoteAttachFailedSignal, remoteTerminalKey } from './state.js'
 import { apiFetch } from './api.js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -93,15 +93,18 @@ export function TerminalPanel() {
   // local one.
   //
   // The `#<attempt>` suffix carries state.js's per-selection counter, which
-  // only advances when the user re-selects the tile that is ALREADY selected.
-  // That is what makes clicking the same Fleet tile a retry: remote attach has
-  // no Restart action (it must not touch the local mutation endpoints), so
-  // after a fatal REMOTE_ATTACH_FAILED disables reconnect, re-clicking the tile
-  // is the only retry gesture the UI offers, and without this the key was
-  // unchanged, the effect never re-ran, and the double-init guard below would
-  // have short-circuited anyway (round 7 #1).
+  // only advances when the user re-selects a tile whose CURRENT attempt has
+  // failed. That is what makes clicking the same Fleet tile a retry: remote
+  // attach has no Restart action (it must not touch the local mutation
+  // endpoints), so after a fatal REMOTE_ATTACH_FAILED disables reconnect,
+  // re-clicking the tile is the only retry gesture the UI offers, and without
+  // this the key was unchanged, the effect never re-ran, and the double-init
+  // guard below would have short-circuited anyway (round 7 #1). Re-clicking a
+  // HEALTHY tile leaves the counter — and this key — alone, so the live
+  // terminal is never torn down (round 8 #2); the failed state that gates the
+  // bump is published from the fatal branch below.
   const terminalKey = remoteName
-    ? `remote:${remoteName}:${sessionId}#${remoteSel.attempt || 0}`
+    ? remoteTerminalKey(remoteName, sessionId, remoteSel.attempt)
     : sessionId
   // #782: terminal-fatal errors (e.g. TMUX_SESSION_NOT_FOUND) render as a
   // banner overlay rather than a `[error:CODE]` line on every WS reconnect.
@@ -155,6 +158,10 @@ export function TerminalPanel() {
     cleanup()
     // #782: a fresh session connection clears any prior fatal banner.
     setFatalError(null)
+    // Round 8 (#2): this attach is starting over, so no attempt is in the
+    // failed state any more. Only one terminal is mounted at a time, so
+    // clearing outright cannot drop another attachment's marker.
+    remoteAttachFailedSignal.value = null
 
     const container = containerRef.current
     const token = authTokenSignal.value
@@ -403,6 +410,10 @@ export function TerminalPanel() {
                   message: payload.message || 'tmux session is not available',
                   hint: payload.hint || '',
                 })
+                // Round 8 (#2): publish the failed state for THIS attempt, so
+                // re-clicking the tile in Fleet is a retry. Nothing else marks
+                // it, so a healthy attachment's re-click stays a no-op.
+                if (remoteName) remoteAttachFailedSignal.value = terminalKey
                 wsStateSignal.value = 'disconnected'
                 return
               }
