@@ -183,7 +183,7 @@ test.describe('fleet pane', () => {
   // 'D' would pop a close-session confirm for fixture sess-001 "agent-deck".
   // The unit suite only covers the signal mutual-exclusivity; this covers the
   // handler.
-  test('local-session shortcuts no-op while a remote session is selected', async ({ page, request }) => {
+  test('local-session shortcuts no-op while a remote session is selected', async ({ page, context, request }) => {
     await request.post('/__fixture/remotes')
     await page.goto('/')
     await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
@@ -220,6 +220,14 @@ test.describe('fleet pane', () => {
     await page.keyboard.press('?')
     await expect(page.locator('[data-testid="shortcuts-overlay"]')).toHaveCount(0)
     await expect(page.locator('.dialog', { hasText: /close session/i })).toHaveCount(0)
+
+    // Shift+Enter: reads the same guard to window.open a session in a new
+    // browser tab (AppShell.js, checked BEFORE bare Enter). Must open nothing.
+    const strayTabPromise = context.waitForEvent('page', { timeout: 2000 }).catch(() => null)
+    await page.keyboard.down('Shift')
+    await page.keyboard.press('Enter')
+    await page.keyboard.up('Shift')
+    expect(await strayTabPromise).toBeNull()
 
     // Enter: must not swap the terminal over to sessions[0].
     await page.keyboard.press('Enter')
