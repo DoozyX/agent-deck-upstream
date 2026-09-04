@@ -321,4 +321,62 @@ test.describe('fleet pane', () => {
     await expect(page.locator('[data-testid="right-rail"]')).not.toHaveAttribute('data-remote-name')
     await expect(page.locator('.sess.sel .tt')).toHaveText('frontend')
   })
+
+  // Review round 6 (#1): the fatal banner became reachable for remote sessions
+  // when REMOTE_ATTACH_FAILED joined TerminalPanel.js's fatal-code set, and it
+  // unconditionally offered a "Restart session" button wired to
+  // POST /api/sessions/{id}/restart — the LOCAL mutation endpoint, called with
+  // the REMOTE session's id. That breaks the design's attach-only scope, and
+  // because a remote id can collide with a local one it could restart an
+  // unrelated local session and then look like the remote had recovered.
+  // `?attach=fail` makes the fixture's attach command exit immediately, which
+  // is the shape of an unreachable host.
+  test('remote attach failure banner offers no local Restart action', async ({ page, request }) => {
+    await request.post('/__fixture/remotes?attach=fail')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    // Any POST to the local restart endpoint while a remote is selected is the
+    // bug itself, so fail loudly rather than asserting only on the DOM.
+    const restartCalls = []
+    page.on('request', (req) => {
+      if (req.method() === 'POST' && /\/api\/sessions\/.*\/restart/.test(req.url())) {
+        restartCalls.push(req.url())
+      }
+    })
+
+    await page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]').click()
+
+    const banner = page.locator('[data-testid="terminal-fatal-banner"]')
+    await expect(banner).toBeVisible({ timeout: 10000 })
+    // The ssh hint is the whole point of the banner for a remote.
+    await expect(banner).toContainText('ssh')
+    await expect(banner.locator('[data-testid="terminal-fatal-restart"]')).toHaveCount(0)
+    // Dismiss stays as the sole remote action and still clears the banner.
+    // The banner sits above the xterm canvas (z-index on the overlay), so this
+    // is a plain user click, not a forced one.
+    await banner.locator('[data-testid="terminal-fatal-dismiss"]').click()
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    expect(restartCalls).toEqual([])
+  })
+
+  // The same banner on a LOCAL session must keep its Restart button: gating it
+  // on remoteName is only allowed to remove the remote case.
+  test('local fatal banner keeps its Restart action', async ({ page, request }) => {
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    // sess-002 is the one seeded session carrying a TmuxSession name
+    // ("agentdeck-fixture-sess-002"), and no such tmux session exists on the
+    // test host, so the local WS attach reports TMUX_SESSION_NOT_FOUND — the
+    // original #782 fatal path. (Sessions with an empty TmuxSession get the
+    // "connected, nothing to attach to" path and never raise a banner.)
+    // Click the tile rather than deep-linking: the terminal pane is mounted
+    // but CSS-hidden while the Fleet tab is active, so the banner would render
+    // hidden. onSelect flips activeTabSignal to 'terminal'.
+    await page.locator('[data-testid="fleet-session-tile"][data-session-id="sess-002"]').click()
+    const banner = page.locator('[data-testid="terminal-fatal-banner"]')
+    await expect(banner).toBeVisible({ timeout: 10000 })
+    await expect(banner.locator('[data-testid="terminal-fatal-restart"]')).toHaveCount(1)
+  })
 })
