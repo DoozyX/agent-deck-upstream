@@ -50,6 +50,31 @@ var selectedChoiceLine = regexp.MustCompile(`^[❯›>]\s*([1-9][0-9]?)\.\s+\S`)
 // otherChoiceLine matches any numbered option line, selected or not.
 var otherChoiceLine = regexp.MustCompile(`^(?:[❯›>]\s*)?([1-9][0-9]?)\.\s+\S`)
 
+// composerMarkers are the glyphs Claude draws its composer input line with. A
+// menu's SELECTED option uses the same "❯", so otherChoiceLine discriminates.
+var composerMarkers = []rune{'❯', '›', '>'}
+
+// isComposerLine reports whether a trimmed pane line is Claude's composer input
+// — a bare prompt or an operator draft — rather than a menu's selected option.
+func isComposerLine(line string) bool {
+	r := []rune(line)
+	if len(r) == 0 {
+		return false
+	}
+	found := false
+	for _, m := range composerMarkers {
+		if r[0] == m {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return false
+	}
+	// "❯ 1. Yes" is a menu option wearing the same marker, not the composer.
+	return !otherChoiceLine.MatchString(line)
+}
+
 // choiceTailLines is how far up the pane the scan reaches. A modal selection is
 // always at the bottom; scanning further would start matching scrollback.
 const choiceTailLines = 40
@@ -64,33 +89,72 @@ const choiceTailLines = 40
 // false positive only makes an automated sender refuse and escalate to a human
 // (recoverable), while a false negative destroys the question (not).
 func PaneAwaitsChoice(content string) bool {
-	tail := paneTail(content, choiceTailLines)
+	lines := strings.Split(paneTail(content, choiceTailLines), "\n")
 
-	for _, marker := range choiceFooterMarkers {
-		if strings.Contains(tail, marker) {
-			return true
-		}
-	}
-
-	// Structural fallback for menus whose footer this version does not render:
-	// a selected numbered option plus at least one other option with a
-	// DIFFERENT number. One number alone is a list item; two are a choice.
+	footer := false
+	lastEvidence := -1  // last line that looks like menu UI
+	lastComposer := -1  // last composer input line
+	lastAssistant := -1 // last assistant turn glyph
 	selected := ""
 	numbers := map[string]bool{}
-	for _, line := range strings.Split(tail, "\n") {
-		line = trimChoiceLine(line)
+
+	for i, raw := range lines {
+		for _, marker := range choiceFooterMarkers {
+			if strings.Contains(raw, marker) {
+				footer = true
+				lastEvidence = i
+				break
+			}
+		}
+		if strings.HasPrefix(strings.TrimSpace(raw), claudeAssistantLinePrefix) {
+			lastAssistant = i
+		}
+		line := trimChoiceLine(raw)
 		if line == "" {
+			continue
+		}
+		if isComposerLine(line) {
+			lastComposer = i
 			continue
 		}
 		if m := selectedChoiceLine.FindStringSubmatch(line); m != nil {
 			selected = m[1]
 			numbers[m[1]] = true
+			lastEvidence = i
 			continue
 		}
 		if m := otherChoiceLine.FindStringSubmatch(line); m != nil {
 			numbers[m[1]] = true
+			lastEvidence = i
 		}
 	}
+
+	if lastEvidence < 0 {
+		return false
+	}
+
+	// A live modal REPLACES the composer and is the last thing drawn above the
+	// status bar — nothing from the conversation renders below it. So when BOTH
+	// an assistant turn and a composer line appear below the last menu line, the
+	// menu is scrollback: another agent quoted it as text (a watchdog escalating
+	// someone else's decision prompt) and then carried on.
+	//
+	// Both signals are required, not either. A menu whose "Type something."
+	// option is active draws a free-text field that also looks like a composer,
+	// so a composer line alone must not retire a live menu — a false positive
+	// only makes an automated sender escalate to a human (recoverable), while a
+	// false negative destroys the question (not).
+	if lastComposer > lastEvidence && lastAssistant > lastEvidence {
+		return false
+	}
+
+	if footer {
+		return true
+	}
+
+	// Structural fallback for menus whose footer this version does not render:
+	// a selected numbered option plus at least one other option with a
+	// DIFFERENT number. One number alone is a list item; two are a choice.
 	return selected != "" && len(numbers) >= 2
 }
 
