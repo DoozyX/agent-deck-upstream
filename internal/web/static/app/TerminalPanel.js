@@ -2,7 +2,7 @@
 // Ports createTerminalUI, connectWS, installTerminalTouchScroll from app.js
 import { html } from 'htm/preact'
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks'
-import { selectedIdSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
+import { selectedIdSignal, selectedRemoteSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
 import { apiFetch } from './api.js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -23,6 +23,17 @@ function wsURLForSession(sessionId, token) {
   const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const url = new URL(
     wsProto + '://' + window.location.host + '/ws/session/' + encodeURIComponent(sessionId)
+  )
+  if (token) url.searchParams.set('token', token)
+  return url.toString()
+}
+
+// Same, for a remote (SSH-attached) session: /ws/remote/<remote>/session/<id>
+function wsURLForRemoteSession(remote, sessionId, token) {
+  const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const url = new URL(
+    wsProto + '://' + window.location.host + '/ws/remote/' + encodeURIComponent(remote) +
+    '/session/' + encodeURIComponent(sessionId)
   )
   if (token) url.searchParams.set('token', token)
   return url.toString()
@@ -73,7 +84,14 @@ function installTouchScroll(container, xtermEl, controller) {
 export function TerminalPanel() {
   const containerRef = useRef(null)
   const ctxRef = useRef(null)  // { terminal, fitAddon, ws, resizeObserver, controller, decoder, reconnectTimer, reconnectAttempt, wsReconnectEnabled, terminalAttached }
-  const sessionId = selectedIdSignal.value
+  const remoteSel = selectedRemoteSignal.value
+  const sessionId = remoteSel ? remoteSel.session.id : selectedIdSignal.value
+  const remoteName = remoteSel ? remoteSel.remote : null
+  // Composite key so switching local <-> remote (or between two remotes) tears
+  // down and rebuilds the terminal exactly as a local session switch does —
+  // two remotes can share a session id, and a remote id can collide with a
+  // local one.
+  const terminalKey = remoteName ? `remote:${remoteName}:${sessionId}` : sessionId
   // #782: terminal-fatal errors (e.g. TMUX_SESSION_NOT_FOUND) render as a
   // banner overlay rather than a `[error:CODE]` line on every WS reconnect.
   // null when there's no fatal error; an object { code, message, hint }
@@ -120,7 +138,7 @@ export function TerminalPanel() {
     // sessionId is unchanged.
     if (
       ctxRef.current &&
-      ctxRef.current.sessionId === sessionId &&
+      ctxRef.current.terminalKey === terminalKey &&
       ctxRef.current.reconnectKey === reconnectKey
     ) return
     cleanup()
@@ -213,6 +231,8 @@ export function TerminalPanel() {
     // Context object for this session
     const ctx = {
       sessionId,
+      remoteName,
+      terminalKey,
       reconnectKey, // #782: stamp the key so the double-init guard can detect a forced reconnect
       terminal,
       fitAddon,
@@ -322,7 +342,9 @@ export function TerminalPanel() {
       ctx.wsReconnectEnabled = true
       wsStateSignal.value = 'connecting'
 
-      const ws = new WebSocket(wsURLForSession(sessionId, token))
+      const ws = new WebSocket(
+        remoteName ? wsURLForRemoteSession(remoteName, sessionId, token) : wsURLForSession(sessionId, token)
+      )
       ws.binaryType = 'arraybuffer'
       ctx.ws = ws
 
@@ -412,7 +434,7 @@ export function TerminalPanel() {
       clearTimeout(resizeTimer)
       cleanup()
     }
-  }, [sessionId, reconnectKey, cleanup])
+  }, [terminalKey, reconnectKey, cleanup])
 
   if (!sessionId) {
     return html`<${EmptyStateDashboard} />`
