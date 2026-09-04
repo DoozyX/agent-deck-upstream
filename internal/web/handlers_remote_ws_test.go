@@ -3,11 +3,14 @@
 package web
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -52,6 +55,18 @@ func remoteFleetSnapshotWithSession(remoteName, sessionID string) session.Remote
 	}
 }
 
+// decodeAPIErrorCode reads and JSON-decodes the api error body from a failed
+// websocket dial's HTTP response, returning the "code" field.
+func decodeAPIErrorCode(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	defer resp.Body.Close()
+	var body apiErrorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode error body: %v", err)
+	}
+	return body.Error.Code
+}
+
 func TestRemoteWSUnauthorized(t *testing.T) {
 	setupRemoteWSConfig(t, remoteWSConfigWithBuildHost)
 	srv := NewServer(Config{
@@ -88,6 +103,9 @@ func TestRemoteWSUnknownRemote404(t *testing.T) {
 	if resp == nil || resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected status %d, got resp=%v", http.StatusNotFound, resp)
 	}
+	if code := decodeAPIErrorCode(t, resp); code != ErrCodeRemoteNotFound {
+		t.Fatalf("expected error code %q, got %q", ErrCodeRemoteNotFound, code)
+	}
 }
 
 func TestRemoteWSUnknownSession404(t *testing.T) {
@@ -108,6 +126,34 @@ func TestRemoteWSUnknownSession404(t *testing.T) {
 	}
 	if resp == nil || resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("expected status %d, got resp=%v", http.StatusNotFound, resp)
+	}
+	if code := decodeAPIErrorCode(t, resp); code != ErrCodeNotFound {
+		t.Fatalf("expected error code %q, got %q", ErrCodeNotFound, code)
+	}
+}
+
+// TestRemoteWSInvalidHost400 covers handleRemoteSessionWS's
+// session.ValidateSSHHost branch (handlers_ws.go): a `[remotes.*]` entry
+// whose host would be parsed by ssh as an option (leading "-") must 400
+// rather than reach exec.Command with attacker-controlled argv (#1206).
+func TestRemoteWSInvalidHost400(t *testing.T) {
+	setupRemoteWSConfig(t, "[remotes.build]\nhost = \"-oProxyCommand=evil\"\n")
+	srv := NewServer(Config{
+		ListenAddr:  "127.0.0.1:0",
+		RemoteFleet: &fakeRemoteFleetLoader{snapshot: remoteFleetSnapshotWithSession("build", "remote-1")},
+	})
+	testServer := httptest.NewServer(srv.Handler())
+	defer testServer.Close()
+
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(testServer.URL, "/ws/remote/build/session/remote-1"), nil)
+	if err == nil {
+		t.Fatal("expected websocket dial error for invalid ssh host")
+	}
+	if resp == nil || resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected status %d, got resp=%v", http.StatusBadRequest, resp)
+	}
+	if code := decodeAPIErrorCode(t, resp); code != ErrCodeBadRequest {
+		t.Fatalf("expected error code %q, got %q", ErrCodeBadRequest, code)
 	}
 }
 
@@ -257,4 +303,73 @@ func TestRemoteWSCloseKillsCommand(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("process %d is still alive after the websocket closed", pid)
+}
+
+// TestRemoteWSOfflineRemoteSessionStillAttachable pins the design's
+// documented behavior (handlers_ws.go's remoteFleetHasSession comment): a
+// stale/offline remote's last-known sessions must stay attachable — the
+// attach itself surfaces any real connectivity failure to the terminal
+// rather than the route 404ing a session that may well still be running.
+// Every other fixture in this file hardcodes Online: true, so nothing else
+// guards against a regression that adds an Online filter here.
+func TestRemoteWSOfflineRemoteSessionStillAttachable(t *testing.T) {
+	setupRemoteWSConfig(t, remoteWSConfigWithBuildHost)
+	srv := NewServer(Config{
+		ListenAddr: "127.0.0.1:0",
+		RemoteFleet: &fakeRemoteFleetLoader{snapshot: session.RemoteFleetSnapshot{
+			Remotes: []session.RemoteFleetRemote{
+				{Name: "build", Online: false, Sessions: []session.RemoteSessionInfo{{ID: "remote-1", Title: "release"}}},
+			},
+		}},
+		RemoteAttachCommand: func(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd {
+			return exec.Command("sh", "-c", "printf READY; cat")
+		},
+	})
+	testServer := httptest.NewServer(srv.Handler())
+	defer testServer.Close()
+
+	conn, resp, err := websocket.DefaultDialer.Dial(wsURL(testServer.URL, "/ws/remote/build/session/remote-1"), nil)
+	if err != nil {
+		if resp != nil {
+			t.Fatalf("dial failed with status %d: %v", resp.StatusCode, err)
+		}
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	expectWSStatusEvent(t, conn, "connected")
+	expectWSStatusEvent(t, conn, "ready")
+	expectWSStatusEvent(t, conn, "terminal_attached")
+
+	if _, err := readBinaryUntilContains(conn, "READY", 4*time.Second); err != nil {
+		t.Fatalf("did not observe READY from remote attach command: %v", err)
+	}
+}
+
+// TestDefaultRemoteAttachCommand exercises the actual production ssh-command
+// builder directly. Every other test overrides Config.RemoteAttachCommand
+// (as does the JS e2e fixture), so without this, a bug in the real argv/env
+// construction — wrong args, TERM not applied — ships uncaught.
+func TestDefaultRemoteAttachCommand(t *testing.T) {
+	cfg := session.RemoteConfig{Host: "test-host"}
+	cmd := defaultRemoteAttachCommand("build", cfg, "remote-1")
+
+	if got, want := filepath.Base(cmd.Path), "ssh"; got != want {
+		t.Fatalf("cmd.Path = %q, want basename %q", cmd.Path, want)
+	}
+
+	wantArgs := append([]string{"ssh"}, session.NewSSHRunner("build", cfg).AttachArgs("remote-1")...)
+	if !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("cmd.Args = %v, want %v", cmd.Args, wantArgs)
+	}
+
+	foundTERM := false
+	for _, kv := range cmd.Env {
+		if strings.HasPrefix(kv, "TERM=") && strings.TrimPrefix(kv, "TERM=") != "" {
+			foundTERM = true
+		}
+	}
+	if !foundTERM {
+		t.Fatalf("cmd.Env missing a non-empty TERM (ensureTERM not applied): %v", cmd.Env)
+	}
 }

@@ -61,9 +61,19 @@ type tmuxPTYBridge struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+
+	// startedAt and mapErr back the quick-exit signal in streamOutput: if the
+	// attach command dies within quickExitGrace of starting, that is treated
+	// as an attach failure (bad host, rejected auth, missing remote binary)
+	// rather than a normal detach, and mapErr's code/message/hint — the same
+	// contract used for a synchronous attach() failure — is sent as an error
+	// frame instead of the silent/session_closed handling a long-lived
+	// session's eventual exit gets.
+	startedAt time.Time
+	mapErr    wsAttachErrorFunc
 }
 
-func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsConnWriter) (*tmuxPTYBridge, error) {
+func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsConnWriter, mapErr wsAttachErrorFunc) (*tmuxPTYBridge, error) {
 	if tmuxSession == "" {
 		return nil, fmt.Errorf("tmux session name is required")
 	}
@@ -75,21 +85,16 @@ func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsC
 		return nil, fmt.Errorf("%w: %s", ErrTmuxSessionNotFound, tmuxSession)
 	}
 
-	b, err := newPTYBridge(tmuxAttachCommand(tmuxSession, tmuxSocketName), sessionID, writer)
-	if err != nil {
-		return nil, err
-	}
-	b.tmuxSession = tmuxSession
-	b.tmuxSocketName = tmuxSocketName
-	return b, nil
+	return newPTYBridge(tmuxAttachCommand(tmuxSession, tmuxSocketName), sessionID, tmuxSession, tmuxSocketName, writer, mapErr)
 }
 
 // newPTYBridge starts cmd in a local PTY and streams its output over writer.
 // It is the shared foundation for both the local tmux attach bridge (via
 // newTmuxPTYBridge, which existence-checks the tmux session first) and the
 // remote SSH attach bridge (handleRemoteSessionWS, which has no local tmux
-// session to check — the remote side owns that).
-func newPTYBridge(cmd *exec.Cmd, sessionID string, writer *wsConnWriter) (*tmuxPTYBridge, error) {
+// session to check — the remote side owns that). tmuxSession/tmuxSocketName
+// are empty for the remote (non-tmux) caller.
+func newPTYBridge(cmd *exec.Cmd, sessionID, tmuxSession, tmuxSocketName string, writer *wsConnWriter, mapErr wsAttachErrorFunc) (*tmuxPTYBridge, error) {
 	if cmd == nil {
 		return nil, fmt.Errorf("command is required")
 	}
@@ -103,11 +108,15 @@ func newPTYBridge(cmd *exec.Cmd, sessionID string, writer *wsConnWriter) (*tmuxP
 	}
 
 	b := &tmuxPTYBridge{
-		sessionID: sessionID,
-		writer:    writer,
-		cmd:       cmd,
-		ptmx:      ptmx,
-		done:      make(chan struct{}),
+		sessionID:      sessionID,
+		tmuxSession:    tmuxSession,
+		tmuxSocketName: tmuxSocketName,
+		writer:         writer,
+		cmd:            cmd,
+		ptmx:           ptmx,
+		done:           make(chan struct{}),
+		startedAt:      time.Now(),
+		mapErr:         mapErr,
 	}
 
 	go b.streamOutput()
@@ -147,7 +156,27 @@ func (b *tmuxPTYBridge) streamOutput() {
 		}
 
 		if err != nil {
-			if !errors.Is(err, io.EOF) {
+			switch {
+			case time.Since(b.startedAt) < quickExitGrace:
+				// The attach command died shortly after connecting — e.g. ssh
+				// reached the host but auth was rejected, or the remote
+				// agent-deck binary is missing. terminal_attached already
+				// fired, so without this the terminal looks attached and
+				// alive but is silently dead. Reuse the same code/message/
+				// hint an attach() failure would have produced.
+				code, message, hint := "TERMINAL_ATTACH_FAILED", "attach process exited shortly after connecting", "Check the server logs for details."
+				if b.mapErr != nil {
+					code, message, hint = b.mapErr(err)
+				}
+				_ = b.writer.WriteJSON(wsServerMessage{
+					Type:      "error",
+					Code:      code,
+					Message:   message,
+					Hint:      hint,
+					SessionID: b.sessionID,
+					Time:      time.Now().UTC(),
+				})
+			case !errors.Is(err, io.EOF):
 				_ = b.writer.WriteJSON(wsServerMessage{
 					Type:      "status",
 					Event:     "session_closed",
@@ -160,6 +189,11 @@ func (b *tmuxPTYBridge) streamOutput() {
 		}
 	}
 }
+
+// quickExitGrace bounds how soon after start an attach command's exit is
+// treated as an attach failure (see streamOutput) rather than a normal
+// detach of a session that ran for a while.
+const quickExitGrace = 3 * time.Second
 
 func (b *tmuxPTYBridge) WriteInput(data string) error {
 	if b == nil {

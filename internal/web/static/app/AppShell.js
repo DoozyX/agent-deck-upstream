@@ -241,6 +241,13 @@ export function AppShell() {
       }
     }
     const focusedSession = () => {
+      // A remote session selection clears selectedIdSignal (mutually
+      // exclusive, see state.js selectLocalSession/selectRemoteSession), so
+      // without this guard every local-session shortcut below (Enter, D,
+      // rename, Shift+Enter) would fall through to sessions[0] and act on
+      // an unrelated local session instead of doing nothing — destructive
+      // for 'D'. None of these shortcuts have a remote-session equivalent.
+      if (selectedRemoteSignal.value) return null
       const sessions = (menuModelSignal.value?.sessions) || []
       const id = selectedIdSignal.value
       return sessions.find(s => s.id === id) || sessions[0] || null
