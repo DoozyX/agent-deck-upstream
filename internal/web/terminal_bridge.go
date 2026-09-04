@@ -84,7 +84,35 @@ type tmuxPTYBridge struct {
 	// excluded; see isRemote.
 	startedAt time.Time
 	mapErr    wsAttachErrorFunc
+
+	// wroteOutput records whether the attach command ever put a byte on the
+	// PTY. See attachFailed for why that matters.
+	wroteOutput atomic.Bool
+
+	// waitOnce/exitCode memoise the single permitted cmd.Wait. Both Close
+	// (which reaps after killing) and attachFailed (which needs the status to
+	// classify a quick exit) need the process reaped, and calling cmd.Wait
+	// from two goroutines is a data race.
+	waitOnce sync.Once
+	exitCode atomic.Int32
 }
+
+// sshFailureExitCode is the status ssh itself exits with when it could not
+// establish the session at all: unreachable host, connection refused, rejected
+// auth, host-key failure. Once ssh HAS connected, `ssh -tt` exits with the
+// REMOTE command's status instead, so 255 is the one code that distinguishes
+// "the dial failed" from "the thing you attached to ended".
+const sshFailureExitCode = 255
+
+// exitCodeUnknown marks a process whose status we never learned (no command, or
+// the bounded wait in attachFailed timed out).
+const exitCodeUnknown = -2
+
+// reapWaitTimeout bounds attachFailed's wait for the exit status. On the path
+// that calls it the child is already gone — that is why the PTY read failed —
+// so this only exists so an exotic case (a grandchild still holding the pts)
+// can never wedge streamOutput and leave b.done unclosed.
+const reapWaitTimeout = 2 * time.Second
 
 func newTmuxPTYBridge(tmuxSession, tmuxSocketName, sessionID string, writer *wsConnWriter, mapErr wsAttachErrorFunc) (*tmuxPTYBridge, error) {
 	if tmuxSession == "" {
@@ -169,6 +197,7 @@ func (b *tmuxPTYBridge) streamOutput() {
 		}
 		n, err := ptmx.Read(buf)
 		if n > 0 {
+			b.wroteOutput.Store(true)
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			if writeErr := b.writer.WriteBinary(chunk); writeErr != nil {
@@ -179,13 +208,17 @@ func (b *tmuxPTYBridge) streamOutput() {
 
 		if err != nil {
 			switch {
-			case b.isRemote() && !b.closing.Load() && time.Since(b.startedAt) < quickExitGrace:
-				// The remote attach command died shortly after connecting —
-				// e.g. ssh reached the host but auth was rejected, or the
-				// remote agent-deck binary is missing. terminal_attached
+			case b.isRemote() && !b.closing.Load() && time.Since(b.startedAt) < quickExitGrace && b.attachFailed():
+				// The remote attach command died without ever giving the user
+				// a session — ssh could not reach the host, auth was rejected,
+				// or the remote agent-deck binary is missing. terminal_attached
 				// already fired, so without this the terminal looks attached
 				// and alive but is silently dead. Reuse the same code/message/
 				// hint an attach() failure would have produced.
+				//
+				// attachFailed is what separates that from a remote session
+				// that genuinely ran and ended inside the grace window; see
+				// its doc comment.
 				//
 				// Deliberately remote-only: a LOCAL tmux attach that exits
 				// this fast is an ordinary detach/close, and TerminalPanel.js
@@ -241,6 +274,74 @@ var quickExitGrace = session.SSHConnectTimeout + quickExitGraceMargin
 // so a dial that times out at exactly ConnectTimeout still lands inside the
 // grace window.
 const quickExitGraceMargin = 5 * time.Second
+
+// attachFailed decides whether a remote attach command's death inside
+// quickExitGrace was a failure to attach at all, or a remote session that
+// genuinely ran and then ended.
+//
+// Round 7 (#2): elapsed time cannot tell those apart, and round 6 widened the
+// window to 15s to cover the ssh dial. That made "attach, watch the agent
+// finish, get told to check your ssh" a normal path rather than a corner: the
+// user got a fatal REMOTE_ATTACH_FAILED banner with a false diagnosis, and the
+// client disables reconnect on that code.
+//
+// Two independent signals mean "never attached", and either is enough:
+//
+//   - Exit status 255 (sshFailureExitCode). `ssh -tt` reserves 255 for its own
+//     errors and otherwise passes the remote command's status through, so this
+//     is the definitive "the dial failed" signal, and it stays true no matter
+//     how much ssh printed on its way out.
+//   - No output at all. NOTE: this is deliberately not the only test, because
+//     the intuitive form of it is wrong. A failed dial DOES write to the PTY —
+//     pty.Start points the child's stderr at the same pts, so
+//     "ssh: connect to host … Operation timed out" is read here as ordinary
+//     output (verified in-tree against a real ssh against an unresolvable
+//     host). Keying solely on "wrote nothing" would therefore have silently
+//     un-fixed round 6's unreachable-host case. It stays as a second clause
+//     because a command that died without emitting a single byte never showed
+//     the user a session either.
+//
+// Anything else — output was produced and the process exited with the remote
+// side's own status — is a session that ran, and falls through to the ordinary
+// EOF/session_closed handling.
+func (b *tmuxPTYBridge) attachFailed() bool {
+	if !b.wroteOutput.Load() {
+		return true
+	}
+	return b.waitExitCode() == sshFailureExitCode
+}
+
+// waitExitCode reaps the attach process and returns its exit status, or
+// exitCodeUnknown if it could not be determined within reapWaitTimeout.
+func (b *tmuxPTYBridge) waitExitCode() int {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		b.reap()
+	}()
+	select {
+	case <-done:
+		return int(b.exitCode.Load())
+	case <-time.After(reapWaitTimeout):
+		return exitCodeUnknown
+	}
+}
+
+// reap runs the one permitted cmd.Wait and records the exit status. Safe to
+// call from several goroutines and any number of times; only the first call
+// waits, the rest block until it finishes.
+func (b *tmuxPTYBridge) reap() {
+	b.waitOnce.Do(func() {
+		code := exitCodeUnknown
+		if b.cmd != nil {
+			_ = b.cmd.Wait()
+			if b.cmd.ProcessState != nil {
+				code = b.cmd.ProcessState.ExitCode()
+			}
+		}
+		b.exitCode.Store(int32(code))
+	})
+}
 
 func (b *tmuxPTYBridge) WriteInput(data string) error {
 	if b == nil {
@@ -319,9 +420,7 @@ func (b *tmuxPTYBridge) Close() {
 				_ = b.cmd.Process.Kill()
 			}
 		}
-		if b.cmd != nil {
-			_ = b.cmd.Wait()
-		}
+		b.reap()
 	})
 }
 

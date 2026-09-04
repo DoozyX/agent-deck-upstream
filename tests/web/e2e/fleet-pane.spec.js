@@ -21,6 +21,18 @@
 
 import { test, expect } from '@playwright/test'
 
+// The Fleet tab is reachable from the desktop/tablet top-tab bar and from the
+// phone's bottom MobileTabs; each is hidden on the other layout, and these
+// specs run on all three projects.
+async function openFleetTab(page) {
+  const mobileTab = page.locator('[data-testid="mobile-tab-fleet"]')
+  if (await mobileTab.isVisible()) {
+    await mobileTab.click()
+    return
+  }
+  await page.locator('.top-tab', { hasText: 'Fleet' }).click()
+}
+
 test.describe('fleet pane', () => {
   test.beforeEach(async ({ request }) => {
     await request.post('/__fixture/reset')
@@ -378,5 +390,46 @@ test.describe('fleet pane', () => {
     const banner = page.locator('[data-testid="terminal-fatal-banner"]')
     await expect(banner).toBeVisible({ timeout: 10000 })
     await expect(banner.locator('[data-testid="terminal-fatal-restart"]')).toHaveCount(1)
+  })
+
+  // Review round 7 (#1): after REMOTE_ATTACH_FAILED the client disables
+  // reconnect, and round 6 (correctly) removed the banner's Restart button for
+  // remotes — leaving re-clicking the Fleet tile as the only retry gesture the
+  // UI offers. It was a no-op: terminalKey was the identical
+  // `remote:build:remote-1` string, reconnectKey only moved via the (now
+  // absent) Restart button, and the terminal pane is CSS-hidden rather than
+  // unmounted, so tab switching did not help either. Only picking a different
+  // session or reloading recovered. state.js's per-selection `attempt` counter
+  // is what makes the re-click re-run the effect.
+  test('re-clicking a failed remote tile retries the attach', async ({ page, request }) => {
+    await request.post('/__fixture/remotes?attach=fail')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = () => page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+
+    await tile().click()
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toBeVisible({ timeout: 10000 })
+
+    // The remote is reachable again; the user's retry gesture is re-clicking
+    // the same tile. Count WS opens from here so the assertion is about the
+    // RE-CLICK, not the first (failed) attach.
+    await request.post('/__fixture/remotes')
+    const opened = []
+    page.on('websocket', ws => {
+      if (ws.url().includes('/ws/remote/build/session/remote-1')) opened.push(ws.url())
+    })
+
+    await openFleetTab(page)
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await tile().click()
+
+    // A fresh WebSocket to the same remote session is the whole fix: without
+    // it the effect never re-runs and the pane stays frozen on the banner.
+    await expect.poll(() => opened.length, { timeout: 10000 }).toBeGreaterThan(0)
+    // And the dead-end state is actually gone, not merely re-rendered.
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
   })
 })
