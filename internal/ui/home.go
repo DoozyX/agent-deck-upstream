@@ -14318,6 +14318,16 @@ type attachResult struct {
 }
 
 // attachCmd implements tea.ExecCommand for custom PTY attach
+// releaseTerminalAutowrap hands the terminal back in its normal wrapping state
+// before a tea.Exec command takes it over (tmux attach, ssh). The TUI pins
+// DECAWM off for its own frames (#607 drift class, see autowrap.go), but the
+// program that runs next renders with its own width assumptions and must not
+// inherit ours. Bubble Tea restarts the renderer with a full repaint when the
+// exec returns, so View re-applies the pin on the very next frame.
+func releaseTerminalAutowrap() {
+	RestoreAutowrap(os.Stdout)
+}
+
 type attachCmd struct {
 	session *tmux.Session
 	opts    tmux.AttachOptions
@@ -14330,6 +14340,7 @@ type attachCmd struct {
 }
 
 func (a attachCmd) Run() error {
+	releaseTerminalAutowrap()
 	// NOTE: Screen clearing is ONLY done in the tea.Exec callback (after Attach returns)
 	// Removing clear screen here prevents double-clearing which corrupts terminal state
 	if a.onExit != nil {
@@ -14381,6 +14392,7 @@ func (e remoteAttachFailedError) Unwrap() error {
 }
 
 func (r remoteCreateAndAttachCmd) Run() error {
+	releaseTerminalAutowrap()
 	if r.onExit != nil {
 		defer r.onExit()
 	}
@@ -14452,6 +14464,7 @@ type attachWindowCmd struct {
 }
 
 func (a attachWindowCmd) Run() error {
+	releaseTerminalAutowrap()
 	if a.onExit != nil {
 		defer a.onExit()
 	}
@@ -14611,6 +14624,7 @@ type remoteAttachCmd struct {
 }
 
 func (r remoteAttachCmd) Run() error {
+	releaseTerminalAutowrap()
 	if r.onExit != nil {
 		defer r.onExit()
 	}
@@ -14906,14 +14920,18 @@ func (h *Home) View() string {
 	// very first frame of the process can still be empty here, and no attach
 	// can be triggered before the first render.
 	if h.isAttaching.Load() { // Atomic read for thread safety
-		return h.lastRenderedFrame
+		return pinAutowrapOff(h.lastRenderedFrame)
 	}
 
 	frame := h.renderFrame()
 	if frame != "" {
 		h.lastRenderedFrame = frame
 	}
-	return frame
+	// #607 class: keep DECAWM off for every frame, including the modal-panel
+	// paths that return before clampViewToViewport. A row the terminal measures
+	// wider than we did is then clipped instead of wrapping into the row below
+	// and shifting the rest of the screen. See internal/ui/autowrap.go.
+	return pinAutowrapOff(frame)
 }
 
 // renderFrame is the real frame builder behind View. Split out so View can
