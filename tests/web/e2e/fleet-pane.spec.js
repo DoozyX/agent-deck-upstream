@@ -432,4 +432,56 @@ test.describe('fleet pane', () => {
     await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
     await expect(page.locator('.work-head .path')).toContainText('REMOTE')
   })
+
+  // Review round 8 (#2): the round-7 retry counter bumped on EVERY re-click of
+  // the already-selected tile, not only after a failure. So the ordinary
+  // gesture in the test above — attach, switch to Fleet to glance at the
+  // fleet, click the same tile to come back — changed terminalKey, defeated
+  // TerminalPanel's double-init guard, disposed the xterm instance, closed the
+  // WebSocket and made the server tear the ssh child down: scrollback gone,
+  // remote tmux client detached and reattached. The local tile is idempotent,
+  // so this was remote-only. The counter now moves only for an attachment that
+  // reported REMOTE_ATTACH_FAILED.
+  test('re-clicking a HEALTHY remote tile leaves the live terminal attached', async ({ page, request }) => {
+    await request.post('/__fixture/remotes')
+    await page.goto('/')
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+
+    const tile = () => page.locator('[data-testid="fleet-remote-card"][data-remote-name="build"] ' +
+      '[data-testid="fleet-remote-session-tile"][data-session-id="remote-1"]')
+
+    const sockets = []
+    page.on('websocket', ws => {
+      if (ws.url().includes('/ws/remote/build/session/remote-1')) sockets.push(ws)
+    })
+
+    await tile().click()
+    // The fixture's healthy attach command holds the PTY open with `cat`, so
+    // this attachment stays live for the rest of the test.
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+    await expect(page.locator('[data-testid="terminal-fatal-banner"]')).toHaveCount(0)
+    await expect.poll(() => sockets.length, { timeout: 10000 }).toBe(1)
+    const first = sockets[0]
+
+    // Stamp the live xterm element. cleanup() calls terminal.dispose(), which
+    // removes this node, and a rebuilt terminal creates a fresh unstamped one —
+    // so the stamp surviving is direct evidence that the xterm instance (and
+    // with it the scrollback) was never torn down. This does not depend on the
+    // xterm renderer exposing its rows in the DOM.
+    const xterm = page.locator('.term-frame .xterm')
+    await expect(xterm).toHaveCount(1)
+    await xterm.evaluate((el) => el.setAttribute('data-e2e-stamp', 'attach-1'))
+
+    await openFleetTab(page)
+    await expect(page.locator('[data-testid="fleet-pane"]')).toBeVisible({ timeout: 5000 })
+    await tile().click()
+    await expect(page.locator('.work-head .path')).toContainText('REMOTE')
+
+    // Give a teardown+rebuild every chance to show up before asserting it did
+    // not: the round-7 behavior opened the replacement socket immediately.
+    await page.waitForTimeout(1500)
+    expect(sockets.length).toBe(1)
+    expect(first.isClosed()).toBe(false)
+    await expect(page.locator('.term-frame .xterm[data-e2e-stamp="attach-1"]')).toHaveCount(1)
+  })
 })

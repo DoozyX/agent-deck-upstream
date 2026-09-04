@@ -23,18 +23,50 @@ export function selectLocalSession(id) {
   selectedIdSignal.value = id
 }
 
-// `attempt` makes re-clicking the ALREADY-selected remote tile a retry gesture
-// instead of a no-op (round 7 #1). TerminalPanel keys its terminal + WebSocket
-// effect on `remote:<name>:<id>`, which does not change on a re-click, and the
+// remoteTerminalKey is the single source of truth for a remote attachment's
+// identity: TerminalPanel keys its terminal + WebSocket effect on it, and
+// remoteAttachFailedSignal below names the exact attempt that failed.
+export function remoteTerminalKey(remote, sessionId, attempt) {
+  return `remote:${remote}:${sessionId}#${attempt || 0}`
+}
+
+// remoteAttachFailedSignal holds the remoteTerminalKey of the remote attachment
+// that ended in a fatal REMOTE_ATTACH_FAILED, or null. TerminalPanel sets it
+// from the fatal frame and clears it whenever it starts a fresh attach, so at
+// most one key — always the currently mounted one — is ever marked.
+export const remoteAttachFailedSignal = signal(null)
+
+// `attempt` makes re-clicking a FAILED remote tile a retry gesture instead of a
+// no-op (round 7 #1). TerminalPanel keys its terminal + WebSocket effect on
+// `remote:<name>:<id>#<attempt>`, which does not change on a re-click, and the
 // pane is only ever CSS-hidden, never unmounted — so a remote terminal parked
 // on a fatal REMOTE_ATTACH_FAILED banner (reconnect disabled) had no way back
 // short of selecting a different session or reloading the page. Selecting a
 // DIFFERENT remote or session already changes that key, so the counter only has
 // to move for the same one.
+//
+// Round 8 (#2): it may only move when THIS attempt is in the failed state.
+// Round 7 bumped on every re-click, so re-selecting a healthy attached remote —
+// glance at the Fleet tab, click the same tile to come back — changed the key,
+// defeated the effect's double-init guard, disposed the xterm instance, closed
+// the WebSocket and made the server tear the ssh child down: scrollback gone,
+// remote tmux client detached and reattached. The local equivalent is
+// idempotent, so that was remote-only. The failed state is carried explicitly
+// in remoteAttachFailedSignal rather than inferred from the WS state (which is
+// briefly 'connecting' during an ordinary healthy reconnect) or by comparing
+// selection objects.
 export function selectRemoteSession(remote, session) {
   const cur = selectedRemoteSignal.value
   const sameTile = !!cur && cur.remote === remote && !!cur.session && cur.session.id === session.id
-  const attempt = sameTile ? (cur.attempt || 0) + 1 : 0
+  const curAttempt = sameTile ? (cur.attempt || 0) : 0
+  const failed =
+    sameTile && remoteAttachFailedSignal.value === remoteTerminalKey(remote, session.id, curAttempt)
+  // A healthy re-click still refreshes the stored session snapshot (RightRail
+  // renders title/status from it) but keeps `attempt` — and therefore
+  // remoteTerminalKey, and therefore TerminalPanel's effect deps — unchanged,
+  // so the live terminal and its WebSocket are left completely alone.
+  const attempt = failed ? curAttempt + 1 : curAttempt
+  if (failed) remoteAttachFailedSignal.value = null
   selectedIdSignal.value = null
   selectedRemoteSignal.value = { remote, session, attempt }
 }

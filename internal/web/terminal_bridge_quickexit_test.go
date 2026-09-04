@@ -2,6 +2,43 @@
 
 package web
 
+// Remote-attach scenario matrix (review round 8). Rounds 6 and 7 each fixed one
+// row and broke the next one in the same code, so every row below is pinned by
+// a named test and they are listed together to make a gap visible:
+//
+//	(a) healthy remote attach, user re-clicks the same tile -> terminal
+//	    untouched, no teardown, no new WebSocket.
+//	      tests/web/unit/state.test.js
+//	        "leaves attempt alone when re-selecting a HEALTHY remote tile"
+//	      tests/web/e2e/fleet-pane.spec.js
+//	        "re-clicking a HEALTHY remote tile leaves the live terminal attached"
+//	(b) attach failed with REMOTE_ATTACH_FAILED, user re-clicks the tile -> a
+//	    new attach attempt is made.
+//	      tests/web/unit/state.test.js
+//	        "bumps attempt when re-selecting a FAILED remote tile"
+//	      tests/web/e2e/fleet-pane.spec.js
+//	        "re-clicking a failed remote tile retries the attach"
+//	(c) ssh cannot connect (exit 255 inside the grace) -> fatal
+//	    REMOTE_ATTACH_FAILED frame, no session_closed.
+//	      TestQuickExitIsFatalOnlyForRemote/remote…,
+//	      TestRemoteAttachFailureStaysFatalWhenSSHPrints (this file)
+//	(d) attach succeeds and the remote session ends inside the grace (output was
+//	    written) -> session_closed, no fatal frame.
+//	      TestRemoteSessionThatRanAndExitedIsNotFatal (this file)
+//	(e) the client closes the WS during the grace -> no fatal frame attempted,
+//	    the child is reaped exactly once, and Close never signals a reaped PID.
+//	      TestRemoteQuickExitSkippedWhenWeClosed (this file),
+//	      TestCloseDoesNotSignalAReapedPID,
+//	      TestCloseAfterQuickExitReapIsSafeEndToEnd
+//	      (terminal_bridge_close_reaped_test.go)
+//	(f) the local tmux attach path is unchanged for all of the above.
+//	      TestQuickExitIsFatalOnlyForRemote/local…  (this file),
+//	      TestCloseDoesNotSignalAReapedPID/"still running"  (a live child is
+//	      still signalled, which is every local detach),
+//	      tests/web/unit/state.test.js "selectLocalSession is idempotent…",
+//	      tests/web/e2e/fleet-pane.spec.js "local fatal banner keeps its Restart
+//	      action"
+
 import (
 	"encoding/json"
 	"net/http"

@@ -95,6 +95,30 @@ type tmuxPTYBridge struct {
 	// from two goroutines is a data race.
 	waitOnce sync.Once
 	exitCode atomic.Int32
+
+	// reaped is set once cmd.Wait has RETURNED, i.e. the child is no longer a
+	// zombie and its PID is free for the OS to hand to somebody else. Close
+	// must not signal after that point.
+	//
+	// Round 8 (#1): before this branch, cmd.Wait only ever ran inside Close,
+	// AFTER the kill, so b.cmd.Process.Pid was always still a (reaped-later)
+	// zombie and syscall.Getpgid on it was always safe. attachFailed's
+	// waitExitCode now reaps at the moment of a quick exit, and on that path
+	// the server does not close the WebSocket — the client keeps the socket
+	// open with reconnect disabled (TerminalPanel.js's fatal branch) — so
+	// serveTerminalWS's deferred Close can run minutes or hours later. If the
+	// host recycled the PID in between, Getpgid would succeed for an unrelated
+	// process and Kill(-pgid, SIGTERM) would take down that whole process
+	// group, which on a deck host means other agent-deck panes.
+	//
+	// Reading b.cmd.ProcessState instead would race with an in-flight Wait.
+	reaped atomic.Bool
+
+	// terminateProcessGroup indirects Close's signal step so the reaped-PID
+	// regression test can observe whether Close signalled at all. nil selects
+	// the production behavior (defaultTerminateProcessGroup); nothing outside
+	// tests sets it.
+	terminateProcessGroup func(*os.Process)
 }
 
 // sshFailureExitCode is the status ssh itself exits with when it could not
@@ -335,6 +359,9 @@ func (b *tmuxPTYBridge) reap() {
 		code := exitCodeUnknown
 		if b.cmd != nil {
 			_ = b.cmd.Wait()
+			// Set before exitCode so any observer that sees a status has also
+			// seen the PID become unsafe to signal.
+			b.reaped.Store(true)
 			if b.cmd.ProcessState != nil {
 				code = b.cmd.ProcessState.ExitCode()
 			}
@@ -412,16 +439,31 @@ func (b *tmuxPTYBridge) Close() {
 			b.ptmx = nil
 		}
 		b.ptmxMu.Unlock()
-		if b.cmd != nil && b.cmd.Process != nil {
-			pgid, err := syscall.Getpgid(b.cmd.Process.Pid)
-			if err == nil {
-				_ = syscall.Kill(-pgid, syscall.SIGTERM)
-			} else {
-				_ = b.cmd.Process.Kill()
+		// !b.reaped: never signal a PID that cmd.Wait has already returned
+		// for — the kernel may have handed it to an unrelated process by now
+		// (round 8 #1, see the reaped field).
+		if !b.reaped.Load() && b.cmd != nil && b.cmd.Process != nil {
+			terminate := b.terminateProcessGroup
+			if terminate == nil {
+				terminate = defaultTerminateProcessGroup
 			}
+			terminate(b.cmd.Process)
 		}
 		b.reap()
 	})
+}
+
+// defaultTerminateProcessGroup SIGTERMs the attach process's whole group so
+// the tmux/ssh client and anything it spawned go down together, falling back
+// to signalling the process alone when it has no group of its own. Callers
+// must have established that the process has not been reaped yet.
+func defaultTerminateProcessGroup(proc *os.Process) {
+	pgid, err := syscall.Getpgid(proc.Pid)
+	if err == nil {
+		_ = syscall.Kill(-pgid, syscall.SIGTERM)
+		return
+	}
+	_ = proc.Kill()
 }
 
 // tmuxHasSessionProbeTimeout bounds the has-session existence probe. The web
