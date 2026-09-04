@@ -28,7 +28,7 @@ func TestNewPTYBridge_RunsArbitraryCommand(t *testing.T) {
 		defer conn.Close()
 
 		writer := newWSConnWriter(conn)
-		bridge, err := newPTYBridge(exec.Command("sh", "-c", "printf ARBITRARY_OK"), "sess-arb", writer)
+		bridge, err := newPTYBridge(exec.Command("sh", "-c", "printf ARBITRARY_OK"), "sess-arb", "", "", writer, nil)
 		if err != nil {
 			t.Errorf("newPTYBridge: %v", err)
 			return

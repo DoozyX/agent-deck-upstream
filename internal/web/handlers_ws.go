@@ -98,7 +98,7 @@ func (s *Server) handleSessionWS(w http.ResponseWriter, r *http.Request) {
 		if menuSession.TmuxSession == "" {
 			return nil, nil
 		}
-		return newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer)
+		return newTmuxPTYBridge(menuSession.TmuxSession, menuSession.TmuxSocketName, sessionID, writer, mapLocalAttachError)
 	}
 	s.serveTerminalWS(w, r, sessionID, snapshot.Profile, attach, mapLocalAttachError)
 }
@@ -159,12 +159,12 @@ func (s *Server) handleRemoteSessionWS(w http.ResponseWriter, r *http.Request) {
 	if attachCmdFn == nil {
 		attachCmdFn = defaultRemoteAttachCommand
 	}
-	attach := func(writer *wsConnWriter) (*tmuxPTYBridge, error) {
-		return newPTYBridge(attachCmdFn(remoteName, remoteCfg, sessionID), sessionID, writer)
-	}
 	mapErr := func(error) (code, message, hint string) {
 		return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal",
 			fmt.Sprintf("Check that ssh can reach %s from the web server host.", remoteCfg.Host)
+	}
+	attach := func(writer *wsConnWriter) (*tmuxPTYBridge, error) {
+		return newPTYBridge(attachCmdFn(remoteName, remoteCfg, sessionID), sessionID, "", "", writer, mapErr)
 	}
 	s.serveTerminalWS(w, r, sessionID, "", attach, mapErr)
 }
@@ -176,11 +176,16 @@ func (s *Server) handleRemoteSessionWS(w http.ResponseWriter, r *http.Request) {
 func defaultRemoteAttachCommand(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd {
 	runner := session.NewSSHRunner(name, cfg)
 	sshArgs := runner.AttachArgs(sessionID)
-	// #nosec G204 G702 -- "ssh" is a fixed binary; sshArgs is built by
-	// SSHRunner.AttachArgs from a [remotes.*] config entry that
-	// handleRemoteSessionWS already ran through session.ValidateSSHHost
-	// before ever calling this function (same validate-then-exec.Command
-	// shape as SSHRunner.Attach's own identical call, internal/session/ssh.go).
+	// #nosec G204 G702 -- "ssh" is a fixed binary. sshArgs is built by
+	// SSHRunner.AttachArgs from a [remotes.*] config entry (host validated by
+	// handleRemoteSessionWS's session.ValidateSSHHost call before this
+	// function ever runs, closing ssh-option injection via the host) and the
+	// attacker-controlled sessionID, which AttachArgs embeds into the remote
+	// command string via buildRemoteCommand's shellQuote (internal/session/
+	// ssh.go) — that's what makes a crafted sessionID safe to pass through
+	// here, not ValidateSSHHost, which only ever sees the host. Same
+	// validate-then-exec.Command shape as SSHRunner.Attach's own identical
+	// call.
 	cmd := exec.Command("ssh", sshArgs...)
 	cmd.Env = ensureTERM(cmd.Env)
 	return cmd
@@ -296,31 +301,30 @@ func (s *Server) serveTerminalWS(w http.ResponseWriter, r *http.Request, session
 		Time:      time.Now().UTC(),
 	})
 
-	var bridge *tmuxPTYBridge
-	if attach != nil {
-		bridge, err = attach(writer)
-		if err != nil {
-			logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
-				slog.String("session_id", logSessionID),
-				slog.String("error", err.Error()))
-			code, message, hint := mapErr(err)
-			_ = writer.WriteJSON(wsServerMessage{
-				Type:      "error",
-				Code:      code,
-				Message:   message,
-				Hint:      hint,
-				SessionID: sessionID,
-				Time:      time.Now().UTC(),
-			})
-		} else if bridge != nil {
-			defer bridge.Close()
-			_ = writer.WriteJSON(wsServerMessage{
-				Type:      "status",
-				Event:     "terminal_attached",
-				SessionID: sessionID,
-				Time:      time.Now().UTC(),
-			})
-		}
+	// attach is always a non-nil closure at both call sites (handleSessionWS,
+	// handleRemoteSessionWS); no nil-guard needed here.
+	bridge, err := attach(writer)
+	if err != nil {
+		logging.ForComponent(logging.CompWeb).Error("terminal_attach_failed",
+			slog.String("session_id", logSessionID),
+			slog.String("error", err.Error()))
+		code, message, hint := mapErr(err)
+		_ = writer.WriteJSON(wsServerMessage{
+			Type:      "error",
+			Code:      code,
+			Message:   message,
+			Hint:      hint,
+			SessionID: sessionID,
+			Time:      time.Now().UTC(),
+		})
+	} else if bridge != nil {
+		defer bridge.Close()
+		_ = writer.WriteJSON(wsServerMessage{
+			Type:      "status",
+			Event:     "terminal_attached",
+			SessionID: sessionID,
+			Time:      time.Now().UTC(),
+		})
 	}
 
 	for {

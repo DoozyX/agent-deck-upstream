@@ -376,15 +376,16 @@ export function TerminalPanel() {
                 ctx.terminalAttached = false
               }
             } else if (payload.type === 'error') {
-              if (payload.code === 'TERMINAL_ATTACH_FAILED' || payload.code === 'TMUX_SESSION_NOT_FOUND') {
+              if (payload.code === 'TERMINAL_ATTACH_FAILED' || payload.code === 'TMUX_SESSION_NOT_FOUND' || payload.code === 'REMOTE_ATTACH_FAILED') {
                 ctx.terminalAttached = false
               }
               // #782: TMUX_SESSION_NOT_FOUND is terminal-fatal — the
               // session is gone, so reconnecting will just emit the same
               // error in a tight loop and spam the terminal. Stop the
               // reconnect cycle and surface a banner with the actionable
-              // hint from the server.
-              if (payload.code === 'TMUX_SESSION_NOT_FOUND') {
+              // hint from the server. REMOTE_ATTACH_FAILED (bad host, ssh
+              // auth rejected) is the same shape for remote sessions.
+              if (payload.code === 'TMUX_SESSION_NOT_FOUND' || payload.code === 'REMOTE_ATTACH_FAILED') {
                 ctx.wsReconnectEnabled = false
                 setFatalError({
                   code: payload.code,

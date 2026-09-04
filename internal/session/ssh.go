@@ -271,8 +271,8 @@ func (r *SSHRunner) Attach(sessionID string) error {
 	if err := ValidateSSHHost(r.Host); err != nil {
 		return err
 	}
-	_ = os.MkdirAll(sshControlDir, 0700)
 
+	// AttachArgs creates sshControlDir itself.
 	sshArgs := r.AttachArgs(sessionID)
 
 	cmd := exec.Command("ssh", sshArgs...)
