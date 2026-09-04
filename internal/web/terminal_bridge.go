@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -61,6 +62,16 @@ type tmuxPTYBridge struct {
 
 	closeOnce sync.Once
 	done      chan struct{}
+
+	// closing is set by Close before it tears the PTY down, so streamOutput's
+	// read error can distinguish "the attach process died on us" from "we
+	// closed it ourselves" (the WS client went away — user closed the tab —
+	// and serveTerminalWS's deferred Close ran). Without it the quick-exit
+	// branch below treats our own teardown inside quickExitGrace as an attach
+	// failure and writes a fatal frame; that is invisible today only because
+	// the write lands on an already-dead connection, which is write-ordering
+	// luck rather than a guarantee.
+	closing atomic.Bool
 
 	// startedAt and mapErr back the quick-exit signal in streamOutput: if a
 	// REMOTE attach command dies within quickExitGrace of starting, that is
@@ -167,7 +178,7 @@ func (b *tmuxPTYBridge) streamOutput() {
 
 		if err != nil {
 			switch {
-			case b.isRemote() && time.Since(b.startedAt) < quickExitGrace:
+			case b.isRemote() && !b.closing.Load() && time.Since(b.startedAt) < quickExitGrace:
 				// The remote attach command died shortly after connecting —
 				// e.g. ssh reached the host but auth was rejected, or the
 				// remote agent-deck binary is missing. terminal_attached
@@ -271,6 +282,10 @@ func (b *tmuxPTYBridge) Close() {
 		return
 	}
 	b.closeOnce.Do(func() {
+		// Set before the fd goes away: streamOutput's blocked Read wakes with
+		// an error the moment ptmx closes, and it must already be able to see
+		// that we are the cause (see the closing field).
+		b.closing.Store(true)
 		b.ptmxMu.Lock()
 		if b.ptmx != nil {
 			_ = b.ptmx.Close()

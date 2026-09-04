@@ -110,3 +110,78 @@ func TestQuickExitIsFatalOnlyForRemote(t *testing.T) {
 		}
 	})
 }
+
+// TestRemoteQuickExitSkippedWhenWeClosed pins the "closed by us" guard. The
+// attach process is long-lived and healthy; the bridge is torn down from our
+// side inside quickExitGrace (what happens when the WS client goes away — the
+// user closes the tab — and serveTerminalWS's deferred Close runs). The PTY
+// read then fails because WE closed the fd, which is not an attach failure, so
+// no fatal frame may be produced.
+//
+// TestRemoteWSCloseKillsCommand covers the same timing end-to-end but cannot
+// observe this: there the client has already closed its side, so any frame the
+// server wrote would be discarded by the failing WriteJSON. Here the client
+// stays connected and would see a stray REMOTE_ATTACH_FAILED.
+func TestRemoteQuickExitSkippedWhenWeClosed(t *testing.T) {
+	mapErr := func(error) (string, string, string) {
+		return "REMOTE_ATTACH_FAILED", "failed to attach remote terminal", "Check ssh."
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
+		if err != nil {
+			t.Errorf("upgrade: %v", err)
+			return
+		}
+		defer conn.Close()
+
+		writer := newWSConnWriter(conn)
+		// tmuxSession "" == the remote shape, the only one the quick-exit
+		// branch applies to.
+		bridge, err := newPTYBridge(exec.Command("sh", "-c", "sleep 30"), "sess-closed", "", "", writer, mapErr)
+		if err != nil {
+			t.Errorf("newPTYBridge: %v", err)
+			return
+		}
+		// Well inside quickExitGrace (3s), and the command is still alive.
+		time.Sleep(200 * time.Millisecond)
+		bridge.Close()
+
+		// Keep serving so the client can observe anything the bridge wrote on
+		// its way out.
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	testServer := httptest.NewServer(mux)
+	defer testServer.Close()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(testServer.URL, "/ws"), nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+	defer conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	_ = conn.SetReadDeadline(deadline)
+	for time.Now().Before(deadline) {
+		msgType, payload, err := conn.ReadMessage()
+		if err != nil {
+			break // read deadline or peer close: nothing more is coming.
+		}
+		if msgType != websocket.TextMessage {
+			continue
+		}
+		var msg wsServerMessage
+		if err := json.Unmarshal(payload, &msg); err != nil {
+			t.Fatalf("decode frame %q: %v", string(payload), err)
+		}
+		if msg.Type == "error" {
+			t.Fatalf("bridge closed by us produced a fatal frame (code=%s message=%s); want none",
+				msg.Code, msg.Message)
+		}
+	}
+}
