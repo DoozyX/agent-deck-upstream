@@ -12658,7 +12658,7 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 		// Cursor on a session: inherit from THAT session (duplicate-like)
 		projectPath = sourceSession.ProjectPath
 		tool = sourceSession.Tool
-		command = sourceSession.Command
+		command = inheritableQuickCreateCommand(sourceSession.Command)
 		if len(sourceSession.ToolOptionsJSON) > 0 {
 			toolOptionsJSON = session.StripResumeFields(sourceSession.ToolOptionsJSON)
 		}
@@ -12673,17 +12673,10 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 		}
 
 		h.instancesMu.RLock()
-		var mostRecent *session.Instance
-		for _, inst := range h.instances {
-			if inst.GroupPath == groupPath {
-				if mostRecent == nil || inst.CreatedAt.After(mostRecent.CreatedAt) {
-					mostRecent = inst
-				}
-			}
-		}
+		mostRecent := quickCreateTemplate(h.instances, groupPath)
 		if mostRecent != nil {
 			tool = mostRecent.Tool
-			command = mostRecent.Command
+			command = inheritableQuickCreateCommand(mostRecent.Command)
 			if len(mostRecent.ToolOptionsJSON) > 0 {
 				toolOptionsJSON = session.StripResumeFields(mostRecent.ToolOptionsJSON)
 			}
@@ -12753,6 +12746,44 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 		"",   // no placeholder
 		true, // quick-create → auto-named handle
 	)
+}
+
+// quickCreateTemplate returns the session a group-header quick-create inherits
+// its tool, command and options from: the most recently created LIVE session in
+// the group. Archived sessions are skipped — they are hidden from the list, so
+// silently inheriting one (the field case was an archived fork continuation)
+// gives the user no way to see where the new session's settings came from.
+func quickCreateTemplate(instances []*session.Instance, groupPath string) *session.Instance {
+	var mostRecent *session.Instance
+	for _, inst := range instances {
+		if inst == nil || inst.GroupPath != groupPath || inst.IsArchived() {
+			continue
+		}
+		if mostRecent == nil || inst.CreatedAt.After(mostRecent.CreatedAt) {
+			mostRecent = inst
+		}
+	}
+	return mostRecent
+}
+
+// inheritableQuickCreateCommand returns the part of a template session's
+// command a brand-new session may reuse: the command itself when it is a
+// reusable base invocation, and nothing when it is bound to the template's own
+// instance or conversation.
+//
+// Fork and continuation flows bake a one-shot launch line into
+// Instance.Command (`cd <source worktree> && export AGENTDECK_INSTANCE_ID=…;
+// exec claude --session-id … --resume … --fork-session …`). Copying that into
+// a new session made every Shift+N in the group land in the fork source's
+// directory, resuming the source's conversation under the source's instance
+// ID. Dropping it here lets the caller's tool fallback rebuild a clean
+// command. ToolOptionsJSON already gets the equivalent treatment via
+// session.StripResumeFields.
+func inheritableQuickCreateCommand(command string) string {
+	if session.CommandIsInstanceBound(command) {
+		return ""
+	}
+	return command
 }
 
 // deriveSessionNameFromPath returns the trailing directory of projectPath as a
