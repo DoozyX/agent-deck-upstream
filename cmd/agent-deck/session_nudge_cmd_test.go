@@ -64,6 +64,24 @@ func TestEvaluateNudgeGate_IdleSessionIsSent(t *testing.T) {
 	}
 }
 
+// A cached "running" status with a live idle-at-empty-prompt substate is the
+// stale-DB signature (heartbeat.log, 2026-09-05: four consecutive beats skipped
+// as "already running" against a conductor sitting at its prompt). The live
+// pane read outranks the cached status: send.
+func TestEvaluateNudgeGate_StaleBusyStatusWithIdlePromptIsSent(t *testing.T) {
+	for _, status := range []string{"running", "active", "starting"} {
+		gate := evaluateNudgeGate(true, status, session.SubstateIdleAtEmptyPrompt, false)
+		if gate.Action != nudgeActionSend {
+			t.Errorf("status %q + idle-at-empty-prompt: want send, got %q (%s)", status, gate.Action, gate.Reason)
+		}
+	}
+	// A busy status with an unknown substate still skips: only the positive
+	// live "idle" verdict overrides the cache.
+	if gate := evaluateNudgeGate(true, "running", session.SubstateNone, false); gate.Action != nudgeActionSkip {
+		t.Errorf("running + no substate: want skip, got %q", gate.Action)
+	}
+}
+
 func TestEvaluateNudgeGate_NotRunningIsRefusedEvenWithForce(t *testing.T) {
 	for _, force := range []bool{false, true} {
 		gate := evaluateNudgeGate(false, "stopped", session.SubstateNone, force)

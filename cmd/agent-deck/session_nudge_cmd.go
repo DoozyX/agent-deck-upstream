@@ -138,9 +138,17 @@ func handleSessionNudge(profile string, args []string) {
 		return // unreachable, satisfies staticcheck SA5011
 	}
 
+	// inst.Status as loaded is the value the last TUI/daemon write left in the
+	// DB — a headless run has nothing refreshing it, so a conductor that
+	// finished its turn hours ago still reads "running". Refresh from the live
+	// pane and hook status files the way `agent-deck status` does; gating a
+	// nudge on the stale value is how a heartbeat skipped four consecutive
+	// beats (45 min) against a conductor sitting at an empty prompt.
+	session.RefreshInstancesForCLIStatus([]*session.Instance{inst})
 	running := inst.Exists()
 	var substate session.Substate
 	if running {
+		_ = inst.UpdateStatus()
 		substate = inst.Substate()
 	}
 	gate := evaluateNudgeGate(running, string(inst.Status), substate, *force)
@@ -263,7 +271,13 @@ func evaluateNudgeGate(running bool, status string, substate session.Substate, f
 	// session is already doing the work a nudge would ask for. Reporting this
 	// as an error would train supervisors to ignore the exit code, which is
 	// the habit that caused the original incident.
-	if isBusyForNudge(status) {
+	//
+	// The substate is a live pane read; the status may be a cached DB value.
+	// When the two disagree — status says "running", pane shows an empty
+	// prompt with nothing in flight — the pane wins: a session at its prompt is
+	// exactly what a nudge is for, and skipping it as "busy" silently disables
+	// the supervisor loop that relies on this gate.
+	if isBusyForNudge(status) && substate != session.SubstateIdleAtEmptyPrompt {
 		return nudgeGate{Action: nudgeActionSkip, Reason: "already " + status}
 	}
 

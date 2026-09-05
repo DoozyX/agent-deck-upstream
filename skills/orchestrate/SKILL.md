@@ -327,10 +327,18 @@ the exact baseline, full-suite, lint/format, build/vet and E2E commands, plus
 the focused-test command shape (how to test only the packages or paths a
 diff touches — incremental review rounds render it as `FOCUSED_TESTS=`); each
 command's required services, credentials and fixtures; who owns that
-infrastructure; and the known environment-dependent failures. Children cite
-that block instead of rediscovering or paraphrasing the same constraints. A
-task may append a task-specific exception, but must not silently replace the
-shared contract.
+infrastructure; the known environment-dependent failures; and the **known
+test-generated drift files** — tracked files the suite itself rewrites
+(`Package.resolved` under `swift test`, a regenerated lockfile, a snapshot
+directory). Reviewers are read-only by design and must not restore them, so
+the drift legitimately survives to the endgame: the merge child, as sole
+occupant, restores exactly the listed files (`git checkout -- <file>`) before
+it merges, and the cleanup executor still refuses any other dirt. Where the
+runner can be told not to write (`swift test --disable-automatic-resolution`,
+`npm ci`), put that in the contract's test command instead and leave the list
+empty. Children cite that block instead of rediscovering or paraphrasing the
+same constraints. A task may append a task-specific exception, but must not
+silently replace the shared contract.
 
 Then record per task: slug, base ref and resolved base sha, branch, worktree
 path, verified launch HEAD and merge base, session ids with each session's
@@ -783,7 +791,12 @@ The reviewer default is mid regardless of the implementer's tier:
 review is verification work (diff vs. spec, run the suite) and the
 Checked/VERDICT format keeps it honest. Freeform or design-heavy tasks get
 a strong reviewer because spec compliance there is a judgment call, not a
-checklist.
+checklist. Run the **last** gate strong when the budget is nearly spent,
+for a reason distinct from difficulty: a mid-tier gate re-raises items
+already dispositioned in earlier rounds, and the final gate cannot afford
+that noise. One run's strong gate-2 matched 9 of 11 findings back to prior
+dispositions and dropped them, leaving 2 genuinely new items; its mid-tier
+predecessors had re-litigated deferred work every round.
 
 Cheap keeps one home: work you would otherwise do yourself. Three properties
 make a job safe to hand down — bounded input, extraction rather than
@@ -1673,6 +1686,15 @@ task's `$RUN_DIR` directory, and give it the exact candidate list from
 `$RUN_DIR/worktrees.tsv`. The pushed remote branch backs the PR, so nothing
 local is still needed. Cleanup stays serial because worktrees and branches
 share repository-wide Git metadata.
+
+`BASE_REF` is the ref the work actually landed on, and on a direct-merge
+endgame that is **`origin/<target>` after a `git fetch`, never the primary
+checkout's local branch**. Merge children push `HEAD:refs/heads/<target>` from
+a detached worktree, so the primary's local `main` stays where the run found
+it; a cleanup child handed `BASE_REF=main` finds no candidate merged into it
+and refuses the whole list — correctly, and uselessly. A PR endgame has the
+same shape: the base is `origin/<base-branch>` after the merge, not a local
+name.
 
 ```bash
 agent-deck session remove <id> --force
