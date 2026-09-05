@@ -125,7 +125,14 @@ The file must exist and `status` must print nothing (ignored ⇒ invisible).
 Once written, read the document for placeholders (`TBD`, "etc.",
 "handle errors"), internal contradictions, scope creep past what was
 approved, and ambiguity a fresh reader would resolve differently than you
-meant. Make non-material fixes in place. The prior design approval covers
+meant. For contradictions, do a mechanical pass rather than a read-through:
+list every named region, state, mode or component the spec defines, grep the
+document for each name, and confirm every mention agrees on its behavior. A
+design once said in prose that a region does *not* repeat a countdown while
+its own table two paragraphs down defined that region's hero *as* the
+countdown; two full terminal review gates were spent re-deriving that from
+scratch before anyone could implement it. Make non-material fixes in place.
+The prior design approval covers
 that document; do not ask for a second document-review approval.
 
 If self-review makes a material change to scope, user-visible behavior,
