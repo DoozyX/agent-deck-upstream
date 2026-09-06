@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -257,7 +258,13 @@ func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("ssh command failed: %w: %s", err, stderr.String())
+		// The remote CLI reports refusals such as "path does not exist" on
+		// stdout; fall back to it so the failure is not a bare exit status.
+		detail := stderr.String()
+		if strings.TrimSpace(detail) == "" {
+			detail = strings.TrimSpace(stdout.String())
+		}
+		return nil, fmt.Errorf("ssh command failed: %w: %s", err, detail)
 	}
 
 	return stdout.Bytes(), nil
@@ -686,6 +693,69 @@ func (r *SSHRunner) FetchSessionPane(ctx context.Context, sessionID string) (str
 	return parseRemoteSessionOutput(output)
 }
 
+// groupListJSON mirrors the subset of `agent-deck group list --json` output
+// the TUI needs: the recursive group path tree. Counts and status are
+// ignored — a group with zero sessions is still a valid move/create target.
+type groupListJSON struct {
+	Groups []groupListEntryJSON `json:"groups"`
+}
+
+type groupListEntryJSON struct {
+	Path     string               `json:"path"`
+	Children []groupListEntryJSON `json:"children,omitempty"`
+}
+
+// FetchGroupPaths retrieves the remote's full group path list from its own
+// state DB via `agent-deck group list --json`. Unlike session-derived group
+// buckets (which can only ever contain groups that currently hold sessions),
+// the remote's group list includes EMPTY groups, so the local move dialog (M
+// key on a remote session) can still offer a folder after every session has
+// been moved out of it. Paths are normalized, deduped and sorted.
+//
+// Returns nil with no error when the remote returns empty output (older
+// agent-deck builds that predate the JSON shape); callers fall back to the
+// groups observed on the fetched sessions.
+func (r *SSHRunner) FetchGroupPaths(ctx context.Context) ([]string, error) {
+	output, err := r.Run(ctx, "group", "list", "--json")
+	if err != nil {
+		return nil, err
+	}
+
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, nil
+	}
+
+	var parsed groupListJSON
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return nil, fmt.Errorf("failed to parse remote group list: %w", err)
+	}
+
+	return parseGroupListPaths(parsed), nil
+}
+
+// parseGroupListPaths flattens the recursive group tree from `group list
+// --json` into normalized, deduped, sorted group paths. Extracted as a pure
+// function so the parsing is unit-testable without an SSH round-trip.
+func parseGroupListPaths(parsed groupListJSON) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	var walk func(entries []groupListEntryJSON)
+	walk = func(entries []groupListEntryJSON) {
+		for _, e := range entries {
+			p := strings.Trim(strings.TrimSpace(e.Path), "/")
+			if p != "" && !seen[p] {
+				seen[p] = true
+				paths = append(paths, p)
+			}
+			walk(e.Children)
+		}
+	}
+	walk(parsed.Groups)
+	sort.Strings(paths)
+	return paths
+}
+
 // FetchCostSummary retrieves the remote agent-deck's cost summary as JSON.
 // #1101: the local TUI's status-line cost segment used to show only events
 // written to the local cost_events table — remote sessions' Stop hooks write
@@ -1063,6 +1133,21 @@ type RemoteAddOptions struct {
 	// WorktreeBranch creates the session in a git worktree for this branch on
 	// the server (-w); the branch is created there when it does not exist.
 	WorktreeBranch string
+	// CreateDir asks the server to create a missing Path (--create-dir). The
+	// TUI sets it only after the server reported the path missing and the
+	// user confirmed; a remote too old for the flag refuses the command.
+	CreateDir bool
+}
+
+// remoteMissingPathMarker is the text the remote `add` prints when its
+// project directory does not exist (see the add command's os.Stat check).
+const remoteMissingPathMarker = "path does not exist"
+
+// IsRemotePathMissing reports whether a remote create failed because the
+// project directory does not exist on the server, so the caller can offer to
+// create it and retry with RemoteAddOptions.CreateDir.
+func IsRemotePathMissing(err error) bool {
+	return err != nil && strings.Contains(err.Error(), remoteMissingPathMarker)
 }
 
 // remoteAddArgs builds the `agent-deck add` argument list for creating a
@@ -1122,6 +1207,9 @@ func remoteAddArgs(o RemoteAddOptions) ([]string, error) {
 	}
 	if b := strings.TrimSpace(o.WorktreeBranch); b != "" {
 		args = append(args, "-w", b)
+	}
+	if o.CreateDir {
+		args = append(args, "--create-dir")
 	}
 	if p := strings.TrimSpace(o.Path); p != "" && p != "." {
 		args = append(args, p)
