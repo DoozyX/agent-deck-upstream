@@ -704,7 +704,15 @@ type Home struct {
 	// remoteCreateSink is an optional override used by tests to capture what
 	// the new-session dialog forwards to the remote-create path (#1353) without
 	// opening an SSH connection. When nil, createRemoteSessionWithOptions runs.
-	remoteCreateSink func(remoteName, tool, title, path, group string, sandbox bool) tea.Cmd
+	remoteCreateSink func(remoteName string, opts session.RemoteAddOptions) tea.Cmd
+	// remoteAccountsFetcher is an optional override used by tests to replace
+	// the SSH fetch of a remote's account slots when its dialog opens.
+	remoteAccountsFetcher func(remoteName string) tea.Cmd
+	// remoteAccountsGen numbers each opening of the remote new-session dialog;
+	// an account fetch answers for the opening that requested it and is
+	// dropped otherwise, so a slow answer for an earlier opening can never
+	// replace the slot list the user is choosing from now.
+	remoteAccountsGen uint64
 	// insertKeySender is the persistent dispatch path opened on
 	// enterInsertMode and closed on exitInsertMode (#1102 perf fix +
 	// remote support). Local sessions get a tmux.KeySender (control-mode
@@ -6565,6 +6573,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.setError(fmt.Errorf("restarted '%s' on %s", msg.title, msg.remoteName))
 		return h, h.fetchRemoteSessions
 
+	case remoteAccountsFetchedMsg:
+		h.applyRemoteAccounts(msg)
+		return h, nil
+
 	case remoteSessionCreatedMsg:
 		if msg.err != nil {
 			h.setError(msg.err)
@@ -8061,13 +8073,17 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// filesystem (#743).
 		if h.pendingRemoteName != "" {
 			remoteName := h.pendingRemoteName
-			name, path, command := h.newDialog.GetRemoteValues()
-			groupPath := h.newDialog.GetSelectedGroup()
-			// The sandbox checkbox applies to the remote too: the remote runs
-			// the container with its own Docker config and image.
-			sandbox := h.newDialog.IsSandboxEnabled()
+			// Everything the dialog collected travels to the remote's own
+			// `add` (account slot, model, Claude toggles, sandbox, worktree,
+			// yolo); a field that command cannot express is refused here,
+			// while the dialog is still open to show the message.
+			opts, optsErr := h.newDialog.GetRemoteCreateOptions()
+			if optsErr != "" {
+				h.newDialog.SetError(optsErr)
+				return h, nil
+			}
 			// Remember the submitted tool for the next dialog open (UX top-3 #2).
-			rememberTool(h.stateDB(), command)
+			rememberTool(h.stateDB(), opts.Tool)
 			h.newDialog.Hide()
 			h.pendingRemoteName = ""
 			h.clearError()
@@ -8075,7 +8091,7 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if h.remoteCreateSink != nil {
 				create = h.remoteCreateSink
 			}
-			return h, create(remoteName, command, name, path, groupPath, sandbox)
+			return h, create(remoteName, opts)
 		}
 
 		// Get values including worktree settings.
@@ -8262,10 +8278,13 @@ func (h *Home) handleNewDialogKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return h, cmd
 }
 
-func (h *Home) showRemoteNewSessionDialog(item session.Item) {
+// showRemoteNewSessionDialog opens the new-session dialog for a remote target
+// and returns the command that fetches the remote's account slots for the
+// dialog's account row (see remoteAccountsFetchedMsg).
+func (h *Home) showRemoteNewSessionDialog(item session.Item) tea.Cmd {
 	remoteName := item.RemoteName
 	if remoteName == "" {
-		return
+		return nil
 	}
 
 	paths := h.remotePathSuggestions(remoteName)
@@ -8300,14 +8319,78 @@ func (h *Home) showRemoteNewSessionDialog(item session.Item) {
 		h.newDialog.pathInput.SetValue(".")
 		h.newDialog.pathSoftSelected = true
 	}
-	// Remote creation goes through the remote CLI. Disable local-only defaults
-	// that ShowInGroup may have inherited from this machine's config.
-	h.newDialog.worktreeEnabled = false
-	h.newDialog.worktreeToggled = false
-	h.newDialog.sandboxEnabled = false
-	h.newDialog.multiRepoEnabled = false
-	h.newDialog.multiRepoPaths = nil
-	h.newDialog.rebuildFocusTargets()
+	// Remote creation goes through the remote CLI, which applies the server's
+	// own defaults. Drop everything ShowInGroup inherited from this machine's
+	// config so only what the user sets in the dialog is forwarded.
+	h.newDialog.ResetRemoteDefaults()
+	// The account row now lists the server's slots, not this machine's: they
+	// arrive asynchronously so opening the dialog never blocks on SSH.
+	fetch := h.fetchRemoteAccounts
+	if h.remoteAccountsFetcher != nil {
+		fetch = h.remoteAccountsFetcher
+	}
+	h.remoteAccountsGen++
+	gen := h.remoteAccountsGen
+	cmd := fetch(remoteName)
+	if cmd == nil {
+		return nil
+	}
+	// Stamp the answer with this opening's generation so applyRemoteAccounts
+	// can tell a late answer for a previous opening from the current one.
+	return func() tea.Msg {
+		msg := cmd()
+		if fetched, ok := msg.(remoteAccountsFetchedMsg); ok {
+			fetched.gen = gen
+			return fetched
+		}
+		return msg
+	}
+}
+
+// remoteAccountsFetchedMsg carries the account slot names configured on a
+// remote, for the new-session dialog opened on that remote.
+type remoteAccountsFetchedMsg struct {
+	remoteName string
+	accounts   []string
+	err        error
+	// gen is the remoteAccountsGen value of the dialog opening that asked.
+	gen uint64
+}
+
+// fetchRemoteAccounts asks the remote for its configured Claude account slots
+// (`accounts --json`, read-only). Only names come back; nothing local is sent.
+func (h *Home) fetchRemoteAccounts(remoteName string) tea.Cmd {
+	return func() tea.Msg {
+		config, err := session.LoadUserConfig()
+		if err != nil || config == nil || config.Remotes == nil {
+			return remoteAccountsFetchedMsg{remoteName: remoteName, err: fmt.Errorf("failed to load remote config")}
+		}
+		rc, ok := config.Remotes[remoteName]
+		if !ok {
+			return remoteAccountsFetchedMsg{remoteName: remoteName, err: fmt.Errorf("remote '%s' not found", remoteName)}
+		}
+		runner := session.NewSSHRunner(remoteName, rc)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		accounts, err := runner.FetchAccounts(ctx)
+		return remoteAccountsFetchedMsg{remoteName: remoteName, accounts: accounts, err: err}
+	}
+}
+
+// applyRemoteAccounts hands the fetched slot names to the dialog when it is
+// still open for that remote and this opening asked for it; a late answer
+// for a closed dialog, a different remote or an earlier opening is dropped. A failed fetch (offline host, or a remote too
+// old for `accounts`) leaves the row hidden rather than offering local names.
+func (h *Home) applyRemoteAccounts(msg remoteAccountsFetchedMsg) {
+	if msg.err != nil || !h.newDialog.IsVisible() || h.pendingRemoteName != msg.remoteName {
+		return
+	}
+	// Same remote, dialog still open, but asked by an earlier opening: the
+	// user may already be choosing from a newer list, so keep it.
+	if msg.gen != h.remoteAccountsGen {
+		return
+	}
+	h.newDialog.SetRemoteAccounts(msg.accounts)
 }
 
 func (h *Home) remotePathSuggestions(remoteName string) []string {
@@ -9591,8 +9674,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if h.cursor >= 0 && h.cursor < len(h.flatItems) {
 			item := h.flatItems[h.cursor]
 			if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
-				h.showRemoteNewSessionDialog(item)
-				return h, nil
+				return h, h.showRemoteNewSessionDialog(item)
 			}
 		}
 
@@ -14296,17 +14378,13 @@ func (a attachCmd) SetStderr(w io.Writer) {}
 // createRemoteSession creates a new session on a remote and auto-attaches to it.
 // Used by quick-create (N): auto-generated name, remote defaults (shell).
 func (h *Home) createRemoteSession(remoteName string) tea.Cmd {
-	return h.createRemoteSessionWithOptions(remoteName, "", "", "", "", false)
+	return h.createRemoteSessionWithOptions(remoteName, session.RemoteAddOptions{})
 }
 
 // remoteCreateAndAttachCmd creates a session on the remote, then attaches to it.
 type remoteCreateAndAttachCmd struct {
 	runner    *session.SSHRunner
-	tool      string
-	title     string
-	path      string
-	group     string
-	sandbox   bool
+	opts      session.RemoteAddOptions
 	createCtx context.Context
 	// onExit: same contract as attachCmd.onExit (#1753) — clear the attach flag
 	// while Bubble Tea's loop is still parked, so the first View() after resume
@@ -14326,10 +14404,10 @@ func (e remoteAttachFailedError) Unwrap() error {
 	return e.err
 }
 
-// Run creates the session on the remote with the dialog's tool, title, path,
-// group and sandbox choice, then attaches to it. A create failure is returned
-// as-is; an attach failure after a successful create is wrapped in
-// remoteAttachFailedError so the caller can tell the two apart.
+// Run creates the session on the remote with the dialog's choices, then
+// attaches to it. A create failure is returned as-is; an attach failure after
+// a successful create is wrapped in remoteAttachFailedError so the caller can
+// tell the two apart.
 func (r remoteCreateAndAttachCmd) Run() error {
 	if r.onExit != nil {
 		defer r.onExit()
@@ -14340,7 +14418,7 @@ func (r remoteCreateAndAttachCmd) Run() error {
 	}
 	ctx, cancel := context.WithTimeout(baseCtx, 20*time.Second)
 	defer cancel()
-	sessionID, err := r.runner.CreateSessionWithOptions(ctx, r.tool, r.title, r.path, r.group, r.sandbox)
+	sessionID, err := r.runner.CreateSessionWithOptions(ctx, r.opts)
 	if err != nil {
 		return err
 	}
@@ -14354,12 +14432,10 @@ func (r remoteCreateAndAttachCmd) SetStdin(reader io.Reader)  {}
 func (r remoteCreateAndAttachCmd) SetStdout(writer io.Writer) {}
 func (r remoteCreateAndAttachCmd) SetStderr(writer io.Writer) {}
 
-// createRemoteSessionWithOptions creates a new session on a remote with an
-// explicit tool/title/path/group from the new-session dialog (#1353), then
-// auto-attaches to it. Empty values fall back to remote defaults (shell,
-// auto-generated name, remote CWD). sandbox forwards the dialog's Docker
-// sandbox checkbox so the remote creates the session with -sandbox.
-func (h *Home) createRemoteSessionWithOptions(remoteName, tool, title, path, group string, sandbox bool) tea.Cmd {
+// createRemoteSessionWithOptions creates a new session on a remote with the
+// new-session dialog's choices (#1353), then auto-attaches to it. Zero values
+// fall back to remote defaults (shell, auto-generated name, remote CWD).
+func (h *Home) createRemoteSessionWithOptions(remoteName string, opts session.RemoteAddOptions) tea.Cmd {
 	config, err := session.LoadUserConfig()
 	if err != nil || config == nil || config.Remotes == nil {
 		return func() tea.Msg {
@@ -14375,7 +14451,7 @@ func (h *Home) createRemoteSessionWithOptions(remoteName, tool, title, path, gro
 	runner := session.NewSSHRunner(remoteName, rc)
 	h.isAttaching.Store(true)
 	return tea.Exec(remoteCreateAndAttachCmd{
-		runner: runner, tool: tool, title: title, path: path, group: group, sandbox: sandbox, createCtx: h.ctx,
+		runner: runner, opts: opts, createCtx: h.ctx,
 		// Clear the flag inside Run(), before Bubble Tea restores the terminal
 		// and resumes the loop (#1753); the callback below is only the belt for
 		// the path where Run() never executes.

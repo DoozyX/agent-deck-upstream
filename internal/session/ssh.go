@@ -526,6 +526,43 @@ func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, err
 	return sessions, nil
 }
 
+// FetchAccounts lists the named Claude account slots configured on the remote
+// (its `accounts --json`), so the TUI's remote new-session dialog offers the
+// server's slots rather than this machine's. Read-only: only names travel back;
+// no config directory or credential file is copied in either direction. A
+// remote too old for `accounts` fails the call, and the caller then hides the
+// account row instead of offering local names the server would reject.
+func (r *SSHRunner) FetchAccounts(ctx context.Context) ([]string, error) {
+	output, err := r.Run(ctx, "accounts", "--json")
+	if err != nil {
+		return nil, err
+	}
+	return parseRemoteAccountNames(output)
+}
+
+// parseRemoteAccountNames extracts the slot names from `accounts --json`
+// output. The remote's config_dir values are deliberately dropped: a path on
+// the server means nothing here and must never be shown as something to pick.
+func parseRemoteAccountNames(output []byte) ([]string, error) {
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || trimmed[0] != '[' {
+		return nil, fmt.Errorf("unexpected remote accounts output: %q", string(trimmed))
+	}
+	var entries []struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(trimmed, &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse remote accounts: %w", err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if name := strings.TrimSpace(e.Name); name != "" {
+			names = append(names, name)
+		}
+	}
+	return names, nil
+}
+
 // FetchPendingRecords retrieves the remote host's completion and transition
 // records over the SAME ssh path every other remote fetch uses (issue #1948).
 //
@@ -991,43 +1028,117 @@ func remoteAttachTERM() string {
 
 // CreateSession creates and starts a quick new session on the remote, returning its ID.
 func (r *SSHRunner) CreateSession(ctx context.Context) (string, error) {
-	return r.CreateSessionWithOptions(ctx, "", "", "", "", false)
+	return r.CreateSessionWithOptions(ctx, RemoteAddOptions{})
+}
+
+// RemoteAddOptions carries the new-session dialog's choices to the remote's
+// own `agent-deck add`. Every name in it (account slot, MCP, branch) is
+// resolved by the server against its own config and filesystem; nothing from
+// this machine's config or credentials is copied. Zero values mean "remote
+// default" so an untouched dialog behaves exactly as before.
+type RemoteAddOptions struct {
+	Tool  string // -c; empty means shell
+	Title string // -t; empty means --quick (auto-generated name)
+	Path  string // positional; empty or "." means remote CWD
+	Group string // -g
+
+	// Sandbox forwards the "Run in Docker sandbox" checkbox as -sandbox; the
+	// image and other Docker settings come from the remote's own config.
+	Sandbox bool
+	// Account is a named slot ([profiles.<name>.claude].config_dir) that must
+	// exist in the server's config.toml. A config directory path is refused.
+	Account string
+	// Model is the per-session model/version override (--model).
+	Model string
+	// MCPs are attached by name at creation (--mcp, repeatable).
+	MCPs []string
+	// ResumeSessionID resumes an existing Claude conversation on the server.
+	ResumeSessionID string
+	// ExtraArgs are already-tokenised claude CLI flags (--extra-arg,
+	// repeatable). The dialog's Claude toggles travel here as the same flags
+	// a local session would launch with.
+	ExtraArgs []string
+	// Yolo enables YOLO mode for Gemini or Codex (--yolo).
+	Yolo bool
+	// WorktreeBranch creates the session in a git worktree for this branch on
+	// the server (-w); the branch is created there when it does not exist.
+	WorktreeBranch string
 }
 
 // remoteAddArgs builds the `agent-deck add` argument list for creating a
 // session on a remote with explicit dialog values (#1353). Empty values fall
 // back to remote defaults: no -c means shell, no -t means --quick
 // (auto-generated name), and an empty or "." path means remote CWD.
-// sandbox forwards the dialog's "Run in Docker sandbox" checkbox as -sandbox;
-// the image and other Docker settings come from the remote's own config.
-func remoteAddArgs(tool, title, path, group string, sandbox bool) []string {
+//
+// Values that cannot be forwarded safely are refused here, before any SSH
+// round trip, instead of being dropped: an account given as a config
+// directory (a local path means nothing on the server and its credentials are
+// never copied) and an --extra-arg token that would fail the server's own
+// validation.
+func remoteAddArgs(o RemoteAddOptions) ([]string, error) {
 	args := []string{"add", "--json"}
-	if t := strings.TrimSpace(title); t != "" {
+	if t := strings.TrimSpace(o.Title); t != "" {
 		args = append(args, "-t", t)
 	} else {
 		args = append(args, "--quick")
 	}
-	if g := strings.TrimSpace(group); g != "" {
+	if g := strings.TrimSpace(o.Group); g != "" {
 		args = append(args, "-g", g)
 	}
-	if c := strings.TrimSpace(tool); c != "" {
+	if c := strings.TrimSpace(o.Tool); c != "" {
 		args = append(args, "-c", c)
 	}
-	if sandbox {
+	if o.Sandbox {
 		args = append(args, "-sandbox")
 	}
-	if p := strings.TrimSpace(path); p != "" && p != "." {
+	if a := strings.TrimSpace(o.Account); a != "" {
+		if strings.ContainsAny(a, `/\`) || strings.HasPrefix(a, "~") || strings.HasPrefix(a, ".") {
+			return nil, fmt.Errorf("account %q looks like a config directory; pass a named account slot that exists in the remote's config.toml (local config directories and credentials are never copied to a remote)", a)
+		}
+		args = append(args, "--account", a)
+	}
+	if m := strings.TrimSpace(o.Model); m != "" {
+		args = append(args, "--model", m)
+	}
+	for _, mcp := range o.MCPs {
+		if name := strings.TrimSpace(mcp); name != "" {
+			args = append(args, "--mcp", name)
+		}
+	}
+	if id := strings.TrimSpace(o.ResumeSessionID); id != "" {
+		args = append(args, "--resume-session", id)
+	}
+	for _, token := range o.ExtraArgs {
+		if token == "" {
+			continue
+		}
+		if err := ValidateClaudeExtraArgToken(token); err != nil {
+			return nil, err
+		}
+		args = append(args, "--extra-arg", token)
+	}
+	if o.Yolo {
+		args = append(args, "--yolo")
+	}
+	if b := strings.TrimSpace(o.WorktreeBranch); b != "" {
+		args = append(args, "-w", b)
+	}
+	if p := strings.TrimSpace(o.Path); p != "" && p != "." {
 		args = append(args, p)
 	}
-	return args
+	return args, nil
 }
 
 // CreateSessionWithOptions creates and starts a new session on the remote with
-// an explicit tool/title/path/group/sandbox from the new-session dialog (#1353),
-// returning its ID. Empty values fall back to remote defaults (see remoteAddArgs).
-func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, tool, title, path, group string, sandbox bool) (string, error) {
+// the new-session dialog's choices (#1353), returning its ID. Zero values fall
+// back to remote defaults (see remoteAddArgs).
+func (r *SSHRunner) CreateSessionWithOptions(ctx context.Context, opts RemoteAddOptions) (string, error) {
+	addArgs, err := remoteAddArgs(opts)
+	if err != nil {
+		return "", err
+	}
 	// Step 1: Create the session
-	output, err := r.Run(ctx, remoteAddArgs(tool, title, path, group, sandbox)...)
+	output, err := r.Run(ctx, addArgs...)
 	if err != nil {
 		return "", fmt.Errorf("failed to create remote session: %w", err)
 	}
