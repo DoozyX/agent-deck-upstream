@@ -160,6 +160,10 @@ type SSHRunner struct {
 	// runFn lets tests stub out command execution. nil = real SSH.
 	runFn func(ctx context.Context, args ...string) ([]byte, error)
 
+	// name is the remote's config name; it keys the shared persistent
+	// channel (#2174). Empty for runners built without a name.
+	name string
+
 	// openStreamFn lets tests stub out the persistent-stream subprocess
 	// without spawning real ssh. nil = real SSH (#1112 bug 2).
 	openStreamFn func(ctx context.Context, args ...string) (io.WriteCloser, func() error, error)
@@ -178,6 +182,7 @@ func NewSSHRunner(name string, rc RemoteConfig) *SSHRunner {
 		configuredPath: rc.AgentDeckPath,
 		Profile:        rc.GetProfile(),
 		commandTimeout: rc.GetCommandTimeout(),
+		name:           name,
 	}
 }
 
@@ -243,6 +248,15 @@ func (r *SSHRunner) OpenStream(ctx context.Context, args ...string) (io.WriteClo
 func (r *SSHRunner) run(ctx context.Context, args ...string) ([]byte, error) {
 	if r.runFn != nil {
 		return r.runFn(ctx, args...)
+	}
+	// Persistent channel first (#2174): one ssh session per remote carries
+	// every command. A transport failure falls through to a plain exec, so
+	// the channel can only make things faster, never break them.
+	if ch := channelFor(r); ch != nil && ch.Connected() {
+		out, err := ch.Request(ctx, args)
+		if !errors.Is(err, errChannelDown) {
+			return out, err
+		}
 	}
 	if err := ValidateSSHHost(r.Host); err != nil {
 		return nil, err
@@ -518,18 +532,20 @@ func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, err
 	if err != nil {
 		return nil, err
 	}
+	return parseRemoteSessions(output)
+}
 
-	// Handle empty/non-JSON output (e.g., "No sessions found" message)
+// parseRemoteSessions decodes `list --json` output; empty or non-JSON output
+// (an older remote, or "No sessions found") is an empty list, not an error.
+func parseRemoteSessions(output []byte) ([]RemoteSessionInfo, error) {
 	trimmed := bytes.TrimSpace(output)
 	if len(trimmed) == 0 || trimmed[0] != '[' {
 		return nil, nil
 	}
-
 	var sessions []RemoteSessionInfo
 	if err := json.Unmarshal(trimmed, &sessions); err != nil {
 		return nil, fmt.Errorf("failed to parse remote sessions: %w", err)
 	}
-
 	return sessions, nil
 }
 
