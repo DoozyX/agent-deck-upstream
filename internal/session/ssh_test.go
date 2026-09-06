@@ -564,6 +564,62 @@ func TestSSHRunnerFetchAccounts_ErrorsAreNotEmptyLists(t *testing.T) {
 	}
 }
 
+// FetchMCPs asks the remote for its MCP names only, through the quiet form
+// that prints one name per line: `mcp list --json` would ship every
+// definition, env included, and credentials commonly live there. Names come
+// back sorted.
+func TestSSHRunnerFetchMCPs(t *testing.T) {
+	var gotArgs []string
+	runner := &SSHRunner{
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			gotArgs = args
+			return []byte("memory\ngithub\n  \n"), nil
+		},
+	}
+	names, err := runner.FetchMCPs(context.Background())
+	if err != nil {
+		t.Fatalf("FetchMCPs: %v", err)
+	}
+	if strings.Join(gotArgs, " ") != "mcp list --quiet" {
+		t.Fatalf("remote command = %q, want \"mcp list --quiet\" (names only; --json would ship definitions and env)", strings.Join(gotArgs, " "))
+	}
+	if strings.Join(names, ",") != "github,memory" {
+		t.Fatalf("names = %v, want [github memory]", names)
+	}
+}
+
+// A remote too old for `mcp list --quiet` exits non-zero (unknown flag); that
+// is an error, never a silent empty list that would look like "no MCPs
+// configured". The payload is not echoed into the error.
+func TestSSHRunnerFetchMCPs_ErrorsAreNotEmptyLists(t *testing.T) {
+	runner := &SSHRunner{
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			return []byte("flag provided but not defined: -quiet\n"), errors.New("exit status 2")
+		},
+	}
+	names, err := runner.FetchMCPs(context.Background())
+	if err == nil {
+		t.Fatalf("FetchMCPs = %v, want an error", names)
+	}
+	if len(names) != 0 {
+		t.Fatalf("names = %v on error, want none", names)
+	}
+}
+
+// A remote with no MCPs prints nothing in quiet mode: that is a real, empty
+// list.
+func TestSSHRunnerFetchMCPs_EmptyListIsNotAnError(t *testing.T) {
+	runner := &SSHRunner{
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			return []byte(""), nil
+		},
+	}
+	names, err := runner.FetchMCPs(context.Background())
+	if err != nil || len(names) != 0 {
+		t.Fatalf("FetchMCPs = %v, %v; want an empty list and no error", names, err)
+	}
+}
+
 func TestSSHRunnerCreateSessionWithOptions_RefusedValueNeverContactsRemote(t *testing.T) {
 	calls := 0
 	runner := &SSHRunner{
@@ -584,7 +640,8 @@ func TestSSHRunnerCreateSessionWithOptions_RefusedValueNeverContactsRemote(t *te
 // TestParseGroupListPaths pins the group-list flattener that backs
 // SSHRunner.FetchGroupPaths: `group list --json` returns a recursive tree
 // whose paths (including EMPTY groups — session_count 0) must all surface,
-// deduped and sorted, for the remote move/create dialogs.
+// deduped and in the remote's own order (siblings as listed, a parent before
+// its children), for the remote move/create dialogs and the group headers.
 func TestParseGroupListPaths(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -624,6 +681,21 @@ func TestParseGroupListPaths(t *testing.T) {
 			],"total_groups":1,"total_sessions":0}`,
 			want: []string{"a"},
 		},
+		{
+			// The remote lists siblings by their persisted Order, which is
+			// not name order once someone has reordered them; that order is
+			// the whole point of the list and must survive the flattening.
+			name: "remote order kept, not re-sorted by name",
+			input: `{"groups":[
+				{"name":"work","path":"work","session_count":1,
+				 "children":[
+					{"name":"zeta","path":"work/zeta","session_count":0},
+					{"name":"alpha","path":"work/alpha","session_count":0}
+				 ]},
+				{"name":"archive","path":"archive","session_count":0}
+			],"total_groups":4,"total_sessions":1}`,
+			want: []string{"work", "work/zeta", "work/alpha", "archive"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -656,5 +728,122 @@ func TestIsRemotePathMissing(t *testing.T) {
 	}
 	if IsRemotePathMissing(nil) {
 		t.Fatal("nil error treated as a missing path")
+	}
+}
+
+// Archive/unarchive forward to the remote's own `session archive` /
+// `session unarchive` verbs with the session id as the only operand, so the
+// remote's archived list stays the single source of truth.
+func TestSSHRunnerArchiveSession_ForwardsRemoteVerbs(t *testing.T) {
+	var calls [][]string
+	runner := &SSHRunner{
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string(nil), args...))
+			return []byte(`{"success":true}`), nil
+		},
+	}
+	if err := runner.ArchiveSession(context.Background(), "abc123"); err != nil {
+		t.Fatalf("ArchiveSession: %v", err)
+	}
+	if err := runner.UnarchiveSession(context.Background(), "abc123"); err != nil {
+		t.Fatalf("UnarchiveSession: %v", err)
+	}
+	want := "session archive abc123|session unarchive abc123"
+	got := make([]string, 0, len(calls))
+	for _, c := range calls {
+		got = append(got, strings.Join(c, " "))
+	}
+	if strings.Join(got, "|") != want {
+		t.Fatalf("remote commands = %q, want %q", strings.Join(got, "|"), want)
+	}
+
+	failing := &SSHRunner{runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+		return nil, errors.New("session 'abc123' is already archived")
+	}}
+	if err := failing.ArchiveSession(context.Background(), "abc123"); err == nil {
+		t.Fatal("a remote refusal must surface as an error")
+	}
+}
+
+// ForkSession forwards exactly the remote's own `session fork --json <id>`
+// (title and group stay server decisions) and returns the new_id it reports.
+func TestSSHRunnerForkSession_ForwardsForkVerb(t *testing.T) {
+	var calls [][]string
+	runner := &SSHRunner{
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			calls = append(calls, append([]string(nil), args...))
+			return []byte(`{"success":true,"parent_id":"parent-abc","new_id":"child-def","new_title":"task-fork"}` + "\n"), nil
+		},
+	}
+
+	newID, err := runner.ForkSession(context.Background(), "parent-abc")
+	if err != nil {
+		t.Fatalf("ForkSession: %v", err)
+	}
+	if newID != "child-def" {
+		t.Fatalf("new ID = %q, want child-def", newID)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly one remote call, got %v", calls)
+	}
+	want := []string{"session", "fork", "--json", "parent-abc"}
+	if strings.Join(calls[0], " ") != strings.Join(want, " ") {
+		t.Fatalf("forwarded args = %v, want %v", calls[0], want)
+	}
+}
+
+// A remote fork that fails (unforkable tool, unknown session, SSH error) must
+// surface the error and never report a session ID.
+func TestSSHRunnerForkSession_ErrorsAreNotIDs(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		err    error
+	}{
+		{name: "ssh error", err: errors.New("session 'x' is not a forkable session (tool: gemini)")},
+		{name: "empty id", output: `{"success":true,"new_id":""}`},
+		{name: "not json", output: "Forked session: a -> b (c)"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner := &SSHRunner{
+				runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+					return []byte(tt.output), tt.err
+				},
+			}
+			newID, err := runner.ForkSession(context.Background(), "parent-abc")
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if newID != "" {
+				t.Fatalf("new ID = %q on error, want empty", newID)
+			}
+		})
+	}
+}
+
+// The TUI forwards shift+up/down on a remote group header as `group reorder`
+// with the full path, and reads the remote's from/to positions back so a
+// refused edge move is never announced as a move.
+func TestRemoteGroupReorderArgsAndResult(t *testing.T) {
+	if got := strings.Join(remoteGroupReorderArgs("work/api", -1), " "); got != "group reorder work/api --up --json" {
+		t.Fatalf("up args = %q", got)
+	}
+	if got := strings.Join(remoteGroupReorderArgs("work", 1), " "); got != "group reorder work --down --json" {
+		t.Fatalf("down args = %q", got)
+	}
+	for _, tc := range []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{"moved", `{"success":true,"name":"work","path":"work","from_position":1,"to_position":0}`, true},
+		{"already at edge", `{"success":true,"name":"work","path":"work","from_position":0,"to_position":0}`, false},
+		{"older remote, human output", "✓ Reordered group 'work': position 1 → 0\n", true},
+		{"empty output", "", true},
+	} {
+		if got := parseGroupReorderMoved([]byte(tc.output)); got != tc.want {
+			t.Errorf("%s: parseGroupReorderMoved = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }

@@ -25,6 +25,8 @@ type remoteCreateCapture struct {
 	// accountsFetchedFor records the remotes whose account slots the dialog
 	// asked for when it opened; the real fetch goes over SSH.
 	accountsFetchedFor []string
+	// mcpsFetchedFor is the same for the remote's MCP names.
+	mcpsFetchedFor []string
 }
 
 func (c *remoteCreateCapture) sink(remoteName string, opts session.RemoteAddOptions) tea.Cmd {
@@ -38,9 +40,15 @@ func (c *remoteCreateCapture) accountsFetcher(remoteName string) tea.Cmd {
 	return nil
 }
 
+func (c *remoteCreateCapture) mcpsFetcher(remoteName string) tea.Cmd {
+	c.mcpsFetchedFor = append(c.mcpsFetchedFor, remoteName)
+	return func() tea.Msg { return nil }
+}
+
 // newRemoteHome builds a Home whose cursor sits on the given remote item, with
-// this machine's config.toml set to configTOML (empty for none) and the two
-// SSH paths the dialog can reach (create, account fetch) replaced by captures.
+// this machine's config.toml set to configTOML (empty for none) and the three
+// SSH paths the dialog can reach (create, account fetch, MCP fetch) replaced
+// by captures.
 func newRemoteHome(t *testing.T, item session.Item, configTOML string) (*Home, *remoteCreateCapture) {
 	t.Helper()
 	home := setXDGTestHome(t)
@@ -55,6 +63,7 @@ func newRemoteHome(t *testing.T, item session.Item, configTOML string) (*Home, *
 	capture := &remoteCreateCapture{}
 	h.remoteCreateSink = capture.sink
 	h.remoteAccountsFetcher = capture.accountsFetcher
+	h.remoteMCPsFetcher = capture.mcpsFetcher
 	return h, capture
 }
 
@@ -542,5 +551,36 @@ func TestRemoteDialog_SandboxUnchecked_NotForwarded(t *testing.T) {
 	}
 	if capture.opts.Title != "plain-task" {
 		t.Fatalf("title = %q, want plain-task", capture.opts.Title)
+	}
+}
+
+// n on one of the remote's OWN group headers (Level > 0) offers the new
+// session in that group, the way n on a local group header does. Before this
+// the dialog forced the default group for every remote header, so a session
+// created from "remotes/box/work" landed in the remote's my-sessions.
+func TestRemoteDialog_RemoteGroupHeader_ForwardsThatGroup(t *testing.T) {
+	item := session.Item{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver/work/api", Level: 2}
+	h, capture := openRemoteDialogOn(t, item, "", "claude", "grouped-task")
+
+	submitRemoteDialog(t, h)
+
+	if capture.calls != 1 || capture.remoteName != "myserver" {
+		t.Fatalf("remote create called %d times for %q, want once for myserver", capture.calls, capture.remoteName)
+	}
+	if capture.opts.Group != "work/api" {
+		t.Fatalf("opts = %+v, want the header's own remote group work/api", capture.opts)
+	}
+}
+
+// The Level-0 "remotes/<host>" header is a local UI bucket, not a remote
+// group: the dialog keeps the default group so nothing bogus is created.
+func TestRemoteDialog_RemoteHostHeader_KeepsDefaultGroup(t *testing.T) {
+	item := session.Item{Type: session.ItemTypeRemoteGroup, RemoteName: "myserver", Path: "remotes/myserver", Level: 0}
+	h, capture := openRemoteDialogOn(t, item, "", "claude", "root-task")
+
+	submitRemoteDialog(t, h)
+
+	if capture.calls != 1 || capture.opts.Group != session.DefaultGroupPath {
+		t.Fatalf("opts = %+v (calls=%d), want the default group for the host header", capture.opts, capture.calls)
 	}
 }

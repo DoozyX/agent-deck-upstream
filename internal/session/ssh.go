@@ -570,6 +570,38 @@ func parseRemoteAccountNames(output []byte) ([]string, error) {
 	return names, nil
 }
 
+// FetchMCPs lists the MCP names defined in the remote's own config.toml (its
+// `mcp list --quiet`, one name per line), so the TUI's remote new-session
+// dialog offers the server's MCPs rather than this machine's. Read-only and
+// names only: the quiet form never serializes a definition, so no command,
+// args, URL or env (where credentials commonly live) crosses SSH at all,
+// unlike `--json`, which ships every field. Nothing local is sent. A remote
+// too old for `mcp list --quiet` fails the call (unknown flag exits non-zero),
+// and the caller then hides the row instead of offering local names the
+// server would reject.
+func (r *SSHRunner) FetchMCPs(ctx context.Context) ([]string, error) {
+	output, err := r.Run(ctx, "mcp", "list", "--quiet")
+	if err != nil {
+		return nil, err
+	}
+	return parseRemoteMCPNames(output), nil
+}
+
+// parseRemoteMCPNames splits `mcp list --quiet` output (one name per line)
+// into a sorted list. A remote with no MCPs prints nothing in quiet mode, so
+// empty output is a real, empty list. The payload is never echoed into an
+// error or log.
+func parseRemoteMCPNames(output []byte) []string {
+	names := make([]string, 0)
+	for _, line := range strings.Split(string(output), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
 // FetchPendingRecords retrieves the remote host's completion and transition
 // records over the SAME ssh path every other remote fetch uses (issue #1948).
 //
@@ -710,7 +742,11 @@ type groupListEntryJSON struct {
 // buckets (which can only ever contain groups that currently hold sessions),
 // the remote's group list includes EMPTY groups, so the local move dialog (M
 // key on a remote session) can still offer a folder after every session has
-// been moved out of it. Paths are normalized, deduped and sorted.
+// been moved out of it. Paths are normalized and deduped, and they keep the
+// order the remote listed them in: that listing is the remote's own group
+// order (siblings by their persisted Order, a parent before its children),
+// which is what the TUI renders remote group headers in and what
+// ReorderGroup changes.
 //
 // Returns nil with no error when the remote returns empty output (older
 // agent-deck builds that predate the JSON shape); callers fall back to the
@@ -735,7 +771,8 @@ func (r *SSHRunner) FetchGroupPaths(ctx context.Context) ([]string, error) {
 }
 
 // parseGroupListPaths flattens the recursive group tree from `group list
-// --json` into normalized, deduped, sorted group paths. Extracted as a pure
+// --json` into normalized, deduped group paths in the remote's own order (a
+// pre-order walk: parent, then its children as listed). Extracted as a pure
 // function so the parsing is unit-testable without an SSH round-trip.
 func parseGroupListPaths(parsed groupListJSON) []string {
 	seen := make(map[string]bool)
@@ -752,8 +789,59 @@ func parseGroupListPaths(parsed groupListJSON) []string {
 		}
 	}
 	walk(parsed.Groups)
-	sort.Strings(paths)
 	return paths
+}
+
+// remoteGroupReorderArgs builds the argv for moving one remote group among
+// its siblings: `group reorder <path> --up|--down --json`. delta < 0 moves
+// up, anything else moves down. The full path is passed, which the remote
+// resolves exactly, so two groups sharing a leaf name in different parents
+// cannot be confused.
+func remoteGroupReorderArgs(groupPath string, delta int) []string {
+	direction := "--down"
+	if delta < 0 {
+		direction = "--up"
+	}
+	return []string{"group", "reorder", groupPath, direction, "--json"}
+}
+
+// groupReorderResultJSON is the payload of `group reorder --json`.
+type groupReorderResultJSON struct {
+	FromPosition int `json:"from_position"`
+	ToPosition   int `json:"to_position"`
+}
+
+// ReorderGroup moves one group of the remote up (delta < 0) or down among its
+// siblings by running `agent-deck group reorder` there, the same command the
+// remote's own TUI runs for shift+up/down on a group header. The order is
+// persisted in the remote's state DB, so every viewer of that remote sees it.
+//
+// The returned bool reports whether the remote actually changed the position:
+// the remote refuses silently when the group is already at the edge of its
+// siblings, and the caller must not announce a move that did not happen. An
+// older remote whose reorder prints no JSON is treated as moved, since it
+// exited 0.
+func (r *SSHRunner) ReorderGroup(ctx context.Context, groupPath string, delta int) (bool, error) {
+	output, err := r.Run(ctx, remoteGroupReorderArgs(groupPath, delta)...)
+	if err != nil {
+		return false, err
+	}
+	return parseGroupReorderMoved(output), nil
+}
+
+// parseGroupReorderMoved reads the from/to positions out of a `group reorder
+// --json` payload. Output that is not JSON reports true: the command exited 0
+// and nothing says the group stayed put.
+func parseGroupReorderMoved(output []byte) bool {
+	trimmed := bytes.TrimSpace(output)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return true
+	}
+	var parsed groupReorderResultJSON
+	if err := json.Unmarshal(trimmed, &parsed); err != nil {
+		return true
+	}
+	return parsed.FromPosition != parsed.ToPosition
 }
 
 // FetchCostSummary retrieves the remote agent-deck's cost summary as JSON.
@@ -1282,6 +1370,43 @@ func (r *SSHRunner) StopSession(ctx context.Context, sessionID string) error {
 func (r *SSHRunner) RestartSession(ctx context.Context, sessionID string) error {
 	_, err := r.Run(ctx, "session", "restart", sessionID)
 	return err
+}
+
+// ArchiveSession stops a session on the remote host and marks it archived
+// there (the remote's own `session archive`), so the remote's archived list
+// is the one source of truth and the next `list --json` reports it archived.
+func (r *SSHRunner) ArchiveSession(ctx context.Context, sessionID string) error {
+	_, err := r.Run(ctx, "session", "archive", sessionID)
+	return err
+}
+
+// UnarchiveSession clears the archive flag on the remote host without
+// restarting the session (the remote's own `session unarchive`).
+func (r *SSHRunner) UnarchiveSession(ctx context.Context, sessionID string) error {
+	_, err := r.Run(ctx, "session", "unarchive", sessionID)
+	return err
+}
+
+// ForkSession forks a session on the remote host through the remote's own
+// `session fork` and returns the new session's ID. Title and group are left
+// to the server (parent title with a "-fork" suffix, parent's group), so the
+// result matches what `agent-deck remote <name> session fork <id>` produces;
+// the server also decides whether the tool is forkable and starts the fork.
+func (r *SSHRunner) ForkSession(ctx context.Context, sessionID string) (string, error) {
+	output, err := r.Run(ctx, "session", "fork", "--json", sessionID)
+	if err != nil {
+		return "", err
+	}
+	var result struct {
+		NewID string `json:"new_id"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(output), &result); err != nil {
+		return "", fmt.Errorf("failed to parse remote fork output: %w", err)
+	}
+	if result.NewID == "" {
+		return "", fmt.Errorf("remote fork returned empty session ID")
+	}
+	return result.NewID, nil
 }
 
 // RemoteSessionInfo represents a session from a remote agent-deck instance.

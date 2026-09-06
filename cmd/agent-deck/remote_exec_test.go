@@ -101,8 +101,11 @@ func TestRemoteCommandParity(t *testing.T) {
 		{"list", "--json"}, {"status", "--json"}, {"session", "show", title, "--json"},
 		{"session", "output", "missing", "--json"}, {"session", "start", "missing", "--json"},
 		{"session", "stop", "missing", "--json"}, {"session", "restart", "missing", "--json"},
-		{"worktree", "info", "missing", "--json"}, {"mcp", "attach", "missing", "none", "--json"},
-		{"skill", "attach", "missing", "none"},
+		{"session", "archive", "missing", "--json"}, {"session", "unarchive", "missing", "--json"},
+		{"session", "fork", "missing", "--json"},
+		{"worktree", "info", "missing", "--json"}, {"mcp", "list", "--json"}, {"mcp", "attach", "missing", "none", "--json"},
+		{"skill", "list", "--json"}, {"skill", "attach", "missing", "none"},
+		{"group", "list", "--json"}, {"group", "reorder", "missing", "--up", "--json"},
 	} {
 		t.Run(strings.Join(args, "_"), func(t *testing.T) {
 			local, localErr, localCode := run(remote, "", args...)
@@ -130,7 +133,7 @@ func TestRemoteCommandParity(t *testing.T) {
 	if out, _, _ := run(controller, "", "list", "--json"); strings.Contains(out, title) {
 		t.Fatalf("remote add wrote controller registry: %s", out)
 	}
-	for _, args := range [][]string{{"version"}, {"session", "remove", title}, {"remote", "list"}, {"--help"}} {
+	for _, args := range [][]string{{"version"}, {"session", "remove", title}, {"remote", "list"}, {"--help"}, {"group", "delete", "work"}} {
 		sentinel := filepath.Join(remote, "unsupported-ssh-called")
 		write(filepath.Join(shim, "sentinel"), "#!/bin/sh\nprintf called > '"+sentinel+"'\n", 0700)
 		write(filepath.Join(controller, ".config", "agent-deck", "config.toml"), fmt.Sprintf("[remotes.lab]\nhost = 'test-host'\nagent_deck_path = '%s'\n", filepath.Join(shim, "sentinel")), 0600)
@@ -391,4 +394,28 @@ func TestRemoteCommandParity(t *testing.T) {
 		t.Errorf("explicit exec: %d %q %q", code, out, stderr)
 	}
 
+}
+
+// The passthrough allow-list must admit the session archive/unarchive verbs
+// the TUI forwards, and keep refusing anything it does not name.
+func TestRemoteCommandArgsSessionArchiveVerbs(t *testing.T) {
+	for _, args := range [][]string{{"session", "archive", "id"}, {"session", "unarchive", "id", "--json"}} {
+		got, err := remoteCommandArgs(args)
+		if err != nil || !reflect.DeepEqual(got, args) {
+			t.Fatalf("remoteCommandArgs(%v) = %v, %v; want the args unchanged", args, got, err)
+		}
+	}
+	if _, err := remoteCommandArgs([]string{"session", "remove", "id"}); err == nil {
+		t.Fatal("session remove must stay unsupported")
+	}
+}
+
+// `session set` (title, title lock, parent, tool session id) is a plain
+// registry update the server owns, so the passthrough forwards it verbatim.
+func TestRemoteCommandArgsSessionSet(t *testing.T) {
+	args := []string{"session", "set", "task", "title", "task 2"}
+	got, err := remoteCommandArgs(args)
+	if err != nil || !reflect.DeepEqual(got, args) {
+		t.Fatalf("remoteCommandArgs(%v) = %v, %v; want the args unchanged", args, got, err)
+	}
 }

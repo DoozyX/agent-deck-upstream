@@ -1623,9 +1623,12 @@ func TestRemoteSelectionNOpensRemoteAwareNewDialog(t *testing.T) {
 	if cmd == nil {
 		t.Fatal("pressing n on a remote session should return the account-slot fetch command")
 	}
-	fetched, isFetch := cmd().(remoteAccountsFetchedMsg)
+	// n batches the account-slot fetch with the MCP-list fetch; the MCP
+	// fetcher is not stubbed here and yields nothing, so the account fetch
+	// is the one message the batch must carry.
+	fetched, isFetch := findAccountsFetched(cmd())
 	if !isFetch {
-		t.Fatalf("the command returned by n must be the account-slot fetch, got %T", cmd())
+		t.Fatalf("the command returned by n must carry the account-slot fetch, got %T", cmd())
 	}
 	if fetched.remoteName != "myserver" {
 		t.Fatalf("account fetch answered for %q, want myserver", fetched.remoteName)
@@ -3443,7 +3446,7 @@ func TestRebuildFlatItemsCollapsedGroupKeepsHeaderInArchivedView(t *testing.T) {
 	}
 }
 
-func TestRebuildFlatItemsArchivedViewOmitsRemoteSessions(t *testing.T) {
+func TestRebuildFlatItemsArchivedViewPartitionsRemoteSessions(t *testing.T) {
 	h := NewHome()
 	h.statusFilter = FilterModeArchived
 
@@ -3459,16 +3462,108 @@ func TestRebuildFlatItemsArchivedViewOmitsRemoteSessions(t *testing.T) {
 
 	h.remoteSessionsMu.Lock()
 	h.remoteSessions = map[string][]session.RemoteSessionInfo{
-		"dev": {{ID: "remote-1", Title: "remote-session", RemoteName: "dev"}},
+		"dev":  {{ID: "remote-1", Title: "remote-live", RemoteName: "dev"}, {ID: "remote-2", Title: "remote-archived", RemoteName: "dev", Archived: true}},
+		"live": {{ID: "remote-3", Title: "live-only", RemoteName: "live"}},
 	}
 	h.remoteSessionsMu.Unlock()
 
-	h.rebuildFlatItems()
-
-	for _, item := range h.flatItems {
-		if item.Type == session.ItemTypeRemoteGroup || item.Type == session.ItemTypeRemoteSession {
-			t.Fatalf("archived view should omit remote rows, got %+v", item)
+	remoteRows := func() (sessions []string, headers []string) {
+		for _, item := range h.flatItems {
+			switch item.Type {
+			case session.ItemTypeRemoteSession:
+				sessions = append(sessions, item.RemoteSession.ID)
+			case session.ItemTypeRemoteGroup:
+				if item.Level == 0 {
+					headers = append(headers, item.RemoteName)
+				}
+			}
 		}
+		return sessions, headers
+	}
+
+	// Archived view: only the remote sessions the remote reports archived, and
+	// only headers for remotes that have one (mirrors the local group rule).
+	h.rebuildFlatItems()
+	sessions, headers := remoteRows()
+	if strings.Join(sessions, ",") != "remote-2" {
+		t.Fatalf("archived view remote sessions = %v, want [remote-2]", sessions)
+	}
+	if strings.Join(headers, ",") != "dev" {
+		t.Fatalf("archived view remote headers = %v, want [dev]", headers)
+	}
+
+	// Active view: the archived remote session is hidden, like a local one.
+	h.statusFilter = ""
+	h.rebuildFlatItems()
+	sessions, headers = remoteRows()
+	if strings.Join(sessions, ",") != "remote-1,remote-3" {
+		t.Fatalf("active view remote sessions = %v, want [remote-1 remote-3]", sessions)
+	}
+	if strings.Join(headers, ",") != "dev,live" {
+		t.Fatalf("active view remote headers = %v, want [dev live]", headers)
+	}
+}
+
+// A / Shift+U on a remote row open the same archive / unarchive confirmation
+// the local row gets, scoped to the remote, and confirming returns a command
+// (the SSH round trip) instead of touching any local instance.
+func TestRemoteArchiveAndUnarchiveUseConfirmDialog(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+
+	live := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &live, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, _ := home.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	h := model.(*Home)
+	if !h.confirmDialog.IsVisible() {
+		t.Fatal("A on a remote row should show the archive confirmation")
+	}
+	if got := h.confirmDialog.GetConfirmType(); got != ConfirmArchiveRemoteSession {
+		t.Fatalf("confirm type after A = %v, want %v", got, ConfirmArchiveRemoteSession)
+	}
+	if got := h.confirmDialog.GetRemoteName(); got != "myserver" {
+		t.Fatalf("remote name after A = %q, want %q", got, "myserver")
+	}
+	if got := h.confirmDialog.GetTargetID(); got != "remote-123" {
+		t.Fatalf("target id after A = %q, want %q", got, "remote-123")
+	}
+	if cmd := h.confirmAction(); cmd == nil {
+		t.Fatal("confirming a remote archive should return the SSH command")
+	}
+	if h.confirmDialog.IsVisible() {
+		t.Fatal("confirming should hide the dialog")
+	}
+
+	// Shift+U is gated on the archived view, exactly like the local path.
+	archived := session.RemoteSessionInfo{ID: "remote-456", Title: "old-session", RemoteName: "myserver", Archived: true}
+	h.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &archived, RemoteName: "myserver"}}
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	h = model.(*Home)
+	if h.confirmDialog.IsVisible() {
+		t.Fatal("Shift+U outside the archived view must not open a dialog")
+	}
+	h.statusFilter = FilterModeArchived
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'U'}})
+	h = model.(*Home)
+	if got := h.confirmDialog.GetConfirmType(); !h.confirmDialog.IsVisible() || got != ConfirmUnarchiveRemoteSession {
+		t.Fatalf("Shift+U on an archived remote row: visible=%v type=%v, want %v", h.confirmDialog.IsVisible(), got, ConfirmUnarchiveRemoteSession)
+	}
+	if got := h.confirmDialog.GetRemoteName(); got != "myserver" {
+		t.Fatalf("remote name after Shift+U = %q, want %q", got, "myserver")
+	}
+	if cmd := h.confirmAction(); cmd == nil {
+		t.Fatal("confirming a remote unarchive should return the SSH command")
+	}
+
+	// A on a row the remote already reports archived is a no-op.
+	h.confirmDialog.Hide()
+	model, _ = h.handleMainKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'A'}})
+	h = model.(*Home)
+	if h.confirmDialog.IsVisible() {
+		t.Fatal("A on an already archived remote row must not open a dialog")
 	}
 }
 
@@ -4250,4 +4345,23 @@ func TestDeleteBindingOnNonDefaultGroupOpensDialog(t *testing.T) {
 	if h.err != nil {
 		t.Errorf("non-default group delete must not set an error, got %v", h.err)
 	}
+}
+
+// findAccountsFetched digs the account-slot fetch result out of a message
+// that may be a tea.BatchMsg (n batches the account fetch with the MCP fetch).
+func findAccountsFetched(msg tea.Msg) (remoteAccountsFetchedMsg, bool) {
+	switch m := msg.(type) {
+	case remoteAccountsFetchedMsg:
+		return m, true
+	case tea.BatchMsg:
+		for _, c := range m {
+			if c == nil {
+				continue
+			}
+			if found, ok := findAccountsFetched(c()); ok {
+				return found, true
+			}
+		}
+	}
+	return remoteAccountsFetchedMsg{}, false
 }
