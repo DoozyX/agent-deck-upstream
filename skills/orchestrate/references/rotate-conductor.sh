@@ -64,7 +64,9 @@ You are the continuation conductor for this orchestrate run, generation $GEN.
 Your predecessor reached its context ceiling and rotated out. This is a
 handoff, not a restart: the run is mid-flight and its children are live.
 
-Read these two files before you do anything else:
+Re-read the orchestrate skill first (use its absolute path recorded in the
+handoff), then follow its "Recovery after compaction or rotation" sequence.
+Read these two files to restore durable run state:
 
   $MANIFEST
       The run's state — every task and the stage it reached.
@@ -72,14 +74,21 @@ Read these two files before you do anything else:
       What was in flight at the instant of rotation: live tasks and their
       stage, open questions, anything awaiting a decision from you.
 
-Then load the orchestrate skill and resume supervision from the heartbeat:
+Restore the approved design constraints from the manifest's bounded summary,
+including scope, non-goals, acceptance criteria, and approved deviations.
+If missing, unclear, or potentially stale, delegate a refresh from the approved
+design to an inspect child before making design-dependent decisions. Do not
+read the full design into conductor context or reopen approved decisions.
+For a run without a design, restore its task or verification contract instead.
+
+After restoring the skill and state, reconcile live children with the heartbeat:
 
   RUN_DIR="$D"
   bash "\$RUN_DIR/poll.sh"
 
 Every live child has already been re-parented to you and will appear in that
 output. Do not re-launch them. Do not redo work the manifest records as done.
-Your first action is the heartbeat, not a status sweep.
+Your first supervision action after recovery is the heartbeat, not a status sweep.
 EOF
 
 # 5. Launch the successor. Under auto, retaining this conductor's connector

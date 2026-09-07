@@ -426,7 +426,11 @@ copies, and never a copy inside a child worktree. A missing or unreadable path
 is a launch blocker — a child handed a path it cannot read improvises from an
 empty spec.
 
-Record `SPEC_PATH` in the manifest. Base every worktree explicitly on the base
+Record `SPEC_PATH` and the absolute path of this orchestrate skill in the
+manifest. For design-fed runs, have an `inspect` child return the bounded
+`## Design constraints` summary described under "Recovery after compaction
+or rotation" and persist it before implementation starts.
+Base every worktree explicitly on the base
 branch; nothing about the spec constrains it any more. Resolve the base once
 per launch and record the immutable sha. Never rely on whatever branch happens
 to be checked out in the repository that invokes `agent-deck launch`.
@@ -1571,6 +1575,34 @@ The same rule covers any binary or generated blob: PDFs, `dist/` bundles,
 minified JS, lockfiles — those have no comparable measured ceiling and a
 single one can be far worse than any screenshot.
 
+### Recovery after compaction or rotation
+
+After either event, complete this recovery sequence before making new task,
+scope, or landing decisions. A compaction summary is not a substitute for
+reloading the workflow and its durable state.
+
+1. Re-read this orchestrate skill, then read `$RUN_DIR/manifest.md` and
+   `$RUN_DIR/conductor-handoff.md`. Restore the verification and landing
+   contracts, live task stages, open decisions, and recorded user approvals.
+   Preserve the absolute skill path and run directory in the handoff.
+2. Recover the approved design constraints from the manifest's
+   `## Design constraints` summary: absolute source path, scope, non-goals,
+   acceptance criteria, and approved deviations. Keep this bounded summary
+   current when a design decision changes. Do not read the full design into
+   conductor context or reopen approved design decisions.
+3. Run the heartbeat to reconcile surviving children. If the design summary
+   is missing, its source is unclear, or it may be stale, use an `inspect`
+   child to re-read the approved design at `SPEC_PATH` and return a bounded
+   summary; record it in the manifest before making design-dependent
+   decisions. Continue supervision while that child runs. If the source is
+   unavailable, report the blocker rather than reconstructing it from memory.
+   For runs without a design, restore the recorded task or verification
+   contract instead; do not invent a design requirement.
+
+Do not relaunch surviving children or redo completed stages. A missing or
+empty handoff requires reconciliation with durable run state and live child
+status before relying on any claimed progress.
+
 **3. Thresholds, tighter than a child's.** Anything long-lived — findings
 lists, baselines, pending questions, PR urls, HEAD shas — goes into
 `$RUN_DIR` the moment you learn it, so the run survives you losing context at
@@ -1591,8 +1623,8 @@ any point. Then:
 
   ```bash
   agent-deck session compact \
-    --instructions "Keep: the run dir path, every live task and its stage, open questions, PR urls, HEAD shas." \
-    --resume 'bash "$RUN_DIR/poll.sh"'
+    --instructions "Keep: the absolute orchestrate skill path, run dir path, design source path, every live task and its stage, open questions, PR urls, HEAD shas." \
+    --resume "Run directory: $RUN_DIR. Re-read the orchestrate skill and follow Recovery after compaction or rotation: read manifest.md and conductor-handoff.md, restore approved design constraints through the bounded summary (delegate a refresh if needed), then reconcile live children with the heartbeat before new task decisions."
   ```
 
   With no id it compacts *you*. It returns immediately — a self-compact runs
