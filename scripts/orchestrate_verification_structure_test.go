@@ -107,7 +107,9 @@ func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 		`HANDOFF="$D/conductor-handoff.md"`,
 		`for f in "$MANIFEST" "$HANDOFF"; do`,
 		`if [ ! -s "$f" ]; then`,
-		"Read these two files before you do anything else:",
+		"Re-read the orchestrate skill first",
+		"Recovery after compaction or rotation",
+		"Read these two files to restore durable run state:",
 		`agent-deck session set-parent "$cid" "$NEW_ID"`,
 		`agent-deck session archive "$SELF_ID"`,
 	}
