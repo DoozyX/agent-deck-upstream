@@ -157,12 +157,13 @@ func TestGroup_NewGroupDefault_ConfigN(t *testing.T) {
 	}
 }
 
-// TestGroup_CountRunningInGroup verifies the count helper only includes
-// running sessions in the target group (not queued, not other groups).
+// TestGroup_CountRunningInGroup verifies the count helper only includes active
+// running sessions in the target group (not queued, archived, or other groups).
 func TestGroup_CountRunningInGroup(t *testing.T) {
 	instances := []*Instance{
 		{GroupPath: "g", Status: StatusRunning},
 		{GroupPath: "g", Status: StatusRunning},
+		{GroupPath: "g", Status: StatusRunning, ArchivedAt: time.Now()},
 		{GroupPath: "g", Status: StatusQueued},
 		{GroupPath: "g", Status: StatusStopped},
 		{GroupPath: "other", Status: StatusRunning},
