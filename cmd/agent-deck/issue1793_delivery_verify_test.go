@@ -126,6 +126,69 @@ func TestIssue1793_NonClaudeTypedPromptGetsAnAttributableRecoveryEnter(t *testin
 	}
 }
 
+func TestIssue1793_CodexRecoveryAttemptIsConsumedWhenEnterFails(t *testing.T) {
+	const msg = "ISSUE1793 CODEX RECOVERY ATTEMPT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses:     []string{"waiting"},
+		panes:        []string{"codex>\n", "codex> " + msg + "\n"},
+		sendEnterErr: errors.New("tmux send-keys Enter failed"),
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("failed recovery must stay an unconfirmed typed delivery: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("a failed recovery Enter must still consume the one-attempt budget, got %d attempts", got)
+	}
+}
+
+func TestIssue1793_CodexForeignDraftIsNeverSubmittedByRecovery(t *testing.T) {
+	const msg = "ISSUE1793 CODEX FOREIGN DRAFT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		// The body reached scrollback, but another actor replaced the current
+		// Codex composer before recovery. The prompt marker is Codex's native
+		// `codex>` form, not Claude's glyph.
+		panes: []string{"codex>\n", "history: " + msg + "\ncodex> deploy production immediately\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("foreign-draft recovery must remain unconfirmed: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("recovery must not submit a foreign Codex draft, got %d Enter presses", got)
+	}
+}
+
+func TestIssue1793_CodexActiveTransitionNeedsNoRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 CODEX NORMAL SUBMIT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		// Baseline is waiting; the first post-send sample is active, so this
+		// normal submission must return before inspecting/nudging the pane.
+		statuses: []string{"waiting", "active"},
+		panes:    []string{"codex>\n", "history: " + msg + "\ncodex>\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("active transition must remain submitted without recovery: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("already-submitted Codex turn must not receive recovery Enter, got %d", got)
+	}
+}
+
 // TestIssue1793_ClaudePath_TypedButNeverSubmitted_IsNotSuccess is the Claude
 // half of the same defect. The Claude verification loop treated "the body is
 // visible in the pane" as delivery evidence and, at the end of its budget,

@@ -3894,7 +3894,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		Message:        message,
 		OwnPasteMarker: baseline.paneOK && baseline.pasteMarkers == 0,
 	}
-	recoveryNudged := false
+	recoveryAttempted := false
 	for i := 0; i < checks; i++ {
 		// Strongest signal first: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
@@ -3935,8 +3935,13 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					sawBody = true
 					arrived = true
 				}
-				if arrived && !recoveryNudged && session.IsCodexCompatible(opts.tool) {
-					recoveryNudged = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
+				if arrived && !recoveryAttempted && session.IsCodexCompatible(opts.tool) {
+					// Consume the single recovery budget before sending. NudgeEnter
+					// reports both an attribution refusal and a transport failure as
+					// false; neither may re-arm another Enter into a pane whose draft
+					// could have changed since this capture.
+					recoveryAttempted = true
+					_ = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
 				}
 			}
 		}

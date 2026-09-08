@@ -338,11 +338,12 @@ func TestWaitForCompletion_Timeout(t *testing.T) {
 }
 
 type mockSendRetryTarget struct {
-	sendKeysErr error
-	statuses    []string
-	statusErrs  []error
-	panes       []string
-	paneErrs    []error
+	sendKeysErr  error
+	sendEnterErr error
+	statuses     []string
+	statusErrs   []error
+	panes        []string
+	paneErrs     []error
 
 	statusIdx atomic.Int32
 	paneIdx   atomic.Int32
@@ -380,7 +381,7 @@ func (m *mockSendRetryTarget) GetStatus() (string, error) {
 
 func (m *mockSendRetryTarget) SendEnter() error {
 	atomic.AddInt32(&m.sendEnterCalls, 1)
-	return nil
+	return m.sendEnterErr
 }
 
 func (m *mockSendRetryTarget) SendCtrlC() error {
