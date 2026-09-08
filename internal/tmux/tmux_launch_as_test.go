@@ -14,6 +14,10 @@
 package tmux
 
 import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -63,24 +67,116 @@ func TestStartCommandSpec_LaunchAs_Service_UsesServiceForm(t *testing.T) {
 
 func TestStartCommandSpec_CarriesCreationIdentityThroughLaunchers(t *testing.T) {
 	for _, launchAs := range []string{"direct", "scope", "service"} {
-		t.Run(launchAs, func(t *testing.T) {
-			s := &Session{
-				Name:                           "agentdeck_test-identity_1234abcd",
-				WorkDir:                        "/tmp/project",
-				LaunchAs:                       launchAs,
-				captureSessionIdentityOnCreate: true,
+		t.Run(launchAs+" captures created identity", func(t *testing.T) {
+			calls, session := startWithFakeLauncher(t, launchAs, false)
+			require.NoError(t, session.Start(""), "fake launcher calls: %s", calls())
+			assert.Equal(t, "$created", session.createdSessionID)
+			wantLauncher := "tmux"
+			if launchAs != "direct" {
+				wantLauncher = "systemd-run"
 			}
-			launcher, args := s.startCommandSpec("/tmp/project", "")
-			if launchAs == "direct" {
-				assert.Equal(t, "tmux", launcher)
-			} else {
-				assert.Equal(t, "systemd-run", launcher)
-				assert.NotContains(t, args, "--pipe", "long-lived launches must not wait on daemon lifetime")
-				assert.Contains(t, args, "-P", "tmux must emit immutable creation identity")
-				assert.Contains(t, args, "-F", "tmux must emit immutable creation identity")
-			}
+			assert.Contains(t, calls(), wantLauncher+" ")
+		})
+
+		t.Run(launchAs+" rejects replacement during capture", func(t *testing.T) {
+			calls, session := startWithFakeLauncher(t, launchAs, true)
+			require.Error(t, session.Start(""))
+			assert.Equal(t, "$created", session.createdSessionID)
+			assert.Contains(t, calls(), "KILLED -u kill-session -t $created")
+			assert.NotContains(t, calls(), "KILLED -u kill-session -t $replacement")
 		})
 	}
+}
+
+func startWithFakeLauncher(t *testing.T, launchAs string, replacement bool) (func() string, *Session) {
+	t.Helper()
+	dir := t.TempDir()
+	callLog := filepath.Join(dir, "calls")
+	fake := filepath.Join(dir, "launcher")
+	script := `#!/bin/sh
+case "$0" in
+*/tmux) mode="tmux" ;;
+*) mode="$1"; shift ;;
+esac
+printf '%s %s\n' "$mode" "$*" >> "$FAKE_LAUNCH_CALLS"
+name=""
+marker=""
+workdir="/"
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-s" ]; then name="$arg"; fi
+  if [ "$previous" = "-e" ]; then marker="${arg#*=}"; fi
+  if [ "$previous" = "-c" ]; then workdir="$arg"; fi
+  previous="$arg"
+done
+is_new=0
+is_list=0
+is_display=0
+is_pane_path=0
+is_has=0
+is_kill=0
+for arg in "$@"; do
+  [ "$arg" = "new-session" ] && is_new=1
+  [ "$arg" = "list-sessions" ] && is_list=1
+  [ "$arg" = "display-message" ] && is_display=1
+	[ "$arg" = "#{pane_current_path}" ] && is_pane_path=1
+  [ "$arg" = "has-session" ] && is_has=1
+  [ "$arg" = "kill-session" ] && is_kill=1
+done
+if [ "$is_new" = "1" ]; then
+    printf '%s\t%s\t%s\n' "$name" "$marker" "$workdir" > "$FAKE_LAUNCH_STATE"
+    printf '$created\n'
+    exit 0 ;
+fi
+if [ "$is_list" = "1" ]; then
+    IFS='	' read -r name marker workdir < "$FAKE_LAUNCH_STATE"
+    if [ "$FAKE_LAUNCH_REPLACEMENT" = "1" ]; then printf '$replacement\t%s\tnew-marker\n' "$name"; else printf '$created\t%s\t%s\n' "$name" "$marker"; fi
+    exit 0 ;
+fi
+if [ "$is_display" = "1" ]; then
+    if [ "$is_pane_path" = "1" ]; then IFS='	' read -r name marker workdir < "$FAKE_LAUNCH_STATE"; printf '%s\n' "$workdir"; else if [ "$FAKE_LAUNCH_REPLACEMENT" = "1" ]; then printf '$replacement\n'; else printf '$created\n'; fi; fi
+    exit 0 ;
+fi
+[ "$is_has" = "1" ] && exit 1
+[ "$is_kill" = "1" ] && printf 'KILLED %s\n' "$*" >> "$FAKE_LAUNCH_CALLS"
+exit 0
+`
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(fake, filepath.Join(dir, "tmux")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("FAKE_LAUNCH_CALLS", callLog)
+	t.Setenv("FAKE_LAUNCH_STATE", filepath.Join(dir, "state"))
+	if replacement {
+		t.Setenv("FAKE_LAUNCH_REPLACEMENT", "1")
+	} else {
+		t.Setenv("FAKE_LAUNCH_REPLACEMENT", "0")
+	}
+	original := execCommand
+	originalContext := execCommandContext
+	execCommand = func(name string, arg ...string) *exec.Cmd {
+		return exec.Command(fake, append([]string{name}, arg...)...)
+	}
+	execCommandContext = func(ctx context.Context, name string, arg ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, fake, append([]string{name}, arg...)...)
+	}
+	t.Cleanup(func() {
+		execCommand = original
+		execCommandContext = originalContext
+	})
+
+	session := NewSession("launcher-behavior", t.TempDir())
+	session.LaunchAs = launchAs
+	return func() string {
+		raw, err := os.ReadFile(callLog)
+		if err != nil {
+			t.Fatalf("read fake launcher calls: %v", err)
+		}
+		return string(raw)
+	}, session
 }
 
 // TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm explicitly pins the
