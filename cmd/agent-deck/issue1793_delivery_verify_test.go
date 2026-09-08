@@ -358,6 +358,24 @@ func TestIssue1793_CodexBaselineWorkingIsNotNewSubmission(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexTimedBaselineWorkingIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 TIMED BASELINE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"• Working (4s • esc to interrupt)\nprior request\n",
+			"• Working (5s • esc to interrupt)\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a pre-existing timed Codex Working state must not submit this body: delivery=%q err=%v", delivery, err)
+	}
+}
+
 func TestIssue1793_CodexMultilinePayloadStartingWorkingIsNotSubmissionEvidence(t *testing.T) {
 	const msg = "working\nISSUE1793 MULTILINE CODEX BODY"
 	mock := &mockSendRetryTarget{

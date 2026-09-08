@@ -2424,6 +2424,17 @@ func (s *Session) Start(command string) error {
 	}
 	workDir = resolvedWorkDir
 
+	// A Session may be reused after a prior launch. Clear the previous launch's
+	// ownership handoff before spawning the next one so a suppressed create
+	// response cannot be compared with, or rolled back through, stale state.
+	if s.launchAckPath != "" {
+		cleanupLaunchAckFiles(s.launchAckPath)
+	}
+	s.launchAckPath = ""
+	s.createdSessionID = ""
+	s.creationMarker = ""
+	s.captureSessionIdentityOnCreate = false
+
 	s.Command = command
 	ackPathForCleanup := ""
 	created := false

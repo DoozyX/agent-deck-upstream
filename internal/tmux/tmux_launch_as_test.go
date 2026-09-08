@@ -79,19 +79,71 @@ func TestStartCommandSpec_CarriesCreationIdentityThroughLaunchers(t *testing.T) 
 		})
 
 		t.Run(launchAs+" rejects replacement during capture", func(t *testing.T) {
-			calls, session := startWithFakeLauncher(t, launchAs, true)
+			calls, state, session := startWithFakeLauncherOptions(t, launchAs, true, false)
 			require.Error(t, session.Start(""))
 			assert.Equal(t, "$created", session.createdSessionID)
 			assert.Contains(t, calls(), "KILLED -u kill-session -t $created")
 			assert.NotContains(t, calls(), "KILLED -u kill-session -t $replacement")
+			assert.True(t, fakeSessionAlive(state(), "$replacement", session.Name),
+				"same-name replacement must survive failed identity capture")
 		})
 	}
 }
 
+func TestStart_RepeatedStartWithMarkerCaptureDoesNotReusePriorOwnership(t *testing.T) {
+	calls, state, session := startWithFakeLauncherOptions(t, "direct", false, true)
+	require.NoError(t, session.Start(""), "first fake launcher calls: %s", calls())
+	oldName := session.Name
+	oldID := session.createdSessionID
+	spawn := execCommand
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		if name == "tmux" && containsArg(args, "new-session") && session.createdSessionID != "" {
+			t.Errorf("new Start spawn retained prior createdSessionID %q", session.createdSessionID)
+		}
+		return spawn(name, args...)
+	}
+	t.Cleanup(func() { execCommand = spawn })
+
+	require.NoError(t, session.Start(""), "second fake launcher calls: %s", calls())
+	if session.Name == oldName {
+		t.Fatalf("repeated Start must regenerate the existing session name")
+	}
+	assert.Equal(t, "$new", session.createdSessionID)
+	assert.Contains(t, state(), "$created\t"+oldName+"\t", "the prior session must survive the second Start")
+	assert.Contains(t, state(), "$new\t"+session.Name+"\t", "the new marker-owned session must survive capture")
+	assert.NotContains(t, calls(), "KILLED -u kill-session -t "+oldID,
+		"stale ownership must not roll back the prior session")
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func fakeSessionAlive(state, wantID, wantName string) bool {
+	for _, line := range strings.Split(strings.TrimSpace(state), "\n") {
+		fields := strings.Split(line, "\t")
+		if len(fields) == 6 && fields[0] == wantID && fields[1] == wantName && fields[4] == "1" && fields[5] == "1" {
+			return true
+		}
+	}
+	return false
+}
+
 func startWithFakeLauncher(t *testing.T, launchAs string, replacement bool) (func() string, *Session) {
+	calls, _, session := startWithFakeLauncherOptions(t, launchAs, replacement, false)
+	return calls, session
+}
+
+func startWithFakeLauncherOptions(t *testing.T, launchAs string, replacement, repeated bool) (func() string, func() string, *Session) {
 	t.Helper()
 	dir := t.TempDir()
 	callLog := filepath.Join(dir, "calls")
+	stateLog := filepath.Join(dir, "state")
 	fake := filepath.Join(dir, "launcher")
 	script := `#!/bin/sh
 case "$0" in
@@ -124,21 +176,88 @@ for arg in "$@"; do
   [ "$arg" = "kill-session" ] && is_kill=1
 done
 if [ "$is_new" = "1" ]; then
-    printf '%s\t%s\t%s\n' "$name" "$marker" "$workdir" > "$FAKE_LAUNCH_STATE"
-    printf '$created\n'
+  expected="$FAKE_LAUNCH_EXPECTED_MODE"
+  if [ "$expected" = "tmux" ] && [ "$mode" != "tmux" ]; then
+    printf 'wrong launcher: expected direct tmux, got %s\n' "$mode" >&2
+    exit 97
+  fi
+  if [ "$expected" = "scope" ]; then
+    [ "$mode" = "systemd-run" ] || { printf 'wrong launcher: expected systemd scope, got %s\n' "$mode" >&2; exit 97; }
+    printf '%s\n' "$*" | grep -q -- '--scope' || { printf 'wrong launcher: expected scope form\n' >&2; exit 97; }
+    printf '%s\n' "$*" | grep -q -- '\.service' && { printf 'wrong launcher: scope received service form\n' >&2; exit 97; }
+  fi
+  if [ "$expected" = "service" ]; then
+    [ "$mode" = "systemd-run" ] || { printf 'wrong launcher: expected systemd service, got %s\n' "$mode" >&2; exit 97; }
+    printf '%s\n' "$*" | grep -q -- '\.service' || { printf 'wrong launcher: expected service form\n' >&2; exit 97; }
+    printf '%s\n' "$*" | grep -q -- '--scope' && { printf 'wrong launcher: service received scope form\n' >&2; exit 97; }
+  fi
+fi
+if [ "$is_new" = "1" ]; then
+    count=0
+    [ -f "$FAKE_LAUNCH_COUNT" ] && count=$(cat "$FAKE_LAUNCH_COUNT")
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$FAKE_LAUNCH_COUNT"
+    id='$created'
+    output='$created'
+    if [ "$count" -gt 1 ] && [ "$FAKE_LAUNCH_REPEATED" = "1" ]; then
+      id='$new'
+      output=''
+    fi
+	if [ "$FAKE_LAUNCH_REPLACEMENT" = "1" ]; then
+	      printf '%s\t%s\t%s\t%s\t1\t0\n' '$created' "$name" "$marker" "$workdir" >> "$FAKE_LAUNCH_STATE"
+	      printf '%s\t%s\t%s\t%s\t1\t1\n' '$replacement' "$name" 'new-marker' "$workdir" >> "$FAKE_LAUNCH_STATE"
+	    else
+	      printf '%s\t%s\t%s\t%s\t1\t1\n' "$id" "$name" "$marker" "$workdir" >> "$FAKE_LAUNCH_STATE"
+    fi
+    printf '%s\n' "$output"
     exit 0 ;
 fi
 if [ "$is_list" = "1" ]; then
-    IFS='	' read -r name marker workdir < "$FAKE_LAUNCH_STATE"
-    if [ "$FAKE_LAUNCH_REPLACEMENT" = "1" ]; then printf '$replacement\t%s\tnew-marker\n' "$name"; else printf '$created\t%s\t%s\n' "$name" "$marker"; fi
+	    while IFS='	' read -r id name marker workdir alive visible; do
+	      [ "$alive" = "1" ] && [ "$visible" = "1" ] && printf '%s\t%s\t%s\n' "$id" "$name" "$marker"
+    done < "$FAKE_LAUNCH_STATE"
     exit 0 ;
 fi
 if [ "$is_display" = "1" ]; then
-    if [ "$is_pane_path" = "1" ]; then IFS='	' read -r name marker workdir < "$FAKE_LAUNCH_STATE"; printf '%s\n' "$workdir"; else if [ "$FAKE_LAUNCH_REPLACEMENT" = "1" ]; then printf '$replacement\n'; else printf '$created\n'; fi; fi
+    target=""
+    previous=""
+    for arg in "$@"; do
+      [ "$previous" = "-t" ] && target="$arg"
+      previous="$arg"
+    done
+    found=0
+	    while IFS='	' read -r id name marker workdir alive visible; do
+      [ "$alive" = "1" ] || continue
+      if [ "$target" = "$name" ] || [ "$target" = "$id" ]; then
+        found=1
+        if [ "$is_pane_path" = "1" ]; then printf '%s\n' "$workdir"; else printf '%s\n' "$id"; fi
+        break
+      fi
+    done < "$FAKE_LAUNCH_STATE"
+    [ "$found" = "1" ] || { printf "can't find session\n" >&2; exit 1; }
     exit 0 ;
 fi
-[ "$is_has" = "1" ] && exit 1
-[ "$is_kill" = "1" ] && printf 'KILLED %s\n' "$*" >> "$FAKE_LAUNCH_CALLS"
+if [ "$is_has" = "1" ]; then
+    target=""
+    previous=""
+    for arg in "$@"; do [ "$previous" = "-t" ] && target="$arg"; previous="$arg"; done
+	    while IFS='	' read -r id name marker workdir alive visible; do
+	      [ "$alive" = "1" ] && [ "$visible" = "1" ] && [ "$target" = "$name" ] && exit 0
+    done < "$FAKE_LAUNCH_STATE"
+    exit 1
+fi
+if [ "$is_kill" = "1" ]; then
+    target=""
+    previous=""
+    for arg in "$@"; do [ "$previous" = "-t" ] && target="$arg"; previous="$arg"; done
+    tmp="$FAKE_LAUNCH_STATE.tmp"
+	    while IFS='	' read -r id name marker workdir alive visible; do
+	      if [ "$target" = "$id" ] || [ "$target" = "$name" ]; then alive=0; fi
+	      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$name" "$marker" "$workdir" "$alive" "$visible" >> "$tmp"
+    done < "$FAKE_LAUNCH_STATE"
+    mv "$tmp" "$FAKE_LAUNCH_STATE"
+    printf 'KILLED %s\n' "$*" >> "$FAKE_LAUNCH_CALLS"
+fi
 exit 0
 `
 	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
@@ -149,11 +268,22 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_LAUNCH_CALLS", callLog)
-	t.Setenv("FAKE_LAUNCH_STATE", filepath.Join(dir, "state"))
+	t.Setenv("FAKE_LAUNCH_STATE", stateLog)
+	t.Setenv("FAKE_LAUNCH_COUNT", filepath.Join(dir, "count"))
+	expectedMode := launchAs
+	if expectedMode == "direct" {
+		expectedMode = "tmux"
+	}
+	t.Setenv("FAKE_LAUNCH_EXPECTED_MODE", expectedMode)
 	if replacement {
 		t.Setenv("FAKE_LAUNCH_REPLACEMENT", "1")
 	} else {
 		t.Setenv("FAKE_LAUNCH_REPLACEMENT", "0")
+	}
+	if repeated {
+		t.Setenv("FAKE_LAUNCH_REPEATED", "1")
+	} else {
+		t.Setenv("FAKE_LAUNCH_REPEATED", "0")
 	}
 	original := execCommand
 	originalContext := execCommandContext
@@ -171,12 +301,18 @@ exit 0
 	session := NewSession("launcher-behavior", t.TempDir())
 	session.LaunchAs = launchAs
 	return func() string {
-		raw, err := os.ReadFile(callLog)
-		if err != nil {
-			t.Fatalf("read fake launcher calls: %v", err)
-		}
-		return string(raw)
-	}, session
+			raw, err := os.ReadFile(callLog)
+			if err != nil {
+				t.Fatalf("read fake launcher calls: %v", err)
+			}
+			return string(raw)
+		}, func() string {
+			raw, err := os.ReadFile(stateLog)
+			if err != nil {
+				t.Fatalf("read fake launcher state: %v", err)
+			}
+			return string(raw)
+		}, session
 }
 
 // TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm explicitly pins the
