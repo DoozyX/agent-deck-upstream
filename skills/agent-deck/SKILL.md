@@ -114,6 +114,7 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 | `agent-deck add -t "Name" -c claude /path` | Create session |
 | `agent-deck launch . -c claude --account <name>` | Create and start a session under a named account slot |
 | `agent-deck accounts [--json]` | List configured named account slots |
+| `agent-deck usage --all [--json]` | Advisory live Claude/Codex quota snapshot; query only when it informs a launch decision |
 | `agent-deck session start/stop/restart <name>` | Control session |
 | `agent-deck session send <name> "message"` | Send message |
 | `agent-deck session send <name> --message-file <file>` | Send message from file (`-` = stdin); no shell quoting. Also on `launch`/`session start` |

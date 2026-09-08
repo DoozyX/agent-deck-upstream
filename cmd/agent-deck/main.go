@@ -419,6 +419,9 @@ func main() {
 		case "accounts":
 			handleAccounts(args[1:])
 			return
+		case "usage":
+			handleUsage(profile, args[1:])
+			return
 		case "conductor":
 			handleConductor(profile, args[1:])
 			return
