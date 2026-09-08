@@ -5090,7 +5090,7 @@ func (i *Instance) Start() error {
 	// New sessions start as STARTING - shows they're initializing
 	// After 5s grace period, status will be properly detected from tmux
 	if command != "" {
-		i.Status = StatusStarting
+		i.SetStatusThreadSafe(StatusStarting)
 	}
 
 	// Start async session ID detection for OpenCode
@@ -5393,7 +5393,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	i.markStarted() // persisted stamp (issue #30 — cross-process freshness guard)
 
 	// New sessions start as STARTING
-	i.Status = StatusStarting
+	i.SetStatusThreadSafe(StatusStarting)
 
 	// Start async session ID detection for tools that persist IDs out-of-band.
 	if i.Tool == "opencode" {

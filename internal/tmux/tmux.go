@@ -2541,7 +2541,7 @@ func (s *Session) Start(command string) error {
 	if cwdErr := s.verifyPaneWorkDirUnlessPlaceholder(workDir); cwdErr != nil {
 		cleanupLaunchAckFiles(s.launchAckPath)
 		s.launchAckPath = ""
-		if killErr := s.Kill(); killErr != nil {
+		if killErr := s.KillIfOwned(); killErr != nil {
 			statusLog.Warn("deleted_cwd_session_cleanup_failed",
 				slog.String("session", logging.SanitizeValue(s.Name)),
 				slog.String("error", killErr.Error()))
@@ -2817,19 +2817,35 @@ func (s *Session) AcknowledgeInitialProcess() error {
 // for a headless one-shot that survived the initial acknowledgement window.
 // The completion marker is published only after output capture has drained, so
 // the callback receives a complete diagnostic and the watcher can then remove
-// every temporary file. A missing session ends the watcher without invoking
-// the callback; explicit Kill() is not a launch failure.
-func (s *Session) WatchInitialProcessCompletion(callback func(exitCode int, diagnostic string)) {
+// every temporary file. The watcher captures the tmux name and immutable
+// session identity at launch. A missing, replaced, or superseded session ends
+// the watcher without invoking the callback; explicit Kill() is not a launch
+// failure.
+func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback func(exitCode int, diagnostic string)) {
 	ackPath := s.launchAckPath
+	sessionName := s.Name
+	sessionID := s.createdSessionID
 	if ackPath == "" {
 		return
 	}
 	s.launchAckPath = ""
+	if sessionName == "" || sessionID == "" {
+		cleanupLaunchAckFiles(ackPath)
+		return
+	}
 	go func() {
 		defer cleanupLaunchAckFiles(ackPath)
 		ticker := time.NewTicker(10 * time.Millisecond)
 		defer ticker.Stop()
 		for {
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+			if !sessionIdentityMatches(sessionID, s.sessionIdentityFor(sessionName)) {
+				return
+			}
 			if raw, err := os.ReadFile(ackPath); err == nil {
 				marker := strings.TrimSpace(string(raw))
 				if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
@@ -2837,10 +2853,11 @@ func (s *Session) WatchInitialProcessCompletion(callback func(exitCode int, diag
 					return
 				}
 			}
-			if !s.Exists() {
+			select {
+			case <-cancel:
 				return
+			case <-ticker.C:
 			}
-			<-ticker.C
 		}
 	}()
 }
@@ -3575,7 +3592,11 @@ func (s *Session) KillIfOwned() error {
 }
 
 func (s *Session) sessionIdentity() string {
-	out, err := s.runBoundedOutput("display-message", "-t", s.Name, "-p", "#{session_id}")
+	return s.sessionIdentityFor(s.Name)
+}
+
+func (s *Session) sessionIdentityFor(name string) string {
+	out, err := s.runBoundedOutput("display-message", "-t", name, "-p", "#{session_id}")
 	if err != nil {
 		return ""
 	}

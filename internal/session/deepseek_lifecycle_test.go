@@ -94,6 +94,45 @@ func waitForPane(t *testing.T, inst *Instance, want string, timeout time.Duratio
 	return ""
 }
 
+func launchAckArtifacts() map[string]struct{} {
+	artifacts := make(map[string]struct{})
+	for _, path := range launchAckArtifactPaths() {
+		artifacts[path] = struct{}{}
+	}
+	return artifacts
+}
+
+func launchAckArtifactPaths() []string {
+	paths, _ := filepath.Glob(filepath.Join(os.TempDir(), "agent-deck-launch-ack-*"))
+	return paths
+}
+
+func waitForLaunchAckArtifactsGone(t *testing.T, before map[string]struct{}, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		matches := launchAckArtifactPaths()
+		newArtifacts := make([]string, 0, len(matches))
+		for _, path := range matches {
+			if _, existed := before[path]; !existed {
+				newArtifacts = append(newArtifacts, path)
+			}
+		}
+		if len(newArtifacts) == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	matches := launchAckArtifactPaths()
+	newArtifacts := make([]string, 0, len(matches))
+	for _, path := range matches {
+		if _, existed := before[path]; !existed {
+			newArtifacts = append(newArtifacts, path)
+		}
+	}
+	t.Fatalf("late-completion marker artifacts remain after %s: %v", timeout, newArtifacts)
+}
+
 func TestDeepSeekLifecycle_LaunchSendRestart(t *testing.T) {
 	// New test: uses TestMain's bootstrapped server on the isolated socket, so
 	// the binary check is the right gate (skipIfNoTmuxServer is the legacy one).
@@ -546,6 +585,7 @@ func TestDeepSeekLifecycle_HeadlessLateCompletion(t *testing.T) {
 		{name: "failure", wantError: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			ackArtifactsBefore := launchAckArtifacts()
 			home := t.TempDir()
 			workspace := t.TempDir()
 			if err := os.WriteFile(filepath.Join(home, ".credentials.yaml"), []byte("deepseek: test\n"), 0o600); err != nil {
@@ -577,11 +617,13 @@ func TestDeepSeekLifecycle_HeadlessLateCompletion(t *testing.T) {
 						t.Fatalf("late failure diagnostic = %q, want output exactly once", rec.DyingOutput)
 					}
 					if !inst.Exists() {
+						waitForLaunchAckArtifactsGone(t, ackArtifactsBefore, 5*time.Second)
 						return
 					}
 				}
 				if !tc.wantError && rec == nil && inst.Exists() {
 					if content, captureErr := inst.PreviewFull(); captureErr == nil && strings.Contains(content, "LATE_HEADLESS_DIAGNOSTIC") {
+						waitForLaunchAckArtifactsGone(t, ackArtifactsBefore, 5*time.Second)
 						return
 					}
 				}
