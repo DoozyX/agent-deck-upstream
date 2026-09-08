@@ -131,6 +131,10 @@ func ParsePromptFromComposerBlock(lines []string) (string, bool) {
 				break
 			}
 		}
+		codexMarker := markerLen == 0 && strings.HasPrefix(strings.ToLower(trimmed), "codex>")
+		if codexMarker {
+			markerLen = len("codex>")
+		}
 		if markerLen == 0 {
 			continue
 		}
@@ -152,7 +156,14 @@ func ParsePromptFromComposerBlock(lines []string) (string, bool) {
 			break
 		}
 
-		return NormalizePromptText(strings.Join(bodyParts, " ")), true
+		body := NormalizePromptText(strings.Join(bodyParts, " "))
+		// A bare Codex prompt has historically been treated as
+		// non-introspectable. Keep that fail-safe behavior; only an actual
+		// Codex draft is actionable by the attribution gate.
+		if codexMarker && body == "" {
+			continue
+		}
+		return body, true
 	}
 	return "", false
 }
@@ -204,6 +215,11 @@ func CurrentComposerPrompt(content string) (string, bool) {
 		for _, marker := range []string{"❯", "›"} {
 			if strings.HasPrefix(trimmed, marker) {
 				return NormalizePromptText(strings.TrimSpace(trimmed[len(marker):])), true
+			}
+		}
+		if strings.HasPrefix(strings.ToLower(trimmed), "codex>") {
+			if body := NormalizePromptText(strings.TrimSpace(trimmed[len("codex>"):])); body != "" {
+				return body, true
 			}
 		}
 	}
