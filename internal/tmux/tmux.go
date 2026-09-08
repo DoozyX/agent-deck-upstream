@@ -1206,6 +1206,10 @@ type Session struct {
 	// created by the current Start call. Cleanup after acknowledgement must use
 	// this identity, not the mutable human-readable name.
 	createdSessionID string
+	// captureSessionIdentityOnCreate asks tmux new-session to print the
+	// immutable identity at creation time. That identity remains a safe cleanup
+	// target even when the later display-message probe is unavailable.
+	captureSessionIdentityOnCreate bool
 
 	// VimMode guarantees the inner agent's input composer is in insert mode
 	// before any text/Enter is delivered. When the inner tool (Claude Code with
@@ -1435,6 +1439,12 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	cols, rows := InitialWindowSize()
 	tmuxArgs := buildInnerTmuxArgs(s.SocketName, "new-session", "-d", "-s", s.Name, "-c", workDir,
 		"-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows))
+	if s.captureSessionIdentityOnCreate {
+		// -P/-F prints the session identity minted by this exact new-session
+		// command. It is an immutable rollback target if the follow-up probe
+		// cannot read the session yet.
+		tmuxArgs = append(tmuxArgs, "-P", "-F", "#{session_id}")
+	}
 	if startWithInitialProcess {
 		// Deliver the pane command as SEPARATE argv tokens (bash, -c, command)
 		// rather than a single shell-quoted string. This is the crux of the
@@ -2453,6 +2463,7 @@ func (s *Session) Start(command string) error {
 	// Commands containing bash-specific syntax are wrapped for fish compatibility.
 	//
 	// workDir was resolved and validated at the top of Start (#1713).
+	s.captureSessionIdentityOnCreate = true
 	launcher, args := s.startCommandSpec(workDir, command)
 	// newSpawnCommand (not bare execCommand) so the spawn — and any tmux server
 	// it starts — runs from SpawnBaseDir and can never inherit a directory that
@@ -2556,11 +2567,19 @@ func (s *Session) Start(command string) error {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 	created = true
-	s.createdSessionID = ""
+	s.createdSessionID = createdSessionIdentityFromOutput(output)
 	createdID, identityErr := s.captureCreatedSessionIdentity()
 	if identityErr != nil {
 		cleanupLaunchAckFiles(s.launchAckPath)
 		s.launchAckPath = ""
+		if s.createdSessionID != "" {
+			if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
+				statusLog.Warn("created_session_rollback_failed",
+					slog.String("session", logging.SanitizeValue(s.Name)),
+					slog.String("identity", logging.SanitizeValue(s.createdSessionID)),
+					slog.String("error", rollbackErr.Error()))
+			}
+		}
 		return fmt.Errorf("tmux session created but immutable identity was not captured: %w", identityErr)
 	}
 	s.createdSessionID = createdID
@@ -2749,6 +2768,26 @@ func (s *Session) Start(command string) error {
 	// The Stop hook (via Claude settings) handles instant YELLOW detection.
 
 	return nil
+}
+
+func createdSessionIdentityFromOutput(output []byte) string {
+	for _, line := range strings.Split(string(output), "\n") {
+		identity := strings.TrimSpace(line)
+		if strings.HasPrefix(identity, "$") && strings.TrimSpace(strings.TrimPrefix(identity, "$")) != "" {
+			return identity
+		}
+	}
+	return ""
+}
+
+// rollbackCreatedSession addresses the session by the immutable identity
+// returned by the creating new-session command. A name-based kill here would
+// be able to delete a replacement session after a delete-and-recreate race.
+func (s *Session) rollbackCreatedSession(identity string) error {
+	if s == nil || strings.TrimSpace(identity) == "" {
+		return fmt.Errorf("tmux session ownership is unproven")
+	}
+	return s.teardown(identity, true, true)
 }
 
 // AcknowledgeInitialProcess proves the initial command did not die before the
@@ -3780,11 +3819,15 @@ func (s *Session) sessionIdentityFor(name string) string {
 func (s *Session) captureCreatedSessionIdentity() (string, error) {
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		probe := s.probeSessionIdentity(s.Name)
-		if probe.state == sessionIdentityOwned {
-			return probe.identity, nil
-		}
-		if probe.state == sessionIdentityMissing {
+		out, err := s.runBoundedOutput("display-message", "-t", s.Name, "-p", "#{session_id}")
+		if err == nil {
+			if identity := strings.TrimSpace(string(out)); identity != "" {
+				if s.createdSessionID != "" && !sessionIdentityMatches(s.createdSessionID, identity) {
+					return "", fmt.Errorf("session identity changed during capture: expected %s, found %s", s.createdSessionID, identity)
+				}
+				return identity, nil
+			}
+		} else if tmuxSessionAbsence(err) {
 			return "", fmt.Errorf("session disappeared before identity capture")
 		}
 		if time.Now().After(deadline) {

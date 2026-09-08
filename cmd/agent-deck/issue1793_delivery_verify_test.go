@@ -274,6 +274,128 @@ func TestIssue1793_CodexWorkingPaneConfirmsSubmittedNoWaitSend(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexPayloadWorkingLineIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "working on the deployment plan"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("payload text beginning with working must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexUnrelatedWorkingLineNeedsThisBody(t *testing.T) {
+	const msg = "ISSUE1793 ATTRIBUTABLE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\nunrelated request\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("unrelated Working text must not submit this request: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexStaleWorkingBodyIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 STALE CODEX BODY"
+	pane := "• Working\n" + msg + "\n"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes:    []string{pane, pane},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("stale body and Working text must not submit again: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexAlternateWorkingTextIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "ISSUE1793 ALTERNATE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"Working on another request\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("alternate UI text must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexDelayedWorkingBeforeBodyIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "ISSUE1793 DELAYED CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("Working before this body must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexWorkingRequiresAttributableEnter(t *testing.T) {
+	const msg = "ISSUE1793 WORKING ENTER ATTRIBUTION BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes:    []string{"codex>\n", "• Working\n" + msg + "\ncodex> foreign draft\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("Working plus a foreign draft must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexWorkingBodyMatchIsWhitespaceSafe(t *testing.T) {
+	const msg = "request with\nmultiple words"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\nrequest with\nmultiple words\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("whitespace-wrapped body with attributable Working line must submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
 // TestIssue1793_ClaudePath_TypedButNeverSubmitted_IsNotSuccess is the Claude
 // half of the same defect. The Claude verification loop treated "the body is
 // visible in the pane" as delivery evidence and, at the end of its budget,

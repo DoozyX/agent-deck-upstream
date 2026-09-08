@@ -215,6 +215,38 @@ func TestCaptureCreatedSessionIdentityRequiresBoundedOwnedProbe(t *testing.T) {
 	}
 }
 
+func TestCaptureCreatedSessionIdentityRetriesTransientEmptyResponse(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "identity-calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
+		"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then exit 0; fi\n"+"  echo '$created'; exit 0\n"+"fi\nexit 1\n")
+
+	identity, err := (&Session{Name: "created"}).captureCreatedSessionIdentity()
+	if err != nil || identity != "$created" {
+		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want retry result $created", identity, err)
+	}
+}
+
+func TestStartRollsBackCreatedSessionWhenIdentityCaptureFails(t *testing.T) {
+	dir := t.TempDir()
+	killLog := filepath.Join(dir, "kill.log")
+	writeFakeTmux(t, dir, "case \" $* \" in\n"+
+		"  *' has-session '*|*' list-sessions '*) exit 1 ;;\n"+
+		"  *' new-session '*) echo '$created'; exit 0 ;;\n"+
+		"  *' display-message '*) exit 0 ;;\n"+
+		"  *' list-panes '*) exit 0 ;;\n"+"  *' kill-session '*) echo \"$*\" >> "+shellQuote(killLog)+"; exit 0 ;;\n"+"  *) exit 0 ;;\n"+"esac\n")
+
+	sess := NewSession("identity-capture-rollback", t.TempDir())
+	err := sess.Start("")
+	if err == nil {
+		t.Fatal("Start() unexpectedly succeeded without an immutable session identity")
+	}
+	if raw, readErr := os.ReadFile(killLog); readErr != nil || len(strings.TrimSpace(string(raw))) == 0 {
+		t.Fatalf("created session was not rolled back: log=%q readErr=%v", raw, readErr)
+	}
+}
+
 func TestLaunchAckScriptFailsClosedWithoutProcessGroupCapability(t *testing.T) {
 	ackPath := filepath.Join(t.TempDir(), "ack")
 	latePath := filepath.Join(t.TempDir(), "late")
