@@ -1,6 +1,13 @@
 package session
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
 
 // TestClassifyTerminatedPane_CleanExitVsCrash pins the classification of a
 // session whose tmux pane has terminated after having been started.
@@ -44,6 +51,95 @@ func TestClassifyTerminatedPane_CleanExitVsCrash(t *testing.T) {
 			if got != tt.want {
 				t.Errorf("classifyTerminatedPane(%d, %v, %q) = %q, want %q",
 					tt.exitCode, tt.haveExitCode, tt.tool, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBoundedShellCodexExecReportsLiveThenCleanCompletion(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	bin := t.TempDir()
+	// The script name is intentionally codex: process-tree inspection must see
+	// the descendant beneath the shell launcher, rather than trusting pane text.
+	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nsleep 1\n"), 0o755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inst := NewInstance("bounded-shell-codex", t.TempDir())
+	inst.Tool = "shell"
+	inst.Command = "codex exec --json work"
+	assert.NoError(t, inst.Start())
+	t.Cleanup(func() { _ = inst.Kill() })
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	sawRunning := false
+	for {
+		assert.NoError(t, inst.UpdateStatus())
+		if inst.GetStatusThreadSafe() == StatusRunning {
+			sawRunning = true
+		}
+		if sawRunning && inst.GetStatusThreadSafe() == StatusStopped {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("status=%s, sawRunning=%v; want live descendant then clean stopped completion", inst.GetStatusThreadSafe(), sawRunning)
+		case <-tick.C:
+		}
+	}
+}
+
+func TestBoundedShellCodexExecReportsNonzeroExit(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	bin := t.TempDir()
+	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nexit 7\n"), 0o755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inst := NewInstance("bounded-shell-codex-fail", t.TempDir())
+	inst.Tool = "shell"
+	inst.Command = "codex exec --json fail"
+	assert.NoError(t, inst.Start())
+	t.Cleanup(func() { _ = inst.Kill() })
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		assert.NoError(t, inst.UpdateStatus())
+		if inst.GetStatusThreadSafe() == StatusError {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("status=%s; want error for codex exec exit 7", inst.GetStatusThreadSafe())
+		case <-tick.C:
+		}
+	}
+}
+
+func TestBoundedCodexExecKeepsExitStatus(t *testing.T) {
+	tests := []struct {
+		command string
+		want    bool
+	}{
+		{"codex exec --json fix-it", true},
+		{"bash -lc 'codex exec --json fix-it'", true},
+		{"codex --model gpt-5.6-terra", false},
+		{"echo codex exec", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.command, func(t *testing.T) {
+			inst := NewInstance("bounded-codex", t.TempDir())
+			inst.Command = tt.command
+			assert.Equal(t, tt.want, inst.isBoundedCodexExec())
+			overrides := inst.buildTmuxOptionOverrides()
+			if tt.want {
+				assert.Equal(t, "on", overrides["remain-on-exit"], "exit 0 must remain observable as stopped")
 			}
 		})
 	}

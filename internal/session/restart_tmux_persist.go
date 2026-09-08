@@ -58,6 +58,14 @@ func (i *Instance) recordRestartOutcome() {
 	}
 }
 
+// PersistRestartOutcome records the live tmux identity and lifecycle state of
+// a successful restart through a targeted write. CLI callers use this instead
+// of a stale full-registry snapshot: the process replacement is already real,
+// so a concurrent status refresh must not make the command report failure.
+func (i *Instance) PersistRestartOutcome() {
+	i.recordRestartOutcome()
+}
+
 // writeRestartOutcome performs the targeted write and reports what stopped it.
 func (i *Instance) writeRestartOutcome() (statedb.WriteStamps, error) {
 	name := ""
