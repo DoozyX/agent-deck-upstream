@@ -484,12 +484,20 @@ func (i *Instance) recordPrepareFailure(command string, prepErr error) {
 // the fast-death path this has no pane to snapshot — the error string is the
 // diagnostic.
 func (i *Instance) recordTmuxStartFailure(command string, startErr error) {
+	diagnostic := startErr.Error()
+	if i.tmuxSession != nil {
+		if content, captureErr := i.tmuxSession.CapturePane(); captureErr == nil {
+			if content = strings.TrimSpace(content); content != "" {
+				diagnostic += ": " + content
+			}
+		}
+	}
 	rec := SpawnFailureRecord{
 		InstanceID:  i.ID,
 		Tool:        i.Tool,
 		Command:     command,
 		Reason:      "tmux_start_failed",
-		DyingOutput: startErr.Error(),
+		DyingOutput: diagnostic,
 	}
 	if err := writeSpawnFailureRecord(rec); err != nil {
 		sessionLog.Warn("spawn_failure_record_write_failed",
