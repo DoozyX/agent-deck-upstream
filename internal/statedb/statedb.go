@@ -2009,6 +2009,17 @@ func (s *StateDB) LifecycleIntents() ([]LifecycleIntent, error) {
 
 // --- Group CRUD ---
 
+const upsertGroupSQL = `
+		INSERT INTO groups (path, name, expanded, sort_order, default_path, max_concurrent)
+		VALUES (?, ?, ?, ?, ?, ?)
+		ON CONFLICT(path) DO UPDATE SET
+			name = excluded.name,
+			expanded = excluded.expanded,
+			sort_order = excluded.sort_order,
+			default_path = excluded.default_path,
+			max_concurrent = excluded.max_concurrent
+	`
+
 // SaveGroups upserts the given groups in a single transaction. It is ADDITIVE:
 // groups absent from the slice are left untouched, never deleted.
 //
@@ -2026,16 +2037,7 @@ func (s *StateDB) SaveGroups(groups []*GroupRow) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(`
-		INSERT INTO groups (path, name, expanded, sort_order, default_path, max_concurrent)
-		VALUES (?, ?, ?, ?, ?, ?)
-		ON CONFLICT(path) DO UPDATE SET
-			name = excluded.name,
-			expanded = excluded.expanded,
-			sort_order = excluded.sort_order,
-			default_path = excluded.default_path,
-			max_concurrent = excluded.max_concurrent
-	`)
+	stmt, err := tx.Prepare(upsertGroupSQL)
 	if err != nil {
 		return err
 	}
@@ -2056,7 +2058,11 @@ func (s *StateDB) SaveGroups(groups []*GroupRow) error {
 
 // LoadGroups returns all groups ordered by sort_order.
 func (s *StateDB) LoadGroups() ([]*GroupRow, error) {
-	rows, err := s.db.Query(`
+	return loadGroups(s.db.Query)
+}
+
+func loadGroups(query func(string, ...any) (*sql.Rows, error)) ([]*GroupRow, error) {
+	rows, err := query(`
 		SELECT path, name, expanded, sort_order, default_path, max_concurrent
 		FROM groups ORDER BY sort_order
 	`)
