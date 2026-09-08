@@ -4,8 +4,10 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -92,6 +94,165 @@ func TestIssue1793_LargePayloadVisibleInPane_IsReportedTypedNotSubmitted(t *test
 	}
 	if fields := (sendDeliveryResult{delivery: delivery}).jsonFields(); fields["submitted"] != false {
 		t.Fatalf("typed must report submitted=false in --json, got %v", fields["submitted"])
+	}
+}
+
+// TestIssue1793_NonClaudeTypedPromptGetsAnAttributableRecoveryEnter reproduces
+// the production Codex failure: the initial Enter is swallowed, while the body
+// is visibly parked in the pane. Codex takes the non-Claude verification path;
+// that path used to report DELIVERY_FAILED after its arrival checks without
+// ever trying the one bare Enter that immediately starts the turn.
+func TestIssue1793_NonClaudeTypedPromptGetsAnAttributableRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 CODEX SUBMIT RECOVERY distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		// The first read is the pre-send baseline. The first post-send read
+		// remains waiting because the original Enter was swallowed; after the
+		// recovery Enter the target starts work.
+		statuses: []string{"waiting", "waiting", "active"},
+		panes:    []string{"codex>\n", "codex> " + msg + "\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err != nil {
+		t.Fatalf("a recovered Codex submission must succeed: %v", err)
+	}
+	if delivery != deliverySubmitted {
+		t.Fatalf("delivery: want %q, got %q", deliverySubmitted, delivery)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("visible prompt with swallowed initial Enter: want one recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexRecoveryAttemptIsConsumedWhenEnterFails(t *testing.T) {
+	const msg = "ISSUE1793 CODEX RECOVERY ATTEMPT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses:     []string{"waiting"},
+		panes:        []string{"codex>\n", "codex> " + msg + "\n"},
+		sendEnterErr: errors.New("tmux send-keys Enter failed"),
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("failed recovery must stay an unconfirmed typed delivery: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("a failed recovery Enter must still consume the one-attempt budget, got %d attempts", got)
+	}
+}
+
+func TestIssue1793_CodexForeignDraftIsNeverSubmittedByRecovery(t *testing.T) {
+	const msg = "ISSUE1793 CODEX FOREIGN DRAFT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		// The body reached scrollback, but another actor replaced the current
+		// Codex composer before recovery. The prompt marker is Codex's native
+		// `codex>` form, not Claude's glyph.
+		panes: []string{"codex>\n", "history: " + msg + "\ncodex> deploy production immediately\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("foreign-draft recovery must remain unconfirmed: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("recovery must not submit a foreign Codex draft, got %d Enter presses", got)
+	}
+}
+
+// TestIssue1793_CodexForeignDraftConsumesRecoveryBudgetAcrossPaneChanges
+// covers the race between arrival evidence and recovery: the body is first
+// visible, but the composer belongs to another actor when recovery is
+// considered. Even if a later capture looks like our draft again, that
+// attribution refusal must consume the only recovery opportunity rather than
+// risk submitting a concurrently replaced prompt.
+func TestIssue1793_CodexForeignDraftConsumesRecoveryBudgetAcrossPaneChanges(t *testing.T) {
+	const msg = "ISSUE1793 CODEX CHANGING PANE distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		panes: []string{
+			"codex>\n", // pre-send baseline
+			"history: " + msg + "\ncodex> deploy production immediately\n",
+			"history: " + msg + "\ncodex> " + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("foreign-draft recovery must remain unconfirmed: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("an attribution refusal must consume recovery budget; got %d Enter presses after pane changed back", got)
+	}
+}
+
+// TestIssue1793_CustomCodexCompatibleToolGetsBoundedRecoveryEnter proves the
+// recovery capability follows compatible_with rather than the built-in tool
+// name, so wrappers retain the same one-Enter safety boundary as native Codex.
+func TestIssue1793_CustomCodexCompatibleToolGetsBoundedRecoveryEnter(t *testing.T) {
+	const tool = "issue1793_codex_wrapper"
+	const msg = "ISSUE1793 CUSTOM CODEX RECOVERY distinctive prompt body"
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+	if err := session.SaveUserConfig(&session.UserConfig{Tools: map[string]session.ToolDef{
+		tool: {Command: "company-codex-wrapper", CompatibleWith: "codex"},
+	}}); err != nil {
+		t.Fatalf("save custom Codex-compatible tool: %v", err)
+	}
+	if !session.IsCodexCompatible(tool) {
+		t.Fatal("custom tool with compatible_with=codex must receive Codex recovery behavior")
+	}
+
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting", "waiting", "active"},
+		panes:    []string{"codex>\n", "codex> " + msg + "\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: tool,
+	})
+
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("custom Codex-compatible recovery must submit: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("custom Codex-compatible tool: want one bounded recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexActiveTransitionNeedsNoRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 CODEX NORMAL SUBMIT distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		// Baseline is waiting; the first post-send sample is active, so this
+		// normal submission must return before inspecting/nudging the pane.
+		statuses: []string{"waiting", "active"},
+		panes:    []string{"codex>\n", "history: " + msg + "\ncodex>\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("active transition must remain submitted without recovery: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("already-submitted Codex turn must not receive recovery Enter, got %d", got)
 	}
 }
 
