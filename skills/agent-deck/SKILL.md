@@ -71,6 +71,7 @@ What agent-deck does, at the noun level (independent of which surface — CLI / 
 | **State persistence** | `state.json` + `task-log.md` + `LEARNINGS.md` + `HANDOFF.md` survive Claude Code compaction/restart | CLI ✅ |
 | **GitHub pipeline oversight** | Conductor-driven release flow: PR merge → tag → goreleaser → release | CLI ✅ |
 | **Remote sessions** | SSH-based remote register / list / attach across hosts | CLI ✅ |
+| **Cross-machine artifacts** | Union a repo's `.agent-deck/<run-id>/` trees between hosts (`artifacts sync`) | CLI ✅ |
 | **Session sharing** | Export / import a Claude conversation for handoff between developers | CLI ✅ |
 | **Consult another agent** | Launch a Codex / Gemini sub-agent for a second opinion | CLI ✅ |
 | **Claude peer messaging** | Deterministic peer names plus native `ListAgents`/`SendMessage` routing with `session send` fallback | Claude tool + CLI fallback ✅ |
@@ -131,6 +132,7 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 | `agent-deck try <name>` | Scratch session in a dated experiment folder |
 | `agent-deck worktree list` | List worktrees with sessions |
 | `agent-deck worktree cleanup` | Find orphaned worktrees/sessions |
+| `agent-deck artifacts sync <remote>` | Union this machine's run artifacts with a remote's (never deletes, never overwrites) |
 | `agent-deck feedback` | Submit feedback (opens rating prompt + optional comment) |
 
 **Status:** `●` running | `◐` waiting | `○` idle | `✕` error
@@ -994,6 +996,27 @@ agent-deck add -t rc-server -c "bash -c 'exec claude remote-control --name X'" /
 ```
 
 The wrapped form injects nothing and runs the command verbatim. Trade-off: the session is opaque to claude session-id tracking / resume-on-restart — fine for server-style subcommands, which have no conversation to resume. Extra *flags* (e.g. `-c "claude --model opus"`) are unaffected — the wrapper-suffix path handles those correctly.
+
+### Run artifacts on a second machine
+
+Run artifacts — `<main-worktree>/.agent-deck/<run-id>/` and `.agent-deck/handoff/<session-id>/` — are project artifacts kept out of git on purpose, so **nothing carries them between machines on its own**. A run recorded on one host is invisible on every other one, `remote drain` included: that pulls completion *records*, never files.
+
+```bash
+agent-deck artifacts sync m1                  # this repo, both directions
+agent-deck artifacts sync m1 --all --dry-run  # every root in the registry, plan only
+agent-deck artifacts sync m1 --json           # scriptable
+```
+
+It is a **union**: pulls what is missing here, pushes what is missing there, and never deletes and never overwrites. What to know before relying on it:
+
+- **Conflicts are reported, not resolved.** Same path, different content on both sides ⇒ it moves in neither direction and the command exits `4`. Everything else still transfers.
+- **A root the remote does not have is skipped with a reason** — never treated as an empty remote tree, which would push a whole local history into a path that is not that repo over there.
+- **Remote paths are the local path remapped through `$HOME`** (`~alice/src/app` → `~bob/src/app`). A root outside `$HOME` is skipped.
+- **Both machines need a build that has the `artifacts` verb.** An older remote is reported as a version error naming `agent-deck remote update`.
+- **`tmp/` and `skills.toml` are never synced** (per-checkout by design), but *other* machine-local state that lives inside a run directory still is — an in-flight run's `.conductor-id`, `.watchdog-id`, `heartbeat.log` and `.poll-raw.json` will travel. **Prefer syncing a run that has finished**; nothing is overwritten, but a live run's coordination files are meaningless on the other host.
+- Exit codes: `0` synced (already-converged says so explicitly), `2` usage/unknown remote, `3` remote unreachable, `4` conflicts.
+
+Full flags and security behavior: [Artifacts Commands](references/cli-reference.md#artifacts-commands).
 
 ### Cross-machine config drift (macOS ↔ Linux)
 
