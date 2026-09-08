@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -92,6 +93,36 @@ func TestIssue1793_LargePayloadVisibleInPane_IsReportedTypedNotSubmitted(t *test
 	}
 	if fields := (sendDeliveryResult{delivery: delivery}).jsonFields(); fields["submitted"] != false {
 		t.Fatalf("typed must report submitted=false in --json, got %v", fields["submitted"])
+	}
+}
+
+// TestIssue1793_NonClaudeTypedPromptGetsAnAttributableRecoveryEnter reproduces
+// the production Codex failure: the initial Enter is swallowed, while the body
+// is visibly parked in the pane. Codex takes the non-Claude verification path;
+// that path used to report DELIVERY_FAILED after its arrival checks without
+// ever trying the one bare Enter that immediately starts the turn.
+func TestIssue1793_NonClaudeTypedPromptGetsAnAttributableRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 CODEX SUBMIT RECOVERY distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		// The first read is the pre-send baseline. The first post-send read
+		// remains waiting because the original Enter was swallowed; after the
+		// recovery Enter the target starts work.
+		statuses: []string{"waiting", "waiting", "active"},
+		panes:    []string{"codex>\n", "codex> " + msg + "\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: "codex",
+	})
+
+	if err != nil {
+		t.Fatalf("a recovered Codex submission must succeed: %v", err)
+	}
+	if delivery != deliverySubmitted {
+		t.Fatalf("delivery: want %q, got %q", deliverySubmitted, delivery)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("visible prompt with swallowed initial Enter: want one recovery Enter, got %d", got)
 	}
 }
 
