@@ -5004,9 +5004,8 @@ func (i *Instance) Start() error {
 		i.recordTmuxStartFailure(command, err)
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("initial session command did not launch: %w", err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
+		return err
 	}
 
 	// #1580: watch for a fast death of the initial process (broken command,
@@ -5331,9 +5330,8 @@ func (i *Instance) StartWithMessage(message string) error {
 		i.recordTmuxStartFailure(command, err)
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("initial session command did not launch: %w", err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
+		return err
 	}
 
 	// #1580: fast-death watcher (sister path to Start()).
@@ -9266,10 +9264,9 @@ func (i *Instance) restart(env map[string]string) error {
 		i.Status = StatusError
 		return fmt.Errorf("failed to restart tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
 		i.Status = StatusError
-		return fmt.Errorf("initial session command did not launch: %w", err)
+		return err
 	}
 
 	mcpLog.Debug("restart_start_succeeded")
