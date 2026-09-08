@@ -1519,6 +1519,15 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -f "$output_path" "$fifo_path" "$marker_tmp"
+# A process-group owner is required before starting the direct command. The
+# wrapper cannot safely reap descendants when neither setsid nor the Perl POSIX
+# fallback exists: its own process group also contains tee and this shell, so a
+# guessed negative child PID would leave descendants alive. Fail closed before
+# creating the FIFO or running user code.
+if ! command -v setsid >/dev/null 2>&1 && ! command -v perl >/dev/null 2>&1; then
+  printf 'exit:125\nlaunch acknowledgement requires setsid or perl for process ownership\n' > "$ack_path"
+  exit 125
+fi
 if ! mkfifo "$fifo_path"; then
   exit 125
 fi
@@ -2547,7 +2556,14 @@ func (s *Session) Start(command string) error {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
 	created = true
-	s.createdSessionID = s.sessionIdentity()
+	s.createdSessionID = ""
+	createdID, identityErr := s.captureCreatedSessionIdentity()
+	if identityErr != nil {
+		cleanupLaunchAckFiles(s.launchAckPath)
+		s.launchAckPath = ""
+		return fmt.Errorf("tmux session created but immutable identity was not captured: %w", identityErr)
+	}
+	s.createdSessionID = createdID
 
 	// Register session in cache immediately to prevent race condition
 	// where Exists() returns false because cache was refreshed before session creation
@@ -3599,10 +3615,10 @@ func (s *Session) EnableMouseMode() error {
 // processes actually die. tmux kill-session sends SIGHUP which some CLI
 // tools (e.g. Claude Code 2.1.27+) ignore, leaving orphan processes.
 func (s *Session) Kill() error {
-	return s.teardown(s.Name, false)
+	return s.teardown(s.Name, false, false)
 }
 
-func (s *Session) teardown(target string, owned bool) error {
+func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 	// Disconnect control mode pipe
 	if pm := GetPipeManager(); pm != nil {
 		pm.Disconnect(s.Name)
@@ -3627,7 +3643,11 @@ func (s *Session) teardown(target string, owned bool) error {
 	// Verify old processes are dead; escalate to SIGKILL if needed. No new
 	// process exists on this path — the session is gone — so nothing is spared.
 	if len(oldPIDs) > 0 {
-		go s.ensureProcessesDead(oldPIDs, nil)
+		if synchronous {
+			EnsurePIDsDead(oldPIDs, 3*time.Second)
+		} else {
+			go s.ensureProcessesDead(oldPIDs, nil)
+		}
 	}
 
 	// Killing a session that no longer exists is success, not failure: tmux
@@ -3655,20 +3675,42 @@ func (s *Session) teardown(target string, owned bool) error {
 // session id, then addresses kill-session by that id so a delete-and-recreate
 // race cannot kill the replacement.
 func (s *Session) KillIfOwned() error {
-	if s == nil || strings.TrimSpace(s.createdSessionID) == "" {
+	if s == nil {
 		return fmt.Errorf("tmux session ownership is unproven")
 	}
-	probe := s.probeSessionIdentity(s.Name)
+	name, identity := s.OwnershipSnapshot()
+	return s.KillIfOwnedSnapshot(name, identity)
+}
+
+// OwnershipSnapshot returns the immutable launch target captured by Start.
+// Callers that retain a launch callback must copy these values before another
+// start can mutate the Session object.
+func (s *Session) OwnershipSnapshot() (name, identity string) {
+	if s == nil {
+		return "", ""
+	}
+	return s.Name, s.createdSessionID
+}
+
+// KillIfOwnedSnapshot is KillIfOwned with an explicitly captured identity.
+// It is used by late callbacks whose Session pointer may be reused for a newer
+// generation. The target name and identity are function arguments, so mutable
+// Session fields cannot redirect cleanup to a replacement session.
+func (s *Session) KillIfOwnedSnapshot(name, identity string) error {
+	if s == nil || strings.TrimSpace(identity) == "" || strings.TrimSpace(name) == "" {
+		return fmt.Errorf("tmux session ownership is unproven")
+	}
+	probe := s.probeSessionIdentity(name)
 	switch probe.state {
 	case sessionIdentityMissing:
 		return nil
 	case sessionIdentityIndeterminate:
 		return fmt.Errorf("tmux session ownership is indeterminate")
 	case sessionIdentityOwned:
-		if !sessionIdentityMatches(s.createdSessionID, probe.identity) {
-			return fmt.Errorf("tmux session ownership changed: expected %s, found %s", s.createdSessionID, probe.identity)
+		if !sessionIdentityMatches(identity, probe.identity) {
+			return fmt.Errorf("tmux session ownership changed: expected %s, found %s", identity, probe.identity)
 		}
-		return s.teardown(s.createdSessionID, true)
+		return s.teardown(identity, true, true)
 	}
 	return fmt.Errorf("tmux session ownership is unproven")
 }
@@ -3692,7 +3734,7 @@ func (s *Session) probeSessionIdentity(name string) sessionIdentityProbe {
 	if actual != "" {
 		return sessionIdentityProbe{state: sessionIdentityOwned, identity: actual}
 	}
-	if err != nil && tmuxSessionAbsence(err) {
+	if (err == nil && actual == "") || (err != nil && tmuxSessionAbsence(err)) {
 		return sessionIdentityProbe{state: sessionIdentityMissing}
 	}
 	return sessionIdentityProbe{state: sessionIdentityIndeterminate}
@@ -3706,7 +3748,10 @@ func tmuxSessionAbsence(err error) bool {
 	text := strings.ToLower(strings.TrimSpace(string(exitErr.Stderr)))
 	return strings.Contains(text, "can't find session") ||
 		strings.Contains(text, "no such session") ||
-		strings.Contains(text, "session not found")
+		strings.Contains(text, "session not found") ||
+		strings.Contains(text, "no server running") ||
+		strings.Contains(text, "server exited unexpectedly") ||
+		strings.Contains(text, "lost server")
 }
 
 func (s *Session) sessionIdentity() string {
@@ -3714,11 +3759,39 @@ func (s *Session) sessionIdentity() string {
 }
 
 func (s *Session) sessionIdentityFor(name string) string {
-	out, err := s.runBoundedOutput("display-message", "-t", name, "-p", "#{session_id}")
-	if err != nil {
-		return ""
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		out, err := s.runBoundedOutput("display-message", "-t", name, "-p", "#{session_id}")
+		if err == nil {
+			if identity := strings.TrimSpace(string(out)); identity != "" {
+				return identity
+			}
+		}
+		if time.Now().After(deadline) {
+			return ""
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return strings.TrimSpace(string(out))
+}
+
+// captureCreatedSessionIdentity is the required, bounded post-create identity
+// step. A live session without this fact cannot be safely owned or cleaned up,
+// so Start refuses to report success rather than arming an unowned watcher.
+func (s *Session) captureCreatedSessionIdentity() (string, error) {
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		probe := s.probeSessionIdentity(s.Name)
+		if probe.state == sessionIdentityOwned {
+			return probe.identity, nil
+		}
+		if probe.state == sessionIdentityMissing {
+			return "", fmt.Errorf("session disappeared before identity capture")
+		}
+		if time.Now().After(deadline) {
+			return "", fmt.Errorf("identity probe remained indeterminate")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (s *Session) sessionIdentityIs(want string) bool {

@@ -256,6 +256,24 @@ func TestIssue1793_CodexActiveTransitionNeedsNoRecoveryEnter(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexWorkingPaneConfirmsSubmittedNoWaitSend(t *testing.T) {
+	const msg = "ISSUE1793 BABA CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("Codex Working pane after a submitted prompt = delivery %q, err %v; want submitted", delivery, err)
+	}
+}
+
 // TestIssue1793_ClaudePath_TypedButNeverSubmitted_IsNotSuccess is the Claude
 // half of the same defect. The Claude verification loop treated "the body is
 // visible in the pane" as delivery evidence and, at the end of its budget,

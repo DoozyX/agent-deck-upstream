@@ -3803,6 +3803,10 @@ type sendArrivalBaseline struct {
 	// a failed read defaulting to "was not active" would turn a
 	// continuously-busy agent into a fake not-active-to-active transition.
 	statusOK bool
+	// content is the successful pre-send pane snapshot. Codex exposes a visible
+	// Working state in the pane while its status probe can remain active both
+	// before and after a send, so submission uses a content transition too.
+	content string
 }
 
 // captureArrivalBaseline snapshots the pane and status before a send. Each
@@ -3810,8 +3814,8 @@ type sendArrivalBaseline struct {
 // baseline is disabled, never guessed.
 func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
 	base := sendArrivalBaseline{}
-	if n, markers, _, _, ok := paneArrivalObservation(target, message); ok {
-		base.occurrences, base.pasteMarkers, base.paneOK = n, markers, true
+	if n, markers, content, _, ok := paneArrivalObservation(target, message); ok {
+		base.occurrences, base.pasteMarkers, base.paneOK, base.content = n, markers, true, content
 	}
 	if status, err := target.GetStatus(); err == nil {
 		base.wasActive, base.statusOK = status == "active", true
@@ -3912,6 +3916,10 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		}
 		if baseline.paneOK {
 			if n, markers, content, paneNow, ok := paneArrivalObservation(target, message); ok {
+				if session.IsCodexCompatible(opts.tool) &&
+					!codexWorkingIndicator(baseline.content, message) && codexWorkingIndicator(content, message) {
+					return deliverySubmitted, nil
+				}
 				arrived := false
 				if n > baseline.occurrences {
 					if opts.tool == "pi" && piComposerEmpty(content, message) {
@@ -3987,6 +3995,29 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 // end a line: with ICRNL set (the tty default) an incoming CR becomes NL
 // before the line discipline sees it, so counting only \n would read a
 // CR-delimited body as one enormous line.
+// codexWorkingIndicator is the content-side submission acknowledgement for
+// Codex-compatible TUIs. Their status probe may report active before the send
+// (startup/tool work) and therefore cannot always provide a useful transition;
+// a newly rendered Working line, absent from the pre-send snapshot, is the
+// attributable state change. The baseline comparison prevents old output from
+// certifying a send that never arrived.
+
+func codexWorkingIndicator(content, message string) bool {
+	// Do not treat a user payload containing the word "working" as the TUI's
+	// state line. Remove its distinctive token before looking for the indicator;
+	// the body itself is arrival evidence, never submission evidence.
+	if token := collapseWhitespace(messageDeliveryToken(message)); token != "" {
+		content = strings.ReplaceAll(content, token, "")
+	}
+	for _, line := range strings.Split(strings.ToLower(content), "\n") {
+		line = strings.TrimSpace(strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*"))
+		if line == "working" || strings.HasPrefix(line, "working ") || strings.HasPrefix(line, "working(") || strings.HasPrefix(line, "working...") {
+			return true
+		}
+	}
+	return false
+}
+
 func longestMessageLineBytes(message string) int {
 	longest := 0
 	for _, line := range strings.FieldsFunc(message, func(r rune) bool {
