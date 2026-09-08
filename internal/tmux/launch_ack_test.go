@@ -1,6 +1,8 @@
 package tmux
 
 import (
+	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,5 +142,119 @@ func TestWatchInitialProcessCompletionIgnoresRecreatedSession(t *testing.T) {
 	case <-called:
 		t.Fatal("stale watcher callback ran for the replacement session")
 	case <-time.After(250 * time.Millisecond):
+	}
+}
+
+func TestWatchInitialProcessCompletionRetriesIndeterminateIdentityProbe(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "identity-calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then echo 'server busy' >&2; exit 1; fi\n"+"  echo '$owned'\n"+"  exit 0\n"+"fi\nexit 1\n")
+
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	if err := os.WriteFile(ackPath, []byte("exit:7\nTRANSIENT_PROBE_DIAGNOSTIC\n"), 0o600); err != nil {
+		t.Fatalf("write acknowledgement: %v", err)
+	}
+	sess := &Session{Name: "probe-retry", createdSessionID: "$owned", launchAckPath: ackPath}
+	called := make(chan string, 1)
+	sess.WatchInitialProcessCompletion(make(chan struct{}), func(code int, diagnostic string) {
+		called <- fmt.Sprintf("%d:%s", code, diagnostic)
+	})
+	select {
+	case got := <-called:
+		if got != "7:TRANSIENT_PROBE_DIAGNOSTIC" {
+			t.Fatalf("callback = %q, want completion after retry", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher abandoned marker after an indeterminate identity probe")
+	}
+}
+
+func TestKillIfOwnedPerformsOwnedTeardown(t *testing.T) {
+	dir := t.TempDir()
+	callLog := filepath.Join(dir, "calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+"echo \"$*\" >> "+shellQuote(callLog)+"\n"+"case \"$1\" in\n"+"display-message) echo '$owned' ;;\n"+"list-panes) echo \"$TEARDOWN_PID\" ;;\n"+"kill-session) ;;\n"+"*) exit 0 ;;\n"+"esac\n")
+	proc := exec.Command("sh", "-c", "sleep 30 & wait")
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start owned process: %v", err)
+	}
+	t.Setenv("TEARDOWN_PID", fmt.Sprint(proc.Process.Pid))
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	logPath := filepath.Join(LogDir(), "owned-teardown.log")
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		t.Fatalf("create log directory: %v", err)
+	}
+	if err := os.WriteFile(logPath, []byte("legacy"), 0o600); err != nil {
+		t.Fatalf("create legacy log: %v", err)
+	}
+
+	sess := &Session{Name: "owned-teardown", createdSessionID: "$owned"}
+	if err := sess.KillIfOwned(); err != nil {
+		t.Fatalf("KillIfOwned: %v", err)
+	}
+	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy log remains, stat error %v", err)
+	}
+	_ = proc.Wait()
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read tmux calls: %v", err)
+	}
+	if !strings.Contains(string(calls), "kill-session -t $owned") {
+		t.Fatalf("teardown did not target immutable session id: %q", calls)
+	}
+}
+
+func TestLaunchAckScriptDoesNotWaitForOutlivingDescendant(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	latePath := filepath.Join(t.TempDir(), "late")
+	command := fmt.Sprintf("(sleep 2; printf LATE > %s) & printf DIRECT; exit 7", shellQuote(latePath))
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("wrapper returned nil for child exit 7")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("wrapper blocked on a descendant-held output descriptor")
+	}
+	marker, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatalf("read completion marker: %v", err)
+	}
+	if !strings.Contains(string(marker), "exit:7\nDIRECT") {
+		t.Fatalf("marker lost direct-child diagnostics: %q", marker)
+	}
+	time.Sleep(2500 * time.Millisecond)
+	if _, err := os.Stat(latePath); !os.IsNotExist(err) {
+		t.Fatalf("outliving descendant survived wrapper cleanup, stat error %v", err)
+	}
+}
+
+func TestAcknowledgeInitialProcessWaitsForSlowCompletionDrain(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	if err := os.WriteFile(ackPath, []byte("pid:999999\n"), 0o600); err != nil {
+		t.Fatalf("write pid marker: %v", err)
+	}
+	if err := os.WriteFile(ackPath+".output", []byte("initial\n"), 0o600); err != nil {
+		t.Fatalf("write initial diagnostic: %v", err)
+	}
+	go func() {
+		for i := 0; i < 5; i++ {
+			time.Sleep(300 * time.Millisecond)
+			f, err := os.OpenFile(ackPath+".output", os.O_APPEND|os.O_WRONLY, 0o600)
+			if err != nil {
+				return
+			}
+			_, _ = fmt.Fprintf(f, "%s-progress-%d\n", strings.Repeat("L", 64*1024), i)
+			_ = f.Close()
+		}
+		_ = os.WriteFile(ackPath, []byte("exit:7\nSLOW_DIAGNOSTIC_COMPLETE\n"), 0o600)
+	}()
+	sess := &Session{Name: "slow-completion", launchAckPath: ackPath}
+	err := sess.AcknowledgeInitialProcess()
+	if err == nil || !strings.Contains(err.Error(), "SLOW_DIAGNOSTIC_COMPLETE") {
+		t.Fatalf("AcknowledgeInitialProcess = %v, want complete slow diagnostic", err)
 	}
 }
