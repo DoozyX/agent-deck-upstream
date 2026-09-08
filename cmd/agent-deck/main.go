@@ -2228,6 +2228,7 @@ func handleAdd(profile string, args []string) {
 	// Build JSON data
 	jsonData := map[string]interface{}{
 		"success": true,
+		"started": false,
 		"id":      newInstance.ID,
 		"title":   newInstance.Title,
 		"path":    path,

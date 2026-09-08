@@ -102,7 +102,11 @@ func TestBoundedShellCodexExecReportsNonzeroExit(t *testing.T) {
 	inst := NewInstance("bounded-shell-codex-fail", t.TempDir())
 	inst.Tool = "shell"
 	inst.Command = "codex exec --json fail"
-	assert.NoError(t, inst.Start())
+	err := inst.Start()
+	if err == nil {
+		t.Fatal("Start() succeeded after the initial command exited 7")
+	}
+	assert.Contains(t, err.Error(), "exit status 7")
 	t.Cleanup(func() { _ = inst.Kill() })
 
 	deadline := time.NewTimer(5 * time.Second)
@@ -120,6 +124,29 @@ func TestBoundedShellCodexExecReportsNonzeroExit(t *testing.T) {
 		case <-tick.C:
 		}
 	}
+}
+
+// TestInitialProcessAcknowledgementRejectsCleanImmediateExit is intentionally
+// a real isolated-tmux regression: tmux creation itself succeeded, but a
+// bounded command that finishes before Start returns is not a launched
+// interactive session. Exit zero stays visible in the error so callers cannot
+// mistake completion for a usable pane.
+func TestInitialProcessAcknowledgementRejectsCleanImmediateExit(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	bin := t.TempDir()
+	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	inst := NewInstance("bounded-shell-codex-clean-exit", t.TempDir())
+	inst.Tool = "shell"
+	inst.Command = "codex exec --json done"
+	err := inst.Start()
+	if err == nil {
+		t.Fatal("Start() succeeded after the initial command exited 0")
+	}
+	assert.Contains(t, err.Error(), "exit status 0")
+	t.Cleanup(func() { _ = inst.Kill() })
 }
 
 func TestBoundedCodexExecKeepsExitStatus(t *testing.T) {
