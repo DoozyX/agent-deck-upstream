@@ -1524,12 +1524,34 @@ if ! mkfifo "$fifo_path"; then
 fi
 tee "$output_path" < "$fifo_path" &
 tee_pid=$!
-bash -c "$command" > "$fifo_path" 2>&1 &
+# Run the direct command in its own process group when the host provides a
+# session launcher. A background descendant must not keep the FIFO open after
+# the direct child exits; tee still mirrors the complete direct-child stream to
+# the pane and records it for the completion marker.
+if command -v setsid >/dev/null 2>&1; then
+  setsid bash -c "$command" > "$fifo_path" 2>&1 &
+elif command -v perl >/dev/null 2>&1; then
+  perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV' bash -c "$command" > "$fifo_path" 2>&1 &
+else
+  bash -c "$command" > "$fifo_path" 2>&1 &
+fi
 child_pid=$!
 printf 'pid:%s\n' "$child_pid" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
 wait "$child_pid"
 exit_code=$?
-wait "$tee_pid"
+# The direct child is complete, so reap its process group before draining tee.
+# This closes inherited FIFO descriptors while keeping all bytes already
+# written by the direct child in the output file and pane.
+kill -TERM -- -"$child_pid" 2>/dev/null || true
+drain_deadline=$((SECONDS + 5))
+while kill -0 "$tee_pid" 2>/dev/null; do
+  if [ "$SECONDS" -ge "$drain_deadline" ]; then
+    kill -KILL "$tee_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 0.01
+done
+wait "$tee_pid" 2>/dev/null || true
 {
   printf 'exit:%s\n' "$exit_code"
   if [ -s "$output_path" ]; then
@@ -2736,7 +2758,6 @@ func (s *Session) AcknowledgeInitialProcess() error {
 	// otherwise a just-created pane can be reported live before its initial
 	// command has even been scheduled.
 	deadline := time.Now().Add(250 * time.Millisecond)
-	var completionDeadline time.Time
 	var marker string
 	for {
 		if raw, err := os.ReadFile(ackPath); err == nil {
@@ -2781,17 +2802,8 @@ func (s *Session) AcknowledgeInitialProcess() error {
 				}
 			}
 			if time.Now().After(deadline) {
-				if !childAlive && completionDeadline.IsZero() {
-					// The child has exited, but the wrapper still owns the
-					// authoritative completion publication while tee drains.
-					completionDeadline = time.Now().Add(time.Second)
-				}
-				if !childAlive && time.Now().Before(completionDeadline) {
-					time.Sleep(time.Millisecond)
-					continue
-				}
 				if !childAlive {
-					return fmt.Errorf("initial command exited before launch acknowledgement")
+					return waitForLaunchAckCompletion(ackPath, marker)
 				}
 				retainAck = s.AllowInitialProcessExit
 				return nil
@@ -2811,6 +2823,51 @@ func (s *Session) AcknowledgeInitialProcess() error {
 	}
 	retainAck = s.AllowInitialProcessExit
 	return nil
+}
+
+const (
+	launchAckDrainQuietPeriod = 2 * time.Second
+	launchAckDrainMax         = 30 * time.Second
+)
+
+// waitForLaunchAckCompletion waits for the wrapper's authoritative exit marker
+// after the direct child has already died. The quiet period is extended by
+// observable marker/output progress, while the absolute cap keeps a broken
+// wrapper bounded. This avoids converting a slow filesystem or a large
+// diagnostic into a false early launch failure.
+func waitForLaunchAckCompletion(ackPath, marker string) error {
+	quietDeadline := time.Now().Add(launchAckDrainQuietPeriod)
+	absoluteDeadline := time.Now().Add(launchAckDrainMax)
+	lastProgress := launchAckProgress(ackPath, marker)
+	for {
+		if raw, err := os.ReadFile(ackPath); err == nil {
+			marker = strings.TrimSpace(string(raw))
+			if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
+				diagnostic := launchAckDiagnostic(marker)
+				if diagnostic != "" {
+					return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d): %s", *exitCode, diagnostic)
+				}
+				return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d)", *exitCode)
+			}
+		}
+		progress := launchAckProgress(ackPath, marker)
+		if progress != lastProgress {
+			lastProgress = progress
+			quietDeadline = time.Now().Add(launchAckDrainQuietPeriod)
+		}
+		if time.Now().After(quietDeadline) || time.Now().After(absoluteDeadline) {
+			return fmt.Errorf("initial command exited before launch acknowledgement")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func launchAckProgress(ackPath, marker string) string {
+	info, err := os.Stat(ackPath + ".output")
+	if err != nil {
+		return marker
+	}
+	return fmt.Sprintf("%s:%d:%d", marker, info.Size(), info.ModTime().UnixNano())
 }
 
 // WatchInitialProcessCompletion watches the retained acknowledgement marker
@@ -2843,8 +2900,22 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 				return
 			default:
 			}
-			if !sessionIdentityMatches(sessionID, s.sessionIdentityFor(sessionName)) {
+			probe := s.probeSessionIdentity(sessionName)
+			switch probe.state {
+			case sessionIdentityMissing:
 				return
+			case sessionIdentityIndeterminate:
+				select {
+				case <-cancel:
+					return
+				case <-ticker.C:
+					continue
+				default:
+				}
+			case sessionIdentityOwned:
+				if !sessionIdentityMatches(sessionID, probe.identity) {
+					return
+				}
 			}
 			if raw, err := os.ReadFile(ackPath); err == nil {
 				marker := strings.TrimSpace(string(raw))
@@ -3528,6 +3599,10 @@ func (s *Session) EnableMouseMode() error {
 // processes actually die. tmux kill-session sends SIGHUP which some CLI
 // tools (e.g. Claude Code 2.1.27+) ignore, leaving orphan processes.
 func (s *Session) Kill() error {
+	return s.teardown(s.Name, false)
+}
+
+func (s *Session) teardown(target string, owned bool) error {
 	// Disconnect control mode pipe
 	if pm := GetPipeManager(); pm != nil {
 		pm.Disconnect(s.Name)
@@ -3538,7 +3613,7 @@ func (s *Session) Kill() error {
 	os.Remove(logFile) // Ignore errors
 
 	// Capture process tree BEFORE killing so we can verify they die
-	_, oldPIDs := s.getPaneProcessTree()
+	_, oldPIDs := s.getPaneProcessTreeFor(target)
 	if len(oldPIDs) > 0 {
 		respawnLog.Info("pre_kill_process_tree", slog.String("session", logging.SanitizeValue(s.Name)), slog.Any("pids", oldPIDs))
 	}
@@ -3547,7 +3622,7 @@ func (s *Session) Kill() error {
 	// SIGKILLed at the deadline yields a non-nil err, which the Exists() re-probe
 	// below resolves: if the server did process the kill, the session is gone and
 	// this returns success anyway.
-	err := s.runBoundedMutation("kill-session", "-t", s.Name)
+	err := s.runBoundedMutation("kill-session", "-t", target)
 
 	// Verify old processes are dead; escalate to SIGKILL if needed. No new
 	// process exists on this path — the session is gone — so nothing is spared.
@@ -3562,8 +3637,14 @@ func (s *Session) Kill() error {
 	// already gone (the post-Unarchive path — Unarchive clears the flag without
 	// restarting tmux). Only surface the error if the session is genuinely
 	// still alive after the kill attempt.
-	if err != nil && !s.Exists() {
-		return nil
+	if err != nil {
+		if owned {
+			if s.probeSessionIdentity(target).state == sessionIdentityMissing {
+				return nil
+			}
+		} else if !s.Exists() {
+			return nil
+		}
 	}
 
 	return err
@@ -3577,18 +3658,55 @@ func (s *Session) KillIfOwned() error {
 	if s == nil || strings.TrimSpace(s.createdSessionID) == "" {
 		return fmt.Errorf("tmux session ownership is unproven")
 	}
-	actual := s.sessionIdentity()
-	if actual == "" && !s.Exists() {
+	probe := s.probeSessionIdentity(s.Name)
+	switch probe.state {
+	case sessionIdentityMissing:
 		return nil
+	case sessionIdentityIndeterminate:
+		return fmt.Errorf("tmux session ownership is indeterminate")
+	case sessionIdentityOwned:
+		if !sessionIdentityMatches(s.createdSessionID, probe.identity) {
+			return fmt.Errorf("tmux session ownership changed: expected %s, found %s", s.createdSessionID, probe.identity)
+		}
+		return s.teardown(s.createdSessionID, true)
 	}
-	if !sessionIdentityMatches(s.createdSessionID, actual) {
-		return fmt.Errorf("tmux session ownership changed: expected %s, found %s", s.createdSessionID, actual)
+	return fmt.Errorf("tmux session ownership is unproven")
+}
+
+type sessionIdentityState uint8
+
+const (
+	sessionIdentityIndeterminate sessionIdentityState = iota
+	sessionIdentityOwned
+	sessionIdentityMissing
+)
+
+type sessionIdentityProbe struct {
+	state    sessionIdentityState
+	identity string
+}
+
+func (s *Session) probeSessionIdentity(name string) sessionIdentityProbe {
+	out, err := s.runBoundedOutput("display-message", "-t", name, "-p", "#{session_id}")
+	actual := strings.TrimSpace(string(out))
+	if actual != "" {
+		return sessionIdentityProbe{state: sessionIdentityOwned, identity: actual}
 	}
-	err := s.runBoundedMutation("kill-session", "-t", s.createdSessionID)
-	if err != nil && !s.sessionIdentityIs(s.createdSessionID) {
-		return nil
+	if err != nil && tmuxSessionAbsence(err) {
+		return sessionIdentityProbe{state: sessionIdentityMissing}
 	}
-	return err
+	return sessionIdentityProbe{state: sessionIdentityIndeterminate}
+}
+
+func tmuxSessionAbsence(err error) bool {
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(string(exitErr.Stderr)))
+	return strings.Contains(text, "can't find session") ||
+		strings.Contains(text, "no such session") ||
+		strings.Contains(text, "session not found")
 }
 
 func (s *Session) sessionIdentity() string {
@@ -3612,7 +3730,11 @@ func (s *Session) sessionIdentityIs(want string) bool {
 // reported as an empty tree; callers that can act on the difference between
 // "no processes" and "could not tell" must use paneProcessTree instead.
 func (s *Session) getPaneProcessTree() (panePID int, allPIDs []int) {
-	panePID, allPIDs, err := s.paneProcessTree()
+	return s.getPaneProcessTreeFor(s.Name)
+}
+
+func (s *Session) getPaneProcessTreeFor(target string) (panePID int, allPIDs []int) {
+	panePID, allPIDs, err := s.paneProcessTreeFor(target)
 	if err != nil {
 		// A failed probe is indistinguishable from "no panes" to our callers,
 		// and they respond by SKIPPING the SIGTERM->SIGKILL escalation that
@@ -3637,7 +3759,11 @@ func (s *Session) getPaneProcessTree() (panePID int, allPIDs []int) {
 // SIGTERM->SIGKILL the process the user just restarted. See
 // escalateAfterRespawn.
 func (s *Session) paneProcessTree() (panePID int, allPIDs []int, err error) {
-	target := s.Name + ":"
+	return s.paneProcessTreeFor(s.Name)
+}
+
+func (s *Session) paneProcessTreeFor(targetName string) (panePID int, allPIDs []int, err error) {
+	target := targetName + ":"
 	// Bounded — see tmuxPollTimeout. Runs on the respawn path: a hang here
 	// stalls the restart that is supposed to clear the bad state.
 	out, err := s.runBoundedOutput("list-panes", "-t", target, "-F", "#{pane_pid}")
