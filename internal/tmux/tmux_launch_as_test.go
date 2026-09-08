@@ -61,6 +61,26 @@ func TestStartCommandSpec_LaunchAs_Service_UsesServiceForm(t *testing.T) {
 		"-x", "173", "-y", "41"}, tmuxArgs)
 }
 
+func TestStartCommandSpec_CarriesCreationIdentityThroughLaunchers(t *testing.T) {
+	for _, launchAs := range []string{"direct", "scope", "service"} {
+		t.Run(launchAs, func(t *testing.T) {
+			s := &Session{
+				Name:                           "agentdeck_test-identity_1234abcd",
+				WorkDir:                        "/tmp/project",
+				LaunchAs:                       launchAs,
+				captureSessionIdentityOnCreate: true,
+			}
+			launcher, args := s.startCommandSpec("/tmp/project", "")
+			if launchAs == "direct" {
+				assert.Equal(t, "tmux", launcher)
+			} else {
+				assert.Equal(t, "systemd-run", launcher)
+				assert.Contains(t, args, "--pipe", "systemd-run must forward tmux's immutable creation identity")
+			}
+		})
+	}
+}
+
 // TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm explicitly pins the
 // SCOPE-MODE argv (legacy PR #467 shape) so a refactor to service mode
 // can't silently break users who set LaunchAs="scope" to keep the old
@@ -75,9 +95,10 @@ func TestStartCommandSpec_LaunchAs_Scope_UsesScopeForm(t *testing.T) {
 	launcher, args := s.startCommandSpec("/tmp/project", "")
 	require.Equal(t, "systemd-run", launcher)
 	require.GreaterOrEqual(t, len(args), 8)
-	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--collect", "--unit"}, args[:5])
-	assert.Equal(t, "agentdeck-tmux-agentdeck-test-scope-1234abcd", args[5])
-	assert.Equal(t, "tmux", args[6])
+	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--pipe", "--collect"}, args[:5])
+	assert.Equal(t, "--unit", args[5])
+	assert.Equal(t, "agentdeck-tmux-agentdeck-test-scope-1234abcd", args[6])
+	assert.Equal(t, "tmux", args[7])
 
 	joined := strings.Join(args, " ")
 	assert.NotContains(t, joined, "--property=Type=forking",

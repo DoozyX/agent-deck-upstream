@@ -247,6 +247,52 @@ func TestStartRollsBackCreatedSessionWhenIdentityCaptureFails(t *testing.T) {
 	}
 }
 
+func TestStartRollsBackCreatedSessionWhenCreationOutputIsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	createLog := filepath.Join(dir, "create.log")
+	killLog := filepath.Join(dir, "kill.log")
+	callLog := filepath.Join(dir, "calls.log")
+	writeFakeTmux(t, dir, "echo \"$*\" >> "+shellQuote(callLog)+"\ncase \" $* \" in\n"+
+		"  *' has-session '*) exit 1 ;;\n"+
+		"  *' new-session '*) echo \"$*\" > "+shellQuote(createLog)+"; exit 0 ;;\n"+
+		"  *' list-sessions '*) [ -f "+shellQuote(createLog)+" ] || exit 0; marker=$(sed -n 's/.*AGENTDECK_SESSION_CREATION_MARKER=\\([^ ]*\\).*/\\1/p' "+shellQuote(createLog)+"); name=$(sed -n 's/.*-s \\([^ ]*\\).*/\\1/p' "+shellQuote(createLog)+"); printf '$created\\t%s\\t%s\\n' \"$name\" \"$marker\"; exit 0 ;;\n"+
+		"  *' display-message '*) echo 'server busy' >&2; exit 1 ;;\n"+
+		"  *' kill-session '*) echo \"$*\" >> "+shellQuote(killLog)+"; exit 0 ;;\n"+
+		"  *) exit 0 ;;\n"+
+		"esac\n")
+
+	sess := NewSession("empty-create-output-rollback", t.TempDir())
+	err := sess.Start("")
+	if err == nil {
+		t.Fatal("Start() unexpectedly succeeded without an immutable session identity")
+	}
+	if raw, readErr := os.ReadFile(killLog); readErr != nil || len(strings.TrimSpace(string(raw))) == 0 {
+		calls, _ := os.ReadFile(callLog)
+		t.Fatalf("created session was not rolled back after empty creation output: log=%q readErr=%v calls=%q", raw, readErr, calls)
+	}
+	if raw, readErr := os.ReadFile(killLog); readErr == nil && !strings.Contains(string(raw), "-t $created") {
+		t.Fatalf("rollback did not target the immutable created session identity: %q", raw)
+	}
+}
+
+func TestRollbackCreatedSessionMarkerMismatchDoesNotKillReplacement(t *testing.T) {
+	dir := t.TempDir()
+	killLog := filepath.Join(dir, "kill.log")
+	writeFakeTmux(t, dir, "case \" $* \" in\n"+
+		"  *' list-sessions '*) printf '$replacement\\treused-name\\tnew-marker\\n'; exit 0 ;;\n"+
+		"  *' kill-session '*) echo \"$*\" >> "+shellQuote(killLog)+"; exit 0 ;;\n"+
+		"  *) exit 0 ;;\n"+
+		"esac\n")
+
+	sess := &Session{Name: "reused-name", creationMarker: "old-marker"}
+	if err := sess.rollbackCreatedSession(""); err == nil {
+		t.Fatal("rollback unexpectedly accepted a replacement session with a different creation marker")
+	}
+	if _, err := os.Stat(killLog); !os.IsNotExist(err) {
+		t.Fatalf("replacement session was targeted after marker mismatch: stat error %v", err)
+	}
+}
+
 func TestLaunchAckScriptFailsClosedWithoutProcessGroupCapability(t *testing.T) {
 	ackPath := filepath.Join(t.TempDir(), "ack")
 	latePath := filepath.Join(t.TempDir(), "late")
