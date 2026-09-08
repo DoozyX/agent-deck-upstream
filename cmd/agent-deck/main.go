@@ -440,6 +440,8 @@ func main() {
 		case "openclaw", "oc":
 			handleOpenClaw(profile, args[1:])
 			return
+		case "artifacts":
+			os.Exit(runArtifacts(os.Stdout, os.Stderr, os.Stdin, args[1:]))
 		case "remote":
 			handleRemote(profile, args[1:])
 			return
