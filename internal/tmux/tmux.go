@@ -1231,6 +1231,11 @@ type Session struct {
 	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
 	RunCommandAsInitialProcess bool
 
+	// launchAckPath is a per-spawn marker written by the initial-process
+	// wrapper. It lets Start distinguish a pane that is still usable from an
+	// initial command that exited while tmux setup was still running.
+	launchAckPath string
+
 	// VimMode guarantees the inner agent's input composer is in insert mode
 	// before any text/Enter is delivered. When the inner tool (Claude Code with
 	// `"editorMode": "vim"`) leaves its prompt in vim NORMAL mode — the default
@@ -1481,7 +1486,15 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// pass through as the command argument verbatim — bash -c "bash -c '…'"
 		// tail-exec's the inner bash, so no extra lingering process and no
 		// re-escaping of the nested single quotes.
-		tmuxArgs = append(tmuxArgs, bashBinary, "-c", command)
+		if s.launchAckPath != "" {
+			// Keep the acknowledgement protocol out of the command string: both
+			// the marker path and user command are positional arguments, so an
+			// unusual project path or command cannot alter the wrapper script.
+			tmuxArgs = append(tmuxArgs, bashBinary, "-c", launchAckScript,
+				"agent-deck-launch-ack", s.launchAckPath, command)
+		} else {
+			tmuxArgs = append(tmuxArgs, bashBinary, "-c", command)
+		}
 	}
 
 	unitBase := serviceUnitBase(s.Name)
@@ -1524,6 +1537,16 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		return "tmux", tmuxArgs
 	}
 }
+
+const launchAckScript = `ack_path="$1"
+command="$2"
+bash -c "$command" &
+child_pid=$!
+printf 'pid:%s\n' "$child_pid" > "$ack_path"
+wait "$child_pid"
+exit_code=$?
+printf 'exit:%s\n' "$exit_code" > "$ack_path"
+exit "$exit_code"`
 
 // buildScopeArgsFromTmuxArgs reconstructs scope-mode systemd-run argv
 // from the bare tmux args. Used by the three-tier fallback in Start()
@@ -2376,6 +2399,22 @@ func (s *Session) Start(command string) error {
 	workDir = resolvedWorkDir
 
 	s.Command = command
+	// An initial-process command can exit between new-session returning and the
+	// caller observing the pane. Give it a private, explicit exit marker so the
+	// caller can reject that false launch success without guessing by sleeping.
+	if command != "" && s.RunCommandAsInitialProcess {
+		ackFile, err := os.CreateTemp("", "agent-deck-launch-ack-*")
+		if err != nil {
+			return fmt.Errorf("create launch acknowledgement marker: %w", err)
+		}
+		if err := ackFile.Close(); err != nil {
+			_ = os.Remove(ackFile.Name())
+			return fmt.Errorf("close launch acknowledgement marker: %w", err)
+		}
+		s.launchAckPath = ackFile.Name()
+	} else {
+		s.launchAckPath = ""
+	}
 	s.invalidateCache()
 	s.Created = time.Now()
 	s.startupAt = s.Created
@@ -2683,6 +2722,108 @@ func (s *Session) Start(command string) error {
 	// The Stop hook (via Claude settings) handles instant YELLOW detection.
 
 	return nil
+}
+
+// AcknowledgeInitialProcess proves the initial command did not die before the
+// creator finished launching the pane. It is a state snapshot, not a delay:
+// an explicit wrapper exit marker wins; otherwise a live primary pane is the
+// acknowledgement. Slow interactive tools remain valid because a live pane is
+// enough, even before they paint a prompt.
+func (s *Session) AcknowledgeInitialProcess() error {
+	ackPath := s.launchAckPath
+	s.launchAckPath = ""
+	if ackPath == "" {
+		return nil
+	}
+	defer os.Remove(ackPath)
+
+	// The pane is created asynchronously by tmux. Wait for the wrapper's
+	// protocol event (not a guessed process-settle sleep) before sampling it;
+	// otherwise a just-created pane can be reported live before its initial
+	// command has even been scheduled.
+	deadline := time.Now().Add(250 * time.Millisecond)
+	var marker string
+	for {
+		if raw, err := os.ReadFile(ackPath); err == nil {
+			marker = strings.TrimSpace(string(raw))
+			if marker != "" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if marker != "" {
+		// A pid marker proves the child was forked, not that it survived the
+		// fork-to-exec boundary. Sample its actual process state until it either
+		// records an exit or remains alive through this acknowledgement window.
+		// This is state-driven observation; there is no unconditional launch
+		// sleep, and slow interactive tools need only keep their process alive.
+		for {
+			if raw, err := os.ReadFile(ackPath); err == nil {
+				marker = strings.TrimSpace(string(raw))
+			}
+			if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
+				return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d)", *exitCode)
+			}
+			if _, pid, ok := parseLaunchAckMarker(marker); ok && pid > 0 {
+				process, findErr := os.FindProcess(pid)
+				if findErr != nil || process.Signal(syscall.Signal(0)) != nil || processIsZombieOrExiting(pid) {
+					return fmt.Errorf("initial command exited before launch acknowledgement")
+				}
+			}
+			if time.Now().After(deadline) {
+				return nil
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if marker == "" {
+		return fmt.Errorf("initial command did not acknowledge launch")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
+	defer cancel()
+	out, err := s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}").Output()
+	if err != nil || strings.TrimSpace(string(out)) != "0" {
+		return fmt.Errorf("initial pane exited before launch acknowledgement")
+	}
+	return nil
+}
+
+// parseLaunchAckMarker is deliberately tiny and pure: the on-disk protocol is
+// the boundary between the pane wrapper and the creator process.
+func parseLaunchAckMarker(marker string) (exitCode *int, pid int, ok bool) {
+	if strings.HasPrefix(marker, "exit:") {
+		code, err := strconv.Atoi(strings.TrimPrefix(marker, "exit:"))
+		if err != nil {
+			return nil, 0, false
+		}
+		return &code, 0, true
+	}
+	if strings.HasPrefix(marker, "pid:") {
+		parsedPID, err := strconv.Atoi(strings.TrimPrefix(marker, "pid:"))
+		if err != nil || parsedPID <= 0 {
+			return nil, 0, false
+		}
+		return nil, parsedPID, true
+	}
+	return nil, 0, false
+}
+
+// processIsZombieOrExiting closes the kill(0) blind spot: Unix retains a
+// zombie until its parent reaps it, and signal 0 reports that zombie as alive.
+// The marker's child is owned by the acknowledgement wrapper, so a Z/X state
+// is definitive early-exit evidence rather than a slow-start condition.
+func processIsZombieOrExiting(pid int) bool {
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return false
+	}
+	state := strings.TrimSpace(string(out))
+	return strings.HasPrefix(state, "Z") || strings.HasPrefix(state, "X")
 }
 
 // hasSessionProbeTimeout bounds a `tmux has-session` existence probe. A tmux
