@@ -39,6 +39,8 @@ var (
 	perfLog    = logging.ForComponent(logging.CompPerf)
 )
 
+const sessionCreationMarkerEnv = "AGENTDECK_SESSION_CREATION_MARKER"
+
 // execCommand is a swappable seam that defaults to exec.Command. Tests
 // override it to inject failure into specific launcher names without
 // mutating host PATH or systemd state. Production callers always read
@@ -1206,6 +1208,10 @@ type Session struct {
 	// created by the current Start call. Cleanup after acknowledgement must use
 	// this identity, not the mutable human-readable name.
 	createdSessionID string
+	// creationMarker is carried in the session environment from the exact
+	// new-session command. It is the safe ownership handoff when a launcher
+	// suppresses the command's -P/-F stdout before identity capture completes.
+	creationMarker string
 	// captureSessionIdentityOnCreate asks tmux new-session to print the
 	// immutable identity at creation time. That identity remains a safe cleanup
 	// target even when the later display-message probe is unavailable.
@@ -1445,6 +1451,9 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// cannot read the session yet.
 		tmuxArgs = append(tmuxArgs, "-P", "-F", "#{session_id}")
 	}
+	if s.creationMarker != "" {
+		tmuxArgs = append(tmuxArgs, "-e", sessionCreationMarkerEnv+"="+s.creationMarker)
+	}
 	if startWithInitialProcess {
 		// Deliver the pane command as SEPARATE argv tokens (bash, -c, command)
 		// rather than a single shell-quoted string. This is the crux of the
@@ -1492,7 +1501,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// We DO NOT use --collect here: --collect unloads the unit once
 		// inactive, which would race with Restart= semantics.
 		svcArgs := []string{
-			"--user", "--unit", unitBase + ".service", "--quiet",
+			"--user", "--unit", unitBase + ".service", "--quiet", "--pipe",
 			"--property=Type=forking",
 			"--property=Restart=on-failure",
 			"--property=RestartSec=5s",
@@ -1509,7 +1518,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// Legacy PR #467 shape — unchanged so existing users opting out
 		// of service mode with launch_as="scope" get identical semantics.
 		scopeArgs := []string{
-			"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux",
+			"--user", "--scope", "--quiet", "--pipe", "--collect", "--unit", unitBase, "tmux",
 		}
 		scopeArgs = append(scopeArgs, tmuxArgs...)
 		return "systemd-run", scopeArgs
@@ -1586,7 +1595,7 @@ exit "$exit_code"`
 // falling all the way back to direct tmux.
 func buildScopeArgsFromTmuxArgs(sessionName string, tmuxArgs []string) []string {
 	unitBase := serviceUnitBase(sessionName)
-	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux"}
+	scopeArgs := []string{"--user", "--scope", "--quiet", "--pipe", "--collect", "--unit", unitBase, "tmux"}
 	return append(scopeArgs, tmuxArgs...)
 }
 
@@ -2463,6 +2472,7 @@ func (s *Session) Start(command string) error {
 	// Commands containing bash-specific syntax are wrapped for fish compatibility.
 	//
 	// workDir was resolved and validated at the top of Start (#1713).
+	s.creationMarker = generateShortID()
 	s.captureSessionIdentityOnCreate = true
 	launcher, args := s.startCommandSpec(workDir, command)
 	// newSpawnCommand (not bare execCommand) so the spawn — and any tmux server
@@ -2572,13 +2582,11 @@ func (s *Session) Start(command string) error {
 	if identityErr != nil {
 		cleanupLaunchAckFiles(s.launchAckPath)
 		s.launchAckPath = ""
-		if s.createdSessionID != "" {
-			if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
-				statusLog.Warn("created_session_rollback_failed",
-					slog.String("session", logging.SanitizeValue(s.Name)),
-					slog.String("identity", logging.SanitizeValue(s.createdSessionID)),
-					slog.String("error", rollbackErr.Error()))
-			}
+		if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
+			statusLog.Warn("created_session_rollback_failed",
+				slog.String("session", logging.SanitizeValue(s.Name)),
+				slog.String("identity", logging.SanitizeValue(s.createdSessionID)),
+				slog.String("error", rollbackErr.Error()))
 		}
 		return fmt.Errorf("tmux session created but immutable identity was not captured: %w", identityErr)
 	}
@@ -2784,10 +2792,31 @@ func createdSessionIdentityFromOutput(output []byte) string {
 // returned by the creating new-session command. A name-based kill here would
 // be able to delete a replacement session after a delete-and-recreate race.
 func (s *Session) rollbackCreatedSession(identity string) error {
-	if s == nil || strings.TrimSpace(identity) == "" {
+	if s == nil {
 		return fmt.Errorf("tmux session ownership is unproven")
 	}
-	return s.teardown(identity, true, true)
+	if strings.TrimSpace(identity) != "" {
+		return s.teardown(identity, true, true)
+	}
+	if strings.TrimSpace(s.creationMarker) == "" || strings.TrimSpace(s.Name) == "" {
+		return fmt.Errorf("tmux session ownership is unproven")
+	}
+	// Read the immutable ID and the creation marker in one server-side
+	// list-sessions snapshot. Checking the marker first and then killing by name
+	// would leave a delete-and-recreate window in which the replacement could
+	// be killed. The ID from this snapshot remains safe even if the name moves
+	// before teardown runs.
+	listing, err := s.runBoundedOutput("list-sessions", "-F", "#{session_id}\t#{session_name}\t#{E:"+sessionCreationMarkerEnv+"}")
+	if err != nil {
+		return fmt.Errorf("tmux session ownership is indeterminate: %w", err)
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(listing)), "\n") {
+		parts := strings.SplitN(line, "\t", 3)
+		if len(parts) == 3 && parts[1] == s.Name && parts[2] == s.creationMarker {
+			return s.teardown(parts[0], true, true)
+		}
+	}
+	return fmt.Errorf("tmux session ownership changed: expected marker %s", s.creationMarker)
 }
 
 // AcknowledgeInitialProcess proves the initial command did not die before the

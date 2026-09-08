@@ -326,6 +326,42 @@ func TestIssue1793_CodexStaleWorkingBodyIsNotNewSubmission(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexBaselineWorkingIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 BASELINE WORKING CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"• Working\ncodex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a pre-existing Codex Working state must not submit this body: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexMultilinePayloadStartingWorkingIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "working\nISSUE1793 MULTILINE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"working\nISSUE1793 MULTILINE CODEX BODY\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a payload line beginning with working must not impersonate Codex Working: delivery=%q err=%v", delivery, err)
+	}
+}
+
 func TestIssue1793_CodexAlternateWorkingTextIsNotSubmissionEvidence(t *testing.T) {
 	const msg = "ISSUE1793 ALTERNATE CODEX BODY"
 	mock := &mockSendRetryTarget{

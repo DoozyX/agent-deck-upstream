@@ -3907,11 +3907,11 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 	recoveryAttempted := false
 	recoveryAccepted := false
+	recoveryIteration := -1
 	codexWorkingSeenBeforeBody := false
 	codexBaselineWorking := false
 	if session.IsCodexCompatible(opts.tool) {
-		token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
-		codexBaselineWorking = codexWorkingLine(baseline.content, token)
+		codexBaselineWorking = codexWorkingLine(baseline.content, "")
 	}
 	for i := 0; i < checks; i++ {
 		// Strongest signal first: an idle agent that starts working received
@@ -3967,12 +3967,14 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					// could have changed since this capture.
 					recoveryAttempted = true
 					recoveryAccepted = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
+					recoveryIteration = i
 				}
 				if session.IsCodexCompatible(opts.tool) &&
 					arrived &&
 					recoveryAccepted &&
+					i > recoveryIteration &&
 					!codexWorkingSeenBeforeBody &&
-					!codexWorkingIndicator(baseline.content, message) &&
+					!codexBaselineWorking &&
 					codexWorkingIndicator(content, message) {
 					return deliverySubmitted, nil
 				}
@@ -4029,13 +4031,35 @@ func codexWorkingIndicator(content, message string) bool {
 }
 
 func codexWorkingLine(content, token string) bool {
-	for _, line := range strings.Split(strings.ToLower(content), "\n") {
-		line = collapseWhitespace(line)
-		if token != "" {
-			// Both operands are normalized. Removing an uncollapsed token from
-			// wrapped pane content misses the exact body and lets payload text
-			// beginning with "working" impersonate the TUI state line.
-			line = strings.ReplaceAll(line, token, "")
+	lines := strings.Split(strings.ToLower(content), "\n")
+	normalizedLines := make([]string, len(lines))
+	for i, line := range lines {
+		normalizedLines[i] = collapseWhitespace(line)
+	}
+	payloadLines := make([]bool, len(lines))
+	if token != "" {
+		joined := strings.Join(normalizedLines, "")
+		for from := 0; ; {
+			relative := strings.Index(joined[from:], token)
+			if relative < 0 {
+				break
+			}
+			start := from + relative
+			end := start + len(token)
+			position := 0
+			for i, line := range normalizedLines {
+				next := position + len(line)
+				if start < next && end > position {
+					payloadLines[i] = true
+				}
+				position = next
+			}
+			from = start + 1
+		}
+	}
+	for i, line := range normalizedLines {
+		if payloadLines[i] {
+			continue
 		}
 		line = strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*")
 		if line == "working" || line == "working..." || strings.HasPrefix(line, "working(") {
