@@ -483,9 +483,13 @@ func (i *Instance) recordPrepareFailure(command string, prepErr error) {
 // failed to create the session (i.tmuxSession.Start returned an error). Unlike
 // the fast-death path this has no pane to snapshot — the error string is the
 // diagnostic.
-func (i *Instance) recordTmuxStartFailure(command string, startErr error) {
+func (i *Instance) recordTmuxStartFailure(command string, startErr error, captured ...string) {
 	diagnostic := startErr.Error()
-	if i.tmuxSession != nil {
+	if len(captured) > 0 {
+		if content := strings.TrimSpace(captured[0]); content != "" {
+			diagnostic += ": " + content
+		}
+	} else if i.tmuxSession != nil {
 		if content, captureErr := i.tmuxSession.CapturePane(); captureErr == nil {
 			if content = strings.TrimSpace(content); content != "" {
 				diagnostic += ": " + content

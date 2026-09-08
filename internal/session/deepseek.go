@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1085,16 +1086,36 @@ func (i *Instance) expectsFastExit() bool {
 func (i *Instance) acknowledgeInitialProcess(command string) error {
 	ackErr := i.tmuxSession.AcknowledgeInitialProcess()
 	if ackErr == nil {
+		if i.expectsFastExit() {
+			i.tmuxSession.WatchInitialProcessCompletion(func(exitCode int, diagnostic string) {
+				if exitCode == 0 {
+					return
+				}
+				completionErr := fmt.Errorf("initial command exited after launch acknowledgement (exit status %d)", exitCode)
+				i.recordTmuxStartFailure(command, completionErr, diagnostic)
+				i.mu.Lock()
+				i.Status = StatusError
+				i.mu.Unlock()
+				if cleanupErr := i.tmuxSession.KillIfOwned(); cleanupErr != nil {
+					sessionLog.Warn("headless_completion_cleanup_failed",
+						slog.String("instance_id", i.ID),
+						slog.String("error", cleanupErr.Error()))
+				}
+			})
+		}
 		return nil
 	}
+	i.Status = StatusError
 	diagnostic := ackErr
+	captured := ""
 	if content, captureErr := i.tmuxSession.CapturePane(); captureErr == nil {
 		if content = strings.TrimSpace(content); content != "" {
+			captured = content
 			diagnostic = fmt.Errorf("%w: %s", ackErr, content)
 		}
 	}
-	i.recordTmuxStartFailure(command, diagnostic)
-	if cleanupErr := i.tmuxSession.Kill(); cleanupErr != nil {
+	i.recordTmuxStartFailure(command, ackErr, captured)
+	if cleanupErr := i.tmuxSession.KillIfOwned(); cleanupErr != nil {
 		return fmt.Errorf("initial session command did not launch: %w (cleanup failed: %v)", diagnostic, cleanupErr)
 	}
 	return fmt.Errorf("initial session command did not launch: %w", diagnostic)

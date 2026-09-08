@@ -1202,6 +1202,10 @@ type Session struct {
 	// wrapper. It lets Start distinguish a pane that is still usable from an
 	// initial command that exited while tmux setup was still running.
 	launchAckPath string
+	// createdSessionID is the tmux server's immutable identity for the session
+	// created by the current Start call. Cleanup after acknowledgement must use
+	// this identity, not the mutable human-readable name.
+	createdSessionID string
 
 	// VimMode guarantees the inner agent's input composer is in insert mode
 	// before any text/Enter is delivered. When the inner tool (Claude Code with
@@ -1507,17 +1511,33 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 
 const launchAckScript = `ack_path="$1"
 command="$2"
-bash -c "$command" > >(tee "${ack_path}.output") 2>&1 &
+output_path="${ack_path}.output"
+fifo_path="${ack_path}.fifo"
+marker_tmp="${ack_path}.tmp"
+cleanup() {
+  rm -f "$output_path" "$fifo_path" "$marker_tmp"
+}
+trap cleanup EXIT
+rm -f "$output_path" "$fifo_path" "$marker_tmp"
+if ! mkfifo "$fifo_path"; then
+  exit 125
+fi
+tee "$output_path" < "$fifo_path" &
+tee_pid=$!
+bash -c "$command" > "$fifo_path" 2>&1 &
 child_pid=$!
-printf 'pid:%s\n' "$child_pid" > "$ack_path"
+printf 'pid:%s\n' "$child_pid" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
 wait "$child_pid"
 exit_code=$?
-printf 'exit:%s\n' "$exit_code" > "$ack_path"
-if [ -s "${ack_path}.output" ]; then
-  cat "${ack_path}.output" >> "$ack_path"
-fi
-rm -f "${ack_path}.output"
-exit 0`
+wait "$tee_pid"
+{
+  printf 'exit:%s\n' "$exit_code"
+  if [ -s "$output_path" ]; then
+    cat "$output_path"
+  fi
+} > "$marker_tmp"
+mv -f "$marker_tmp" "$ack_path"
+exit "$exit_code"`
 
 // buildScopeArgsFromTmuxArgs reconstructs scope-mode systemd-run argv
 // from the bare tmux args. Used by the three-tier fallback in Start()
@@ -2355,6 +2375,14 @@ func (s *Session) Start(command string) error {
 	workDir = resolvedWorkDir
 
 	s.Command = command
+	ackPathForCleanup := ""
+	created := false
+	defer func() {
+		if !created && ackPathForCleanup != "" {
+			cleanupLaunchAckFiles(ackPathForCleanup)
+			s.launchAckPath = ""
+		}
+	}()
 	// An initial-process command can exit between new-session returning and the
 	// caller observing the pane. Give it a private, explicit exit marker so the
 	// caller can reject that false launch success without guessing by sleeping.
@@ -2368,6 +2396,7 @@ func (s *Session) Start(command string) error {
 			return fmt.Errorf("close launch acknowledgement marker: %w", err)
 		}
 		s.launchAckPath = ackFile.Name()
+		ackPathForCleanup = ackFile.Name()
 	} else {
 		s.launchAckPath = ""
 	}
@@ -2495,6 +2524,8 @@ func (s *Session) Start(command string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create tmux session: %w (output: %s)", err, string(output))
 	}
+	created = true
+	s.createdSessionID = s.sessionIdentity()
 
 	// Register session in cache immediately to prevent race condition
 	// where Exists() returns false because cache was refreshed before session creation
@@ -2508,6 +2539,8 @@ func (s *Session) Start(command string) error {
 	// such a session as started is the exact "looked created, never ran the
 	// agent" failure from the report — tear it down and say why instead.
 	if cwdErr := s.verifyPaneWorkDirUnlessPlaceholder(workDir); cwdErr != nil {
+		cleanupLaunchAckFiles(s.launchAckPath)
+		s.launchAckPath = ""
 		if killErr := s.Kill(); killErr != nil {
 			statusLog.Warn("deleted_cwd_session_cleanup_failed",
 				slog.String("session", logging.SanitizeValue(s.Name)),
@@ -2687,17 +2720,23 @@ func (s *Session) Start(command string) error {
 // enough, even before they paint a prompt.
 func (s *Session) AcknowledgeInitialProcess() error {
 	ackPath := s.launchAckPath
-	s.launchAckPath = ""
 	if ackPath == "" {
 		return nil
 	}
-	defer os.Remove(ackPath)
+	retainAck := false
+	defer func() {
+		if !retainAck {
+			cleanupLaunchAckFiles(ackPath)
+			s.launchAckPath = ""
+		}
+	}()
 
 	// The pane is created asynchronously by tmux. Wait for the wrapper's
 	// protocol event (not a guessed process-settle sleep) before sampling it;
 	// otherwise a just-created pane can be reported live before its initial
 	// command has even been scheduled.
 	deadline := time.Now().Add(250 * time.Millisecond)
+	var completionDeadline time.Time
 	var marker string
 	for {
 		if raw, err := os.ReadFile(ackPath); err == nil {
@@ -2723,21 +2762,38 @@ func (s *Session) AcknowledgeInitialProcess() error {
 			}
 			if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
 				if *exitCode != 0 || !s.AllowInitialProcessExit {
-					diagnostic := strings.TrimSpace(strings.TrimPrefix(marker, fmt.Sprintf("exit:%d", *exitCode)))
+					diagnostic := launchAckDiagnostic(marker)
 					if diagnostic != "" {
 						return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d): %s", *exitCode, diagnostic)
 					}
 					return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d)", *exitCode)
 				}
+				retainAck = s.AllowInitialProcessExit
 				return nil
 			}
+			childAlive := false
 			if _, pid, ok := parseLaunchAckMarker(marker); ok && pid > 0 {
 				process, findErr := os.FindProcess(pid)
-				if findErr != nil || process.Signal(syscall.Signal(0)) != nil || processIsZombieOrExiting(pid) {
-					return fmt.Errorf("initial command exited before launch acknowledgement")
+				if findErr == nil && process.Signal(syscall.Signal(0)) == nil && !processIsZombieOrExiting(pid) {
+					childAlive = true
+					// The child is still live; a pid marker is enough to accept a
+					// slow interactive process once the acknowledgement window ends.
 				}
 			}
 			if time.Now().After(deadline) {
+				if !childAlive && completionDeadline.IsZero() {
+					// The child has exited, but the wrapper still owns the
+					// authoritative completion publication while tee drains.
+					completionDeadline = time.Now().Add(time.Second)
+				}
+				if !childAlive && time.Now().Before(completionDeadline) {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				if !childAlive {
+					return fmt.Errorf("initial command exited before launch acknowledgement")
+				}
+				retainAck = s.AllowInitialProcessExit
 				return nil
 			}
 			time.Sleep(time.Millisecond)
@@ -2753,7 +2809,61 @@ func (s *Session) AcknowledgeInitialProcess() error {
 	if err != nil || strings.TrimSpace(string(out)) != "0" {
 		return fmt.Errorf("initial pane exited before launch acknowledgement")
 	}
+	retainAck = s.AllowInitialProcessExit
 	return nil
+}
+
+// WatchInitialProcessCompletion watches the retained acknowledgement marker
+// for a headless one-shot that survived the initial acknowledgement window.
+// The completion marker is published only after output capture has drained, so
+// the callback receives a complete diagnostic and the watcher can then remove
+// every temporary file. A missing session ends the watcher without invoking
+// the callback; explicit Kill() is not a launch failure.
+func (s *Session) WatchInitialProcessCompletion(callback func(exitCode int, diagnostic string)) {
+	ackPath := s.launchAckPath
+	if ackPath == "" {
+		return
+	}
+	s.launchAckPath = ""
+	go func() {
+		defer cleanupLaunchAckFiles(ackPath)
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if raw, err := os.ReadFile(ackPath); err == nil {
+				marker := strings.TrimSpace(string(raw))
+				if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
+					callback(*exitCode, launchAckDiagnostic(marker))
+					return
+				}
+			}
+			if !s.Exists() {
+				return
+			}
+			<-ticker.C
+		}
+	}()
+}
+
+func cleanupLaunchAckFiles(ackPath string) {
+	if ackPath == "" {
+		return
+	}
+	for _, suffix := range []string{"", ".output", ".tmp", ".fifo"} {
+		_ = os.Remove(ackPath + suffix)
+	}
+}
+
+func launchAckDiagnostic(marker string) string {
+	parts := strings.SplitN(marker, "\n", 2)
+	if len(parts) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+func sessionIdentityMatches(expected, actual string) bool {
+	return strings.TrimSpace(expected) != "" && strings.TrimSpace(expected) == strings.TrimSpace(actual)
 }
 
 // parseLaunchAckMarker is deliberately tiny and pure: the on-disk protocol is
@@ -3440,6 +3550,40 @@ func (s *Session) Kill() error {
 	}
 
 	return err
+}
+
+// KillIfOwned terminates only the tmux session created by the current Start
+// call. It proves the mutable name still resolves to the same immutable tmux
+// session id, then addresses kill-session by that id so a delete-and-recreate
+// race cannot kill the replacement.
+func (s *Session) KillIfOwned() error {
+	if s == nil || strings.TrimSpace(s.createdSessionID) == "" {
+		return fmt.Errorf("tmux session ownership is unproven")
+	}
+	actual := s.sessionIdentity()
+	if actual == "" && !s.Exists() {
+		return nil
+	}
+	if !sessionIdentityMatches(s.createdSessionID, actual) {
+		return fmt.Errorf("tmux session ownership changed: expected %s, found %s", s.createdSessionID, actual)
+	}
+	err := s.runBoundedMutation("kill-session", "-t", s.createdSessionID)
+	if err != nil && !s.sessionIdentityIs(s.createdSessionID) {
+		return nil
+	}
+	return err
+}
+
+func (s *Session) sessionIdentity() string {
+	out, err := s.runBoundedOutput("display-message", "-t", s.Name, "-p", "#{session_id}")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func (s *Session) sessionIdentityIs(want string) bool {
+	return sessionIdentityMatches(want, s.sessionIdentity())
 }
 
 // getPaneProcessTree returns the pane's direct PID and all descendant PIDs.
