@@ -34,6 +34,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/procfd"
 	"github.com/asheshgoplani/agent-deck/internal/send"
+	"github.com/asheshgoplani/agent-deck/internal/shellwords"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/telemetry"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -4537,13 +4538,36 @@ func (i *Instance) buildTmuxOptionOverrides() map[string]string {
 	// its answer and exits BY DESIGN, and without remain-on-exit tmux tears the
 	// pane down with the answer still in it — the user asked a question and got
 	// a closed window. Keeping the pane is what makes a one-shot readable.
-	if i.IsSandboxed() || i.expectsFastExit() {
+	if i.IsSandboxed() || i.expectsFastExit() || i.isBoundedCodexExec() {
 		if overrides == nil {
 			overrides = make(map[string]string)
 		}
 		overrides["remain-on-exit"] = "on"
 	}
 	return overrides
+}
+
+// isBoundedCodexExec identifies Codex's non-interactive `exec` surface.  It
+// deliberately uses the configured command rather than Tool: a registered
+// shell launcher is allowed to wrap `codex exec …`, and its clean terminal
+// exit needs the same observable exit status as a native Codex session.
+func (i *Instance) isBoundedCodexExec() bool {
+	fields, ok := shellwords.Split(i.Command)
+	if !ok || len(fields) == 0 {
+		return false
+	}
+	if shellwords.ExecutableBase(fields) == "codex" {
+		for _, field := range fields[1:] {
+			if field == "exec" {
+				return true
+			}
+		}
+	}
+	if filepath.Base(fields[0]) == "bash" && len(fields) >= 3 && (fields[1] == "-c" || fields[1] == "-lc") {
+		inner, ok := shellwords.Split(fields[2])
+		return ok && shellwords.ExecutableBase(inner) == "codex" && len(inner) > 1 && inner[1] == "exec"
+	}
+	return false
 }
 
 // adoptExplicitClaudeSessionID adopts an explicit `--session-id <uuid>` baked
@@ -4963,7 +4987,7 @@ func (i *Instance) Start() error {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative per-group/per-conductor skill+mcp loadout
@@ -5288,7 +5312,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative skill+mcp loadout before spawn — sister
@@ -5891,6 +5915,18 @@ func (i *Instance) UpdateStatus() error {
 			if i.tmuxSession != nil && (hs.Status == "running" || hs.Status == "waiting") {
 				i.tmuxSession.ResetAcknowledged()
 			}
+		}
+	}
+
+	// `codex exec` is a bounded command, including when a registered shell
+	// launcher wraps it. Its prompt/output heuristics describe the launcher
+	// shell, not the descendant doing the work. A live Codex descendant is
+	// therefore authoritative until it exits; remain-on-exit then lets the
+	// terminal path classify exit 0 as stopped and a non-zero exit as error.
+	if i.isBoundedCodexExec() {
+		if candidates, _ := i.collectCodexProcessCandidates(); len(candidates) > 0 {
+			i.Status = StatusRunning
+			return nil
 		}
 	}
 
@@ -9203,7 +9239,7 @@ func (i *Instance) restart(env map[string]string) error {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell"
+	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative skill+mcp loadout before respawn — sister
