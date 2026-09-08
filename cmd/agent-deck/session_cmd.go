@@ -870,6 +870,10 @@ func handleSessionRestart(profile string, args []string) {
 	}
 
 	// Restart the session
+	// Register this command's database before Restart. A restart is a process
+	// replacement, and its tmux name/status must be committed independently of
+	// this CLI's stale registry snapshot.
+	adoptStateDB(storage)
 	if err := inst.RestartWithEnv(envFlags); err != nil {
 		out.Error(fmt.Sprintf("failed to restart session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
@@ -877,6 +881,8 @@ func handleSessionRestart(profile string, args []string) {
 	// Stamp the persisted freshness marker so subsequent watchdog ticks see
 	// this session as "just started" and skip (issue #30).
 	inst.LastStartedAt = time.Now()
+	inst.PersistRestartOutcome()
+	restartOutcome := restartOutcomeFor(inst, true)
 	warning := inst.ConsumeCodexRestartWarning()
 	if warning != "" && !*jsonOutput {
 		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
@@ -887,11 +893,10 @@ func handleSessionRestart(profile string, args []string) {
 		inst.PostStartSync(3 * time.Second)
 	}
 
-	// Save updated state
-	if err := saveSessionData(storage, instances, groups); err != nil {
-		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
-	}
+	// Do not write the pre-restart registry snapshot here. It can conflict with
+	// (or overwrite) a concurrent status refresh after the replacement process
+	// has already started. PersistRestartOutcome above atomically committed the
+	// state this operation owns; unrelated state is left to its owning writer.
 
 	// Output success
 	data := map[string]interface{}{
@@ -902,6 +907,8 @@ func handleSessionRestart(profile string, args []string) {
 	if warning != "" {
 		data["warning"] = warning
 	}
+	restartOutcome.addTo(data)
+	restartOutcome.warn(os.Stderr)
 	out.Success(fmt.Sprintf("Restarted session: %s", inst.Title), data)
 }
 
