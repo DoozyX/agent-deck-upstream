@@ -1081,3 +1081,18 @@ func (i *Instance) expectsFastExit() bool {
 	}
 	return DeepSeekProfileMode(i.resolveDeepSeekProfile()) == deepSeekModeHeadless
 }
+
+func (i *Instance) acknowledgeInitialProcess(command string) error {
+	if i.expectsFastExit() {
+		return nil
+	}
+	ackErr := i.tmuxSession.AcknowledgeInitialProcess()
+	if ackErr == nil {
+		return nil
+	}
+	i.recordTmuxStartFailure(command, ackErr)
+	if cleanupErr := i.tmuxSession.Kill(); cleanupErr != nil {
+		return fmt.Errorf("initial session command did not launch: %w (cleanup failed: %v)", ackErr, cleanupErr)
+	}
+	return fmt.Errorf("initial session command did not launch: %w", ackErr)
+}
