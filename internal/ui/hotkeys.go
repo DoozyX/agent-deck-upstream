@@ -27,6 +27,7 @@ const (
 	hotkeySkillsManager    = "skills_manager"
 	hotkeyTogglePreview    = "toggle_preview"
 	hotkeyCycleGroupView   = "cycle_group_view"
+	hotkeyCycleTimeFilter  = "cycle_time_filter"
 	hotkeyMarkUnread       = "mark_unread"
 	hotkeyQuickApprove     = "quick_approve"
 	hotkeyPromptSession    = "prompt_session" // #1410: prompt the highlighted session without attaching
@@ -105,6 +106,7 @@ var hotkeyActionOrder = []string{
 	hotkeySkillsManager,
 	hotkeyTogglePreview,
 	hotkeyCycleGroupView,
+	hotkeyCycleTimeFilter,
 	hotkeyMarkUnread,
 	hotkeyQuickApprove,
 	hotkeyPromptSession,
@@ -155,6 +157,7 @@ var defaultHotkeyBindings = map[string]string{
 	hotkeySkillsManager:    "s",
 	hotkeyTogglePreview:    "v",
 	hotkeyCycleGroupView:   "t",
+	hotkeyCycleTimeFilter:  "*",
 	hotkeyMarkUnread:       "u",
 	hotkeyQuickApprove:     "a",
 	hotkeyPromptSession:    "o",

@@ -182,6 +182,8 @@ type InstanceData struct {
 
 // GroupData represents serializable group data
 type GroupData struct {
+	storageSnapshot *groupStorageSnapshot
+
 	Name        string `json:"name"`
 	Path        string `json:"path"`
 	Expanded    bool   `json:"expanded"`
@@ -383,11 +385,18 @@ func (s *Storage) Save(instances []*Instance) error {
 // DeleteInstance / RemoveSessionAndVerify at the moment the user deletes a
 // session, or statedb.ClearAllInstances for an intentional full wipe.
 func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) error {
+	rows, err := s.saveWithGroups(instances, groupTree)
+	if err == nil {
+		s.refreshCommittedGroupTitles(instances, rows)
+	}
+	return err
+}
+
+func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([]*statedb.InstanceRow, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
 	if s.db == nil {
-		return fmt.Errorf("storage database not initialized")
+		return nil, fmt.Errorf("storage database not initialized")
 	}
 	if err := s.rejectNewGroups(instances, groupTree); err != nil {
 		return err
@@ -396,48 +405,62 @@ func (s *Storage) SaveWithGroups(instances []*Instance, groupTree *GroupTree) er
 	// Enforce one Claude conversation owner across persisted sessions.
 	// This protects CLI-only flows as well (the TUI already applies this in-memory).
 	UpdateClaudeSessionsWithDedup(instances)
-
-	// Convert instances to database rows
-	rows := make([]*statedb.InstanceRow, len(instances))
+	updates := make([]statedb.InstanceSnapshot, len(instances))
+	clearIntents := make([]bool, len(instances))
 	for i, inst := range instances {
+		if inst == nil {
+			return nil, fmt.Errorf("nil instance")
+		}
 		row, err := instanceToRow(inst)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		rows[i] = row
-	}
-
-	if err := s.db.UpsertInstances(rows); err != nil {
-		return fmt.Errorf("failed to save instances: %w", err)
-	}
-
-	// Intentional generic_session_id clear is a one-shot for this save.
-	// Consume only after a successful write so a failed Upsert can retry
-	// with explicit empty still applied (see consumeGenericSessionIDCleared).
-	consumeGenericSessionIDCleared(instances...)
-
-	// Save groups (including empty ones)
-	if groupTree != nil {
-		groupRows := make([]*statedb.GroupRow, 0, len(groupTree.GroupList))
-		for _, g := range groupTree.GroupList {
-			groupRows = append(groupRows, &statedb.GroupRow{
-				Path:          g.Path,
-				Name:          g.Name,
-				Expanded:      g.Expanded,
-				Order:         g.Order,
-				DefaultPath:   g.DefaultPath,
-				MaxConcurrent: g.MaxConcurrent,
-			})
-		}
-		if err := s.db.SaveGroups(groupRows); err != nil {
-			return fmt.Errorf("failed to save groups: %w", err)
+		updates[i].Desired = row
+		clearIntents[i] = inst.genericSessionIDCleared
+		if snapshot := inst.storageSnapshot; snapshot != nil && snapshot.dbPath == s.dbPath {
+			updates[i].Original = snapshot.original
+			updates[i].Stored = snapshot.stored
 		}
 	}
-
-	// Touch metadata for change detection by other instances
+	groupBatch, err := s.prepareGroupSave(groupTree)
+	if err != nil {
+		return nil, err
+	}
+	result, err := s.db.MergeRegistrySnapshots(updates, groupBatch.updates)
+	if err != nil {
+		return nil, fmt.Errorf("failed to save instances: %w", err)
+	}
+	for i, inst := range instances {
+		// Only the submitted representation was saved. Reading the live model
+		// again here could acknowledge edits made while this save was in flight.
+		original := statedb.CloneInstanceRow(updates[i].Desired)
+		if clearIntents[i] {
+			inst.genericSessionIDCleared = false
+			original.ToolData = WriteGenericSessionIDToToolData(original.ToolData, "", time.Time{}, false)
+			original.ToolData = WriteGenericSessionScopeToToolData(original.ToolData, "", "", "", false)
+		}
+		s.rememberInstanceSnapshot(inst, original, result.Instances[i])
+	}
+	s.finishGroupSave(groupBatch, result.Groups)
 	_ = s.db.Touch()
+	return result.Instances, nil
+}
 
-	return nil
+// instanceStorageSnapshot belongs to the returned Instance, not to the Storage
+// handle's most recent load. Keep both representations: after a merge the caller
+// can still hold stale unedited fields, which must not become future edit intent.
+type instanceStorageSnapshot struct {
+	dbPath   string
+	original *statedb.InstanceRow
+	stored   *statedb.InstanceRow
+}
+
+func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *statedb.InstanceRow) {
+	inst.storageSnapshot = &instanceStorageSnapshot{
+		dbPath:   s.dbPath,
+		original: statedb.CloneInstanceRow(original),
+		stored:   statedb.CloneInstanceRow(stored),
+	}
 }
 
 // UpdateTitleIfUnlocked sets an instance's title with a single conditional
@@ -481,9 +504,8 @@ func (s *Storage) DeleteInstance(id string, lifecycleToken ...string) error {
 }
 
 // DeleteGroupSubtree removes a group and all of its descendants from the groups
-// table. SaveGroups is additive (upsert, never prune), so intentional group
-// removal — delete, rename, move — must call this explicitly; otherwise the old
-// path rows linger and the group resurrects on the next reload.
+// table without snapshot conflict checks. Interactive edits use GroupTree
+// mutations with SaveWithGroups so member changes and deletion are atomic.
 func (s *Storage) DeleteGroupSubtree(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -633,15 +655,8 @@ func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instan
 	return nil
 }
 
-// ErrInsertNotPersistent is returned by InsertSessionAndVerify when, after
-// retries, the row is still missing from the database. The most likely cause
-// is a concurrent SaveInstances rewrite from another agent-deck process
-// that loaded the instances slice before this INSERT landed and then
-// DELETE'd the row via the `DELETE FROM instances WHERE id NOT IN (...)`
-// step inside SaveInstances.
-//
-// Surfacing this as a real error (rather than silently returning success)
-// is the user-facing half of the issue #1031 fix.
+// ErrInsertNotPersistent reports that a successfully inserted row was removed
+// before verification. Do not retry the insertion over a deliberate deletion.
 var ErrInsertNotPersistent = errors.New("insert not persistent: row dropped by concurrent writer")
 
 // insertVerifyAttempts and insertVerifyBackoff control the post-commit
@@ -748,10 +763,10 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	if err != nil {
 		return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
 	}
-	if exists {
-		return nil
+	if !exists {
+		return fmt.Errorf("%w: concurrent deletion conflict for instance %s", ErrInsertNotPersistent, newInstance.ID)
 	}
-	return fmt.Errorf("%w: %s", ErrInsertNotPersistent, newInstance.ID)
+	return nil
 }
 
 func (s *Storage) rejectNewGroups(candidateInstances []*Instance, groupTree *GroupTree) error {
@@ -843,6 +858,7 @@ func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
 		)
 		return true, nil
 	}
+	original := statedb.CloneInstanceRow(row)
 	newToolData, err := swapAdditionalPath(row.ToolData, row.ProjectPath, newCwd)
 	if err != nil {
 		return true, err
@@ -850,7 +866,7 @@ func (s *Storage) SyncInstanceCwd(id, newCwd string) (bool, error) {
 	row.ToolData = newToolData
 	row.ProjectPath = newCwd
 	row.LastAccessed = time.Now()
-	if err := s.db.SaveInstance(row); err != nil {
+	if _, err := s.db.MergeInstanceSnapshots([]statedb.InstanceSnapshot{{Original: original, Stored: original, Desired: row}}, nil); err != nil {
 		return true, fmt.Errorf("failed to persist cwd for %s: %w", id, err)
 	}
 	_ = s.db.Touch()
@@ -971,7 +987,7 @@ func (s *Storage) saveSingleInstance(row *statedb.InstanceRow) error {
 //     touched.
 //
 //  2. Clobber vs. concurrent edit of a row being revived. A full-row write
-//     (INSERT OR REPLACE / saveSingleInstance) would push EVERY column from
+//     (INSERT OR REPLACE) would push EVERY column from
 //     revive's stale in-memory snapshot, overwriting any field (title, group,
 //     tool_data, last_accessed, claude_session_id, …) a concurrent process
 //     edited between revive's load and its save. Revive owns exactly ONE field:
@@ -1004,64 +1020,20 @@ func (s *Storage) PersistRevivedInstances(instances []*Instance) error {
 	return s.db.PersistInstanceStatusesTx(updates)
 }
 
-// PersistRecoveredInstances persists the rows a fleet-recovery sweep restarted,
-// and ONLY those rows.
-//
-// Why it is not PersistRevivedInstances: a revive mutates exactly one field
-// (Status), so that method can use a status-only UPDATE. A restart replaces the
-// process — status, tmux session name, socket, and the tool conversation id in
-// tool_data can all change — so the recovered rows need a full-row write.
-//
-// Why it is not SaveWithGroups: that path converts and rewrites EVERY instance
-// in the caller's snapshot. During a 65-session recovery the sweep runs for
-// minutes, so its snapshot is stale by construction, and a full rewrite would
-// push stale columns over any edit another process made to a session the sweep
-// never touched. Writing one targeted row per restarted session (via
-// statedb.SaveInstance, which merges tool_data extras and auto-name fields
-// rather than blindly replacing them) keeps the blast radius to the sessions
-// the sweep actually owns. No path here deletes anything: there is no
-// DELETE-NOT-IN sweep, so a session added concurrently can never be lost
-// (the 2026-06-04 data-loss class).
-//
-// Errors are per-row and returned joined, so one bad row does not hide the rest.
+// PersistRecoveredInstances saves only the recovered sessions, using their
+// loaded snapshots to preserve concurrent edits and reject conflicting changes.
+// Failures are per-row and joined so one bad session does not hide the rest.
 func (s *Storage) PersistRecoveredInstances(instances []*Instance) error {
 	var errs []error
 	for _, inst := range instances {
 		if inst == nil {
 			continue
 		}
-		row, err := instanceToRow(inst)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("convert %s: %w", inst.ID, err))
-			continue
-		}
-		if err := s.saveSingleInstance(row); err != nil {
+		if err := s.Save([]*Instance{inst}); err != nil {
 			errs = append(errs, err)
-			continue
 		}
-		consumeGenericSessionIDCleared(inst)
 	}
 	return errors.Join(errs...)
-}
-
-// consumeGenericSessionIDCleared drops the one-shot intentional-clear flag
-// after a successful persistence of the corresponding tool_data write.
-//
-// Without this, a long-lived TUI Instance that once ran
-// `session set tool-session-id ""` keeps genericSessionIDCleared=true forever.
-// Every later SaveWithGroups (title rename, status tick, full table save)
-// would re-emit explicit empty generic_session_id and wipe a concurrent
-// WriteGenericSessionBinding / live-capture re-bind of a new conversation id.
-//
-// Must run only after the DB write succeeds: consuming before Upsert would
-// let a failed save + retry omit the key and sticky-merge resurrect the
-// pre-clear id when write-through (GetGlobal / Persist) was not used.
-func consumeGenericSessionIDCleared(insts ...*Instance) {
-	for _, inst := range insts {
-		if inst != nil {
-			inst.genericSessionIDCleared = false
-		}
-	}
 }
 
 // instanceToRow converts a session.Instance into the statedb row shape.
@@ -1159,7 +1131,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// intentionalClear makes sticky MergeToolDataExtras honor operator clears
 	// without breaking stale-empty full-table saves (see generic_session_persist.go).
 	// The genericSessionIDCleared flag is consumed by the save caller after a
-	// successful DB write (consumeGenericSessionIDCleared), not here: converting
+	// successful DB write, not here: converting
 	// without persisting must not drop clear intent.
 	toolData = WriteGenericSessionIDToToolData(toolData, inst.GenericSessionID, inst.GenericDetectedAt, inst.genericSessionIDCleared)
 	// The scope travels with the id, under the same omission/explicit-empty
@@ -1267,15 +1239,11 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 	}
 
 	// Load from SQLite
-	dbRows, err := s.db.LoadInstances()
+	snapshot, err := s.db.LoadRegistrySnapshot()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+		return nil, nil, err
 	}
-
-	dbGroups, err := s.db.LoadGroups()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
-	}
+	dbRows, dbGroups := snapshot.Instances, snapshot.Groups
 
 	// Convert to InstanceData format (for backward compat with CLI commands)
 	instances := make([]*InstanceData, len(dbRows))
@@ -1498,7 +1466,7 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 
 	if s.db == nil {
 		storageLog.Debug("load_db_not_initialized", slog.String("profile", s.profile))
-		return []*Instance{}, nil, nil
+		return []*Instance{}, nil, nil, nil
 	}
 
 	// Load from SQLite
@@ -1512,13 +1480,9 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 		dbRows, err = s.db.LoadInstances()
 	}
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+		return nil, nil, nil, err
 	}
-
-	dbGroups, err := s.db.LoadGroups()
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
-	}
+	dbRows, dbGroups := snapshot.Instances, snapshot.Groups
 
 	// Convert to InstanceData for the existing convertToInstances pipeline
 	data := &StorageData{
@@ -1626,7 +1590,46 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 		}
 	}
 
-	return s.convertToInstances(data)
+	instances, groups, err := s.convertToInstances(data)
+	if err == nil {
+		byID := make(map[string]*statedb.InstanceRow, len(dbRows))
+		for _, row := range dbRows {
+			byID[row.ID] = row
+		}
+		for _, inst := range instances {
+			original, convertErr := instanceToRow(inst)
+			if convertErr != nil {
+				return nil, nil, nil, convertErr
+			}
+			stored := byID[inst.ID]
+			if stored != nil && stored.GroupPath == DefaultGroupName {
+				// Known legacy normalization is migration intent, not an incidental
+				// display difference. Commit membership with the group's path move.
+				original.GroupPath = stored.GroupPath
+			}
+			s.rememberInstanceSnapshot(inst, original, stored)
+		}
+		groupsByPath := make(map[string]*statedb.GroupRow, len(dbGroups))
+		for _, row := range dbGroups {
+			groupsByPath[row.Path] = row
+		}
+		if legacy := groupsByPath[DefaultGroupName]; legacy != nil {
+			if groupsByPath[DefaultGroupPath] != nil {
+				return nil, nil, nil, fmt.Errorf("legacy default group migration conflicts with existing %q group", DefaultGroupPath)
+			}
+			groupsByPath[DefaultGroupPath] = legacy
+		}
+		for _, group := range groups {
+			stored := groupsByPath[group.Path]
+			original := groupDataToRow(group)
+			if stored != nil && stored.Path == DefaultGroupName {
+				original.Path = stored.Path
+			}
+			group.storageSnapshot = &groupStorageSnapshot{dbPath: s.dbPath,
+				original: original, stored: statedb.CloneGroupRow(stored)}
+		}
+	}
+	return instances, groups, snapshot, err
 }
 
 // SaveRecentSession captures a deleted session's config for quick re-creation.
@@ -1803,6 +1806,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 				slog.String("fallback_group", DefaultGroupPath),
 			)
 			groupPath = DefaultGroupPath
+		}
+		if tmuxSess != nil {
+			tmuxSess.GroupPath = groupPath
 		}
 
 		// Expand tilde in project path (handles paths like ~/project saved from UI)
