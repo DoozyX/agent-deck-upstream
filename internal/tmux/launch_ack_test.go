@@ -1,6 +1,12 @@
 package tmux
 
-import "testing"
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestParseLaunchAckMarker(t *testing.T) {
 	tests := []struct {
@@ -30,3 +36,71 @@ func TestParseLaunchAckMarker(t *testing.T) {
 }
 
 func intPtr(value int) *int { return &value }
+
+func TestLaunchAckScriptPublishesDrainedOutputAndPreservesExit(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	command := `printf 'DIAGNOSTIC_ONCE\n'; exit 7`
+	cmd := exec.Command("bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("launch acknowledgement wrapper returned nil for child exit 7")
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 7 {
+		t.Fatalf("wrapper error = %v, want exit status 7", err)
+	}
+
+	marker, readErr := os.ReadFile(ackPath)
+	if readErr != nil {
+		t.Fatalf("read completion marker: %v", readErr)
+	}
+	text := string(marker)
+	if !strings.Contains(text, "exit:7\n") {
+		t.Fatalf("completion marker = %q, want exit:7", text)
+	}
+	if !strings.Contains(text, "DIAGNOSTIC_ONCE") {
+		t.Fatalf("completion marker = %q, want drained diagnostic", text)
+	}
+	if strings.Contains(text, "exit:7\nDIAGNOSTIC_ONCE\n") == false {
+		t.Fatalf("completion marker published before diagnostic drain: %q", text)
+	}
+	for _, suffix := range []string{".output", ".tmp", ".fifo"} {
+		if _, err := os.Stat(ackPath + suffix); !os.IsNotExist(err) {
+			t.Errorf("temporary file %s still exists (stat error %v)", ackPath+suffix, err)
+		}
+	}
+}
+
+func TestSessionIdentityMismatchIsNotOwned(t *testing.T) {
+	if sessionIdentityMatches("$1", "$2") {
+		t.Fatal("different tmux session identities must not be treated as owned")
+	}
+	if !sessionIdentityMatches("$1", "$1") {
+		t.Fatal("matching tmux session identity must be treated as owned")
+	}
+}
+
+func TestKillIfOwnedDoesNotKillRecreatedSession(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	name := "launch-ack-owner-race"
+	if output, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create original session: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	sess := &Session{Name: name}
+	sess.createdSessionID = sess.sessionIdentity()
+	if sess.createdSessionID == "" {
+		t.Fatal("original session has no tmux session identity")
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", name).Run() })
+	if err := exec.Command("tmux", "kill-session", "-t", name).Run(); err != nil {
+		t.Fatalf("delete original session: %v", err)
+	}
+	if output, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("recreate replacement session: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	if err := sess.KillIfOwned(); err == nil {
+		t.Fatal("ownership mismatch unexpectedly allowed cleanup")
+	}
+	if !sess.Exists() {
+		t.Fatal("ownership mismatch cleanup killed the replacement session")
+	}
+}

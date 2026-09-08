@@ -530,4 +530,67 @@ func TestDeepSeekLifecycle_HeadlessNonzeroExitFailsAndCleans(t *testing.T) {
 	if rec == nil || !strings.Contains(rec.DyingOutput, "MISSING_CREDENTIAL") {
 		t.Fatalf("SpawnFailure() = %#v, want preserved credential diagnostic", rec)
 	}
+	if rec != nil && strings.Count(rec.DyingOutput, "MISSING_CREDENTIAL") != 1 {
+		t.Fatalf("SpawnFailure().DyingOutput = %q, want credential diagnostic exactly once", rec.DyingOutput)
+	}
+}
+
+func TestDeepSeekLifecycle_HeadlessLateCompletion(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	fake := fakeDshPath(t)
+	for _, tc := range []struct {
+		name      string
+		wantError bool
+	}{
+		{name: "success"},
+		{name: "failure", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			workspace := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, ".credentials.yaml"), []byte("deepseek: test\n"), 0o600); err != nil {
+				t.Fatalf("write fake credentials: %v", err)
+			}
+			t.Setenv("DSH_HOME", home)
+			withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{
+				Command: fake, ConfigDir: home, Profile: "headless",
+			}})
+
+			inst := NewInstanceWithTool("deepseek-headless-late-"+tc.name, workspace, "deepseek")
+			task := "__agentdeck_late_success__"
+			if tc.wantError {
+				task = "__agentdeck_late_failure__"
+			}
+			err := inst.StartWithMessage(task)
+			if err != nil {
+				t.Fatalf("StartWithMessage() = %v, want post-ack success", err)
+			}
+
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				rec := inst.SpawnFailure()
+				if tc.wantError && rec != nil {
+					if !strings.Contains(rec.DyingOutput, "LATE_HEADLESS_DIAGNOSTIC") {
+						t.Fatalf("late failure diagnostic = %q, want preserved output", rec.DyingOutput)
+					}
+					if strings.Count(rec.DyingOutput, "LATE_HEADLESS_DIAGNOSTIC") != 1 {
+						t.Fatalf("late failure diagnostic = %q, want output exactly once", rec.DyingOutput)
+					}
+					if !inst.Exists() {
+						return
+					}
+				}
+				if !tc.wantError && rec == nil && inst.Exists() {
+					if content, captureErr := inst.PreviewFull(); captureErr == nil && strings.Contains(content, "LATE_HEADLESS_DIAGNOSTIC") {
+						return
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if tc.wantError {
+				t.Fatalf("late nonzero completion was not recorded; session exists=%v", inst.Exists())
+			}
+			t.Fatalf("successful late completion did not remain a clean one-shot; session exists=%v", inst.Exists())
+		})
+	}
 }

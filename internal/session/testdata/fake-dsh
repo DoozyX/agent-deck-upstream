@@ -176,6 +176,18 @@ case "$profile" in
     fi
     require_credential
     record_session "$(new_session_id)"
+    case "$*" in
+      __agentdeck_late_success__)
+        sleep 1
+        printf 'LATE_HEADLESS_DIAGNOSTIC\n' >&2
+        exit 0
+        ;;
+      __agentdeck_late_failure__)
+        sleep 1
+        printf 'LATE_HEADLESS_DIAGNOSTIC\n' >&2
+        exit 7
+        ;;
+    esac
     printf 'answered: %s\n' "$*"
     exit 0
     ;;
