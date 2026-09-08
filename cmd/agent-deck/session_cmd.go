@@ -3906,6 +3906,13 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		OwnPasteMarker: baseline.paneOK && baseline.pasteMarkers == 0,
 	}
 	recoveryAttempted := false
+	recoveryAccepted := false
+	codexWorkingSeenBeforeBody := false
+	codexBaselineWorking := false
+	if session.IsCodexCompatible(opts.tool) {
+		token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
+		codexBaselineWorking = codexWorkingLine(baseline.content, token)
+	}
 	for i := 0; i < checks; i++ {
 		// Strongest signal first: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
@@ -3916,10 +3923,6 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 		}
 		if baseline.paneOK {
 			if n, markers, content, paneNow, ok := paneArrivalObservation(target, message); ok {
-				if session.IsCodexCompatible(opts.tool) &&
-					!codexWorkingIndicator(baseline.content, message) && codexWorkingIndicator(content, message) {
-					return deliverySubmitted, nil
-				}
 				arrived := false
 				if n > baseline.occurrences {
 					if opts.tool == "pi" && piComposerEmpty(content, message) {
@@ -3950,13 +3953,28 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					sawBody = true
 					arrived = true
 				}
+				codex := session.IsCodexCompatible(opts.tool)
+				if codex {
+					token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
+					if codexWorkingLine(content, token) && !arrived && !codexBaselineWorking {
+						codexWorkingSeenBeforeBody = true
+					}
+				}
 				if arrived && !recoveryAttempted && session.IsCodexCompatible(opts.tool) {
 					// Consume the single recovery budget before sending. NudgeEnter
 					// reports both an attribution refusal and a transport failure as
 					// false; neither may re-arm another Enter into a pane whose draft
 					// could have changed since this capture.
 					recoveryAttempted = true
-					_ = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
+					recoveryAccepted = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
+				}
+				if session.IsCodexCompatible(opts.tool) &&
+					arrived &&
+					recoveryAccepted &&
+					!codexWorkingSeenBeforeBody &&
+					!codexWorkingIndicator(baseline.content, message) &&
+					codexWorkingIndicator(content, message) {
+					return deliverySubmitted, nil
 				}
 			}
 		}
@@ -4003,15 +4021,24 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 // certifying a send that never arrived.
 
 func codexWorkingIndicator(content, message string) bool {
-	// Do not treat a user payload containing the word "working" as the TUI's
-	// state line. Remove its distinctive token before looking for the indicator;
-	// the body itself is arrival evidence, never submission evidence.
-	if token := collapseWhitespace(messageDeliveryToken(message)); token != "" {
-		content = strings.ReplaceAll(content, token, "")
+	token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
+	if token == "" || !strings.Contains(strings.ToLower(collapseWhitespace(content)), token) {
+		return false
 	}
+	return codexWorkingLine(content, token)
+}
+
+func codexWorkingLine(content, token string) bool {
 	for _, line := range strings.Split(strings.ToLower(content), "\n") {
-		line = strings.TrimSpace(strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*"))
-		if line == "working" || strings.HasPrefix(line, "working ") || strings.HasPrefix(line, "working(") || strings.HasPrefix(line, "working...") {
+		line = collapseWhitespace(line)
+		if token != "" {
+			// Both operands are normalized. Removing an uncollapsed token from
+			// wrapped pane content misses the exact body and lets payload text
+			// beginning with "working" impersonate the TUI state line.
+			line = strings.ReplaceAll(line, token, "")
+		}
+		line = strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*")
+		if line == "working" || line == "working..." || strings.HasPrefix(line, "working(") {
 			return true
 		}
 	}
