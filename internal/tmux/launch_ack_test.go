@@ -207,8 +207,8 @@ func TestCaptureCreatedSessionIdentityRequiresBoundedOwnedProbe(t *testing.T) {
 	countPath := filepath.Join(dir, "identity-calls")
 	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
 		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
-		"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then echo 'server busy' >&2; exit 1; fi\n"+"  echo '$created'; exit 0\n"+"fi\nexit 1\n")
-	sess := &Session{Name: "created"}
+		"if [ \"$1\" = \"list-sessions\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then exit 1; fi\n"+"  printf '$created\\tcreated\\tmarker\\n'; exit 0\n"+"fi\nexit 1\n")
+	sess := &Session{Name: "created", creationMarker: "marker"}
 	identity, err := sess.captureCreatedSessionIdentity()
 	if err != nil || identity != "$created" {
 		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want bounded retry to $created", identity, err)
@@ -220,11 +220,23 @@ func TestCaptureCreatedSessionIdentityRetriesTransientEmptyResponse(t *testing.T
 	countPath := filepath.Join(dir, "identity-calls")
 	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
 		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
-		"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then exit 0; fi\n"+"  echo '$created'; exit 0\n"+"fi\nexit 1\n")
+		"if [ \"$1\" = \"list-sessions\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then exit 0; fi\n"+"  printf '$created\\tcreated\\tmarker\\n'; exit 0\n"+"fi\nexit 1\n")
 
-	identity, err := (&Session{Name: "created"}).captureCreatedSessionIdentity()
+	identity, err := (&Session{Name: "created", creationMarker: "marker"}).captureCreatedSessionIdentity()
 	if err != nil || identity != "$created" {
 		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want retry result $created", identity, err)
+	}
+}
+
+func TestCaptureCreatedSessionIdentityRejectsUnmarkedReplacement(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+"if [ \"$1\" = \"display-message\" ]; then echo '$replacement'; exit 0; fi\n"+"if [ \"$1\" = \"list-sessions\" ]; then echo '$replacement\\treused-name\\tnew-marker'; exit 0; fi\n"+"exit 1\n")
+
+	sess := &Session{Name: "reused-name", creationMarker: "old-marker"}
+	identity, err := sess.captureCreatedSessionIdentity()
+	if err == nil || identity != "" {
+		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want rejection of replacement", identity, err)
 	}
 }
 
@@ -262,16 +274,11 @@ func TestStartRollsBackCreatedSessionWhenCreationOutputIsEmpty(t *testing.T) {
 		"esac\n")
 
 	sess := NewSession("empty-create-output-rollback", t.TempDir())
-	err := sess.Start("")
-	if err == nil {
-		t.Fatal("Start() unexpectedly succeeded without an immutable session identity")
+	if err := sess.Start(""); err != nil {
+		t.Fatalf("Start() failed to capture immutable identity from marker snapshot: %v", err)
 	}
-	if raw, readErr := os.ReadFile(killLog); readErr != nil || len(strings.TrimSpace(string(raw))) == 0 {
-		calls, _ := os.ReadFile(callLog)
-		t.Fatalf("created session was not rolled back after empty creation output: log=%q readErr=%v calls=%q", raw, readErr, calls)
-	}
-	if raw, readErr := os.ReadFile(killLog); readErr == nil && !strings.Contains(string(raw), "-t $created") {
-		t.Fatalf("rollback did not target the immutable created session identity: %q", raw)
+	if raw, readErr := os.ReadFile(killLog); readErr == nil && len(strings.TrimSpace(string(raw))) != 0 {
+		t.Fatalf("successful marker handoff unexpectedly rolled back: %q", raw)
 	}
 }
 

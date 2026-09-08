@@ -1501,7 +1501,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// We DO NOT use --collect here: --collect unloads the unit once
 		// inactive, which would race with Restart= semantics.
 		svcArgs := []string{
-			"--user", "--unit", unitBase + ".service", "--quiet", "--pipe",
+			"--user", "--unit", unitBase + ".service", "--quiet",
 			"--property=Type=forking",
 			"--property=Restart=on-failure",
 			"--property=RestartSec=5s",
@@ -1518,7 +1518,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// Legacy PR #467 shape — unchanged so existing users opting out
 		// of service mode with launch_as="scope" get identical semantics.
 		scopeArgs := []string{
-			"--user", "--scope", "--quiet", "--pipe", "--collect", "--unit", unitBase, "tmux",
+			"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux",
 		}
 		scopeArgs = append(scopeArgs, tmuxArgs...)
 		return "systemd-run", scopeArgs
@@ -1595,7 +1595,7 @@ exit "$exit_code"`
 // falling all the way back to direct tmux.
 func buildScopeArgsFromTmuxArgs(sessionName string, tmuxArgs []string) []string {
 	unitBase := serviceUnitBase(sessionName)
-	scopeArgs := []string{"--user", "--scope", "--quiet", "--pipe", "--collect", "--unit", unitBase, "tmux"}
+	scopeArgs := []string{"--user", "--scope", "--quiet", "--collect", "--unit", unitBase, "tmux"}
 	return append(scopeArgs, tmuxArgs...)
 }
 
@@ -3846,18 +3846,27 @@ func (s *Session) sessionIdentityFor(name string) string {
 // step. A live session without this fact cannot be safely owned or cleaned up,
 // so Start refuses to report success rather than arming an unowned watcher.
 func (s *Session) captureCreatedSessionIdentity() (string, error) {
+	if strings.TrimSpace(s.creationMarker) == "" || strings.TrimSpace(s.Name) == "" {
+		return "", fmt.Errorf("tmux session creation marker is unavailable")
+	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		out, err := s.runBoundedOutput("display-message", "-t", s.Name, "-p", "#{session_id}")
+		out, err := s.runBoundedOutput("list-sessions", "-F", "#{session_id}\t#{session_name}\t#{E:"+sessionCreationMarkerEnv+"}")
 		if err == nil {
-			if identity := strings.TrimSpace(string(out)); identity != "" {
+			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+				parts := strings.SplitN(line, "\t", 3)
+				if len(parts) != 3 || parts[1] != s.Name || parts[2] != s.creationMarker {
+					continue
+				}
+				identity := strings.TrimSpace(parts[0])
+				if identity == "" {
+					continue
+				}
 				if s.createdSessionID != "" && !sessionIdentityMatches(s.createdSessionID, identity) {
 					return "", fmt.Errorf("session identity changed during capture: expected %s, found %s", s.createdSessionID, identity)
 				}
 				return identity, nil
 			}
-		} else if tmuxSessionAbsence(err) {
-			return "", fmt.Errorf("session disappeared before identity capture")
 		}
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("identity probe remained indeterminate")

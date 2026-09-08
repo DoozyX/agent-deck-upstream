@@ -274,6 +274,20 @@ func TestIssue1793_CodexWorkingPaneConfirmsSubmittedNoWaitSend(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexTimedWorkingPaneConfirmsSubmitted(t *testing.T) {
+	const msg = "ISSUE1793 TIMED CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working (4s • esc to interrupt)\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("timed Codex Working pane = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("timed Working state must not receive recovery Enter, got %d", got)
+	}
+}
+
 func TestIssue1793_CodexPayloadWorkingLineIsNotSubmissionEvidence(t *testing.T) {
 	const msg = "working on the deployment plan"
 	mock := &mockSendRetryTarget{

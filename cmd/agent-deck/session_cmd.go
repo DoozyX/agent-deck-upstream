@@ -3954,6 +3954,15 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					arrived = true
 				}
 				codex := session.IsCodexCompatible(opts.tool)
+				// Codex renders the timed Working line together with the submitted
+				// body. That is already submission evidence; sending a recovery
+				// Enter would deliver a second Enter to the accepted prompt. Keep
+				// attribution strict when another prompt/draft is visible.
+				if codex && arrived && !recoveryAttempted &&
+					codexWorkingIndicator(content, message) && codexTimedWorkingLine(content) &&
+					!strings.Contains(strings.ToLower(content), "codex>") {
+					return deliverySubmitted, nil
+				}
 				if codex {
 					token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
 					if codexWorkingLine(content, token) && !arrived && !codexBaselineWorking {
@@ -4062,7 +4071,19 @@ func codexWorkingLine(content, token string) bool {
 			continue
 		}
 		line = strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*")
-		if line == "working" || line == "working..." || strings.HasPrefix(line, "working(") {
+		if line == "working" || line == "working..." ||
+			strings.HasPrefix(line, "working(") ||
+			(strings.HasPrefix(line, "working") && strings.Contains(line, "esc to interrupt")) {
+			return true
+		}
+	}
+	return false
+}
+
+func codexTimedWorkingLine(content string) bool {
+	for _, line := range strings.Split(strings.ToLower(content), "\n") {
+		line = collapseWhitespace(strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*"))
+		if strings.HasPrefix(line, "working(") && strings.Contains(line, "esctointerrupt") {
 			return true
 		}
 	}
