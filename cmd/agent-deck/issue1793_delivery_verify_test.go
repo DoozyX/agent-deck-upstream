@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 )
 
@@ -165,6 +166,72 @@ func TestIssue1793_CodexForeignDraftIsNeverSubmittedByRecovery(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
 		t.Fatalf("recovery must not submit a foreign Codex draft, got %d Enter presses", got)
+	}
+}
+
+// TestIssue1793_CodexForeignDraftConsumesRecoveryBudgetAcrossPaneChanges
+// covers the race between arrival evidence and recovery: the body is first
+// visible, but the composer belongs to another actor when recovery is
+// considered. Even if a later capture looks like our draft again, that
+// attribution refusal must consume the only recovery opportunity rather than
+// risk submitting a concurrently replaced prompt.
+func TestIssue1793_CodexForeignDraftConsumesRecoveryBudgetAcrossPaneChanges(t *testing.T) {
+	const msg = "ISSUE1793 CODEX CHANGING PANE distinctive prompt body"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		panes: []string{
+			"codex>\n", // pre-send baseline
+			"history: " + msg + "\ncodex> deploy production immediately\n",
+			"history: " + msg + "\ncodex> " + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+
+	if err == nil || delivery != deliveryTyped {
+		t.Fatalf("foreign-draft recovery must remain unconfirmed: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("an attribution refusal must consume recovery budget; got %d Enter presses after pane changed back", got)
+	}
+}
+
+// TestIssue1793_CustomCodexCompatibleToolGetsBoundedRecoveryEnter proves the
+// recovery capability follows compatible_with rather than the built-in tool
+// name, so wrappers retain the same one-Enter safety boundary as native Codex.
+func TestIssue1793_CustomCodexCompatibleToolGetsBoundedRecoveryEnter(t *testing.T) {
+	const tool = "issue1793_codex_wrapper"
+	const msg = "ISSUE1793 CUSTOM CODEX RECOVERY distinctive prompt body"
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	session.ClearUserConfigCache()
+	t.Cleanup(session.ClearUserConfigCache)
+	if err := session.SaveUserConfig(&session.UserConfig{Tools: map[string]session.ToolDef{
+		tool: {Command: "company-codex-wrapper", CompatibleWith: "codex"},
+	}}); err != nil {
+		t.Fatalf("save custom Codex-compatible tool: %v", err)
+	}
+	if !session.IsCodexCompatible(tool) {
+		t.Fatal("custom tool with compatible_with=codex must receive Codex recovery behavior")
+	}
+
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting", "waiting", "active"},
+		panes:    []string{"codex>\n", "codex> " + msg + "\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, tool: tool,
+	})
+
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("custom Codex-compatible recovery must submit: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 1 {
+		t.Fatalf("custom Codex-compatible tool: want one bounded recovery Enter, got %d", got)
 	}
 }
 
