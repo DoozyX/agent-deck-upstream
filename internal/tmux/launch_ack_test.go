@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseLaunchAckMarker(t *testing.T) {
@@ -102,5 +103,42 @@ func TestKillIfOwnedDoesNotKillRecreatedSession(t *testing.T) {
 	}
 	if !sess.Exists() {
 		t.Fatal("ownership mismatch cleanup killed the replacement session")
+	}
+}
+
+func TestWatchInitialProcessCompletionIgnoresRecreatedSession(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	name := "launch-ack-watcher-race"
+	if output, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("create original session: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+	sess := &Session{Name: name}
+	sess.createdSessionID = sess.sessionIdentity()
+	if sess.createdSessionID == "" {
+		t.Fatal("original session has no tmux session identity")
+	}
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	sess.launchAckPath = ackPath
+	if err := os.WriteFile(ackPath, []byte("pid:42\n"), 0o600); err != nil {
+		t.Fatalf("write launch marker: %v", err)
+	}
+	t.Cleanup(func() { _ = exec.Command("tmux", "kill-session", "-t", name).Run() })
+	if err := exec.Command("tmux", "kill-session", "-t", name).Run(); err != nil {
+		t.Fatalf("delete original session: %v", err)
+	}
+	if output, err := exec.Command("tmux", "new-session", "-d", "-s", name, "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("recreate replacement session: %v (%s)", err, strings.TrimSpace(string(output)))
+	}
+
+	called := make(chan struct{}, 1)
+	sess.WatchInitialProcessCompletion(make(chan struct{}), func(int, string) { called <- struct{}{} })
+	if err := os.WriteFile(ackPath, []byte("exit:7\nSTALE\n"), 0o600); err != nil {
+		t.Fatalf("write stale completion marker: %v", err)
+	}
+
+	select {
+	case <-called:
+		t.Fatal("stale watcher callback ran for the replacement session")
+	case <-time.After(250 * time.Millisecond):
 	}
 }

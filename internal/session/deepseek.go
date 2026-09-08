@@ -1087,16 +1087,20 @@ func (i *Instance) acknowledgeInitialProcess(command string) error {
 	ackErr := i.tmuxSession.AcknowledgeInitialProcess()
 	if ackErr == nil {
 		if i.expectsFastExit() {
-			i.tmuxSession.WatchInitialProcessCompletion(func(exitCode int, diagnostic string) {
+			launchSession := i.tmuxSession
+			gen, wake := i.newSpawnGenWatch()
+			launchSession.WatchInitialProcessCompletion(wake, func(exitCode int, diagnostic string) {
 				if exitCode == 0 {
 					return
 				}
 				completionErr := fmt.Errorf("initial command exited after launch acknowledgement (exit status %d)", exitCode)
-				i.recordTmuxStartFailure(command, completionErr, diagnostic)
-				i.mu.Lock()
-				i.Status = StatusError
-				i.mu.Unlock()
-				if cleanupErr := i.tmuxSession.KillIfOwned(); cleanupErr != nil {
+				if !i.commitSpawnWatchWrite(gen, func() {
+					i.recordTmuxStartFailure(command, completionErr, diagnostic)
+					i.SetStatusThreadSafe(StatusError)
+				}) {
+					return
+				}
+				if cleanupErr := launchSession.KillIfOwned(); cleanupErr != nil {
 					sessionLog.Warn("headless_completion_cleanup_failed",
 						slog.String("instance_id", i.ID),
 						slog.String("error", cleanupErr.Error()))
@@ -1105,7 +1109,7 @@ func (i *Instance) acknowledgeInitialProcess(command string) error {
 		}
 		return nil
 	}
-	i.Status = StatusError
+	i.SetStatusThreadSafe(StatusError)
 	diagnostic := ackErr
 	captured := ""
 	if content, captureErr := i.tmuxSession.CapturePane(); captureErr == nil {
