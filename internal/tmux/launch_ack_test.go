@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -167,6 +168,150 @@ func TestWatchInitialProcessCompletionRetriesIndeterminateIdentityProbe(t *testi
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("watcher abandoned marker after an indeterminate identity probe")
+	}
+}
+
+func TestProbeSessionIdentityEmptySuccessfulResponseIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"display-message\" ]; then exit 0; fi\nexit 1\n")
+	probe := (&Session{Name: "gone"}).probeSessionIdentity("gone")
+	if probe.state != sessionIdentityMissing {
+		t.Fatalf("empty successful identity probe = %v, want missing", probe.state)
+	}
+}
+
+func TestProbeSessionIdentityAuthoritativeNoServerIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\nif [ \"$1\" = \"-L\" ]; then shift 2; fi\nif [ \"$1\" = \"display-message\" ]; then echo 'no server running' >&2; exit 1; fi\nexit 1\n")
+	probe := (&Session{Name: "gone"}).probeSessionIdentity("gone")
+	if probe.state != sessionIdentityMissing {
+		t.Fatalf("authoritative no-server identity probe = %v, want missing", probe.state)
+	}
+}
+
+func TestSessionIdentityForRetriesTransientEmptyResponse(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "identity-calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
+		"if [ \"$1\" = \"display-message\" ]; then\n"+
+		"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -lt 2 ]; then exit 0; fi\n"+"  echo '$created'; exit 0\nfi\nexit 1\n")
+	identity := (&Session{Name: "created"}).sessionIdentityFor("created")
+	if identity != "$created" {
+		t.Fatalf("sessionIdentityFor() = %q, want retry result $created", identity)
+	}
+}
+
+func TestCaptureCreatedSessionIdentityRequiresBoundedOwnedProbe(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "identity-calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
+		"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+"  if [ $n -eq 1 ]; then echo 'server busy' >&2; exit 1; fi\n"+"  echo '$created'; exit 0\n"+"fi\nexit 1\n")
+	sess := &Session{Name: "created"}
+	identity, err := sess.captureCreatedSessionIdentity()
+	if err != nil || identity != "$created" {
+		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want bounded retry to $created", identity, err)
+	}
+}
+
+func TestLaunchAckScriptFailsClosedWithoutProcessGroupCapability(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	latePath := filepath.Join(t.TempDir(), "late")
+	command := fmt.Sprintf("(sleep 1; printf LATE > %s) & printf DIRECT; exit 7", shellQuote(latePath))
+	pathDir := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(pathDir, 0o755); err != nil {
+		t.Fatalf("mkdir capability-minimal PATH: %v", err)
+	}
+	for _, name := range []string{"bash", "cat", "kill", "mkfifo", "mv", "rm", "sleep", "tee"} {
+		target, err := exec.LookPath(name)
+		if err != nil {
+			t.Skipf("%s unavailable: %v", name, err)
+		}
+		if err := os.Symlink(target, filepath.Join(pathDir, name)); err != nil {
+			t.Fatalf("link %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", pathDir)
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bash, "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	err = cmd.Run()
+	if err == nil {
+		t.Fatal("capability-minimal wrapper unexpectedly reported success")
+	}
+	if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 125 {
+		t.Fatalf("capability-minimal wrapper error = %v, want exit 125", err)
+	}
+	if _, err := os.Stat(latePath); !os.IsNotExist(err) {
+		t.Fatalf("capability-minimal wrapper launched an unowned descendant: stat error %v", err)
+	}
+	marker, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatalf("read fail-closed marker: %v", err)
+	}
+	if !strings.Contains(string(marker), "exit:125") {
+		t.Fatalf("fail-closed marker = %q, want exit:125", marker)
+	}
+}
+
+func TestKillIfOwnedSynchronouslyReapsOwnedDescendants(t *testing.T) {
+	dir := t.TempDir()
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
+		"if [ \"$1\" = \"display-message\" ]; then echo '$owned'; exit 0; fi\n"+
+		"if [ \"$1\" = \"list-panes\" ]; then echo \"$TEARDOWN_PID\"; exit 0; fi\n"+"if [ \"$1\" = \"kill-session\" ]; then exit 0; fi\nexit 0\n")
+	proc := exec.Command("sh", "-c", "trap '' HUP; sleep 30")
+	if err := proc.Start(); err != nil {
+		t.Fatalf("start owned process: %v", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = proc.Wait(); close(done) }()
+	t.Setenv("TEARDOWN_PID", fmt.Sprint(proc.Process.Pid))
+	sess := &Session{Name: "owned-sync", createdSessionID: "$owned"}
+	if err := sess.KillIfOwned(); err != nil {
+		t.Fatalf("KillIfOwned: %v", err)
+	}
+	if err := syscall.Kill(proc.Process.Pid, syscall.Signal(0)); err == nil {
+		t.Fatal("owned descendant still alive after synchronous KillIfOwned returned")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("owned process was not reaped after KillIfOwned returned")
+	}
+}
+
+func TestKillIfOwnedSnapshotIgnoresMutableReplacementFields(t *testing.T) {
+	dir := t.TempDir()
+	callLog := filepath.Join(dir, "calls")
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
+		"echo \"$*\" >> "+shellQuote(callLog)+"\n"+
+		"case \"$1\" in\n"+
+		"display-message) echo '$old';;\n"+
+		"list-panes) exit 0;;\n"+
+		"kill-session) exit 0;;\n"+
+		"*) exit 0;;\n"+
+		"esac\n")
+	launch := &Session{Name: "old-name", createdSessionID: "$old"}
+	capturedName, capturedID := launch.OwnershipSnapshot()
+	launch.Name = "replacement-name"
+	launch.createdSessionID = "$replacement"
+	if err := launch.KillIfOwnedSnapshot(capturedName, capturedID); err != nil {
+		t.Fatalf("captured immutable cleanup: %v", err)
+	}
+	calls, err := os.ReadFile(callLog)
+	if err != nil {
+		t.Fatalf("read tmux calls: %v", err)
+	}
+	if !strings.Contains(string(calls), "kill-session -t $old") {
+		t.Fatalf("cleanup did not use captured identity: %q", calls)
+	}
+	if strings.Contains(string(calls), "$replacement") {
+		t.Fatalf("cleanup followed mutable replacement identity: %q", calls)
 	}
 }
 

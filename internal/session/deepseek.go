@@ -1088,6 +1088,7 @@ func (i *Instance) acknowledgeInitialProcess(command string) error {
 	if ackErr == nil {
 		if i.expectsFastExit() {
 			launchSession := i.tmuxSession
+			launchSessionName, launchSessionID := launchSession.OwnershipSnapshot()
 			gen, wake := i.newSpawnGenWatch()
 			launchSession.WatchInitialProcessCompletion(wake, func(exitCode int, diagnostic string) {
 				if exitCode == 0 {
@@ -1100,7 +1101,14 @@ func (i *Instance) acknowledgeInitialProcess(command string) error {
 				}) {
 					return
 				}
-				if cleanupErr := launchSession.KillIfOwned(); cleanupErr != nil {
+				// The generation may change after the guarded record write. Do not
+				// clean up a stale completion once a restart has begun; the retained
+				// name/identity also prevents a reused Session pointer from targeting
+				// the replacement.
+				if i.spawnGen.Load() != gen {
+					return
+				}
+				if cleanupErr := launchSession.KillIfOwnedSnapshot(launchSessionName, launchSessionID); cleanupErr != nil {
 					sessionLog.Warn("headless_completion_cleanup_failed",
 						slog.String("instance_id", i.ID),
 						slog.String("error", cleanupErr.Error()))
