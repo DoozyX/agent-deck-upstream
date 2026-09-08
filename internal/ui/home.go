@@ -48,6 +48,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/terminal"
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
 	"github.com/asheshgoplani/agent-deck/internal/update"
+	"github.com/asheshgoplani/agent-deck/internal/usage"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 	"github.com/asheshgoplani/agent-deck/internal/vcsbackend"
 	"github.com/asheshgoplani/agent-deck/internal/watcher"
@@ -581,6 +582,11 @@ type Home struct {
 	// FooterMinimal. Cached so every render of a frame agrees. Additive/opt-in:
 	// it only changes WHAT the footer advertises, never a keybinding.
 	footerMode string
+	// usageSnapshots is populated by an optional background OpenUsage query.
+	// Empty means no bar, preserving the historic layout exactly.
+	usageSnapshots     []usage.Snapshot
+	lastUsageFetch     time.Time
+	usageFetchInFlight bool
 
 	// attachOnCreate, when true, makes creating a session via the new-session
 	// dialog attach to the new session's pane immediately instead of only
@@ -1305,24 +1311,33 @@ func (h *Home) stackedPreviewTopY() int {
 	if h.getLayoutMode() != LayoutModeStacked {
 		return -1
 	}
-	const helpBarHeight = 2
-	filterBarHeight := 1
-	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
-		updateBannerHeight = 1
-	}
-	maintenanceBannerHeight := 0
-	if h.maintenanceMsg != "" {
-		maintenanceBannerHeight = 1
-	}
-	debugBarHeight := 0
-	if h.debugMode {
-		debugBarHeight = 1
-	}
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	contentHeight := h.mainContentHeight()
 	listHeight := h.stackedListHeight(contentHeight)
 	// content top + full list block (title + body) + the 1-row separator.
 	return h.contentChromeTop() + listHeight + 1
+}
+
+func (h *Home) usageBarHeight() int {
+	return lipgloss.Height(renderUsageBar(h.usageSnapshots, h.width))
+}
+
+// mainContentHeight is shared by rendering, scrolling, and stacked mouse routing.
+func (h *Home) mainContentHeight() int {
+	return h.mainContentHeightForUsageBar(h.usageBarHeight())
+}
+
+func (h *Home) mainContentHeightForUsageBar(usageBarHeight int) int {
+	height := h.height - 1 - 2 - 1 - usageBarHeight // header, help, filter, usage
+	if h.shouldRenderUpdateNudge() {
+		height--
+	}
+	if h.maintenanceMsg != "" {
+		height--
+	}
+	if h.debugMode {
+		height--
+	}
+	return height
 }
 
 // Messages
@@ -1418,6 +1433,54 @@ type openCodeDetectionCompleteMsg struct {
 
 type updateCheckMsg struct {
 	info *update.UpdateInfo
+}
+
+type usageFetchedMsg struct {
+	snapshots []usage.Snapshot
+	accounts  []usage.Account
+}
+
+func usageSnapshotKey(snapshot usage.Snapshot) string {
+	home := snapshot.Home
+	if home == "" {
+		home = snapshot.Account
+	}
+	return string(snapshot.Provider) + "\x00" + home
+}
+
+func mergeUsageSnapshots(previous, fresh []usage.Snapshot, accounts []usage.Account) []usage.Snapshot {
+	merged := make(map[string]usage.Snapshot, len(previous)+len(fresh))
+	discovered := make(map[string]struct{}, len(accounts))
+	for _, account := range accounts {
+		discovered[string(account.Provider)+"\x00"+account.Home] = struct{}{}
+	}
+	for _, snapshot := range previous {
+		if accounts != nil {
+			if _, ok := discovered[usageSnapshotKey(snapshot)]; !ok {
+				continue
+			}
+		}
+		snapshot.Stale = true
+		merged[usageSnapshotKey(snapshot)] = snapshot
+	}
+	for _, snapshot := range fresh {
+		merged[usageSnapshotKey(snapshot)] = snapshot
+	}
+	out := make([]usage.Snapshot, 0, len(merged))
+	for _, snapshot := range merged {
+		out = append(out, snapshot)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Provider != out[j].Provider {
+			return out[i].Provider == usage.Claude
+		}
+		li, lj := strings.ToLower(out[i].Account), strings.ToLower(out[j].Account)
+		if li != lj {
+			return li < lj
+		}
+		return out[i].Home < out[j].Home
+	})
+	return out
 }
 
 type (
@@ -3382,27 +3445,11 @@ func (h *Home) syncViewport() {
 	// - Help bar: 2 lines (border + content)
 	// Panel title within content: 2 lines (title + underline)
 	// Panel content: contentHeight - 2 lines
-	helpBarHeight := 2
 	panelTitleLines := 2 // SESSIONS title + underline (matches View())
-
-	// Filter bar is always shown for consistent layout (matches View())
-	filterBarHeight := 1
-	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
-		updateBannerHeight = 1
-	}
-	maintenanceBannerHeight := 0
-	if h.maintenanceMsg != "" {
-		maintenanceBannerHeight = 1
-	}
-	debugBarHeight := 0
-	if h.debugMode {
-		debugBarHeight = 1
-	}
 
 	// contentHeight = total height for main content area
 	// MUST match View(): subtract debugBarHeight when the debug footer is rendered.
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	contentHeight := h.mainContentHeight()
 
 	// Preview, when visible, sits beside Sessions rather than consuming rows.
 	panelContentHeight := contentHeight - panelTitleLines
@@ -3654,23 +3701,9 @@ func (h *Home) cleanupNotifications() {
 // getVisibleHeight returns the number of visible items in the session list
 // Used for vi-style pagination (Ctrl+u/d/f/b)
 func (h *Home) getVisibleHeight() int {
-	helpBarHeight := 2
 	panelTitleLines := 2
-	filterBarHeight := 1
-	updateBannerHeight := 0
-	if h.shouldRenderUpdateNudge() {
-		updateBannerHeight = 1
-	}
-	maintenanceBannerHeight := 0
-	if h.maintenanceMsg != "" {
-		maintenanceBannerHeight = 1
-	}
-	debugBarHeight := 0
-	if h.debugMode {
-		debugBarHeight = 1
-	}
 
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	contentHeight := h.mainContentHeight()
 
 	panelContentHeight := contentHeight - panelTitleLines
 
@@ -3722,12 +3755,14 @@ func (h *Home) Init() tea.Cmd {
 		h.intervalHookRunner.Start()
 	}
 
+	h.usageFetchInFlight = true
 	cmds := []tea.Cmd{
 		h.sessionLoadCmd(nil, true),
 
 		h.tick(),
 		h.reviverTick(),
 		h.checkForUpdate(),
+		h.fetchUsage,
 		h.fetchRemoteSessions,
 		h.waitRemoteChange,
 		// Opt-in telemetry daily report. MaybeSend re-reads consent from
@@ -3750,6 +3785,54 @@ func (h *Home) Init() tea.Cmd {
 	cmds = append(cmds, h.startWatcherEngine())
 
 	return tea.Batch(cmds...)
+}
+
+// fetchUsage is outside the render loop. OpenUsage failures are intentionally
+// silent because the status bar is optional advisory information.
+func (h *Home) fetchUsage() tea.Msg {
+	config, err := session.LoadUserConfig()
+	if err != nil {
+		return usageFetchedMsg{}
+	}
+	accounts := []usage.Account{}
+	add := func(provider usage.Provider, home, label string) {
+		home = session.ExpandPath(home)
+		if home != "" {
+			accounts = append(accounts, usage.Account{Provider: provider, Home: home, Label: label})
+		}
+	}
+	profileNames := make([]string, 0, len(config.Profiles))
+	for name := range config.Profiles {
+		profileNames = append(profileNames, name)
+	}
+	sort.Strings(profileNames)
+	for _, name := range profileNames {
+		add(usage.Claude, config.GetProfileClaudeConfigDir(name), name)
+		add(usage.Codex, config.GetProfileCodexConfigDir(name), name)
+	}
+	add(usage.Claude, config.Claude.ConfigDir, "Claude")
+	add(usage.Codex, config.Codex.ConfigDir, "Codex")
+	add(usage.Claude, usage.DefaultHome(usage.Claude), "Claude")
+	add(usage.Codex, usage.DefaultHome(usage.Codex), "Codex")
+	accounts = usage.DedupeAndSortAccounts(accounts)
+	snapshots := []usage.Snapshot{}
+	runner := usage.Runner{}
+	for _, account := range accounts {
+		if snapshot, err := runner.Query(h.ctx, account); err == nil {
+			snapshots = append(snapshots, snapshot)
+		}
+	}
+	sort.Slice(snapshots, func(i, j int) bool {
+		if snapshots[i].Provider != snapshots[j].Provider {
+			return snapshots[i].Provider == usage.Claude
+		}
+		li, lj := strings.ToLower(snapshots[i].Account), strings.ToLower(snapshots[j].Account)
+		if li != lj {
+			return li < lj
+		}
+		return snapshots[i].Home < snapshots[j].Home
+	})
+	return usageFetchedMsg{snapshots: snapshots, accounts: accounts}
 }
 
 // checkForUpdate checks for updates asynchronously
@@ -6761,6 +6844,12 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case usageFetchedMsg:
+		h.usageSnapshots = mergeUsageSnapshots(h.usageSnapshots, msg.snapshots, msg.accounts)
+		h.lastUsageFetch = time.Now()
+		h.usageFetchInFlight = false
+		return h, nil
+
 	case quitMsg:
 		// Execute final shutdown logic after splash delay. Two quit messages can
 		// be queued (e.g. 'q' pressed twice before the splash resolves); running
@@ -17451,16 +17540,13 @@ func (h *Home) renderFrame() string {
 	// FILTER BAR (quick status filters)
 	// ═══════════════════════════════════════════════════════════════════
 	// Always show filter bar for consistent layout (prevents viewport jumping)
-	filterBarHeight := 1
 	b.WriteString(h.renderFilterBar())
 	b.WriteString("\n")
 
 	// ═══════════════════════════════════════════════════════════════════
 	// UPDATE BANNER (if update available)
 	// ═══════════════════════════════════════════════════════════════════
-	updateBannerHeight := 0
 	if h.shouldRenderUpdateNudge() {
-		updateBannerHeight = 1
 		updateStyle := lipgloss.NewStyle().
 			Foreground(ColorBg).
 			Background(ColorYellow).
@@ -17474,9 +17560,7 @@ func (h *Home) renderFrame() string {
 	// ═══════════════════════════════════════════════════════════════════
 	// MAINTENANCE BANNER (if maintenance completed recently)
 	// ═══════════════════════════════════════════════════════════════════
-	maintenanceBannerHeight := 0
 	if h.maintenanceMsg != "" {
-		maintenanceBannerHeight = 1
 		maintStyle := lipgloss.NewStyle().
 			Foreground(ColorBg).
 			Background(ColorCyan).
@@ -17490,13 +17574,9 @@ func (h *Home) renderFrame() string {
 	// ═══════════════════════════════════════════════════════════════════
 	// MAIN CONTENT AREA - Responsive layout based on terminal width
 	// ═══════════════════════════════════════════════════════════════════
-	helpBarHeight := 2 // Help bar takes 2 lines (border + content)
-	debugBarHeight := 0
-	if h.debugMode {
-		debugBarHeight = 1
-	}
+	usageBar := renderUsageBar(h.usageSnapshots, h.width)
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help, -debugBarHeight debug
-	contentHeight := h.height - 1 - helpBarHeight - updateBannerHeight - maintenanceBannerHeight - filterBarHeight - debugBarHeight
+	contentHeight := h.mainContentHeightForUsageBar(lipgloss.Height(usageBar))
 
 	// Route to appropriate layout based on terminal width
 	layoutMode := h.getLayoutMode()
@@ -17515,6 +17595,10 @@ func (h *Home) renderFrame() string {
 	mainContent = ensureExactHeight(mainContent, contentHeight)
 	b.WriteString(mainContent)
 	b.WriteString("\n")
+	if usageBar != "" {
+		b.WriteString(usageBar)
+		b.WriteString("\n")
+	}
 
 	// ═══════════════════════════════════════════════════════════════════
 	// HELP BAR (context-aware shortcuts) — replaced by the insert-mode

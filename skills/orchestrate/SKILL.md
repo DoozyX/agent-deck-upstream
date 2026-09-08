@@ -16,6 +16,16 @@ independent review loop until clean, a PR, and CI babysat to green. The user
 gets one final report, and that report is the only place screenshots are ever
 referenced.
 
+## Advisory usage context
+
+Before a multi-child launch wave, optionally run `agent-deck usage --all --json`
+once when OpenUsage is available. Re-check only after a child reports the
+existing `usage-limit` substate or before a later wave after that snapshot has
+expired. This information may inform a recommendation, but never blocks a
+launch, switches an account automatically, or overrides an explicit tool or
+account choice. Do not query it during ordinary polling, focused single tasks,
+or every-turn hooks; continue unchanged when it is unavailable.
+
 **Requires:** everything `fleet` requires. Delivery/PR entrances additionally
 require an authenticated `gh` for the target repo; verification-only work does
 not.
