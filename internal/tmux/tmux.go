@@ -1196,6 +1196,7 @@ type Session struct {
 	// process instead of sending it via SendKeysAndEnter after session creation.
 	// Sandbox sessions enable this so pane-dead detection can restart exited tools.
 	RunCommandAsInitialProcess bool
+	AllowInitialProcessExit    bool
 
 	// launchAckPath is a per-spawn marker written by the initial-process
 	// wrapper. It lets Start distinguish a pane that is still usable from an
@@ -1506,13 +1507,17 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 
 const launchAckScript = `ack_path="$1"
 command="$2"
-bash -c "$command" &
+bash -c "$command" > >(tee "${ack_path}.output") 2>&1 &
 child_pid=$!
 printf 'pid:%s\n' "$child_pid" > "$ack_path"
 wait "$child_pid"
 exit_code=$?
 printf 'exit:%s\n' "$exit_code" > "$ack_path"
-exit "$exit_code"`
+if [ -s "${ack_path}.output" ]; then
+  cat "${ack_path}.output" >> "$ack_path"
+fi
+rm -f "${ack_path}.output"
+exit 0`
 
 // buildScopeArgsFromTmuxArgs reconstructs scope-mode systemd-run argv
 // from the bare tmux args. Used by the three-tier fallback in Start()
@@ -2717,7 +2722,14 @@ func (s *Session) AcknowledgeInitialProcess() error {
 				marker = strings.TrimSpace(string(raw))
 			}
 			if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
-				return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d)", *exitCode)
+				if *exitCode != 0 || !s.AllowInitialProcessExit {
+					diagnostic := strings.TrimSpace(strings.TrimPrefix(marker, fmt.Sprintf("exit:%d", *exitCode)))
+					if diagnostic != "" {
+						return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d): %s", *exitCode, diagnostic)
+					}
+					return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d)", *exitCode)
+				}
+				return nil
 			}
 			if _, pid, ok := parseLaunchAckMarker(marker); ok && pid > 0 {
 				process, findErr := os.FindProcess(pid)
@@ -2747,6 +2759,7 @@ func (s *Session) AcknowledgeInitialProcess() error {
 // parseLaunchAckMarker is deliberately tiny and pure: the on-disk protocol is
 // the boundary between the pane wrapper and the creator process.
 func parseLaunchAckMarker(marker string) (exitCode *int, pid int, ok bool) {
+	marker = strings.SplitN(marker, "\n", 2)[0]
 	if strings.HasPrefix(marker, "exit:") {
 		code, err := strconv.Atoi(strings.TrimPrefix(marker, "exit:"))
 		if err != nil {

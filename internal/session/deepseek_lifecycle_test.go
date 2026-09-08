@@ -500,3 +500,34 @@ func TestDeepSeekLifecycle_HeadlessRestartWithoutTaskIsRefused(t *testing.T) {
 		t.Error("CanRestart() = false once the task is known")
 	}
 }
+
+func TestDeepSeekLifecycle_HeadlessNonzeroExitFailsAndCleans(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	fake := fakeDshPath(t)
+	dshHome := t.TempDir()
+	workspace := t.TempDir()
+	t.Setenv("DSH_HOME", dshHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{
+		Command:   fake,
+		ConfigDir: dshHome,
+		Profile:   "headless",
+	}})
+
+	inst := NewInstanceWithTool("deepseek-headless-nonzero-e2e", workspace, "deepseek")
+	err := inst.StartWithMessage("run without credentials")
+	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("StartWithMessage() = %v, want headless exit status 1", err)
+	}
+	if inst.Exists() {
+		t.Fatal("failed headless launch left a stale tmux session")
+	}
+	if !inst.LastStartedAt.IsZero() {
+		t.Fatalf("LastStartedAt = %v, want zero after failed launch", inst.LastStartedAt)
+	}
+	rec := inst.SpawnFailure()
+	if rec == nil || !strings.Contains(rec.DyingOutput, "MISSING_CREDENTIAL") {
+		t.Fatalf("SpawnFailure() = %#v, want preserved credential diagnostic", rec)
+	}
+}

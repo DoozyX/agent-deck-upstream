@@ -4988,6 +4988,7 @@ func (i *Instance) Start() error {
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
 	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative per-group/per-conductor skill+mcp loadout
@@ -5323,6 +5324,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	ApplyConfiguredLoadout(i)
 
 	i.preAcceptCursorWorkspaceTrust()
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
@@ -9251,6 +9253,7 @@ func (i *Instance) restart(env map[string]string) error {
 	// Re-assert the declarative skill+mcp loadout before respawn — sister
 	// call to Start(); config edits land on the next restart this way.
 	ApplyConfiguredLoadout(i)
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 
 	mcpLog.Debug("restart_starting_new_session", slog.String("command", command))
 
