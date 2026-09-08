@@ -3960,6 +3960,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 				// attribution strict when another prompt/draft is visible.
 				if codex && arrived && !recoveryAttempted &&
 					codexWorkingIndicator(content, message) && codexTimedWorkingLine(content) &&
+					!codexBaselineWorking &&
 					!strings.Contains(strings.ToLower(content), "codex>") {
 					return deliverySubmitted, nil
 				}
