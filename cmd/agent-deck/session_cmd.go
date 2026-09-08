@@ -3803,7 +3803,7 @@ type sendArrivalBaseline struct {
 // baseline is disabled, never guessed.
 func captureArrivalBaseline(target sendRetryTarget, message string) sendArrivalBaseline {
 	base := sendArrivalBaseline{}
-	if n, markers, _, ok := paneArrivalObservation(target, message); ok {
+	if n, markers, _, _, ok := paneArrivalObservation(target, message); ok {
 		base.occurrences, base.pasteMarkers, base.paneOK = n, markers, true
 	}
 	if status, err := target.GetStatus(); err == nil {
@@ -3881,6 +3881,20 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 	}
 
 	sawBody := false
+	// Codex has no reliable composer-state signal, so it takes this arrival
+	// verifier instead of the Claude loop. If its body arrived but the first
+	// Enter was swallowed, recover with one attributable bare Enter — the same
+	// bounded action the Claude loop takes on an unsent prompt. More retries
+	// would be blind because Codex does not expose an equivalent composer state.
+	//
+	// The baseline is provenance for a collapsed paste marker: when the
+	// composer held no marker before this send, a newly observed marker is ours.
+	// A verbatim body is independently attributable through Message.
+	attrib := send.EnterAttribution{
+		Message:        message,
+		OwnPasteMarker: baseline.paneOK && baseline.pasteMarkers == 0,
+	}
+	recoveryNudged := false
 	for i := 0; i < checks; i++ {
 		// Strongest signal first: an idle agent that starts working received
 		// what it started working on, which is submission, not just arrival.
@@ -3890,7 +3904,8 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 			}
 		}
 		if baseline.paneOK {
-			if n, markers, content, ok := paneArrivalObservation(target, message); ok {
+			if n, markers, content, paneNow, ok := paneArrivalObservation(target, message); ok {
+				arrived := false
 				if n > baseline.occurrences {
 					if opts.tool == "pi" && piComposerEmpty(content, message) {
 						return deliverySubmitted, nil
@@ -3898,6 +3913,7 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					// Keep polling: the body is in, but the turn may still
 					// start within the budget and upgrade this to submitted.
 					sawBody = true
+					arrived = true
 				}
 				// A paste marker the COMPOSER did not hold before the send is
 				// the collapsed rendering of this send's own framed body
@@ -3917,6 +3933,10 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 				// unsent bytes.
 				if markers > baseline.pasteMarkers {
 					sawBody = true
+					arrived = true
+				}
+				if arrived && !recoveryNudged && session.IsCodexCompatible(opts.tool) {
+					recoveryNudged = attrib.NudgeEnter(target, paneNow, tmux.StripANSI)
 				}
 			}
 		}
@@ -4016,18 +4036,18 @@ func maxDeliverableLineBytes(target sendRetryTarget) int {
 // composer holding one more marker than before is unsubmitted payload.
 //
 // Both counts are raw observations; the caller compares them to its baseline.
-func paneArrivalObservation(target sendRetryTarget, message string) (int, int, string, bool) {
+func paneArrivalObservation(target sendRetryTarget, message string) (int, int, string, send.PaneCapture, bool) {
 	token := collapseWhitespace(messageDeliveryToken(message))
 	if token == "" {
-		return 0, 0, "", false
+		return 0, 0, "", send.PaneCapture{}, false
 	}
 	raw, err := target.CapturePaneFresh()
 	if err != nil {
-		return 0, 0, "", false
+		return 0, 0, "", send.PaneCapture{}, false
 	}
 	content := tmux.StripANSI(raw)
 	return strings.Count(collapseWhitespace(content), token),
-		send.ComposerPasteMarkerCount(raw, tmux.StripANSI), content, true
+		send.ComposerPasteMarkerCount(raw, tmux.StripANSI), content, send.Captured(raw), true
 }
 
 // piComposerEmpty recognizes Pi's editor between its final two horizontal
