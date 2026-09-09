@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -164,9 +165,29 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 func TestIssue1793_PublicStartPathsUseIsolatedWrapperAndCleanDescendants(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	bin := t.TempDir()
-	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	pidDir := t.TempDir()
+	pidPath := filepath.Join(pidDir, "descendant.pid")
+	// Every descendant this stub ever spawns is also appended here. pidPath
+	// holds only the LATEST one (the Restart case starts twice and overwrites
+	// it), so a cleanup driven by pidPath alone strands the earlier one — and
+	// the descendant traps TERM on purpose, so nothing short of KILL reaps it.
+	// Observed before this: dozens of unkillable-by-TERM sleep loops surviving
+	// for hours on the developer's machine.
+	allPidsPath := filepath.Join(pidDir, "descendants.pids")
 	codexPath := filepath.Join(bin, "codex")
-	script := fmt.Sprintf("#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) & printf '%%s' $! > %q\nprintf PUBLIC_START_PATH\nsleep 0.3\nexit 0\n", pidPath)
+	script := fmt.Sprintf("#!/bin/sh\n(trap '' TERM; while :; do sleep 1; done) & printf '%%s' $! > %q\nprintf '%%s\\n' $! >> %q\nprintf PUBLIC_START_PATH\nsleep 0.3\nexit 0\n", pidPath, allPidsPath)
+	t.Cleanup(func() {
+		raw, err := os.ReadFile(allPidsPath)
+		if err != nil {
+			return
+		}
+		for _, line := range strings.Fields(string(raw)) {
+			var pid int
+			if _, err := fmt.Sscanf(line, "%d", &pid); err == nil && pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
 	if err := os.WriteFile(codexPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
