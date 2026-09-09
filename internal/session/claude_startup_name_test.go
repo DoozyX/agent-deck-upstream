@@ -189,9 +189,18 @@ func TestStartupNameOwnedResumeAndScratch(t *testing.T) {
 			configDir := filepath.Join(root, "account")
 			startupNameConfig(t, fmt.Sprintf("[profiles.work.claude]\nconfig_dir=%q\n", configDir))
 			inst := &Instance{Tool: "claude", Title: "Owned 日本語", Account: "work", ID: "deck-owned", ProjectPath: root, ClaudeSessionID: "22222222-2222-4222-8222-222222222222"}
+			// A worker scratch dir does NOT move CLAUDE_CONFIG_DIR on macOS:
+			// Claude keys OAuth credentials by that literal path, so pointing it
+			// at scratch forks the profile's refresh token into its own Keychain
+			// item. The scratch dir arrives through --settings instead.
+			wantSettings := ""
 			if scratch {
 				inst.WorkerScratchConfigDir = filepath.Join(root, "scratch")
-				configDir = inst.WorkerScratchConfigDir
+				if runtimeGOOS() == "darwin" {
+					wantSettings = filepath.Join(inst.WorkerScratchConfigDir, "settings.json")
+				} else {
+					configDir = inst.WorkerScratchConfigDir
+				}
 			}
 			dir := claudeProjectDirForTest(t, filepath.Join(root, "account"), root)
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -205,6 +214,9 @@ func TestStartupNameOwnedResumeAndScratch(t *testing.T) {
 			command := inst.buildClaudeResumeCommand()
 			if !strings.Contains(command, "--name 'Owned 日本語'") || !strings.Contains(command, "--resume "+inst.ClaudeSessionID) || !strings.Contains(command, "CLAUDE_CONFIG_DIR="+configDir) {
 				t.Fatalf("wrong bound resume: %s", command)
+			}
+			if wantSettings != "" && !strings.Contains(command, "--settings "+wantSettings) {
+				t.Fatalf("scratch overlay not passed through --settings: %s", command)
 			}
 			inst.Command = "custom-wrapper"
 			if command := inst.buildClaudeResumeCommand(); strings.Contains(command, "--name") {

@@ -1919,12 +1919,12 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName string) string {
 	var flags []string
 
-	// Claude Code 2.1.224+ exposes managed sessions to ListAgents/SendMessage
-	// by name. Give agent-deck sessions a stable, collision-resistant address,
-	// while preserving an operator's explicit --name from extra_args.
-	if !i.suppliesClaudeName() {
-		flags = append(flags, "--name "+shellescape.Quote(i.ClaudePeerName()))
-	}
+	// No --name here. #2075 made the deck title the single startup name,
+	// emitted below as launchName, and defined every case that must carry no
+	// name at all: an arbitrary custom command, an operator's own --name in
+	// extra_args, and an unbound continue/resume. The older peer-address
+	// injection fired in exactly those cases, so it is gone; ClaudeAddressName
+	// reports whatever name this startup actually carries.
 
 	// macOS Claude Code keys OAuth credentials by the literal
 	// CLAUDE_CONFIG_DIR. Pointing it at a worker scratch directory therefore

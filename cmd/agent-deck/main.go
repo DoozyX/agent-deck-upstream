@@ -2542,7 +2542,7 @@ func buildListJSON(profileName string, instances []*session.Instance) ([]byte, e
 			ParentID:          inst.ParentSessionID,
 		}
 		if inst.PeerMessagingCandidate() {
-			sj.PeerName = inst.ClaudePeerName()
+			sj.PeerName = inst.ClaudeAddressName()
 			sj.PeerCandidate = true
 		}
 		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
@@ -2630,7 +2630,7 @@ func handleListAllProfiles(jsonOutput, archivedOnly, includeArchived bool) {
 					ParentID:          inst.ParentSessionID,
 				}
 				if inst.PeerMessagingCandidate() {
-					row.PeerName = inst.ClaudePeerName()
+					row.PeerName = inst.ClaudeAddressName()
 					row.PeerCandidate = true
 				}
 				allSessions = append(allSessions, row)

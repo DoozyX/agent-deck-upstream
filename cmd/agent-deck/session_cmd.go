@@ -1827,7 +1827,7 @@ func handleSessionShow(profile string, args []string) {
 
 	if session.IsClaudeCompatible(inst.Tool) {
 		jsonData["claude_session_id"] = inst.ClaudeSessionID
-		jsonData["peer_name"] = inst.ClaudePeerName()
+		jsonData["peer_name"] = inst.ClaudeAddressName()
 		jsonData["peer_messaging_candidate"] = true
 		jsonData["can_fork"] = inst.CanFork()
 		jsonData["can_restart"] = inst.CanRestart()
