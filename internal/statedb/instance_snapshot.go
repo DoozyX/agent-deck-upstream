@@ -119,16 +119,23 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 		}
 		seen[id] = true
 		if byID[id] == nil {
-			// A row missing from the snapshot may simply be gone, or it may be
-			// durably deleted. The tombstone is the more specific answer and
-			// callers match on it (a recovered-instance write must not
-			// resurrect a deleted id), so it wins over the generic conflict.
 			tombstoned, tombErr := instanceTombstoned(ctx, conn, id)
 			if tombErr != nil {
 				return nil, tombErr
 			}
+			if tombstoned && update.Stored == nil {
+				// A stale writer that never observed the row is finishing an
+				// insert for a durably deleted id. Skip it: the write completes
+				// without resurrecting anything, which is what the blocked
+				// writer in WithInstancesAbsent must be allowed to do.
+				merged[i] = nil
+				continue
+			}
 			if tombstoned {
-				return nil, fmt.Errorf("%w: %s", ErrInstanceTombstoned, id)
+				// The writer holds a snapshot, so this is an edit racing a
+				// durable deletion. It stays a deletion conflict, and also
+				// reports the tombstone so recovery sweeps can match on it.
+				return nil, fmt.Errorf("stale concurrent deletion conflict for instance %s: %w", id, ErrInstanceTombstoned)
 			}
 		}
 		merged[i], err = mergeInstanceSnapshot(update, byID[id])
@@ -152,6 +159,9 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 		}
 	}
 	for _, row := range merged {
+		if row == nil {
+			continue
+		}
 		if err := writeSnapshotRow(ctx, conn, row, byID[row.ID] != nil); err != nil {
 			return nil, err
 		}

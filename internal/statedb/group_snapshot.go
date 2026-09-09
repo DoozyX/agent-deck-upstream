@@ -42,6 +42,11 @@ func mergeGroupSnapshots(updates []GroupSnapshot, current []*GroupRow, instances
 		effectiveInstances[row.ID] = row
 	}
 	for _, row := range mergedInstances {
+		// A row can be nil when a tombstoned insert was skipped rather than
+		// resurrected; it contributes no group membership.
+		if row == nil {
+			continue
+		}
 		effectiveInstances[row.ID] = row
 	}
 	targets := make(map[string]bool)
@@ -94,6 +99,9 @@ func mergeGroupSnapshots(updates []GroupSnapshot, current []*GroupRow, instances
 	// were absent from the caller's snapshot. Reloading makes them reviewable.
 	requestedInstances := make(map[string]*InstanceRow, len(mergedInstances))
 	for _, row := range mergedInstances {
+		if row == nil {
+			continue
+		}
 		requestedInstances[row.ID] = row
 	}
 	for path := range removed {
