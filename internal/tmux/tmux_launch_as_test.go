@@ -127,6 +127,23 @@ func TestStart_RepeatedStartWithMarkerCaptureDoesNotReusePriorOwnership(t *testi
 		"stale ownership must not roll back the prior session")
 }
 
+func TestStartSendKeysFailureCleansUpOnlyNewOwnedSession(t *testing.T) {
+	calls, state, session := startWithFakeLauncherOptions(t, "direct", false, false)
+	t.Setenv("FAKE_LAUNCH_SEND_FAIL", "1")
+	if err := session.Start("echo issue1793"); err == nil {
+		t.Fatal("Start unexpectedly succeeded after pane-shell delivery failure")
+	}
+	if fakeSessionAlive(state(), "$created", session.Name) {
+		t.Fatalf("pane-shell delivery failure left the newly created session live: %s", state())
+	}
+	if session.Exists() {
+		t.Fatal("pane-shell delivery failure left the newly created session persisted in the session cache")
+	}
+	if !strings.Contains(calls(), "KILLED -u kill-session -t $created") {
+		t.Fatalf("pane-shell delivery failure did not clean up the owned session: %s", calls())
+	}
+}
+
 func containsArg(args []string, want string) bool {
 	for _, arg := range args {
 		if arg == want {
@@ -178,15 +195,21 @@ is_list=0
 is_display=0
 is_pane_path=0
 is_has=0
-is_kill=0
-for arg in "$@"; do
+	is_kill=0
+	is_send=0
+	for arg in "$@"; do
   [ "$arg" = "new-session" ] && is_new=1
   [ "$arg" = "list-sessions" ] && is_list=1
   [ "$arg" = "display-message" ] && is_display=1
 	[ "$arg" = "#{pane_current_path}" ] && is_pane_path=1
   [ "$arg" = "has-session" ] && is_has=1
-  [ "$arg" = "kill-session" ] && is_kill=1
-done
+	  [ "$arg" = "kill-session" ] && is_kill=1
+	  [ "$arg" = "send-keys" ] && is_send=1
+	done
+	if [ "$is_send" = "1" ] && [ "$FAKE_LAUNCH_SEND_FAIL" = "1" ]; then
+	  printf 'send failure\n' >&2
+	  exit 42
+	fi
 if [ "$is_new" = "1" ]; then
   expected="$FAKE_LAUNCH_EXPECTED_MODE"
   if [ "$expected" = "tmux" ] && [ "$mode" != "tmux" ]; then
@@ -442,6 +465,19 @@ func TestStartCommandSpec_LaunchAs_CaseInsensitive(t *testing.T) {
 // RunCommandAsInitialProcess path (sandbox sessions, custom claude
 // commands) composes correctly with service mode. Failure here means
 // sandbox sessions silently lose their auto-restart guarantee.
+func TestStartCommandSpec_InitialProcessKeepsInteractivePTY(t *testing.T) {
+	s := &Session{
+		Name:                       "agentdeck_test-interactive_1234abcd",
+		WorkDir:                    "/tmp/project",
+		RunCommandAsInitialProcess: true,
+		launchAckPath:              "/tmp/ack",
+	}
+	_, args := s.startCommandSpec("/tmp/project", "codex")
+	if len(args) < 4 || args[len(args)-2] != "interactive" || args[len(args)-1] != "codex" {
+		t.Fatalf("interactive initial process must use the PTY-preserving wrapper mode, args=%q", args)
+	}
+}
+
 func TestStartCommandSpec_LaunchAs_ServiceWithInitialProcess(t *testing.T) {
 	s := &Session{
 		Name:                       "agentdeck_test-svcinit_1234abcd",
