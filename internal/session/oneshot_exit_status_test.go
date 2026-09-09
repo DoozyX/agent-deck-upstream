@@ -126,27 +126,28 @@ func TestBoundedShellCodexExecReportsNonzeroExit(t *testing.T) {
 	}
 }
 
-// TestInitialProcessAcknowledgementRejectsCleanImmediateExit is intentionally
-// a real isolated-tmux regression: tmux creation itself succeeded, but a
-// bounded command that finishes before Start returns is not a launched
-// interactive session. Exit zero stays visible in the error so callers cannot
-// mistake completion for a usable pane.
-func TestInitialProcessAcknowledgementRejectsCleanImmediateExit(t *testing.T) {
+// TestInitialProcessAcknowledgementAcceptsCleanImmediateExit is the one-shot
+// contract: a bounded command may finish before Start returns, and its output
+// remains available in the stopped pane.
+func TestInitialProcessAcknowledgementAcceptsCleanImmediateExit(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 
 	bin := t.TempDir()
-	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\nexit 0\n"), 0o755))
+	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\nprintf 'ONE_SHOT_OUTPUT\\n'\nexit 0\n"), 0o755))
 	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	inst := NewInstance("bounded-shell-codex-clean-exit", t.TempDir())
 	inst.Tool = "shell"
 	inst.Command = "codex exec --json done"
-	err := inst.Start()
-	if err == nil {
-		t.Fatal("Start() succeeded after the initial command exited 0")
-	}
-	assert.Contains(t, err.Error(), "exit status 0")
+	assert.NoError(t, inst.Start())
 	t.Cleanup(func() { _ = inst.Kill() })
+	assert.Eventually(t, func() bool {
+		_ = inst.UpdateStatus()
+		return inst.GetStatusThreadSafe() == StatusStopped
+	}, 5*time.Second, 50*time.Millisecond)
+	code, ok := inst.GetTmuxSession().PaneDeadExitStatus()
+	assert.True(t, ok, "remain-on-exit must preserve the completed one-shot pane")
+	assert.Equal(t, 0, code)
 }
 
 func TestBoundedCodexExecKeepsExitStatus(t *testing.T) {
@@ -156,6 +157,10 @@ func TestBoundedCodexExecKeepsExitStatus(t *testing.T) {
 	}{
 		{"codex exec --json fix-it", true},
 		{"bash -lc 'codex exec --json fix-it'", true},
+		{"codex --add-dir exec", false},
+		{"codex -C exec", false},
+		{"codex --model gpt-5 exec --json fix-it", true},
+		{"codex --model gpt-5 e --json fix-it", true},
 		{"codex --model gpt-5.6-terra", false},
 		{"echo codex exec", false},
 	}

@@ -316,6 +316,20 @@ func TestIssue1793_CodexSubmittedBodyContainingPromptLiteralDoesNotNeedRecovery(
 	}
 }
 
+func TestIssue1793_CodexMultilineSubmittedBodyContainingPromptLiteralDoesNotNeedRecovery(t *testing.T) {
+	const msg = "ISSUE1793 first line\ninclude the literal codex> prompt\nfinal line"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("multiline submitted Codex body containing codex> = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("multiline submitted body containing codex> must not receive duplicate recovery Enter, got %d", got)
+	}
+}
+
 func TestIssue1793_CodexTimedWorkingDoesNotSubmitForeignDraftFromExistingTurn(t *testing.T) {
 	const msg = "ISSUE1793 PREEXISTING TURN DRAFT"
 	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{

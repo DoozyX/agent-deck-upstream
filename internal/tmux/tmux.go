@@ -625,6 +625,10 @@ func removeSessionFromCacheIfGeneration(name string, generation uint64) {
 func newSessionCacheGenerations(data map[string]int64) map[string]uint64 {
 	generations := make(map[string]uint64, len(data))
 	for name := range data {
+		if existing, ok := sessionCacheGenerations[name]; ok {
+			generations[name] = existing
+			continue
+		}
 		sessionCacheNextGeneration++
 		generations[name] = sessionCacheNextGeneration
 	}
@@ -1575,12 +1579,13 @@ launch_mode="$2"
 command="$3"
 output_path="${ack_path}.output"
 fifo_path="${ack_path}.fifo"
+capture_fifo_path="${ack_path}.capture-fifo"
 marker_tmp="${ack_path}.tmp"
 cleanup() {
-  rm -f "$output_path" "$fifo_path" "$marker_tmp"
+  rm -f "$output_path" "$fifo_path" "$capture_fifo_path" "$marker_tmp"
 }
 trap cleanup EXIT
-rm -f "$output_path" "$fifo_path" "$marker_tmp"
+rm -f "$output_path" "$fifo_path" "$capture_fifo_path" "$marker_tmp"
 
 # Interactive TUIs must remain in the pane's controlling terminal. The wrapper
 # writes the launch marker and then runs the command in the same foreground
@@ -1607,7 +1612,15 @@ fi
 if ! mkfifo "$fifo_path"; then
   exit 125
 fi
-tee >(tail -c 65536 > "$output_path") < "$fifo_path" &
+if ! mkfifo "$capture_fifo_path"; then
+  exit 125
+fi
+# Keep the bounded output writer explicitly joinable. A process substitution
+# writer is not a child we can wait for portably, so completion could race its
+# final write to .output.
+tail -c 65536 < "$capture_fifo_path" > "$output_path" &
+capture_pid=$!
+tee "$capture_fifo_path" < "$fifo_path" &
 tee_pid=$!
 # Run the direct command in its own process group when the host provides a
 # session launcher. A background descendant must not keep the FIFO open after
@@ -1624,10 +1637,29 @@ child_pid=$!
 printf 'pid:%s\n' "$child_pid" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
 wait "$child_pid"
 exit_code=$?
-# The direct child is complete, so reap its process group before draining tee.
-# This closes inherited FIFO descriptors while keeping all bytes already
-# written by the direct child in the output file and pane.
+# The direct child is complete, so terminate every process in its owned group
+# before draining tee. Descendants may ignore SIGTERM; bounded escalation is
+# required before publishing a completion marker or returning from the wrapper.
 kill -TERM -- -"$child_pid" 2>/dev/null || true
+group_deadline=$((SECONDS + 1))
+while kill -0 -- -"$child_pid" 2>/dev/null; do
+  if [ "$SECONDS" -ge "$group_deadline" ]; then
+    kill -KILL -- -"$child_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 0.01
+done
+group_deadline=$((SECONDS + 1))
+while kill -0 -- -"$child_pid" 2>/dev/null; do
+  if [ "$SECONDS" -ge "$group_deadline" ]; then
+    break
+  fi
+  sleep 0.01
+done
+if kill -0 -- -"$child_pid" 2>/dev/null; then
+  printf 'exit:125\nowned process group did not terminate\n' > "$ack_path"
+  exit 125
+fi
 drain_deadline=$((SECONDS + 5))
 while kill -0 "$tee_pid" 2>/dev/null; do
   if [ "$SECONDS" -ge "$drain_deadline" ]; then
@@ -1637,7 +1669,15 @@ while kill -0 "$tee_pid" 2>/dev/null; do
   sleep 0.01
 done
 wait "$tee_pid" 2>/dev/null || true
-wait 2>/dev/null || true
+# tee closes the capture FIFO only after all direct output has reached it.
+while kill -0 "$capture_pid" 2>/dev/null; do
+  if [ "$SECONDS" -ge "$drain_deadline" ]; then
+    kill -KILL "$capture_pid" 2>/dev/null || true
+    break
+  fi
+  sleep 0.01
+done
+wait "$capture_pid" 2>/dev/null || true
 {
   printf 'exit:%s\n' "$exit_code"
   if [ -s "$output_path" ]; then
@@ -3095,6 +3135,7 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 				pollAttempt++
 				continue
 			case sessionIdentityOwned:
+				indeterminateAttempts = 0
 				if !sessionIdentityMatches(sessionID, probe.identity) {
 					return
 				}
