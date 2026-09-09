@@ -14199,7 +14199,13 @@ func (h *Home) createSessionInGroupWithWorktreeAndOptions(
 					setupWarning = formatSetupWarning(setupErr)
 				}
 			}
-			path = worktreePath
+			// [worktree].session_cwd decides whether the session starts in the
+			// worktree (default) or at the repo root so its conversation joins
+			// the root project's `claude --resume` history. Baked into
+			// ProjectPath here, at creation, so the choice never moves an
+			// existing session's transcripts.
+			path = session.ResolveWorktreeSessionCwd(
+				session.GetWorktreeSessionCwd(), worktreePath, worktreeRepoRoot)
 		}
 
 		tool, command := createSessionTool(command)
@@ -15245,7 +15251,11 @@ func (h *Home) buildForkCmd(
 			if opts == nil {
 				opts = &session.ClaudeOptions{}
 			}
-			opts.WorkDir = worktreePath
+			// [worktree].session_cwd may start the fork at the repo root so its
+			// transcript joins the root project's resume history; the worktree
+			// fields below are unaffected either way.
+			opts.WorkDir = session.ResolveWorktreeSessionCwd(
+				session.GetWorktreeSessionCwd(), worktreePath, repoRoot)
 			opts.WorktreePath = worktreePath
 			opts.WorktreeRepoRoot = repoRoot
 			opts.WorktreeBranch = branchName
