@@ -123,7 +123,10 @@ func ClassifyMCPError(err error) MCPErrorKind {
 		return MCPErrorMutationDisabled
 	case strings.Contains(msg, "rate limit"), strings.Contains(msg, "too many"):
 		return MCPErrorRateLimited
-	case strings.Contains(msg, "malformed"), strings.Contains(msg, "invalid"):
+	case strings.Contains(msg, "malformed"),
+		strings.Contains(msg, "required property"),
+		strings.Contains(msg, "additional properties"),
+		strings.Contains(msg, "additional property"):
 		return MCPErrorMalformed
 	default:
 		return MCPErrorBackend
@@ -155,8 +158,9 @@ func MCPToolCatalog() []MCPToolSpec {
 			Description: "Return current sessions, groups, conductors, and statuses. Read-only.",
 			Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: true},
 			InputSchema: map[string]any{
-				"type":       "object",
-				"properties": map[string]any{},
+				"type":                 "object",
+				"properties":           map[string]any{},
+				"additionalProperties": false,
 			},
 		},
 		{
@@ -243,7 +247,8 @@ func NewMCPHandler(deps MCPDependencies) http.Handler {
 	}, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if deps.Authorize != nil && !deps.Authorize(r) {
+		// Fail closed: a missing Authorize seam is treated as unauthorized.
+		if deps.Authorize == nil || !deps.Authorize(r) {
 			http.Error(w, ErrMCPUnauthorized.Error(), http.StatusUnauthorized)
 			return
 		}
