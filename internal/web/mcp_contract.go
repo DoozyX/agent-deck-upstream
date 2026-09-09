@@ -261,32 +261,5 @@ func MCPToolCatalog() []MCPToolSpec {
 	}
 }
 
-// NewMCPHandler returns the dedicated Streamable HTTP MCP handler.
-//
-// Task 01 settles the transport, auth gate, and dependency seams only.
-// Tool registration and business logic belong to Task 02; this handler
-// exposes a bare MCP server so initialize succeeds over Streamable HTTP.
-func NewMCPHandler(deps MCPDependencies) http.Handler {
-	server := mcpsdk.NewServer(&mcpsdk.Implementation{
-		Name:    "agent-deck",
-		Version: "0.0.0-contract",
-	}, nil)
-	inner := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server {
-		return server
-	}, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
-
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Fail closed: a missing Authorize seam is treated as unauthorized.
-		if deps.Authorize == nil || !deps.Authorize(r) {
-			http.Error(w, ErrMCPUnauthorized.Error(), http.StatusUnauthorized)
-			return
-		}
-		// Keep deps referenced so the constructor signature stays the Task 01
-		// contract even before Task 02 consumes Loader/Mutator/mutation seams.
-		_ = deps.Loader
-		_ = deps.Mutator
-		_ = deps.MutationsAllowed
-		_ = deps.AllowMutation
-		inner.ServeHTTP(w, r)
-	})
-}
+// NewMCPHandler is implemented in mcp.go (Task 02): Streamable HTTP transport,
+// auth gate, and the six tool registrations against MCPDependencies.
