@@ -113,7 +113,7 @@ func ClassifyMCPError(err error) MCPErrorKind {
 	case errors.Is(err, ErrMCPBackend):
 		return MCPErrorBackend
 	}
-	msg := strings.ToLower(err.Error())
+	msg := strings.ToLower(strings.TrimSpace(err.Error()))
 	switch {
 	case strings.Contains(msg, "not found"):
 		return MCPErrorNotFound
@@ -123,15 +123,37 @@ func ClassifyMCPError(err error) MCPErrorKind {
 		return MCPErrorMutationDisabled
 	case strings.Contains(msg, "rate limit"), strings.Contains(msg, "too many"):
 		return MCPErrorRateLimited
-	case strings.Contains(msg, "malformed"),
-		strings.Contains(msg, "required property"),
-		strings.Contains(msg, "missing properties"), // jsonschema-go: "required: missing properties: [...]"
-		strings.Contains(msg, "additional properties"),
-		strings.Contains(msg, "additional property"),
-		strings.Contains(msg, "unexpected additional"):
+	case isMCPMalformedValidationMessage(msg):
 		return MCPErrorMalformed
 	default:
 		return MCPErrorBackend
+	}
+}
+
+// MCPAdditionalPropertyPrefix is the exact singular MCP validator wrapper form
+// ClassifyMCPError accepts for undeclared tool inputs (Task 02 may emit this).
+const MCPAdditionalPropertyPrefix = "mcp: additional property:"
+
+// isMCPMalformedValidationMessage matches only pinned jsonschema-go forms and
+// the explicit MCP singular wrapper prefix — not bare substrings like
+// "missing properties" or "additional property" that can appear in backend text.
+// jsonschema-go may wrap as "validating <path>: <form>"; peel ": "-segments
+// until a recognized form is a prefix of the remainder.
+func isMCPMalformedValidationMessage(msg string) bool {
+	for {
+		msg = strings.TrimSpace(msg)
+		switch {
+		case strings.HasPrefix(msg, "mcp: malformed"),
+			strings.HasPrefix(msg, MCPAdditionalPropertyPrefix),
+			strings.HasPrefix(msg, "required: missing properties:"),
+			strings.HasPrefix(msg, "unexpected additional properties"):
+			return true
+		}
+		_, rest, ok := strings.Cut(msg, ": ")
+		if !ok || rest == "" || rest == msg {
+			return false
+		}
+		msg = rest
 	}
 }
 
