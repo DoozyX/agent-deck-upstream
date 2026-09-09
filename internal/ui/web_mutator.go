@@ -206,6 +206,23 @@ func (m *WebMutator) RestartSession(id string) error {
 	return inst.Restart()
 }
 
+// SendToSession delivers a user message to an existing session using the same
+// reliable CLI send path as `agent-deck session send`.
+func (m *WebMutator) SendToSession(sessionID, message string) error {
+	unlock, err := m.beginHeadlessTx()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	m.h.instancesMu.RLock()
+	inst := m.h.instanceByID[sessionID]
+	m.h.instancesMu.RUnlock()
+	if inst == nil {
+		return fmt.Errorf("session not found: %s", sessionID)
+	}
+	return session.SendSessionMessageReliable(m.h.profile, inst.ID, message)
+}
+
 // DeleteSession kills a session and removes it from persistent storage.
 // Before removal, the instance is pushed onto the web undo stack so a
 // subsequent UndoDelete (POST /api/sessions/undelete) can restore it.

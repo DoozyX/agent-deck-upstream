@@ -125,6 +125,10 @@ type SessionMutator interface {
 	StartSession(sessionID string) error
 	StopSession(sessionID string) error
 	RestartSession(sessionID string) error
+	// SendToSession delivers a user message to an existing session (MCP /
+	// remote control). Implementations must not accept shell commands or
+	// arbitrary HTTP targets — only sessionID + message text.
+	SendToSession(sessionID, message string) error
 	DeleteSession(sessionID string) error
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).
@@ -299,6 +303,12 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("POST /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
+
+	// Dedicated Streamable HTTP MCP endpoint (/mcp). Enabled only when a
+	// bearer token is configured: authorizeRequest short-circuits to allow
+	// when Token is empty, so tokenless MCP would otherwise be an open
+	// loopback surface. Keep /api/mcps catalog/session routes above separate.
+	s.registerMCPRoute(mux)
 
 	handler := withRecover(s.csrfProtect(mux))
 
