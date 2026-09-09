@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Codex subagent-thread rebind poisoning (incident 2026-07-15, ares fleet).
@@ -135,18 +136,98 @@ func readCodexRolloutThreadMeta(path string) codexThreadMeta {
 	return meta
 }
 
+// codexRolloutMissTTL bounds how long "no rollout flushed for this id yet" is
+// reused instead of re-globbing.
+//
+// codexThreadMetaCache makes a POSITIVE lookup a one-time cost, but a miss re-ran
+// codexRolloutPathInHome on every call, and that glob walks every day directory
+// under codexHome/sessions — measured 58-77ms against a 142-day, 6.5k-file tree.
+// UpdateHookStatus holds i.mu across the gate call, so an uncached miss stalls
+// every concurrent UpdateStatus for the same instance; on a 26-live-codex-session
+// deck that lock wait was the dominant term in the TUI's status sweep (155ms
+// median unattributed per codex session, against 1ms for claude).
+//
+// Absence is still not cached forever — a rollout may flush after the first hook
+// event referencing it, so the entry expires and the next call re-globs. Within
+// the window the gate fails open, which is exactly what it already does for an
+// unflushed candidate (see shouldRejectCodexSubagentRebind).
+const codexRolloutMissTTL = 5 * time.Second
+
+var (
+	codexRolloutMissMu sync.Mutex
+	codexRolloutMisses = map[string]time.Time{}
+	// codexRolloutNow is a test seam for the miss window.
+	codexRolloutNow = time.Now
+)
+
+// codexRolloutMissKey scopes a miss to the home it was looked up in: the same
+// id genuinely resolves differently across codex homes (issue #1929).
+func codexRolloutMissKey(sessionID, codexHome string) string {
+	return codexHome + "\x00" + sessionID
+}
+
+// codexRolloutMissFresh reports whether a recent lookup already found nothing.
+func codexRolloutMissFresh(key string) bool {
+	codexRolloutMissMu.Lock()
+	defer codexRolloutMissMu.Unlock()
+	at, ok := codexRolloutMisses[key]
+	if !ok {
+		return false
+	}
+	if codexRolloutNow().Sub(at) >= codexRolloutMissTTL {
+		delete(codexRolloutMisses, key)
+		return false
+	}
+	return true
+}
+
+// codexRolloutMissRecord stamps a miss, pruning expired entries so a fleet that
+// churns candidate ids cannot grow the map without bound.
+func codexRolloutMissRecord(key string) {
+	now := codexRolloutNow()
+	codexRolloutMissMu.Lock()
+	defer codexRolloutMissMu.Unlock()
+	for k, at := range codexRolloutMisses {
+		if now.Sub(at) >= codexRolloutMissTTL {
+			delete(codexRolloutMisses, k)
+		}
+	}
+	codexRolloutMisses[key] = now
+}
+
+// codexRolloutMissForget drops a miss once the rollout has been found, so a
+// later home-scoped lookup never reads a stale absence.
+func codexRolloutMissForget(key string) {
+	codexRolloutMissMu.Lock()
+	defer codexRolloutMissMu.Unlock()
+	delete(codexRolloutMisses, key)
+}
+
+// resetCodexRolloutMissCache clears the miss window. Test-only.
+func resetCodexRolloutMissCache() {
+	codexRolloutMissMu.Lock()
+	defer codexRolloutMissMu.Unlock()
+	clear(codexRolloutMisses)
+}
+
 // codexThreadMetaForSession resolves (with caching) the thread metadata for a
 // session id. ok is false when no rollout is flushed for the id yet.
 func codexThreadMetaForSession(sessionID, codexHome string) (codexThreadMeta, bool) {
 	if v, ok := codexThreadMetaCache.Load(sessionID); ok {
 		return v.(codexThreadMeta), true
 	}
+	key := codexRolloutMissKey(sessionID, codexHome)
+	if codexRolloutMissFresh(key) {
+		return codexThreadMeta{}, false
+	}
 	path := codexRolloutPathInHome(sessionID, codexHome)
 	if path == "" {
+		codexRolloutMissRecord(key)
 		return codexThreadMeta{}, false
 	}
 	meta := readCodexRolloutThreadMeta(path)
 	codexThreadMetaCache.Store(sessionID, meta)
+	codexRolloutMissForget(key)
 	return meta, true
 }
 

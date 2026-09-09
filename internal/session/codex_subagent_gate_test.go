@@ -371,3 +371,88 @@ func TestUpdateCodexSession_DiskScan_RejectsLoneSubagent(t *testing.T) {
 			"rollout matches; got %q", inst.CodexSessionID)
 	}
 }
+
+// The rollout-miss window (perf: TUI status sweep, 2026-09-09).
+//
+// codexThreadMetaForSession's miss path re-globbed codexHome/sessions/*/*/* on
+// every call. UpdateHookStatus holds i.mu across the gate, so on a deck with
+// tens of live codex sessions that glob was the dominant term in the status
+// sweep. Misses are now reused for codexRolloutMissTTL.
+
+func TestCodexRolloutMiss_ReusedWithinTheWindow(t *testing.T) {
+	inst, codexHome := newCodexGateInstance(t)
+	sid := uniqueSID(t)
+
+	resetCodexRolloutMissCache()
+	t.Cleanup(resetCodexRolloutMissCache)
+	now := time.Now()
+	codexRolloutNow = func() time.Time { return now }
+	t.Cleanup(func() { codexRolloutNow = time.Now })
+
+	if _, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir()); ok {
+		t.Fatal("expected no rollout before one is seeded")
+	}
+
+	// A rollout flushing inside the window is deliberately not observed yet:
+	// the gate fails open exactly as it already did for an unflushed candidate.
+	seedCodexRolloutWithMeta(t, codexHome, sid, "subagent", "parent-1", false)
+	if _, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir()); ok {
+		t.Fatal("expected the cached miss to be reused inside the window")
+	}
+
+	now = now.Add(codexRolloutMissTTL)
+	meta, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir())
+	if !ok {
+		t.Fatal("expected the rollout to be found once the window expired")
+	}
+	if meta.ThreadSource != "subagent" {
+		t.Fatalf("thread source = %q, want subagent", meta.ThreadSource)
+	}
+}
+
+func TestCodexRolloutMiss_IsScopedToTheHome(t *testing.T) {
+	inst, codexHome := newCodexGateInstance(t)
+	sid := uniqueSID(t)
+
+	resetCodexRolloutMissCache()
+	t.Cleanup(resetCodexRolloutMissCache)
+
+	otherHome := filepath.Join(t.TempDir(), ".codex-other")
+	if _, ok := codexThreadMetaForSession(sid, otherHome); ok {
+		t.Fatal("expected no rollout in the unrelated home")
+	}
+
+	// #1929: the same id resolves differently per home, so a miss recorded
+	// against one home must not answer for another.
+	seedCodexRolloutWithMeta(t, codexHome, sid, "subagent", "parent-1", false)
+	meta, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir())
+	if !ok {
+		t.Fatal("expected the rollout in this instance's own home to be found")
+	}
+	if meta.ThreadSource != "subagent" {
+		t.Fatalf("thread source = %q, want subagent", meta.ThreadSource)
+	}
+}
+
+func TestCodexRolloutMiss_ForgottenOnceFound(t *testing.T) {
+	inst, codexHome := newCodexGateInstance(t)
+	sid := uniqueSID(t)
+
+	resetCodexRolloutMissCache()
+	t.Cleanup(resetCodexRolloutMissCache)
+
+	if _, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir()); !ok {
+		key := codexRolloutMissKey(sid, inst.getCodexHomeDir())
+		if !codexRolloutMissFresh(key) {
+			t.Fatal("expected the miss to be recorded")
+		}
+	}
+	seedCodexRolloutWithMeta(t, codexHome, sid, "user", "", false)
+	resetCodexRolloutMissCache()
+	if _, ok := codexThreadMetaForSession(sid, inst.getCodexHomeDir()); !ok {
+		t.Fatal("expected the seeded rollout to be found")
+	}
+	if codexRolloutMissFresh(codexRolloutMissKey(sid, inst.getCodexHomeDir())) {
+		t.Fatal("expected the miss entry to be dropped once the rollout was found")
+	}
+}
