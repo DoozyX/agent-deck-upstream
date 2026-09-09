@@ -222,6 +222,81 @@ func TestServer_MCPRoute_MutationPolicyAndRateLimit(t *testing.T) {
 	})
 }
 
+// Direct Config{ReadOnly:true} must fail closed even when WebMutations remains true
+// (production web_cmd clears both, but NewServer accepts the flags independently).
+func TestServer_MCPRoute_ReadOnlyBlocksMutations(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, ReadOnly: true, WebMutations: true})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	cs := connectWiredMCP(t, ts.URL, wiringToken)
+
+	raw, isErr, err := callToolJSON(t, cs, "fleet_status", map[string]any{})
+	if err != nil || isErr {
+		t.Fatalf("authenticated read fleet_status must still work: isErr=%v err=%v", isErr, err)
+	}
+	var fleet MCPFleetStatusResult
+	if err := json.Unmarshal(raw, &fleet); err != nil {
+		t.Fatalf("decode fleet_status: %v", err)
+	}
+	if fleet.TotalSessions != 2 {
+		t.Fatalf("fleet_status=%+v", fleet)
+	}
+
+	_, isErr, err = callToolJSON(t, cs, "session_details", map[string]any{"sessionId": "sess-1"})
+	if err != nil || isErr {
+		t.Fatalf("authenticated read session_details must still work: isErr=%v err=%v", isErr, err)
+	}
+
+	for _, tool := range []string{"send_to_session", "start_session", "stop_session", "restart_session"} {
+		args := map[string]any{"sessionId": "sess-1"}
+		if tool == "send_to_session" {
+			args["message"] = "should not mutate"
+		}
+		_, isErr, err := callToolJSON(t, cs, tool, args)
+		if !isErr || ClassifyMCPError(err) != MCPErrorMutationDisabled {
+			t.Fatalf("%s under ReadOnly: want mutation_disabled; isErr=%v kind=%s err=%v",
+				tool, isErr, ClassifyMCPError(err), err)
+		}
+	}
+}
+
+func TestServer_MCPRoute_SendToSessionDelegatesToLiveMutator(t *testing.T) {
+	var gotID, gotMsg string
+	srv := NewServer(Config{
+		ListenAddr:   "127.0.0.1:0",
+		Token:        wiringToken,
+		WebMutations: true,
+		MenuData:     snapshotLoader{snap: sampleFleetSnapshot()},
+	})
+	srv.SetMutator(&fakeMutator{
+		sendToSessionFn: func(id, message string) error {
+			gotID, gotMsg = id, message
+			return nil
+		},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	cs := connectWiredMCP(t, ts.URL, wiringToken)
+
+	raw, isErr, err := callToolJSON(t, cs, "send_to_session", map[string]any{
+		"sessionId": "sess-wired-42",
+		"message":   "hello live mutator",
+	})
+	if err != nil || isErr {
+		t.Fatalf("send_to_session: isErr=%v err=%v", isErr, err)
+	}
+	if gotID != "sess-wired-42" || gotMsg != "hello live mutator" {
+		t.Fatalf("live mutator got id=%q msg=%q, want sess-wired-42 / hello live mutator", gotID, gotMsg)
+	}
+	var mutRes MCPMutationResult
+	if err := json.Unmarshal(raw, &mutRes); err != nil {
+		t.Fatalf("decode: %v body=%s", err, raw)
+	}
+	if !mutRes.OK || mutRes.SessionID != "sess-wired-42" {
+		t.Fatalf("result=%+v", mutRes)
+	}
+}
+
 func TestServer_MCPRoute_SeparateFromAPIMCPs(t *testing.T) {
 	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
 	mgr := newFakeMCPManager()
