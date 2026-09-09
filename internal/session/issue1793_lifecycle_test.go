@@ -24,6 +24,88 @@ func TestIssue1793_BoundedCodexExecUsesIsolatedInitialProcess(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
+	valueOptions := []struct {
+		name   string
+		option string
+	}{
+		{name: "image", option: "--image"},
+		{name: "short image", option: "-i"},
+		{name: "model", option: "--model"},
+		{name: "short model", option: "-m"},
+		{name: "local provider", option: "--local-provider"},
+		{name: "profile", option: "--profile"},
+		{name: "short profile", option: "-p"},
+		{name: "sandbox", option: "--sandbox"},
+		{name: "short sandbox", option: "-s"},
+		{name: "cwd", option: "--cd"},
+		{name: "short cwd", option: "-C"},
+		{name: "add dir", option: "--add-dir"},
+		{name: "config", option: "--config"},
+		{name: "short config", option: "-c"},
+		{name: "color", option: "--color"},
+		{name: "approval", option: "--ask-for-approval"},
+		{name: "short approval", option: "-a"},
+		{name: "thread source", option: "--thread-source"},
+		{name: "output schema", option: "--output-schema"},
+		{name: "last message", option: "--output-last-message"},
+		{name: "short last message", option: "-o"},
+		{name: "remote", option: "--remote"},
+		{name: "remote token env", option: "--remote-auth-token-env"},
+		{name: "enable", option: "--enable"},
+		{name: "disable", option: "--disable"},
+	}
+	tests := []struct {
+		name   string
+		fields []string
+		want   bool
+	}{
+		{name: "exec subcommand", fields: []string{"codex", "exec"}, want: true},
+		{name: "exec visible alias", fields: []string{"codex", "e"}, want: true},
+		{name: "long value option", fields: []string{"codex", "--model", "gpt-5", "exec"}, want: true},
+		{name: "short value option", fields: []string{"codex", "-m", "gpt-5", "exec"}, want: true},
+		{name: "attached short value", fields: []string{"codex", "-mgpt-5", "exec"}, want: true},
+		{name: "name equals value", fields: []string{"codex", "--model=gpt-5", "exec"}, want: true},
+		{name: "all boolean families", fields: []string{"codex", "--strict-config", "--json", "--ephemeral", "--ignore-rules", "exec"}, want: true},
+		{name: "config value named exec", fields: []string{"codex", "--config", "exec", "--json", "task"}, want: false},
+		{name: "config equals exec", fields: []string{"codex", "--config=exec", "--json", "task"}, want: false},
+		{name: "config value containing exec", fields: []string{"codex", "--config", "model=exec", "exec"}, want: true},
+		{name: "boolean equals form is not a value option", fields: []string{"codex", "--json=exec", "task", "exec"}, want: false},
+		{name: "each value option consumes exec", fields: []string{"codex", "--image", "exec"}, want: false},
+		{name: "short image consumes exec", fields: []string{"codex", "-i", "exec"}, want: false},
+		{name: "cwd consumes exec", fields: []string{"codex", "--cd", "exec"}, want: false},
+		{name: "short cwd consumes exec", fields: []string{"codex", "-C", "exec"}, want: false},
+		{name: "sandbox consumes exec", fields: []string{"codex", "--sandbox", "exec"}, want: false},
+		{name: "profile consumes exec", fields: []string{"codex", "--profile", "exec"}, want: false},
+		{name: "add dir consumes exec", fields: []string{"codex", "--add-dir", "exec"}, want: false},
+		{name: "local provider consumes exec", fields: []string{"codex", "--local-provider", "exec"}, want: false},
+		{name: "thread source consumes exec", fields: []string{"codex", "--thread-source", "exec"}, want: false},
+		{name: "output schema consumes exec", fields: []string{"codex", "--output-schema", "exec"}, want: false},
+		{name: "last message consumes exec", fields: []string{"codex", "--output-last-message", "exec"}, want: false},
+		{name: "short last message consumes exec", fields: []string{"codex", "-o", "exec"}, want: false},
+		{name: "color consumes exec", fields: []string{"codex", "--color", "exec"}, want: false},
+		{name: "short config consumes exec", fields: []string{"codex", "-c", "exec"}, want: false},
+		{name: "double dash terminates options", fields: []string{"codex", "--", "exec"}, want: false},
+		{name: "positional prompt is not subcommand", fields: []string{"codex", "task", "exec"}, want: false},
+		{name: "unknown option fails closed", fields: []string{"codex", "--future-option", "exec"}, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isCodexExecArgs(tt.fields); got != tt.want {
+				t.Fatalf("isCodexExecArgs(%q) = %v, want %v", tt.fields, got, tt.want)
+			}
+		})
+	}
+	for _, option := range valueOptions {
+		t.Run("value option preserves later exec: "+option.name, func(t *testing.T) {
+			fields := []string{"codex", option.option, "value", "exec"}
+			if !isCodexExecArgs(fields) {
+				t.Fatalf("isCodexExecArgs(%q) = false, want true", fields)
+			}
+		})
+	}
+}
+
 func TestIssue1793_PublicStartPathsUseIsolatedWrapperAndCleanDescendants(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	bin := t.TempDir()
