@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1071,13 +1072,86 @@ func DeepSeekProfileBundles(profileDir string) []string {
 //   - tmux `remain-on-exit` is set, so the pane (and the answer in it) survives
 //     the process that printed it.
 //
-// Today the only such surface is DeepSeek's headless profile, whose whole
-// contract is "answer one task, print the final assistant message, and exit"
-// (0 when the turn completed, else 1). It is a method rather than a package
-// function so a second one-shot surface has an obvious home.
+// DeepSeek's headless profile and bounded Codex exec share the contract
+// "answer one task, print the final assistant message, and exit" (0 when the
+// turn completed, else 1). It is a method rather than a package function so
+// every start path consumes the same one-shot decision.
 func (i *Instance) expectsFastExit() bool {
-	if i == nil || i.Tool != "deepseek" {
+	if i == nil {
+		return false
+	}
+	if i.isBoundedCodexExec() {
+		return true
+	}
+	if i.Tool != "deepseek" {
 		return false
 	}
 	return DeepSeekProfileMode(i.resolveDeepSeekProfile()) == deepSeekModeHeadless
+}
+
+// runCommandAsInitialProcess chooses the spawn shape for a tool command.
+// Interactive DeepSeek profiles must start under the pane's shell: the
+// acknowledgement wrapper uses setsid for ownership, which intentionally
+// removes the child from the controlling terminal and makes a TUI read EOF.
+// The shell-delivery path keeps the pane PTY while the immutable tmux session
+// identity still supplies cleanup ownership. One-shot DeepSeek and all other
+// existing tool paths retain their initial-process behavior.
+func (i *Instance) runCommandAsInitialProcess() bool {
+	if i == nil {
+		return false
+	}
+	if i.Tool == "deepseek" && i.deepSeekPromptDelivery() == DeepSeekPromptPane {
+		return false
+	}
+	return i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+}
+
+func (i *Instance) acknowledgeInitialProcess(command string) error {
+	ackErr := i.tmuxSession.AcknowledgeInitialProcess()
+	if ackErr == nil {
+		if i.expectsFastExit() {
+			launchSession := i.tmuxSession
+			launchSessionName, launchSessionID := launchSession.OwnershipSnapshot()
+			gen, wake := i.newSpawnGenWatch()
+			launchSession.WatchInitialProcessCompletion(wake, func(exitCode int, diagnostic string) {
+				if exitCode == 0 {
+					return
+				}
+				completionErr := fmt.Errorf("initial command exited after launch acknowledgement (exit status %d)", exitCode)
+				if !i.commitSpawnWatchWrite(gen, func() {
+					i.recordTmuxStartFailure(command, completionErr, diagnostic)
+					i.SetStatusThreadSafe(StatusError)
+				}) {
+					return
+				}
+				// The generation may change after the guarded record write. Do not
+				// clean up a stale completion once a restart has begun; the retained
+				// name/identity also prevents a reused Session pointer from targeting
+				// the replacement.
+				if i.spawnGen.Load() != gen {
+					return
+				}
+				if cleanupErr := launchSession.KillIfOwnedSnapshot(launchSessionName, launchSessionID); cleanupErr != nil {
+					sessionLog.Warn("headless_completion_cleanup_failed",
+						slog.String("instance_id", i.ID),
+						slog.String("error", cleanupErr.Error()))
+				}
+			})
+		}
+		return nil
+	}
+	i.SetStatusThreadSafe(StatusError)
+	diagnostic := ackErr
+	captured := ""
+	if content, captureErr := i.tmuxSession.CapturePane(); captureErr == nil {
+		if content = strings.TrimSpace(content); content != "" {
+			captured = content
+			diagnostic = fmt.Errorf("%w: %s", ackErr, content)
+		}
+	}
+	i.recordTmuxStartFailure(command, ackErr, captured)
+	if cleanupErr := i.tmuxSession.KillIfOwned(); cleanupErr != nil {
+		return fmt.Errorf("initial session command did not launch: %w (cleanup failed: %v)", diagnostic, cleanupErr)
+	}
+	return fmt.Errorf("initial session command did not launch: %w", diagnostic)
 }

@@ -542,6 +542,9 @@ func setupStubClaudeOnPATH(t *testing.T, home string) string {
 
 	// Configure [claude] command = <abs stub> via the user config under the
 	// isolated HOME. This is read by GetClaudeCommand() at dispatch time.
+	if err := os.MkdirAll(filepath.Join(home, ".agent-deck"), 0o700); err != nil {
+		t.Fatalf("setupStubClaudeOnPATH: mkdir config dir: %v", err)
+	}
 	cfgPath := filepath.Join(home, ".agent-deck", "config.toml")
 	cfgBody := "[claude]\ncommand = \"" + stubAbs + "\"\n"
 	if err := os.WriteFile(cfgPath, []byte(cfgBody), 0o644); err != nil {

@@ -3096,8 +3096,9 @@ func TestStartCommandSpec_UserScope(t *testing.T) {
 
 	launcher, args := s.startCommandSpec("/tmp/project", "")
 	require.Equal(t, "systemd-run", launcher)
-	require.GreaterOrEqual(t, len(args), 8)
-	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--collect", "--unit"}, args[:5])
+	require.GreaterOrEqual(t, len(args), 7)
+	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--collect"}, args[:4])
+	assert.Equal(t, "--unit", args[4])
 	assert.Equal(t, "agentdeck-tmux-agentdeck-test-session-1234abcd", args[5])
 	assert.Equal(t, []string{"tmux", "-u", "new-session", "-d", "-s", "agentdeck_test-session_1234abcd", "-c", "/tmp/project",
 		"-x", "173", "-y", "41"}, args[6:])

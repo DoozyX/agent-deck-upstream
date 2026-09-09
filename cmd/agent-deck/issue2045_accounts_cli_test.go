@@ -29,7 +29,29 @@ config_dir = "~/.claude-work"
 	// test. A successful no-op executable lets the real command reach every
 	// create/start/save stage without sharing the developer's tmux server.
 	binDir := t.TempDir()
-	fakeTmux := "#!/bin/sh\ncase \" $* \" in\n  *' has-session '*) exit 1 ;;\nesac\nexit 0\n"
+	fakeTmux := `#!/bin/sh
+state="$0.state"
+name=""
+marker=""
+previous=""
+for arg in "$@"; do
+  [ "$previous" = "-s" ] && name="$arg"
+  case "$arg" in
+    AGENTDECK_SESSION_CREATION_MARKER=*) marker="${arg#*=}" ;;
+  esac
+  previous="$arg"
+done
+case " $* " in
+  *' has-session '*) exit 1 ;;
+  *' new-session '*) printf '%s|%s\n' "$name" "$marker" > "$state"; exit 0 ;;
+  *' list-sessions '*)
+    [ -f "$state" ] || exit 0
+    IFS='|' read -r name marker < "$state"
+    printf '$created\t%s\t%s\n' "$name" "$marker"
+    exit 0 ;;
+esac
+exit 0
+`
 	if err := os.WriteFile(filepath.Join(binDir, "tmux"), []byte(fakeTmux), 0o755); err != nil {
 		t.Fatal(err)
 	}

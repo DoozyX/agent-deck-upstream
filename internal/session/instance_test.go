@@ -774,7 +774,10 @@ func TestInstance_UpdateClaudeSession_PreservesExistingID(t *testing.T) {
 // contains a zombie session ID (no conversation data) and the current session has
 // real data, the zombie is rejected and the current session is preserved.
 func TestInstance_UpdateClaudeSession_RejectZombie(t *testing.T) {
-	skipIfNoTmuxServer(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	configDir := t.TempDir()
 	origConfigDir := os.Getenv("CLAUDE_CONFIG_DIR")
@@ -1212,7 +1215,10 @@ func TestInstance_UpdateGeminiSession_UsesLatestFromFilesystem(t *testing.T) {
 }
 
 func TestInstance_Restart_ResumesClaudeSession(t *testing.T) {
-	skipIfNoTmuxServer(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	// Create instance with known session ID (simulating previous session)
 	inst := NewInstanceWithTool("restart-test", "/tmp", "claude")

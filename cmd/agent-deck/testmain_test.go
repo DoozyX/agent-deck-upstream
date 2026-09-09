@@ -24,6 +24,11 @@ func TestMain(m *testing.M) {
 // Skipping this leaked per-run temp dirs on every run — the 2026-06-07
 // pty-exhaustion incident class.
 func runTestMain(m *testing.M) int {
+	// Tests frequently replace HOME with a per-test directory. Keep Go's
+	// downloaded module and build caches outside those t.TempDir trees so
+	// read-only module-cache files cannot make testing.T cleanup fail.
+	configureStableGoCaches()
+
 	// Helper subprocesses (e.g. the Task6 XDG help-path test) are spawned by a
 	// parent test that has ALREADY exported a safe, sandboxed HOME+XDG and set
 	// the specific XDG_*_HOME values the subprocess must observe. Re-running
@@ -102,6 +107,21 @@ func runTestMain(m *testing.M) int {
 	harness.RemoveBuildArtifacts()
 
 	return code
+}
+
+// configureStableGoCaches pins GOMODCACHE/GOCACHE to the real Go caches so a
+// test that swaps HOME cannot relocate them into a t.TempDir tree, where
+// read-only module-cache files make cleanup fail.
+func configureStableGoCaches() {
+	for _, key := range []string{"GOMODCACHE", "GOCACHE"} {
+		if os.Getenv(key) != "" {
+			continue
+		}
+		value, err := exec.Command("go", "env", key).Output()
+		if err == nil && strings.TrimSpace(string(value)) != "" {
+			_ = os.Setenv(key, strings.TrimSpace(string(value)))
+		}
+	}
 }
 
 // cleanupTestSessions kills any tmux sessions created during testing.

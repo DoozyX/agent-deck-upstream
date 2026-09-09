@@ -51,6 +51,9 @@ func TestRemoteAgent_InProcessProbeMatchesCLI(t *testing.T) {
 		t.Fatalf("newRemoteAgentProbe: %v", err)
 	}
 	defer closeProbe()
+	previousGlobal := statedb.GetGlobal()
+	statedb.SetGlobal(nil)
+	t.Cleanup(func() { statedb.SetGlobal(previousGlobal) })
 	// The probe is read-only: it relies on no global state DB being
 	// registered in the agent process, and it must leave the stamp the
 	// watcher compares untouched (finding 2: a probe that moved the stamp
