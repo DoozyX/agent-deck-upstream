@@ -171,6 +171,49 @@ func TestServer_MCPRoute_AllowsReverseProxyHostOnLoopback(t *testing.T) {
 	}
 }
 
+func TestServer_MCPRoute_SupportsCORSPreflight(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, MCPNoAuth: true, WebMutations: true})
+	req := httptest.NewRequest(http.MethodOptions, MCPRoute, nil)
+	req.Header.Set("Origin", "https://chatgpt.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set("Access-Control-Request-Headers", "authorization, content-type, mcp-session-id")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS /mcp status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	for header, want := range map[string]string{
+		"Access-Control-Allow-Origin":   "*",
+		"Access-Control-Allow-Methods":  "GET, POST, DELETE, OPTIONS",
+		"Access-Control-Allow-Headers":  "authorization, content-type, mcp-session-id, mcp-protocol-version",
+		"Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version, www-authenticate",
+	} {
+		if got := rec.Header().Get(header); got != want {
+			t.Errorf("%s=%q, want %q", header, got, want)
+		}
+	}
+
+	initReq := httptest.NewRequest(http.MethodPost, MCPRoute, strings.NewReader(mcpInitializeBody()))
+	initReq.Header.Set("Origin", "https://chatgpt.com")
+	initReq.Header.Set("Content-Type", "application/json")
+	initReq.Header.Set("Accept", "application/json, text/event-stream")
+	initRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CORS initialize status=%d body=%s, want 200", initRec.Code, initRec.Body.String())
+	}
+	if got := initRec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("initialize Access-Control-Allow-Origin=%q, want %q", got, "*")
+	}
+	if got := initRec.Header().Get("Access-Control-Expose-Headers"); got != "mcp-session-id, mcp-protocol-version, www-authenticate" {
+		t.Errorf("initialize Access-Control-Expose-Headers=%q", got)
+	}
+	if got := initRec.Header().Get("Mcp-Session-Id"); got == "" {
+		t.Error("initialize did not return Mcp-Session-Id")
+	}
+}
+
 func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
 	previousTimeout := mcpSessionTimeout
 	mcpSessionTimeout = 200 * time.Millisecond

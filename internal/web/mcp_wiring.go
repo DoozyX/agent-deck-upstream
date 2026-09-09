@@ -22,7 +22,7 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		authorize = func(*http.Request) bool { return true }
 	}
 
-	mux.Handle(MCPRoute, NewMCPHandler(MCPDependencies{
+	mcpHandler := NewMCPHandler(MCPDependencies{
 		Loader:    s.menuData,
 		Mutator:   &mcpLiveMutator{s: s},
 		Authorize: authorize,
@@ -35,7 +35,31 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		AllowMutation: func() bool {
 			return s.mutationLimiter.Allow()
 		},
-	}))
+	})
+	mux.Handle(MCPRoute, withMCPCORS(mcpHandler))
+}
+
+// withMCPCORS handles browser clients that preflight MCP requests and need to
+// read the session ID returned by Streamable HTTP. MCP uses Authorization
+// headers rather than cookies, so a wildcard origin is valid here. This is
+// scoped to /mcp; the browser/API routes retain their existing CSRF policy.
+func withMCPCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for header, value := range map[string]string{
+			"Access-Control-Allow-Origin":   "*",
+			"Access-Control-Allow-Methods":  "GET, POST, DELETE, OPTIONS",
+			"Access-Control-Allow-Headers":  "authorization, content-type, mcp-session-id, mcp-protocol-version",
+			"Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version, www-authenticate",
+			"Access-Control-Max-Age":        "86400",
+		} {
+			w.Header().Set(header, value)
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // mcpLiveMutator forwards SessionMutator calls to the Server-injected mutator
