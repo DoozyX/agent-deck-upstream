@@ -4566,9 +4566,75 @@ func (i *Instance) isBoundedCodexExec() bool {
 	return false
 }
 
-// isCodexExecArgs parses the global options that Codex accepts before its
-// subcommand. Values are consumed positionally so a value named "exec" is not
-// mistaken for the subcommand. The short "e" alias is equivalent to exec.
+// codexExecOptionArity describes the only two option shapes that matter while
+// locating Codex's subcommand: a flag or one value. The list mirrors the
+// current top-level and exec CLI definitions, including aliases, so a value
+// named "exec" cannot be mistaken for the subcommand.
+type codexExecOptionArity uint8
+
+const (
+	codexExecFlag codexExecOptionArity = iota
+	codexExecValue
+)
+
+var codexExecGlobalOptions = map[string]codexExecOptionArity{
+	// Shared options.
+	"--image":            codexExecValue,
+	"-i":                 codexExecValue,
+	"--model":            codexExecValue,
+	"-m":                 codexExecValue,
+	"--local-provider":   codexExecValue,
+	"--profile":          codexExecValue,
+	"-p":                 codexExecValue,
+	"--sandbox":          codexExecValue,
+	"-s":                 codexExecValue,
+	"--cd":               codexExecValue,
+	"-C":                 codexExecValue,
+	"--add-dir":          codexExecValue,
+	"--config":           codexExecValue,
+	"-c":                 codexExecValue,
+	"--color":            codexExecValue,
+	"--ask-for-approval": codexExecValue,
+	"-a":                 codexExecValue,
+
+	// Exec-only options.
+	"--thread-source":       codexExecValue,
+	"--output-schema":       codexExecValue,
+	"--output-last-message": codexExecValue,
+	"-o":                    codexExecValue,
+
+	// Top-level options and boolean shared/exec options.
+	"--remote":                codexExecValue,
+	"--remote-auth-token-env": codexExecValue,
+	"--enable":                codexExecValue,
+	"--disable":               codexExecValue,
+	"--strict-config":         codexExecFlag,
+	"--skip-git-repo-check":   codexExecFlag,
+	"--ephemeral":             codexExecFlag,
+	"--ignore-user-config":    codexExecFlag,
+	"--ignore-rules":          codexExecFlag,
+	"--json":                  codexExecFlag,
+	"--experimental-json":     codexExecFlag,
+	"--oss":                   codexExecFlag,
+	"--approve-for-me":        codexExecFlag,
+	"--not-so-yolo":           codexExecFlag,
+	"--dangerously-bypass-approvals-and-sandbox": codexExecFlag,
+	"--yolo":                          codexExecFlag,
+	"--dangerously-bypass-hook-trust": codexExecFlag,
+	"--worktree":                      codexExecFlag,
+	"--search":                        codexExecFlag,
+	"--no-alt-screen":                 codexExecFlag,
+	"--help":                          codexExecFlag,
+	"-h":                              codexExecFlag,
+	"--version":                       codexExecFlag,
+	"-V":                              codexExecFlag,
+}
+
+// isCodexExecArgs parses the supported global options that Codex accepts
+// before its subcommand. Unknown options fail closed because guessing their
+// arity could turn a positional value into a false exec subcommand. Both
+// --name=value and attached short values are consumed by the option parser.
+// The short "e" alias is equivalent to exec.
 func isCodexExecArgs(fields []string) bool {
 	for idx := 1; idx < len(fields); idx++ {
 		field := fields[idx]
@@ -4581,14 +4647,34 @@ func isCodexExecArgs(fields []string) bool {
 		if !strings.HasPrefix(field, "-") {
 			return false
 		}
-		if strings.Contains(field, "=") {
-			continue
-		}
-		switch field {
-		case "--add-dir", "-C", "--model", "--profile", "--config", "--color":
-			if idx+1 < len(fields) {
-				idx++
+
+		option := field
+		inlineValue := false
+		if name, _, hasEquals := strings.Cut(field, "="); hasEquals {
+			option, inlineValue = name, true
+		} else if !strings.HasPrefix(field, "--") {
+			// Clap accepts a short option's value attached to the option, e.g.
+			// -mgpt-5. Match the known short name before treating it as unknown.
+			for short := range codexExecGlobalOptions {
+				if len(short) == 2 && strings.HasPrefix(short, "-") &&
+					strings.HasPrefix(field, short) && len(field) > len(short) {
+					option, inlineValue = short, true
+					break
+				}
 			}
+		}
+		arity, known := codexExecGlobalOptions[option]
+		if !known {
+			return false
+		}
+		if inlineValue && arity == codexExecFlag {
+			return false
+		}
+		if arity == codexExecValue && !inlineValue {
+			if idx+1 >= len(fields) {
+				return false
+			}
+			idx++
 		}
 	}
 	return false

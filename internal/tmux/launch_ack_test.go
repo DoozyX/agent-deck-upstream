@@ -39,6 +39,24 @@ func TestParseLaunchAckMarker(t *testing.T) {
 	}
 }
 
+func TestCleanupLaunchAckFilesRemovesEveryProtocolArtifact(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	suffixes := []string{"", ".output", ".tmp", ".fifo", ".capture-fifo"}
+	for _, suffix := range suffixes {
+		if err := os.WriteFile(ackPath+suffix, []byte("protocol"), 0o600); err != nil {
+			t.Fatalf("create %s: %v", suffix, err)
+		}
+	}
+
+	cleanupLaunchAckFiles(ackPath)
+
+	for _, suffix := range suffixes {
+		if _, err := os.Stat(ackPath + suffix); !os.IsNotExist(err) {
+			t.Errorf("protocol artifact %s remains after abnormal cleanup (stat error %v)", suffix, err)
+		}
+	}
+}
+
 func intPtr(value int) *int { return &value }
 
 func TestLaunchAckScriptPublishesDrainedOutputAndPreservesExit(t *testing.T) {

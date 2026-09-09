@@ -330,6 +330,29 @@ func TestIssue1793_CodexMultilineSubmittedBodyContainingPromptLiteralDoesNotNeed
 	}
 }
 
+func TestIssue1793_ExecuteSendPublishesMultilineCodexSubmission(t *testing.T) {
+	const msg = "ISSUE1793 first line\ninclude the literal codex> prompt\nfinal line"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+	tun := testGuardTuning(sendRetryOptions{maxRetries: 3, checkDelay: 0})
+	result, err := executeSend(mock, "codex", msg, false, tun)
+	if err != nil {
+		t.Fatalf("command-facing multiline Codex send failed: %v", err)
+	}
+	fields := result.jsonFields()
+	if fields["delivery"] != deliverySubmitted || fields["submitted"] != true {
+		t.Fatalf("command-facing result = %#v, want submitted=true", fields)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("command-facing multiline submission must not receive recovery Enter, got %d", got)
+	}
+}
+
 func TestIssue1793_CodexTimedWorkingDoesNotSubmitForeignDraftFromExistingTurn(t *testing.T) {
 	const msg = "ISSUE1793 PREEXISTING TURN DRAFT"
 	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{

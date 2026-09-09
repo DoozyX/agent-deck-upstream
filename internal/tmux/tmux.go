@@ -3182,7 +3182,7 @@ func cleanupLaunchAckFiles(ackPath string) {
 	if ackPath == "" {
 		return
 	}
-	for _, suffix := range []string{"", ".output", ".tmp", ".fifo"} {
+	for _, suffix := range []string{"", ".output", ".tmp", ".fifo", ".capture-fifo"} {
 		_ = os.Remove(ackPath + suffix)
 	}
 }
