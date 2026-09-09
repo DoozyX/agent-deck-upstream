@@ -27,6 +27,7 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		Loader:       s.menuData,
 		Mutator:      live,
 		OutputReader: live,
+		RemoteFleet:  s.remoteFleet,
 		Authorize:    authorize,
 		MutationsAllowed: func() bool {
 			// ReadOnly and WebMutations are independent Config inputs; both must

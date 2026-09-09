@@ -215,6 +215,12 @@ func mcpFleetStatus(deps MCPDependencies) (MCPFleetStatusResult, error) {
 		TotalSessions: snap.TotalSessions,
 		Sessions:      make([]MCPSessionSummary, 0, mcpNonNegCap(snap.TotalSessions)),
 		Groups:        make([]MCPGroupSummary, 0, mcpNonNegCap(snap.TotalGroups)),
+		Remotes:       make([]session.RemoteFleetRemote, 0),
+	}
+	if deps.RemoteFleet != nil {
+		remote := deps.RemoteFleet.Snapshot()
+		out.Remotes = remote.Remotes
+		out.RemoteCounts = remote.Counts
 	}
 	for _, item := range snap.Items {
 		if item.Group != nil {
