@@ -586,10 +586,6 @@ func TestRemoteAgent_CancelRightAfterRequest(t *testing.T) {
 	h.closeAndWait()
 }
 
-type writerFunc func([]byte) (int, error)
-
-func (f writerFunc) Write(b []byte) (int, error) { return f(b) }
-
 // Finding 10: a command reply carries the DB stamp after the command ran,
 // so the local side can tell a listing older than its last action.
 func TestRemoteAgent_ReplyCarriesStamp(t *testing.T) {

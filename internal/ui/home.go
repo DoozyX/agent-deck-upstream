@@ -650,10 +650,15 @@ type Home struct {
 	uiStateSaveTicks     int      // Counter for periodic UI state saves in tick handler
 
 	// Remote sessions (Phase 2: Agent-Deck Remotes)
-	remoteSessions     map[string][]session.RemoteSessionInfo // remoteName -> sessions
-	remoteGroups       map[string][]session.GroupData         // remoteName -> saved groups, including empty groups
-	remoteFromCache    map[string]bool                        // remoteName -> data is a startup cache snapshot, not live yet
-	remoteFetchedAt    map[string]time.Time                   // remoteName -> when its sessions last came from a live fetch
+	remoteSessions map[string][]session.RemoteSessionInfo // remoteName -> sessions
+	// remoteGroups holds each remote's FULL group path list as reported by
+	// its own state DB (`agent-deck group list --json`, fetched on the same
+	// fleet poll). Unlike session-derived buckets it includes EMPTY groups,
+	// so the M move dialog can still offer a remote folder after every
+	// session has been moved out of it. Guarded by remoteSessionsMu.
+	remoteGroups       map[string][]string  // remoteName -> group paths in the remote's own order (incl. empty groups)
+	remoteFromCache    map[string]bool      // remoteName -> data is a startup cache snapshot, not live yet
+	remoteFetchedAt    map[string]time.Time // remoteName -> when its sessions last came from a live fetch
 	remoteSessionsMu   sync.RWMutex
 	lastRemoteFetch    time.Time // When remote sessions were last fetched
 	remotesFetchActive bool      // Prevents overlapping fetches
@@ -1616,8 +1621,21 @@ type remoteFetchRunner interface {
 // change shaped like one). Every other configured remote is listed in
 // failed/groupsFailed so the merge keeps their rows untouched.
 type remoteSessionsFetchedMsg struct {
-	sessions map[string][]session.RemoteSessionInfo
-	groups   map[string][]session.GroupData
+	// gen is the fetch's sequence number (see Home.remoteFetchSeq).
+	gen uint64
+	// pushed marks a result that did not come from a poll round (a change
+	// the remote pushed over its channel), so it is not counted against the
+	// round's outstanding fetches and never touches the in-flight guard.
+	pushed bool
+	// inRound marks one of the per-remote results a remoteFetchRoundMsg
+	// fanned out; only those count down remoteFetchOutstanding. A message
+	// from outside a round (config unreadable, no remotes configured) must
+	// not steal a slot from a round still in flight.
+	inRound bool
+	// configErr is set when the user config could not be read; the handler
+	// then keeps every cached remote instead of treating them as removed.
+	configErr error
+	sessions  map[string][]session.RemoteSessionInfo
 	// #1101: per-remote cost summary collected on the same SSH fanout.
 	costs map[string]*costs.RemoteCostSummary
 	// groups holds each remote's FULL group path list (incl. empty groups)
@@ -3223,33 +3241,51 @@ func (h *Home) rebuildFlatItemsAt(now time.Time) {
 	// existing behavior.
 	remoteRows := make([]session.Item, 0)
 	remoteActivity := make(map[string]session.GroupActivity)
-	if h.statusFilter != FilterModeArchived {
-		h.remoteSessionsMu.RLock()
-		remoteNamesSet := make(map[string]bool, len(h.remoteSessions)+len(h.remoteGroups))
-		remoteSnapshots := make(map[string]session.RemoteSnapshot, len(h.remoteSessions)+len(h.remoteGroups))
-		for name, sessions := range h.remoteSessions {
-			remoteNamesSet[name] = true
-			snapshot := remoteSnapshots[name]
-			snapshot.Sessions = append([]session.RemoteSessionInfo(nil), sessions...)
-			remoteSnapshots[name] = snapshot
-		}
-		for name, groups := range h.remoteGroups {
-			remoteNamesSet[name] = true
-			snapshot := remoteSnapshots[name]
-			snapshot.Groups = append([]session.GroupData(nil), groups...)
-			remoteSnapshots[name] = snapshot
-		}
-		h.remoteSessionsMu.RUnlock()
-
-		remoteNames := make([]string, 0, len(remoteNamesSet))
-		for name := range remoteNamesSet {
-			remoteNames = append(remoteNames, name)
-		}
-		sort.Strings(remoteNames)
+	// Header counts are taken once here from the same in-view slices the
+	// renderer used to rescan per header per frame (finding 11).
+	// No archived-view gate here: the per-remote slices above are already
+	// partitioned by viewArchived, so the archived view gets exactly the
+	// remote sessions the remote reports archived.
+	h.remoteHeaderCounts = make(map[string]remoteHeaderCount)
+	{
 		for _, remoteName := range remoteNames {
-			snapshot := remoteSnapshots[remoteName]
-			remoteRows = append(remoteRows, buildRemoteSnapshotFlatItems(remoteName, snapshot, h.remoteGroupsCollapsed, h.remoteSessionOrder.forRemote(remoteName))...)
-			for _, remoteSession := range snapshot.Sessions {
+			sessions := remotes[remoteName]
+			for path, counts := range remoteHeaderCounts(remoteName, sessions) {
+				h.remoteHeaderCounts[path] = counts
+			}
+			if h.timeFilter != session.TimeFilterAll {
+				filtered := make([]session.RemoteSessionInfo, 0, len(sessions))
+				for _, remote := range sessions {
+					if remoteMatchesTime(remote) {
+						filtered = append(filtered, remote)
+					}
+				}
+				if len(filtered) == 0 {
+					continue
+				}
+				sessions = filtered
+			}
+			// Filter before building rows so collapsed headers and connectors
+			// describe the surviving sessions.
+			// #1553: nest each remote's sessions under their Group paths
+			// instead of dumping them flat at Level 1.
+			// #1875: apply the user's manual row order for this remote, and
+			// the remote's own group order to the group headers. In the plain
+			// active view, empty remote groups get a header row too, like an
+			// empty local group; any filter or the archived view hides them.
+			showEmptyGroups := !viewArchived && h.timeFilter == session.TimeFilterAll && h.statusFilter == ""
+			rows := buildRemoteFlatItemsWithEmptyGroups(remoteName, sessions, h.remoteGroupsCollapsed, h.remoteSessionOrder.forRemote(remoteName), remoteGroupLists[remoteName], showEmptyGroups)
+			for _, row := range rows {
+				// An empty group's header has no session to count; give it
+				// a zero entry so the renderer never falls back to a scan.
+				if row.Type == session.ItemTypeRemoteGroup {
+					if _, ok := h.remoteHeaderCounts[row.Path]; !ok {
+						h.remoteHeaderCounts[row.Path] = remoteHeaderCount{}
+					}
+				}
+			}
+			remoteRows = append(remoteRows, rows...)
+			for _, remoteSession := range sessions {
 				path := "remotes/" + remoteName + "/" + normalizeRemoteGroupPath(remoteSession.Group)
 				parts := strings.Split(path, "/")
 				for i := range parts {
@@ -4509,62 +4545,14 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	// make every remote session vanish until the TUI restarts.
 	session.CleanStaleSSHSockets()
 
-	results := make(map[string][]session.RemoteSessionInfo, len(config.Remotes))
-	groupResults := make(map[string][]session.GroupData, len(config.Remotes))
-	// #1101: remote cost summaries piggy-back on the existing remote-fetch
-	// channel so the status-line cost segment doesn't lag behind the session
-	// list. nil-valued entries indicate fetch failures (e.g., older remote
-	// agent-deck without `costs summary --json`); the renderer treats those
-	// as "remote contributes zero" so a single broken remote can't poison
-	// the displayed total.
-	costResults := make(map[string]*costs.RemoteCostSummary, len(config.Remotes))
-	// #1170: track remotes that errored so the handler keeps their last-good
-	// sessions instead of dropping them.
-	failed := make(map[string]bool, len(config.Remotes))
-	var mu sync.Mutex
-	var wg sync.WaitGroup
+	return remoteFetchRoundMsg{gen: gen, fetches: h.remoteFetchCmds(gen, config.Remotes)}
+}
 
-	// #1170: fetch every remote in parallel, each with its OWN timeout, so a
-	// single slow/offline remote can't starve the others. The previous code
-	// shared one 15s budget across all remotes fetched sequentially, which
-	// made healthy remotes drop out of the result map (and flicker in the
-	// TUI) whenever an earlier remote was slow.
-	for name, rc := range config.Remotes {
-		wg.Add(1)
-		go func(name string, rc session.RemoteConfig) {
-			defer wg.Done()
-			// Honor the per-remote command_timeout_seconds: hosts with large
-			// session fleets legitimately need more than the old flat 15s.
-			ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
-			defer cancel()
-
-			runner := session.NewSSHRunner(name, rc)
-			snapshot, err := runner.FetchSnapshot(ctx)
-			if err != nil {
-				mu.Lock()
-				failed[name] = true
-				mu.Unlock()
-				return
-			}
-			sessions := snapshot.Sessions
-			for i := range sessions {
-				sessions[i].RemoteName = name
-			}
-			// #1912 follow-up: the session-list fetch may have consumed most
-			// of the shared budget on a slow remote, which silently dropped
-			// that remote's spend from the totals. Give costs their own bound.
-			costCtx, costCancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
-			summary, costErr := runner.FetchCostSummary(costCtx)
-			costCancel()
-
-			mu.Lock()
-			results[name] = sessions
-			groupResults[name] = snapshot.Groups
-			if costErr == nil && summary != nil {
-				costResults[name] = summary
-			}
-			mu.Unlock()
-		}(name, rc)
+// remoteFetchCmds builds one Cmd per configured remote for fetch round gen.
+func (h *Home) remoteFetchCmds(gen uint64, remotes map[string]session.RemoteConfig) []tea.Cmd {
+	names := make([]string, 0, len(remotes))
+	for name := range remotes {
+		names = append(names, name)
 	}
 	cmds := make([]tea.Cmd, 0, len(remotes))
 	for name, rc := range remotes {
@@ -4573,7 +4561,94 @@ func (h *Home) fetchRemoteSessions() tea.Msg {
 	return cmds
 }
 
-	return remoteSessionsFetchedMsg{sessions: results, groups: groupResults, costs: costResults, failed: failed}
+// fetchOneRemote fetches one remote's sessions, cost summary and group list
+// and shapes them as a result for that remote alone: every other configured
+// remote is marked failed so the merge keeps its rows, and a remote missing
+// from the config altogether is absent from both lists and so drops out.
+func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, configured []string) remoteSessionsFetchedMsg {
+	msg := remoteSessionsFetchedMsg{
+		gen:          gen,
+		inRound:      true,
+		sessions:     make(map[string][]session.RemoteSessionInfo, 1),
+		costs:        make(map[string]*costs.RemoteCostSummary, 1),
+		groups:       make(map[string][]string, 1),
+		groupsFailed: make(map[string]bool, len(configured)),
+		failed:       make(map[string]bool, len(configured)),
+	}
+	for _, other := range configured {
+		if other != name {
+			msg.failed[other] = true
+			msg.groupsFailed[other] = true
+		}
+	}
+
+	// Honor the per-remote command_timeout_seconds: hosts with large
+	// session fleets legitimately need more than the old flat 15s. Each
+	// remote runs under its own bound (#1170) and answers on its own
+	// (#2177), so one slow or offline host starves nobody.
+	ctx, cancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
+	defer cancel()
+
+	var runner remoteFetchRunner
+	if h.newRemoteFetchRunner != nil {
+		runner = h.newRemoteFetchRunner(name, rc)
+	} else {
+		runner = session.NewSSHRunner(name, rc)
+	}
+	sessions, err := runner.FetchSessions(ctx)
+	if err != nil {
+		// #1170: the handler keeps this remote's last-good sessions; the
+		// group list can't be trusted either, so keep that too.
+		msg.failed[name] = true
+		msg.groupsFailed[name] = true
+		return msg
+	}
+	for i := range sessions {
+		sessions[i].RemoteName = name
+	}
+	// The cost summary and the group list are independent of the session
+	// list and of each other, so they run concurrently over the same
+	// ControlMaster connection: one round trip per poll instead of three in
+	// a row (#2167). Each keeps its own bound, and a failure degrades as
+	// before: costs to "contributes zero", groups to the session-derived
+	// fallback in remoteGroupPaths.
+	var (
+		summary    *costs.RemoteCostSummary
+		costErr    error
+		groupPaths []string
+		groupErr   error
+		side       sync.WaitGroup
+	)
+	side.Add(2)
+	go func() {
+		defer side.Done()
+		costCtx, costCancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
+		defer costCancel()
+		summary, costErr = runner.FetchCostSummary(costCtx)
+	}()
+	go func() {
+		defer side.Done()
+		groupCtx, groupCancel := context.WithTimeout(h.ctx, rc.GetCommandTimeout())
+		defer groupCancel()
+		groupPaths, groupErr = runner.FetchGroupPaths(groupCtx)
+	}()
+	side.Wait()
+
+	msg.sessions[name] = sessions
+	// #1101: a nil summary (older remote without `costs summary --json`)
+	// is left out so the renderer treats the remote as contributing zero.
+	if costErr == nil && summary != nil {
+		msg.costs[name] = summary
+	}
+	if groupErr == nil {
+		if groupPaths == nil {
+			groupPaths = []string{}
+		}
+		msg.groups[name] = groupPaths
+	} else {
+		msg.groupsFailed[name] = true
+	}
+	return msg
 }
 
 // mergeRemoteSessions reconciles a freshly fetched remote-session map against
@@ -4609,10 +4684,6 @@ func mergeRemoteValues[T any](prev, fetched map[string][]T, failed map[string]bo
 		}
 	}
 	return merged
-}
-
-func mergeRemoteGroups(prev, fetched map[string][]session.GroupData, failed map[string]bool) map[string][]session.GroupData {
-	return mergeRemoteValues(prev, fetched, failed)
 }
 
 // shouldFetchRemoteSessions reports whether the periodic tick should kick off
@@ -4689,27 +4760,12 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 	if watcher != nil {
 		issuedTicket = watcher.issueLoad()
 	}
-
-	// Capture file mtime BEFORE loading to detect external changes later
-	loadMtime, _ := h.storage.GetFileMtime()
-
-	instances, groups, err := h.storage.LoadWithGroups()
-	if err == nil {
-		err = session.RecoverLifecycleIntents(h.storage, instances)
-	}
-	msg := loadSessionsMsg{instances: instances, groups: groups, err: err, loadMtime: loadMtime}
-
-	// Initialize pool AFTER sessions are loaded
-	userConfig, configErr := session.LoadUserConfig()
-	if configErr == nil && userConfig != nil && userConfig.MCPPool.Enabled {
-		pool, poolErr := session.InitializeGlobalPool(h.ctx, userConfig, instances)
-		if poolErr != nil {
-			mcpUILog.Warn("pool_init_failed", slog.String("error", poolErr.Error()))
-			msg.poolError = poolErr
-		} else if pool != nil {
-			proxies := pool.ListServers()
-			mcpUILog.Info("pool_initialized", slog.Int("proxies", len(proxies)))
-			msg.poolProxies = len(proxies)
+	return func() tea.Msg {
+		ticket := issuedTicket
+		msg := loadSessionsMsg{loadSequence: sequence, loadWatcher: watcher, restoreState: restore}
+		if storage == nil {
+			msg.err = fmt.Errorf("storage not initialized")
+			return msg
 		}
 		if watcher != nil {
 			var err error
@@ -4722,6 +4778,11 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 		}
 		msg.loadMtime, _ = storage.GetFileMtime()
 		msg.instances, msg.groups, msg.persistedSnapshot, msg.err = storage.LoadWithGroupsSnapshot()
+		if msg.err == nil {
+			// Lifecycle intents recorded by a CLI process must be reconciled
+			// against the rows this load observed, before anything renders.
+			msg.err = session.RecoverLifecycleIntents(storage, msg.instances)
+		}
 		if watcher != nil {
 			finished, err := watcher.endLoad(ticket)
 			msg.watcherTicket = &finished
@@ -7869,17 +7930,8 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Outstanding counts add up so an overlapping round (ctrl+r during
 		// a poll) keeps the guard until every fetch of both has landed.
 		h.remoteSessionsMu.Lock()
-		// #1170: merge rather than wholesale-replace so a remote that errored
-		// this round keeps its last-good sessions instead of flickering out.
-		h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
-		h.remoteGroups = mergeRemoteGroups(h.remoteGroups, msg.groups, msg.failed)
-		for name := range msg.sessions {
-			if !msg.failed[name] {
-				delete(h.remoteFromCache, name)
-			}
-		}
-		h.lastRemoteFetch = time.Now()
-		h.remotesFetchActive = false
+		h.remotesFetchActive = true
+		h.remoteFetchOutstanding += len(msg.fetches)
 		h.remoteSessionsMu.Unlock()
 		return h, tea.Batch(msg.fetches...)
 
@@ -9195,7 +9247,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Unlock()
 			} else {
 				remoteName, remoteSessionID, remoteKey, ok := h.selectedRemotePreviewTarget()
-				if ok {
+				// The remote agent pushes the focused pane over the channel;
+				// the ssh poll only runs while that is not the case (channel
+				// down, old remote, watch still being set up).
+				if ok && !remotePaneWatchActive(remoteName, remoteSessionID) {
 					h.previewCacheMu.Lock()
 					cachedTime, hasCached := h.previewCacheTime[remoteKey]
 					cacheExpired := !hasCached || time.Since(cachedTime) > remotePreviewCacheTTL
@@ -20009,18 +20064,29 @@ func (h *Home) renderSessionItem(
 	if isMaestro {
 		displayTitle = "⬢ " + displayTitle
 	}
-	if instState.autoName && listWidth > 0 {
-		// Task descriptions can be long; truncate to the row's free width so the
-		// tool label and badges stay on-row. Keep the reserved terms below in
-		// sync with the row format that follows.
-		reserved := leftGutterWidth + cellWidth(baseIndent) + cellWidth(selectionPrefix) +
-			cellWidth(treeStyle.Render(treeConnector)) + cellWidth(windowChevron) +
-			cellWidth(status) + 1 /* space before title */ + cellWidth(tool) +
-			cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
-			cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
-			cellWidth(agentBadge) + cellWidth(timestampBadge) + cellWidth(ctxBadge)
-		budget := listWidth - reserved - 1 // -1 trailing margin
-		if budget > 0 && cellWidth(displayTitle) > budget {
+	// Include the stored slot in the existing badge/title cell budget. Normal
+	// titles need the same reservation as auto-names so the badge stays visible.
+	reserved := leftGutterWidth + cellWidth(baseIndent) + cellWidth(selectionPrefix) +
+		cellWidth(treeStyle.Render(treeConnector)) + cellWidth(windowChevron) +
+		cellWidth(status) + 1 + cellWidth(tool) +
+		cellWidth(maestroBadge) + cellWidth(yoloBadge) + cellWidth(worktreeBadge) +
+		cellWidth(sandboxBadge) + cellWidth(multiRepoBadge) + cellWidth(sshBadge) +
+		cellWidth(agentBadge) + cellWidth(timestampBadge) + cellWidth(ctxBadge)
+	accountBudget := instState.accountDisplay.width
+	if listWidth > 0 {
+		accountBudget = min(accountBudget, max(0, listWidth-reserved-2))
+	}
+	accountBadge, accountWidth := instState.accountDisplay.fit(accountBudget)
+	if accountBadge != "" {
+		accountStyle := DimStyle
+		if selected {
+			accountStyle = SessionStatusSelStyle
+		}
+		accountBadge = accountStyle.Render(accountBadge)
+	}
+	if listWidth > 0 {
+		budget := max(0, listWidth-reserved-accountWidth-1)
+		if cellWidth(displayTitle) > budget {
 			displayTitle = cellTruncate(displayTitle, budget, "…")
 		}
 	}
@@ -20030,7 +20096,7 @@ func (h *Home) renderSessionItem(
 	// The leading gutter (leftGutterWidth) keeps sessions aligned with group
 	// rows, which reserve the same gutter for root hotkey numbers.
 	row := fmt.Sprintf(
-		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s%s%s",
+		"%s%s%s%s%s%s %s%s%s%s%s%s%s%s%s%s%s%s",
 		strings.Repeat(" ", leftGutterWidth),
 		baseIndent,
 		selectionPrefix,

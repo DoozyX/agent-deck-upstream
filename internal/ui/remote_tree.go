@@ -31,19 +31,37 @@ func buildRemoteFlatItems(remoteName string, sessions []session.RemoteSessionInf
 	return buildRemoteFlatItemsOrdered(remoteName, sessions, collapsed, nil)
 }
 
-func buildRemoteSnapshotFlatItems(remoteName string, snapshot session.RemoteSnapshot, collapsed map[string]bool, order map[string][]string) []session.Item {
-	return buildRemoteFlatItemsWithGroupsOrdered(remoteName, snapshot.Sessions, snapshot.Groups, collapsed, order)
-}
-
 // buildRemoteFlatItemsOrdered is buildRemoteFlatItems with the manual
 // row-order overlay (#1875) applied. order holds THIS remote's group path ->
 // session IDs (i.e. remoteOrder.forRemote(remoteName)) and may be nil, in
 // which case each bucket keeps the order the remote listed.
 func buildRemoteFlatItemsOrdered(remoteName string, sessions []session.RemoteSessionInfo, collapsed map[string]bool, order map[string][]string) []session.Item {
-	return buildRemoteFlatItemsWithGroupsOrdered(remoteName, sessions, nil, collapsed, order)
+	return buildRemoteFlatItemsWithGroups(remoteName, sessions, collapsed, order, nil)
 }
 
-func buildRemoteFlatItemsWithGroupsOrdered(remoteName string, sessions []session.RemoteSessionInfo, groups []session.GroupData, collapsed map[string]bool, order map[string][]string) []session.Item {
+// buildRemoteFlatItemsWithGroups is buildRemoteFlatItemsWithEmptyGroups with
+// empty groups left out: only groups that currently hold a session get a
+// header row. Filtered views (status, time, archived) use this form so a
+// filter never surfaces an empty folder as if it matched.
+func buildRemoteFlatItemsWithGroups(remoteName string, sessions []session.RemoteSessionInfo, collapsed map[string]bool, order map[string][]string, groupPaths []string) []session.Item {
+	return buildRemoteFlatItemsWithEmptyGroups(remoteName, sessions, collapsed, order, groupPaths, false)
+}
+
+// buildRemoteFlatItemsWithEmptyGroups is buildRemoteFlatItemsOrdered with the
+// remote's OWN group order applied to the group headers. groupPaths is the
+// remote's group list as `group list --json` returned it (see
+// SSHRunner.FetchGroupPaths): siblings in the remote's persisted order, a
+// parent before its children. It may be nil or incomplete, in which case the
+// groups it does not mention keep their lexicographic order, so a remote too
+// old to report the list, or a group seen only on a session, renders exactly
+// as before.
+//
+// With includeEmpty set, every path in groupPaths also gets a header row even
+// when no session lives in it, so a group just created on the remote (or one
+// emptied by moves) stays visible and addressable, the way an empty local
+// group renders as "name (0)". This is the remote's own list, so a remote too
+// old to report one simply shows no empty groups.
+func buildRemoteFlatItemsWithEmptyGroups(remoteName string, sessions []session.RemoteSessionInfo, collapsed map[string]bool, order map[string][]string, groupPaths []string, includeEmpty bool) []session.Item {
 	items := make([]session.Item, 0, len(sessions)+2)
 
 	remoteRoot := "remotes/" + remoteName
@@ -67,13 +85,6 @@ func buildRemoteFlatItemsWithGroupsOrdered(remoteName string, sessions []session
 	for i := range sessions {
 		g := normalizeRemoteGroupPath(sessions[i].Group)
 		buckets[g] = append(buckets[g], i)
-	}
-	for _, group := range groups {
-		if g := strings.Trim(strings.TrimSpace(group.Path), "/"); g != "" {
-			if _, ok := buckets[g]; !ok {
-				buckets[g] = nil
-			}
-		}
 	}
 
 	// Sort group paths so that a parent path lands directly before all of its

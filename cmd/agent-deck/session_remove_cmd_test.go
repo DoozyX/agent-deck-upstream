@@ -408,7 +408,18 @@ func TestSessionRemoveAllErroredTerminalVerification(t *testing.T) {
 				}
 				if !resurrected {
 					resurrected = true
-					return s.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups))
+					// The stale full-table write this injects is what a
+					// concurrent writer would use to resurrect the row. Since
+					// the snapshot merge landed, such a write is refused at the
+					// source instead of resurrecting anything — a stronger
+					// guarantee than the retry loop this case was written for.
+					// Treat that refusal as "resurrection prevented" so the
+					// removal proceeds; any other error is still fatal.
+					err := s.SaveWithGroups(instances, session.NewGroupTreeWithGroups(instances, groups))
+					if err != nil && strings.Contains(err.Error(), "stale concurrent deletion conflict") {
+						return nil
+					}
+					return err
 				}
 				return nil
 			}

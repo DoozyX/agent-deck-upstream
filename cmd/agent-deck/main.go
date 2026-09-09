@@ -1105,6 +1105,8 @@ var commandRegistry = map[string]bool{
 	"desktop-notifications": true,
 	"run-task":              true, "inbox": true, "feedback": true, "creds-refresh": true,
 	"debug-dump": true, "version": true, "help": true,
+	"artifacts": true, "config": true, "telemetry": true, "usage": true,
+	"--help": true, "-h": true, "--version": true, "-v": true,
 }
 
 // extractProfileFlag extracts the global -p or --profile flag from args,
@@ -2363,6 +2365,8 @@ func handleList(profile string, args []string) {
 		fmt.Println("Usage: agent-deck list [options]")
 		fmt.Println()
 		fmt.Println("List active sessions. Archived sessions are excluded by default.")
+		fmt.Println("ACCOUNT shows the quoted stored account slot, not a resolved account or login identity.")
+		fmt.Println(`JSON always includes the raw "account" string, including "" when no slot is stored.`)
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -2405,91 +2409,28 @@ func handleList(profile string, args []string) {
 	}
 
 	if *jsonOutput {
-		// JSON output for scripting
-		type sessionJSON struct {
-			ID                string    `json:"id"`
-			ParentSessionID   string    `json:"parent_session_id,omitempty"`
-			ParentProjectPath string    `json:"parent_project_path,omitempty"`
-			Title             string    `json:"title"`
-			Path              string    `json:"path"`
-			Group             string    `json:"group"`
-			Tool              string    `json:"tool"`
-			Command           string    `json:"command,omitempty"`
-			ModelID           string    `json:"model_id,omitempty"`
-			Model             string    `json:"model,omitempty"`
-			ModelVersion      string    `json:"model_version,omitempty"`
-			Status            string    `json:"status"`
-			Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
-			TmuxSession       string    `json:"tmux_session,omitempty"`
-			Profile           string    `json:"profile"`
-			CreatedAt         time.Time `json:"created_at"`
-			SSHHost           string    `json:"ssh_host,omitempty"`
-			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
-			Channels          []string  `json:"channels,omitempty"`
-			ExtraArgs         []string  `json:"extra_args,omitempty"`
-			Color             string    `json:"color,omitempty"` // issue #391
-			Archived          bool      `json:"archived"`
-			ArchivedAt        time.Time `json:"archived_at,omitempty"`
-			PeerName          string    `json:"peer_name,omitempty"`
-			PeerCandidate     bool      `json:"peer_messaging_candidate,omitempty"`
-			// Deliberately NOT omitempty: `ls --json` used to carry no parent
-			// field at all, so `.parent_id` read null for every session and a
-			// conductor verifying that a child parented could not tell "not
-			// parented" from "this view never had the answer". An always-present
-			// key makes "" mean unparented and a MISSING key mean the binary
-			// predates this fix.
-			ParentID string `json:"parent_id"`
-		}
-		// Warm tmux pane-title cache + load hook statuses so the CLI
-		// reports the same Status the TUI and /api/menu do (issue #610).
+		// JSON output for scripting. The plain array comes from
+		// buildListJSON so `list --json` and the remote agent's pushed
+		// listing cannot drift apart.
 		session.RefreshInstancesForCLIStatus(instances)
-		sessions := make([]sessionJSON, len(instances))
-		for i, inst := range instances {
-			_ = inst.UpdateStatus()
-			parentProjectPath := listParentProjectPath(inst, instances)
-			sj := sessionJSON{
-				ID:                inst.ID,
-				ParentSessionID:   inst.ParentSessionID,
-				ParentProjectPath: parentProjectPath,
-				Title:             inst.Title,
-				Path:              inst.ProjectPath,
-				Group:             inst.GroupPath,
-				Tool:              inst.Tool,
-				Command:           inst.Command,
-				Status:            StatusString(inst.Status),
-				Substate:          string(inst.Substate()),
-				Profile:           storage.Profile(),
-				CreatedAt:         inst.CreatedAt,
-				SSHHost:           inst.SSHHost,
-				SSHRemotePath:     inst.SSHRemotePath,
-				Channels:          inst.Channels,
-				ExtraArgs:         inst.ExtraArgs,
-				Color:             inst.Color,
-				Archived:          inst.IsArchived(),
-				ArchivedAt:        inst.ArchivedAt,
-				ParentID:          inst.ParentSessionID,
+		if !*includeGroups {
+			output, err := buildListJSON(storage.Profile(), instances)
+			if err != nil {
+				fmt.Printf("Error: failed to format JSON output: %v\n", err)
+				os.Exit(1)
 			}
-			if inst.PeerMessagingCandidate() {
-				sj.PeerName = inst.ClaudePeerName()
-				sj.PeerCandidate = true
-			}
-			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-				sj.TmuxSession = tmuxSess.Name
-			}
-			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
-				sj.ModelID = modelInfo.ModelID
-				sj.Model = modelInfo.ModelID
-				sj.ModelVersion = modelInfo.Version
-			}
-			sessions[i] = sj
+			fmt.Print(string(output))
+			return
 		}
-		var payload any = sessions
-		if *includeGroups {
-			payload = struct {
-				Sessions []sessionJSON        `json:"sessions"`
-				Groups   []*session.GroupData `json:"groups"`
-			}{Sessions: sessions, Groups: groups}
+		sessions, err := buildListJSON(storage.Profile(), instances)
+		if err != nil {
+			fmt.Printf("Error: failed to format JSON output: %v\n", err)
+			os.Exit(1)
 		}
+		payload := struct {
+			Sessions json.RawMessage      `json:"sessions"`
+			Groups   []*session.GroupData `json:"groups"`
+		}{Sessions: sessions, Groups: groups}
 		output, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
@@ -2518,6 +2459,100 @@ func handleList(profile string, args []string) {
 
 	// Show update notice if available
 	printUpdateNotice()
+}
+
+// buildListJSON is the body of `list --json`: every session with its status
+// refreshed, as the indented array the CLI prints, trailing newline included.
+// handleList prints it and the remote agent's change probe (#2177) pushes it,
+// so a listing that arrives by push is byte-identical to one that was
+// fetched. Callers warm the status caches first
+// (session.RefreshInstancesForCLIStatus); an empty profile yields "[]".
+func buildListJSON(profileName string, instances []*session.Instance) ([]byte, error) {
+	type sessionJSON struct {
+		ID                string    `json:"id"`
+		ParentSessionID   string    `json:"parent_session_id,omitempty"`
+		ParentProjectPath string    `json:"parent_project_path,omitempty"`
+		Title             string    `json:"title"`
+		Path              string    `json:"path"`
+		Group             string    `json:"group"`
+		Tool              string    `json:"tool"`
+		Account           string    `json:"account"`
+		Command           string    `json:"command,omitempty"`
+		ModelID           string    `json:"model_id,omitempty"`
+		Model             string    `json:"model,omitempty"`
+		ModelVersion      string    `json:"model_version,omitempty"`
+		Status            string    `json:"status"`
+		Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
+		TmuxSession       string    `json:"tmux_session,omitempty"`
+		Profile           string    `json:"profile"`
+		CreatedAt         time.Time `json:"created_at"`
+		SSHHost           string    `json:"ssh_host,omitempty"`
+		SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+		Channels          []string  `json:"channels,omitempty"`
+		ExtraArgs         []string  `json:"extra_args,omitempty"`
+		Color             string    `json:"color,omitempty"` // issue #391
+		Archived          bool      `json:"archived"`
+		ArchivedAt        time.Time `json:"archived_at,omitempty"`
+		// LastActivityAt lets a remote caller (session.RemoteSessionInfo)
+		// apply the local recency filter (session.TimeFilterMode) to this
+		// session, the same way it applies to a local one.
+		LastActivityAt string `json:"last_activity_at,omitempty"`
+		PeerName       string `json:"peer_name,omitempty"`
+		PeerCandidate  bool   `json:"peer_messaging_candidate,omitempty"`
+		// Deliberately NOT omitempty: `ls --json` used to carry no parent
+		// field at all, so `.parent_id` read null for every session and a
+		// conductor verifying that a child parented could not tell "not
+		// parented" from "this view never had the answer". An always-present
+		// key makes "" mean unparented and a MISSING key mean the binary
+		// predates this fix.
+		ParentID string `json:"parent_id"`
+	}
+	// Warm tmux pane-title cache + load hook statuses so the CLI
+	// reports the same Status the TUI and /api/menu do (issue #610).
+	session.RefreshInstancesForCLIStatus(instances)
+	sessions := make([]sessionJSON, len(instances))
+	for i, inst := range instances {
+		_ = inst.UpdateStatus()
+		parentProjectPath := listParentProjectPath(inst, instances)
+		sj := sessionJSON{
+			ID:                inst.ID,
+			ParentSessionID:   inst.ParentSessionID,
+			ParentProjectPath: parentProjectPath,
+			Title:             inst.Title,
+			Path:              inst.ProjectPath,
+			Group:             inst.GroupPath,
+			Tool:              inst.Tool,
+			Account:           inst.Account,
+			Command:           inst.Command,
+			Status:            StatusString(inst.Status),
+			Substate:          string(inst.Substate()),
+			Profile:           profileName,
+			CreatedAt:         inst.CreatedAt,
+			SSHHost:           inst.SSHHost,
+			SSHRemotePath:     inst.SSHRemotePath,
+			Channels:          inst.Channels,
+			ExtraArgs:         inst.ExtraArgs,
+			Color:             inst.Color,
+			Archived:          inst.IsArchived(),
+			ArchivedAt:        inst.ArchivedAt,
+			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
+			ParentID:          inst.ParentSessionID,
+		}
+		if inst.PeerMessagingCandidate() {
+			sj.PeerName = inst.ClaudePeerName()
+			sj.PeerCandidate = true
+		}
+		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+			sj.TmuxSession = tmuxSess.Name
+		}
+		if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+			sj.ModelID = modelInfo.ModelID
+			sj.Model = modelInfo.ModelID
+			sj.ModelVersion = modelInfo.Version
+		}
+		sessions[i] = sj
+	}
+	return json.MarshalIndent(sessions, "", "  ")
 }
 
 func loadInstancesForList(storage *session.Storage, archivedOnly, includeArchived bool) ([]*session.Instance, []*session.GroupData, error) {

@@ -10,7 +10,7 @@ func TestSSHAttachPortableTERM(t *testing.T) {
 		t.Run(tc.input, func(t *testing.T) {
 			t.Setenv("TERM", tc.input)
 			r := &SSHRunner{Host: "fixture"}
-			args := r.buildAttachArgs("quoted ' session")
+			args := r.AttachArgs("quoted ' session")
 			if command := args[len(args)-1]; !strings.HasPrefix(command, "env TERM="+shellQuote(tc.want)+" ") {
 				t.Fatalf("remote command: %q", command)
 			}
@@ -22,6 +22,6 @@ func BenchmarkSSHAttachArgs(b *testing.B) {
 	b.Setenv("TERM", "xterm-256color")
 	runner := &SSHRunner{Host: "fixture"}
 	for i := 0; i < b.N; i++ {
-		runner.buildAttachArgs("session")
+		runner.AttachArgs("session")
 	}
 }
