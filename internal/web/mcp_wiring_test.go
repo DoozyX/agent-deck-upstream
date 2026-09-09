@@ -140,6 +140,29 @@ func TestServer_MCPRoute_AuthenticatedInitializeAndFleetStatus(t *testing.T) {
 	}
 }
 
+func TestServer_MCPRoute_AllowsReverseProxyHostOnLoopback(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	req, err := http.NewRequest(http.MethodPost, ts.URL+MCPRoute, strings.NewReader(mcpInitializeBody()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Host = "mcp-agent-deck.example.com"
+	req.Header.Set("Authorization", "Bearer "+wiringToken)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	resp, err := ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200 for an authenticated reverse-proxy Host", resp.StatusCode)
+	}
+}
+
 func TestServer_MCPRoute_MalformedAndInputValidation(t *testing.T) {
 	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
 	ts := httptest.NewServer(srv.Handler())

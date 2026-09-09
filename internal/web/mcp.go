@@ -20,7 +20,10 @@ func NewMCPHandler(deps MCPDependencies) http.Handler {
 
 	inner := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server {
 		return server
-	}, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
+	}, &mcpsdk.StreamableHTTPOptions{
+		JSONResponse:                true,
+		DisableLocalhostProtection: true,
+	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Fail closed on nil or false Authorize (never bypass when the seam is missing).
