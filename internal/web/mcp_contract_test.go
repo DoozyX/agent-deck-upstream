@@ -211,6 +211,12 @@ func TestClassifyMCPErrorKinds(t *testing.T) {
 		{errors.New(`tmux echoed additional property "pane" in status`), MCPErrorBackend},
 		{errors.New("required property sessionId missing from remote host"), MCPErrorBackend},
 		{errors.New("additional properties are not allowed by the remote"), MCPErrorBackend},
+		// Backend domain prefixes must not be peeled into validator forms.
+		{errors.New("storage: required: missing properties: [sessionId]"), MCPErrorBackend},
+		// Positive: jsonschema-go "validating <path>: " wrappers still classify.
+		{errors.New(`validating root: required: missing properties: ["sessionId"]`), MCPErrorMalformed},
+		{errors.New(`validating root: validating /properties/outer: required: missing properties: ["sessionId"]`), MCPErrorMalformed},
+		{errors.New(`validating root: unexpected additional properties ["command"]`), MCPErrorMalformed},
 	}
 	for _, tc := range cases {
 		if got := ClassifyMCPError(tc.err); got != tc.kind {
