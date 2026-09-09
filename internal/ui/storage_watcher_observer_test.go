@@ -80,11 +80,26 @@ func TestStorageWatcherStatusOnlyChangesDoNotReload(t *testing.T) {
 	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "status-only", Title: "session", Tool: "shell", Status: "idle"}))
 	settleWatcherInitialLoad(t, w, db)
 
-	// Status coordination is a volatile field in the registry row. It must not
-	// make the TUI rebuild every hydrated Instance when another deck writes it.
-	require.NoError(t, db.WriteStatus("status-only", "running", "shell"))
+	// A status sweep may also confirm/change its locally detected tool. Record
+	// that known WriteStatus provenance before the write, as Home does.
+	w.NotifyStatusWrite("status-only", "running", "codex")
+	require.NoError(t, db.WriteStatus("status-only", "running", "codex"))
 	w.checkAndNotify()
 	requireNoWatcherSignal(t, w)
+}
+
+func TestStorageWatcherExternalToolOnlyChangeReloads(t *testing.T) {
+	db := newTestDB(t)
+	w, err := NewStorageWatcher(db)
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "tool-only", Title: "session", Tool: "shell", Status: "idle"}))
+	settleWatcherInitialLoad(t, w, db)
+
+	_, err = db.DB().Exec("UPDATE instances SET tool = ? WHERE id = ?", "codex", "tool-only")
+	require.NoError(t, err)
+	w.checkAndNotify()
+	requireWatcherSignal(t, w)
 }
 
 func TestStorageWatcherStatusChurnDuringLoadDoesNotKeepReloadPending(t *testing.T) {

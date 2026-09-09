@@ -257,11 +257,10 @@ func filterWatcherSnapshot(snapshot *statedb.RegistrySnapshotResult, archived bo
 }
 
 // registrySnapshotsMateriallyEqual compares the fields that require
-// rehydrating the TUI. WriteStatus intentionally updates only the volatile
-// status/tool pair (plus the separate acknowledgment column), and those
-// values are refreshed by the background status path. Treating them as a
-// registry edit makes concurrent agent-deck processes turn every status tick
-// into a full session reload, which starves scroll input on a busy profile.
+// rehydrating the TUI. Status is refreshed by the background status path and
+// is therefore volatile. Tool remains material: NotifyStatusWrite advances
+// the baseline for known local WriteStatus calls, while an external tool edit
+// must hydrate the changed session definition.
 func registrySnapshotsMateriallyEqual(a, b *statedb.RegistrySnapshotResult) bool {
 	if a == nil || b == nil {
 		return a == b
@@ -281,8 +280,6 @@ func registrySnapshotsMateriallyEqual(a, b *statedb.RegistrySnapshotResult) bool
 		rightCopy := *right
 		leftCopy.Status = ""
 		rightCopy.Status = ""
-		leftCopy.Tool = ""
-		rightCopy.Tool = ""
 		if !reflect.DeepEqual(leftCopy, rightCopy) {
 			return false
 		}

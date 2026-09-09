@@ -128,6 +128,30 @@ func TestMCPInfoForRenderUsesOnlyCachedValues(t *testing.T) {
 	}
 }
 
+func TestMCPInfoFetchCompletionBeforeInvalidationIsDiscarded(t *testing.T) {
+	h := NewHome()
+	t.Cleanup(h.Close)
+	inst := &session.Instance{ID: "mcp-invalidated-in-flight", Tool: "codex"}
+	h.refreshSessionRenderSnapshot([]*session.Instance{inst})
+
+	staleFetch := h.fetchMCPInfo(inst)
+	if staleFetch == nil {
+		t.Fatal("initial MCP fetch was not started")
+	}
+	h.invalidatePreviewCache(inst.ID)
+	_, _ = h.Update(staleFetch())
+
+	h.mcpPreviewCacheMu.RLock()
+	_, staleCached := h.mcpPreviewCache[inst.ID]
+	h.mcpPreviewCacheMu.RUnlock()
+	if staleCached {
+		t.Fatal("MCP completion predating invalidation restored stale cache data")
+	}
+	if retry := h.fetchMCPInfo(inst); retry == nil {
+		t.Fatal("stale MCP completion suppressed the post-invalidation retry")
+	}
+}
+
 func TestRecentSessionsLoadedMessageUpdatesVisibleLocalDialog(t *testing.T) {
 	h, _, _ := newWatcherEffectsHome(t)
 	h.newDialog.ShowInGroup("work", "work", "/tmp", nil, "")
