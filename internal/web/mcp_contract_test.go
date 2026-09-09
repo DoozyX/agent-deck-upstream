@@ -195,18 +195,22 @@ func TestClassifyMCPErrorKinds(t *testing.T) {
 		{ErrMCPRateLimited, MCPErrorRateLimited},
 		{ErrMCPBackend, MCPErrorBackend},
 		{errors.New("session not found: abc"), MCPErrorNotFound},
-		{errors.New("malformed tool arguments"), MCPErrorMalformed},
-		{errors.New("required property sessionId missing"), MCPErrorMalformed},
+		{errors.New("mcp: malformed input"), MCPErrorMalformed},
 		{errors.New("required: missing properties: [\"sessionId\"]"), MCPErrorMalformed},
-		{errors.New("additional properties are not allowed"), MCPErrorMalformed},
-		// Singular form must classify as malformed (not only the plural phrasing).
-		{errors.New(`additional property "command" is not allowed`), MCPErrorMalformed},
 		{errors.New(`unexpected additional properties ["command"]`), MCPErrorMalformed},
+		// Singular MCP wrapper must use the exact prefixed form.
+		{errors.New(MCPAdditionalPropertyPrefix + ` "command"`), MCPErrorMalformed},
 		{errors.New("boom"), MCPErrorBackend},
 		// Backend failures that merely contain "invalid" must stay backend.
-		// (Supersedes any interim wording that mapped bare "invalid" to malformed.)
 		{errors.New("invalid session state from backend"), MCPErrorBackend},
 		{errors.New("tmux returned invalid pane id"), MCPErrorBackend},
+		// Negative: backend text that contains validator substrings but is not
+		// a pinned jsonschema-go / MCP wrapper message must stay backend.
+		{errors.New("storage lost missing properties while syncing"), MCPErrorBackend},
+		{errors.New("conductor reported an unexpected additional session"), MCPErrorBackend},
+		{errors.New(`tmux echoed additional property "pane" in status`), MCPErrorBackend},
+		{errors.New("required property sessionId missing from remote host"), MCPErrorBackend},
+		{errors.New("additional properties are not allowed by the remote"), MCPErrorBackend},
 	}
 	for _, tc := range cases {
 		if got := ClassifyMCPError(tc.err); got != tc.kind {
@@ -256,19 +260,28 @@ func TestClassifyMCPError_JSONSchemaResolvedForms(t *testing.T) {
 		}
 	})
 
-	t.Run("singular_additional_property", func(t *testing.T) {
-		// Drive the real schema once, then assert the singular message form
-		// (validators may pluralize; the classifier must accept singular too).
+	t.Run("unexpected_additional_properties_resolved", func(t *testing.T) {
 		err := resolve(t, "fleet_status").Validate(map[string]any{"command": "x"})
 		if err == nil {
 			t.Fatal("expected additional-properties validation error")
 		}
+		if !strings.Contains(err.Error(), "unexpected additional properties") {
+			t.Fatalf("unexpected validator wording: %v", err)
+		}
 		if got := ClassifyMCPError(err); got != MCPErrorMalformed {
 			t.Fatalf("ClassifyMCPError(resolved %v) = %v, want malformed", err, got)
 		}
-		singular := errors.New(`additional property "command" is not allowed`)
+	})
+
+	t.Run("singular_additional_property_prefixed", func(t *testing.T) {
+		singular := errors.New(MCPAdditionalPropertyPrefix + ` "command"`)
 		if got := ClassifyMCPError(singular); got != MCPErrorMalformed {
 			t.Fatalf("ClassifyMCPError(%v) = %v, want malformed", singular, got)
+		}
+		// Non-prefixed singular phrasing must not reclassify backend noise.
+		loose := errors.New(`additional property "command" is not allowed`)
+		if got := ClassifyMCPError(loose); got != MCPErrorBackend {
+			t.Fatalf("ClassifyMCPError(%v) = %v, want backend", loose, got)
 		}
 	})
 }
