@@ -13,7 +13,10 @@ func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 	rowType := reflect.TypeOf(InstanceRow{})
 	for field := 0; field < rowType.NumField(); field++ {
 		name := rowType.Field(field).Name
-		if name == "ID" || name == "ToolData" {
+		// PersistenceGeneration is not a column of `instances`: it is read
+		// back from instance_tombstones by the loader's COALESCE subquery, so
+		// no snapshot merge can carry a caller-set value through a write.
+		if name == "ID" || name == "ToolData" || name == "PersistenceGeneration" {
 			continue
 		}
 		t.Run(name, func(t *testing.T) {
@@ -29,7 +32,7 @@ func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 				value.SetString("other writer")
 			case reflect.Bool:
 				value.SetBool(true)
-			case reflect.Int:
+			case reflect.Int, reflect.Int64:
 				value.SetInt(42)
 			case reflect.Struct:
 				value.Set(reflect.ValueOf(time.Unix(12345, 0)))

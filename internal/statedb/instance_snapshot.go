@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"time"
@@ -117,6 +118,19 @@ func (s *StateDB) mergeRegistrySnapshotsOnce(updates []InstanceSnapshot, groups 
 			return nil, fmt.Errorf("duplicate instance snapshot: %s", id)
 		}
 		seen[id] = true
+		if byID[id] == nil {
+			// A row missing from the snapshot may simply be gone, or it may be
+			// durably deleted. The tombstone is the more specific answer and
+			// callers match on it (a recovered-instance write must not
+			// resurrect a deleted id), so it wins over the generic conflict.
+			tombstoned, tombErr := instanceTombstoned(ctx, conn, id)
+			if tombErr != nil {
+				return nil, tombErr
+			}
+			if tombstoned {
+				return nil, fmt.Errorf("%w: %s", ErrInstanceTombstoned, id)
+			}
+		}
 		merged[i], err = mergeInstanceSnapshot(update, byID[id])
 		if err != nil {
 			return nil, err
@@ -316,4 +330,18 @@ func writeSnapshotRow(ctx context.Context, conn *sql.Conn, row *InstanceRow, exi
 	}
 	_, err := conn.ExecContext(ctx, query, args...)
 	return err
+}
+
+// instanceTombstoned reports whether id carries an active durable deletion
+// tombstone, read inside the caller's open transaction.
+func instanceTombstoned(ctx context.Context, conn *sql.Conn, id string) (bool, error) {
+	var active int
+	err := conn.QueryRowContext(ctx, "SELECT active FROM instance_tombstones WHERE id = ?", id).Scan(&active)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return active != 0, nil
 }

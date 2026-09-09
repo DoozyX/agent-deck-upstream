@@ -1216,9 +1216,22 @@ func (s *StateDB) LoadInstancesByArchive(archived bool) ([]*InstanceRow, error) 
 }
 
 func (s *StateDB) loadInstances(where string) ([]*InstanceRow, error) {
+	return loadInstancesWhere(s.db.Query, where)
+}
+
+// loadInstances reads every instance through the caller's own query function so
+// transaction-scoped callers (instance_snapshot, registry_observer) observe the
+// rows their open transaction has written. #2114 refactored this into the
+// *StateDB method above and dropped the free function while leaving its three
+// callers in place, which left the package uncompilable.
+func loadInstances(query func(string, ...any) (*sql.Rows, error)) ([]*InstanceRow, error) {
+	return loadInstancesWhere(query, "")
+}
+
+func loadInstancesWhere(query func(string, ...any) (*sql.Rows, error), where string) ([]*InstanceRow, error) {
 	// #nosec G202 -- where is selected only from the two constant predicates in
 	// LoadInstancesByArchive (or empty in LoadInstances), never user input.
-	query := `
+	stmt := `
 		SELECT id, title, project_path, group_path, sort_order,
 			command, wrapper, tool, status, tmux_session, tmux_socket_name,
 			created_at, last_accessed,
@@ -1228,7 +1241,7 @@ func (s *StateDB) loadInstances(where string) ([]*InstanceRow, error) {
 			COALESCE((SELECT generation FROM instance_tombstones WHERE id = instances.id), 0)
 		FROM instances ` + where + ` ORDER BY sort_order
 	`
-	rows, err := s.db.Query(query)
+	rows, err := query(stmt)
 	if err != nil {
 		return nil, err
 	}

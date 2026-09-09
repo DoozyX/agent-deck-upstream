@@ -22,7 +22,7 @@ func TestSSHAttachCommandExecution(t *testing.T) {
 				t.Fatal(err)
 			}
 			runner := &SSHRunner{Host: "fixture", AgentDeckPath: executable, Profile: "profile ' quoted"}
-			args := runner.buildAttachArgs("session ' quoted")
+			args := runner.AttachArgs("session ' quoted")
 			output, err := exec.Command("/bin/sh", "-c", args[len(args)-1]).CombinedOutput()
 			if err != nil {
 				t.Fatalf("command failed: %v: %s", err, output)

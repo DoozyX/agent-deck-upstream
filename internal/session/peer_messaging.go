@@ -54,15 +54,6 @@ func (i *Instance) PeerMessagingCandidate() bool {
 	return i != nil && IsClaudeCompatible(i.Tool)
 }
 
-func extraArgsSupplyName(extraArgs []string) bool {
-	for _, tok := range extraArgs {
-		if tok == "--name" || strings.HasPrefix(tok, "--name=") {
-			return true
-		}
-	}
-	return false
-}
-
 func (i *Instance) suppliesClaudeName() bool {
 	if extraArgsSupplyName(i.ExtraArgs) || commandTokensSupplyName(i.Wrapper) {
 		return true
