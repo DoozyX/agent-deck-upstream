@@ -84,10 +84,11 @@ func registerMCPTools(server *mcpsdk.Server, deps MCPDependencies) {
 }
 
 func mcpGuardMutation(deps MCPDependencies) error {
-	if deps.MutationsAllowed != nil && !deps.MutationsAllowed() {
+	// Fail closed when safety seams are missing or deny the mutation.
+	if deps.MutationsAllowed == nil || !deps.MutationsAllowed() {
 		return ErrMCPMutationDisabled
 	}
-	if deps.AllowMutation != nil && !deps.AllowMutation() {
+	if deps.AllowMutation == nil || !deps.AllowMutation() {
 		return ErrMCPRateLimited
 	}
 	return nil
@@ -116,8 +117,8 @@ func mcpFleetStatus(deps MCPDependencies) (MCPFleetStatusResult, error) {
 		Profile:       snap.Profile,
 		TotalGroups:   snap.TotalGroups,
 		TotalSessions: snap.TotalSessions,
-		Sessions:      make([]MCPSessionSummary, 0, snap.TotalSessions),
-		Groups:        make([]MCPGroupSummary, 0, snap.TotalGroups),
+		Sessions:      make([]MCPSessionSummary, 0, mcpNonNegCap(snap.TotalSessions)),
+		Groups:        make([]MCPGroupSummary, 0, mcpNonNegCap(snap.TotalGroups)),
 	}
 	for _, item := range snap.Items {
 		if item.Group != nil {
@@ -184,17 +185,24 @@ func mcpSendToSession(deps MCPDependencies, in MCPSendToSessionInput) (MCPMutati
 	if err != nil {
 		return MCPMutationResult{}, err
 	}
-	msg := strings.TrimSpace(in.Message)
-	if msg == "" {
+	// Trim only to reject all-whitespace input; forward the original message.
+	if strings.TrimSpace(in.Message) == "" {
 		return MCPMutationResult{}, fmt.Errorf("%w: message is required", ErrMCPMalformed)
 	}
 	if deps.Mutator == nil {
 		return MCPMutationResult{}, fmt.Errorf("%w: session mutator unavailable", ErrMCPBackend)
 	}
-	if err := deps.Mutator.SendToSession(id, msg); err != nil {
+	if err := deps.Mutator.SendToSession(id, in.Message); err != nil {
 		return MCPMutationResult{}, mapMutatorError(err)
 	}
 	return MCPMutationResult{SessionID: id, OK: true}, nil
+}
+
+func mcpNonNegCap(n int) int {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 func mcpMutateSession(deps MCPDependencies, sessionID string, fn func(SessionMutator, string) error) (MCPMutationResult, error) {
