@@ -260,6 +260,102 @@ func TestMCP_SendToSession_DelegatesOnly(t *testing.T) {
 	}
 }
 
+func TestMCP_SendToSession_PreservesMeaningfulWhitespace(t *testing.T) {
+	const wantMsg = "  indented code\n\tline\n"
+	var gotMsg string
+	mut := &fakeMutator{
+		sendToSessionFn: func(_, message string) error {
+			gotMsg = message
+			return nil
+		},
+	}
+	cs, _ := connectMCP(t, mcpTestDeps(t, mut))
+	_, isErr, err := callToolJSON(t, cs, "send_to_session", map[string]any{
+		"sessionId": "sess-1",
+		"message":   wantMsg,
+	})
+	if err != nil || isErr {
+		t.Fatalf("send_to_session: isErr=%v err=%v", isErr, err)
+	}
+	if gotMsg != wantMsg {
+		t.Fatalf("mutator message = %q, want byte-for-byte %q", gotMsg, wantMsg)
+	}
+
+	_, isErr, err = callToolJSON(t, cs, "send_to_session", map[string]any{
+		"sessionId": "sess-1",
+		"message":   "   \n\t  ",
+	})
+	if !isErr || ClassifyMCPError(err) != MCPErrorMalformed {
+		t.Fatalf("all-whitespace message: isErr=%v kind=%s err=%v", isErr, ClassifyMCPError(err), err)
+	}
+}
+
+func TestMCP_NilMutationSeamsFailClosed(t *testing.T) {
+	var delegated atomic.Int64
+	mut := &fakeMutator{
+		startSessionFn: func(string) error {
+			delegated.Add(1)
+			return nil
+		},
+		sendToSessionFn: func(string, string) error {
+			delegated.Add(1)
+			return nil
+		},
+	}
+
+	deps := mcpTestDeps(t, mut)
+	deps.MutationsAllowed = nil
+	cs, _ := connectMCP(t, deps)
+	for _, tool := range []string{"send_to_session", "start_session", "stop_session", "restart_session"} {
+		args := map[string]any{"sessionId": "sess-1"}
+		if tool == "send_to_session" {
+			args["message"] = "x"
+		}
+		_, isErr, err := callToolJSON(t, cs, tool, args)
+		if !isErr || ClassifyMCPError(err) != MCPErrorMutationDisabled {
+			t.Fatalf("%s nil MutationsAllowed: isErr=%v kind=%s err=%v", tool, isErr, ClassifyMCPError(err), err)
+		}
+	}
+
+	deps = mcpTestDeps(t, mut)
+	deps.AllowMutation = nil
+	cs2, _ := connectMCP(t, deps)
+	_, isErr, err := callToolJSON(t, cs2, "start_session", map[string]any{"sessionId": "sess-1"})
+	if !isErr || ClassifyMCPError(err) != MCPErrorRateLimited {
+		t.Fatalf("nil AllowMutation: isErr=%v kind=%s err=%v", isErr, ClassifyMCPError(err), err)
+	}
+	if delegated.Load() != 0 {
+		t.Fatalf("nil safety seams must not delegate; delegated=%d", delegated.Load())
+	}
+}
+
+func TestMCP_FleetStatus_NegativeTotalsNoPanic(t *testing.T) {
+	deps := mcpTestDeps(t, nil)
+	deps.Loader = snapshotLoader{snap: &MenuSnapshot{
+		Profile:       "default",
+		TotalGroups:   -3,
+		TotalSessions: -1,
+		Items: []MenuItem{
+			{Type: "session", Session: &MenuSession{ID: "sess-neg", Title: "Neg", Tool: "claude", Status: session.StatusIdle}},
+		},
+	}}
+	cs, _ := connectMCP(t, deps)
+	raw, isErr, err := callToolJSON(t, cs, "fleet_status", map[string]any{})
+	if err != nil || isErr {
+		t.Fatalf("fleet_status with negative totals: isErr=%v err=%v", isErr, err)
+	}
+	var got MCPFleetStatusResult
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("decode: %v body=%s", err, raw)
+	}
+	if got.TotalSessions != -1 || got.TotalGroups != -3 {
+		t.Fatalf("totals = %+v", got)
+	}
+	if len(got.Sessions) != 1 || got.Sessions[0].ID != "sess-neg" {
+		t.Fatalf("sessions=%+v", got.Sessions)
+	}
+}
+
 func TestMCP_LifecycleTools_DelegateAndGuards(t *testing.T) {
 	var started, stopped, restarted []string
 	mut := &fakeMutator{
