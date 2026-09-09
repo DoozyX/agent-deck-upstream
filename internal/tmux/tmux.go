@@ -1509,8 +1509,15 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			"--property=StartLimitIntervalSec=60",
 			"--property=KillMode=control-group",
 			"--property=TimeoutStopSec=15s",
-			"tmux",
 		}
+		// A user service is started by the user manager, not by this
+		// process, so it does not inherit the caller's dynamic environment.
+		// Carry the socket base explicitly or the service creates its tmux
+		// server on the default socket and the creator cannot prove ownership.
+		if tmuxTmp := os.Getenv("TMUX_TMPDIR"); tmuxTmp != "" {
+			svcArgs = append(svcArgs, "--setenv=TMUX_TMPDIR="+tmuxTmp)
+		}
+		svcArgs = append(svcArgs, "tmux")
 		svcArgs = append(svcArgs, tmuxArgs...)
 		return "systemd-run", svcArgs
 

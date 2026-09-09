@@ -936,6 +936,19 @@ func TestDeepSeekPromptDelivery(t *testing.T) {
 	}
 }
 
+func TestDeepSeekInteractiveProfileUsesShellPaneProcess(t *testing.T) {
+	withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{Profile: "tui"}})
+	interactive := &Instance{Tool: "deepseek", ID: "interactive"}
+	if interactive.runCommandAsInitialProcess() {
+		t.Fatal("interactive DeepSeek profile must start through the pane shell so it retains the controlling PTY")
+	}
+
+	withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{Profile: "headless"}})
+	if !(&Instance{Tool: "deepseek", ID: "headless"}).runCommandAsInitialProcess() {
+		t.Fatal("headless DeepSeek profile must retain initial-process launch for one-shot acknowledgement")
+	}
+}
+
 // TestDeepSeekHeadlessTaskRoundTrip pins the persistence half of P1c: the task
 // travels in the tool_data extras zone, so a restart in a fresh process still
 // knows what to replay.
