@@ -21,7 +21,10 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		Mutator:   &mcpLiveMutator{s: s},
 		Authorize: s.authorizeRequest,
 		MutationsAllowed: func() bool {
-			return s.cfg.WebMutations
+			// ReadOnly and WebMutations are independent Config inputs; both must
+			// allow writes (web_cmd clears WebMutations when --read-only is set,
+			// but direct Config{ReadOnly:true, WebMutations:true} must still deny).
+			return !s.cfg.ReadOnly && s.cfg.WebMutations
 		},
 		AllowMutation: func() bool {
 			return s.mutationLimiter.Allow()
