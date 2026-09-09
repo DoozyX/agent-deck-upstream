@@ -1900,8 +1900,11 @@ func handleAdd(profile string, args []string) {
 			}
 		}
 		worktreeRepoRoot = repoRoot
-		// Update path to point to worktree so session uses worktree as working directory
-		path = worktreePath
+		// Point the session's working directory at the worktree, unless
+		// [worktree].session_cwd = "repo-root" asks for the base repository so
+		// the conversation joins the root project's `claude --resume` history.
+		path = session.ResolveWorktreeSessionCwd(
+			session.GetWorktreeSessionCwd(), worktreePath, worktreeRepoRoot)
 	}
 
 	// Default title to folder name

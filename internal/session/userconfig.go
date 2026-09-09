@@ -2509,6 +2509,24 @@ type WorktreeSettings struct {
 	// AutoCleanup: remove worktree when session is deleted (default: true, nil = true)
 	AutoCleanup *bool `toml:"auto_cleanup,omitempty"`
 
+	// SessionCwd selects the working directory a new worktree session starts
+	// in. Claude Code buckets conversation history by startup cwd
+	// (~/.claude/projects/<slug-of-cwd>/), so a session started inside the
+	// worktree gets its own resume history that is invisible from the repo
+	// root — one throwaway bucket per worktree.
+	//
+	//   "worktree"  (default) — start in the worktree, today's behaviour.
+	//   "repo-root"           — start in the base repository, so every
+	//                           session in the repo shares one resume
+	//                           history. The worktree is still created and
+	//                           is passed to the agent via --add-dir plus a
+	//                           system-prompt directive telling it to work
+	//                           there.
+	//
+	// The choice is applied at session creation and baked into the session's
+	// project path, so flipping it never moves an existing session's history.
+	SessionCwd string `toml:"session_cwd,omitempty"`
+
 	// DefaultEnabled controls whether worktree creation is pre-selected in
 	// new-session and fork dialogs by default.
 	// Default: false

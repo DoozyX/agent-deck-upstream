@@ -1385,7 +1385,11 @@ func handleSessionFork(profile string, args []string) {
 
 		userConfig, _ := session.LoadUserConfig()
 		opts = session.NewClaudeOptions(userConfig)
-		opts.WorkDir = worktreePath
+		// See ResolveWorktreeSessionCwd: "repo-root" mode starts the fork in
+		// the base repository so its transcript joins the root project's
+		// resume history; the worktree still holds the work.
+		opts.WorkDir = session.ResolveWorktreeSessionCwd(
+			session.GetWorktreeSessionCwd(), worktreePath, repoRoot)
 		opts.WorktreePath = worktreePath
 		opts.WorktreeRepoRoot = repoRoot
 		opts.WorktreeBranch = wtBranch

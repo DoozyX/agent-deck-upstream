@@ -1945,6 +1945,22 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 		flags = append(flags, "--add-dir "+shellescape.Quote(i.ParentProjectPath))
 	}
 
+	// [worktree].session_cwd = "repo-root": the session starts at the repo root
+	// (so its transcript joins the root project's resume history) but owns a
+	// worktree elsewhere. Grant the worktree explicitly and tell the agent to
+	// work there — without the directive it would treat the repo root as its
+	// work tree and commit onto whatever branch the main checkout has out.
+	if i.RunsOutsideItsWorktree() {
+		if resolveRealPath(i.WorktreePath) != resolveRealPath(i.ParentProjectPath) {
+			flags = append(flags, "--add-dir "+shellescape.Quote(i.WorktreePath))
+		}
+		if directive := WorktreeCwdDirective(
+			i.WorktreePath, i.WorktreeBranch, i.EffectiveWorkingDir(),
+		); directive != "" {
+			flags = append(flags, "--append-system-prompt "+shellescape.Quote(directive))
+		}
+	}
+
 	// Multi-repo: pass all project paths via --add-dir (deduplicated, excluding cwd)
 	if i.MultiRepoEnabled {
 		seen := make(map[string]bool)
