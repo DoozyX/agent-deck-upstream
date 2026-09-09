@@ -219,6 +219,45 @@ func TestBuildWebServer_MCPRoutesUnavailableWithoutToken(t *testing.T) {
 	}
 }
 
+func TestBuildWebServer_MCPNoAuthOnlyBypassesDedicatedMCP(t *testing.T) {
+	withTempHomeAndConfig(t, "")
+	srv, err := buildWebServer("test-profile", []string{
+		"--listen", "127.0.0.1:0",
+		"--token", "flag-secret",
+		"--mcp-no-auth",
+	}, emptyMenuData{}, noopMutator{})
+	if err != nil {
+		t.Fatalf("buildWebServer: %v", err)
+	}
+
+	mcp := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(mcp, func() *http.Request {
+		req := httptest.NewRequest(http.MethodPost, web.MCPRoute, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"no-auth","version":"0"}}}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		return req
+	}())
+	if mcp.Code != http.StatusOK {
+		t.Fatalf("unauthenticated /mcp status=%d body=%s, want 200", mcp.Code, mcp.Body.String())
+	}
+
+	api := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(api, httptest.NewRequest(http.MethodGet, "/api/menu", nil))
+	if api.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/menu status=%d body=%s, want 401", api.Code, api.Body.String())
+	}
+}
+
+func TestParseWebCommandOptions_MCPNoAuth(t *testing.T) {
+	options, err := parseWebCommandOptions([]string{"--mcp-no-auth"})
+	if err != nil {
+		t.Fatalf("parseWebCommandOptions: %v", err)
+	}
+	if !options.mcpNoAuth {
+		t.Fatal("--mcp-no-auth was not parsed")
+	}
+}
+
 // TestResolveWebToken_FailsClosed pins the resolver's refusal paths. Every one
 // of them must return an error: returning an empty token instead would turn
 // Server.authorize() into a no-op and open every authenticated route.

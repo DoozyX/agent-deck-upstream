@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/time/rate"
@@ -88,6 +89,13 @@ func TestServer_MCPRoute_CredentialMatrix(t *testing.T) {
 			t.Fatalf("initialize body missing protocolVersion: %s", rec.Body.String())
 		}
 	})
+
+	t.Run("lowercase bearer initializes", func(t *testing.T) {
+		rec := postMCP(t, h, MCPRoute, "bearer "+wiringToken, mcpInitializeBody(), "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+		}
+	})
 }
 
 func TestServer_MCPRoute_UnavailableWithoutToken(t *testing.T) {
@@ -160,6 +168,44 @@ func TestServer_MCPRoute_AllowsReverseProxyHostOnLoopback(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200 for an authenticated reverse-proxy Host", resp.StatusCode)
+	}
+}
+
+func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
+	previousTimeout := mcpSessionTimeout
+	mcpSessionTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { mcpSessionTimeout = previousTimeout })
+
+	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	newClientSession := func() *mcpsdk.ClientSession {
+		t.Helper()
+		client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "timeout-test", Version: "0"}, nil)
+		session, err := client.Connect(context.Background(), &mcpsdk.StreamableClientTransport{
+			Endpoint:   ts.URL + MCPRoute,
+			HTTPClient: bearerHTTPClient(wiringToken),
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+		return session
+	}
+
+	idle := newClientSession()
+	active := newClientSession()
+	time.Sleep(100 * time.Millisecond)
+	if _, err := active.ListTools(context.Background(), nil); err != nil {
+		t.Fatalf("active session should remain usable before timeout: %v", err)
+	}
+	time.Sleep(150 * time.Millisecond)
+	if _, err := idle.ListTools(context.Background(), nil); err == nil {
+		t.Fatal("idle session should expire")
+	}
+	if _, err := active.ListTools(context.Background(), nil); err != nil {
+		t.Fatalf("active session should remain usable after idle session expires: %v", err)
 	}
 }
 

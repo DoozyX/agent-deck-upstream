@@ -7,19 +7,25 @@ import (
 )
 
 // registerMCPRoute mounts the dedicated Streamable HTTP MCP endpoint.
-// Production MCP is available only when Config.Token is non-empty.
+// Production MCP is available when Config.Token is non-empty. MCPNoAuth is an
+// explicit temporary escape hatch for the dedicated endpoint only; it does
+// not change authorization on the rest of the web server.
 func (s *Server) registerMCPRoute(mux *http.ServeMux) {
-	if strings.TrimSpace(s.cfg.Token) == "" {
+	if strings.TrimSpace(s.cfg.Token) == "" && !s.cfg.MCPNoAuth {
 		mux.HandleFunc(MCPRoute, func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, ErrMCPUnauthorized.Error(), http.StatusUnauthorized)
 		})
 		return
 	}
+	authorize := s.authorizeRequest
+	if s.cfg.MCPNoAuth {
+		authorize = func(*http.Request) bool { return true }
+	}
 
 	mux.Handle(MCPRoute, NewMCPHandler(MCPDependencies{
 		Loader:    s.menuData,
 		Mutator:   &mcpLiveMutator{s: s},
-		Authorize: s.authorizeRequest,
+		Authorize: authorize,
 		MutationsAllowed: func() bool {
 			// ReadOnly and WebMutations are independent Config inputs; both must
 			// allow writes (web_cmd clears WebMutations when --read-only is set,

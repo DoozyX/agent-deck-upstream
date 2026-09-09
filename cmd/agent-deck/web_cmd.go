@@ -37,6 +37,7 @@ type webCommandOptions struct {
 	readOnly         bool
 	token            string
 	tokenFile        string
+	mcpNoAuth        bool
 	insecureBind     bool
 	pushEnabled      bool
 	pushVAPIDSubject string
@@ -51,6 +52,7 @@ func parseWebCommandOptions(args []string) (webCommandOptions, error) {
 	fs.BoolVar(&options.readOnly, "read-only", false, "Run in read-only mode (input disabled)")
 	fs.StringVar(&options.token, "token", "", "Bearer token for API/WS access")
 	fs.StringVar(&options.tokenFile, "token-file", "", "Read bearer token for API/WS access from a 0600 file (keeps the secret out of the process argv)")
+	fs.BoolVar(&options.mcpNoAuth, "mcp-no-auth", false, "Expose full-permission /mcp without bearer auth (UNSAFE: temporary testing only; web/API routes stay token-protected when a token is configured)")
 	fs.BoolVar(&options.insecureBind, "insecure-bind", false, "Allow binding a non-loopback address with no --token or --token-file (UNSAFE: exposes an unauthenticated RCE surface to the network)")
 	fs.BoolVar(&options.pushEnabled, "push", false, "Enable web push notifications (auto-generates VAPID keys per profile)")
 	fs.StringVar(&options.pushVAPIDSubject, "push-vapid-subject", "mailto:agentdeck@localhost", "VAPID subject used for web push notifications")
@@ -74,6 +76,7 @@ func parseWebCommandOptions(args []string) (webCommandOptions, error) {
 		fmt.Println("  agent-deck web --no-tui --listen 127.0.0.1:9000")
 		fmt.Println("  agent-deck web --listen 0.0.0.0:8420 --token secret  # expose to LAN (token REQUIRED)")
 		fmt.Println("  agent-deck web --listen 0.0.0.0:8420 --token-file ~/.config/agent-deck/web-token")
+		fmt.Println("  agent-deck web --no-tui --token-file ~/.config/agent-deck/web-token --mcp-no-auth  # temporary MCP testing")
 		fmt.Println()
 		fmt.Println("Security: the server binds loopback (127.0.0.1) by default. Binding a")
 		fmt.Println("non-loopback address without --token or --token-file is refused — it would")
@@ -83,6 +86,8 @@ func parseWebCommandOptions(args []string) (webCommandOptions, error) {
 		fmt.Println("(chmod 600); it keeps the secret out of argv, where any local user can read")
 		fmt.Println("it from /proc. MCP administration over HTTP is only wired when a token is")
 		fmt.Println("configured — an unauthenticated server keeps those routes unavailable.")
+		fmt.Println("--mcp-no-auth is a temporary unsafe exception for /mcp only; keep")
+		fmt.Println("--token or --token-file to leave the browser/API routes protected.")
 	}
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
@@ -149,6 +154,7 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 		ReadOnly:            options.readOnly,
 		WebMutations:        resolveMutationsEnabled(options.readOnly),
 		Token:               resolvedToken,
+		MCPNoAuth:           options.mcpNoAuth,
 		InsecureBind:        options.insecureBind,
 		TrustedDomains:      session.GetWebTrustedDomains(),
 		ConfirmLinkOpen:     &confirmLinkOpen,
@@ -173,9 +179,9 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 	// no unauthenticated surface. See TestBuildWebServer_MCPRoutesAuth for the
 	// endpoint-by-endpoint regression matrix.
 	//
-	// The dedicated Streamable HTTP /mcp endpoint is gated the same way inside
-	// web.NewServer (Config.Token): it is mounted only when resolveWebToken
-	// yielded a non-empty bearer. Do not duplicate auth here.
+	// The dedicated Streamable HTTP /mcp endpoint is gated inside web.NewServer
+	// (Config.Token), with the explicit --mcp-no-auth escape hatch handled only
+	// there. Do not duplicate its route authorization here.
 	if resolvedToken != "" {
 		server.SetMCPManager(web.NewDefaultMCPManager())
 	}
