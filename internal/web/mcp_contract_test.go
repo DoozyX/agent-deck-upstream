@@ -19,10 +19,10 @@ func TestMCPRouteConstant(t *testing.T) {
 	}
 }
 
-func TestMCPToolCatalog_ExactSixWithReadOnlyAnnotations(t *testing.T) {
+func TestMCPToolCatalog_ExactEightWithReadOnlyAnnotations(t *testing.T) {
 	catalog := MCPToolCatalog()
-	if len(catalog) != 6 {
-		t.Fatalf("catalog len = %d, want 6", len(catalog))
+	if len(catalog) != 8 {
+		t.Fatalf("catalog len = %d, want 8", len(catalog))
 	}
 	wantNames := []string{
 		"fleet_status",
@@ -31,6 +31,8 @@ func TestMCPToolCatalog_ExactSixWithReadOnlyAnnotations(t *testing.T) {
 		"start_session",
 		"stop_session",
 		"restart_session",
+		"create_session",
+		"delete_session",
 	}
 	for i, name := range wantNames {
 		if catalog[i].Name != name {
@@ -47,6 +49,12 @@ func TestMCPToolCatalog_ExactSixWithReadOnlyAnnotations(t *testing.T) {
 		if readOnly != wantRO {
 			t.Fatalf("tool %q ReadOnlyHint = %v, want %v", name, readOnly, wantRO)
 		}
+		if name == "delete_session" && (catalog[i].Annotations.DestructiveHint == nil || !*catalog[i].Annotations.DestructiveHint) {
+			t.Fatalf("delete_session must advertise destructiveHint=true")
+		}
+		if name == "create_session" && (catalog[i].Annotations.DestructiveHint == nil || *catalog[i].Annotations.DestructiveHint) {
+			t.Fatalf("create_session must advertise destructiveHint=false")
+		}
 	}
 }
 
@@ -58,6 +66,8 @@ func TestMCPToolInputSchemas_RequiredFieldsNoCommandOrURL(t *testing.T) {
 		"start_session":   {"sessionId"},
 		"stop_session":    {"sessionId"},
 		"restart_session": {"sessionId"},
+		"create_session":  {"title", "projectPath"},
+		"delete_session":  {"sessionId"},
 	}
 	for _, tool := range MCPToolCatalog() {
 		required, ok := cases[tool.Name]
