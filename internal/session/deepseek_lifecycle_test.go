@@ -94,6 +94,45 @@ func waitForPane(t *testing.T, inst *Instance, want string, timeout time.Duratio
 	return ""
 }
 
+func launchAckArtifacts() map[string]struct{} {
+	artifacts := make(map[string]struct{})
+	for _, path := range launchAckArtifactPaths() {
+		artifacts[path] = struct{}{}
+	}
+	return artifacts
+}
+
+func launchAckArtifactPaths() []string {
+	paths, _ := filepath.Glob(filepath.Join(os.TempDir(), "agent-deck-launch-ack-*"))
+	return paths
+}
+
+func waitForLaunchAckArtifactsGone(t *testing.T, before map[string]struct{}, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		matches := launchAckArtifactPaths()
+		newArtifacts := make([]string, 0, len(matches))
+		for _, path := range matches {
+			if _, existed := before[path]; !existed {
+				newArtifacts = append(newArtifacts, path)
+			}
+		}
+		if len(newArtifacts) == 0 {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	matches := launchAckArtifactPaths()
+	newArtifacts := make([]string, 0, len(matches))
+	for _, path := range matches {
+		if _, existed := before[path]; !existed {
+			newArtifacts = append(newArtifacts, path)
+		}
+	}
+	t.Fatalf("late-completion marker artifacts remain after %s: %v", timeout, newArtifacts)
+}
+
 func TestDeepSeekLifecycle_LaunchSendRestart(t *testing.T) {
 	// New test: uses TestMain's bootstrapped server on the isolated socket, so
 	// the binary check is the right gate (skipIfNoTmuxServer is the legacy one).
@@ -498,5 +537,102 @@ func TestDeepSeekLifecycle_HeadlessRestartWithoutTaskIsRefused(t *testing.T) {
 	inst.DeepSeekTask = "run the tests"
 	if !inst.CanRestart() {
 		t.Error("CanRestart() = false once the task is known")
+	}
+}
+
+func TestDeepSeekLifecycle_HeadlessNonzeroExitFailsAndCleans(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+
+	fake := fakeDshPath(t)
+	dshHome := t.TempDir()
+	workspace := t.TempDir()
+	t.Setenv("DSH_HOME", dshHome)
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{
+		Command:   fake,
+		ConfigDir: dshHome,
+		Profile:   "headless",
+	}})
+
+	inst := NewInstanceWithTool("deepseek-headless-nonzero-e2e", workspace, "deepseek")
+	err := inst.StartWithMessage("run without credentials")
+	if err == nil || !strings.Contains(err.Error(), "exit status 1") {
+		t.Fatalf("StartWithMessage() = %v, want headless exit status 1", err)
+	}
+	if inst.Exists() {
+		t.Fatal("failed headless launch left a stale tmux session")
+	}
+	if !inst.LastStartedAt.IsZero() {
+		t.Fatalf("LastStartedAt = %v, want zero after failed launch", inst.LastStartedAt)
+	}
+	rec := inst.SpawnFailure()
+	if rec == nil || !strings.Contains(rec.DyingOutput, "MISSING_CREDENTIAL") {
+		t.Fatalf("SpawnFailure() = %#v, want preserved credential diagnostic", rec)
+	}
+	if rec != nil && strings.Count(rec.DyingOutput, "MISSING_CREDENTIAL") != 1 {
+		t.Fatalf("SpawnFailure().DyingOutput = %q, want credential diagnostic exactly once", rec.DyingOutput)
+	}
+}
+
+func TestDeepSeekLifecycle_HeadlessLateCompletion(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	fake := fakeDshPath(t)
+	for _, tc := range []struct {
+		name      string
+		wantError bool
+	}{
+		{name: "success"},
+		{name: "failure", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ackArtifactsBefore := launchAckArtifacts()
+			home := t.TempDir()
+			workspace := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, ".credentials.yaml"), []byte("deepseek: test\n"), 0o600); err != nil {
+				t.Fatalf("write fake credentials: %v", err)
+			}
+			t.Setenv("DSH_HOME", home)
+			withConfig(t, &UserConfig{DeepSeek: DeepSeekSettings{
+				Command: fake, ConfigDir: home, Profile: "headless",
+			}})
+
+			inst := NewInstanceWithTool("deepseek-headless-late-"+tc.name, workspace, "deepseek")
+			task := "__agentdeck_late_success__"
+			if tc.wantError {
+				task = "__agentdeck_late_failure__"
+			}
+			err := inst.StartWithMessage(task)
+			if err != nil {
+				t.Fatalf("StartWithMessage() = %v, want post-ack success", err)
+			}
+
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
+				rec := inst.SpawnFailure()
+				if tc.wantError && rec != nil {
+					if !strings.Contains(rec.DyingOutput, "LATE_HEADLESS_DIAGNOSTIC") {
+						t.Fatalf("late failure diagnostic = %q, want preserved output", rec.DyingOutput)
+					}
+					if strings.Count(rec.DyingOutput, "LATE_HEADLESS_DIAGNOSTIC") != 1 {
+						t.Fatalf("late failure diagnostic = %q, want output exactly once", rec.DyingOutput)
+					}
+					if !inst.Exists() {
+						waitForLaunchAckArtifactsGone(t, ackArtifactsBefore, 5*time.Second)
+						return
+					}
+				}
+				if !tc.wantError && rec == nil && inst.Exists() {
+					if content, captureErr := inst.PreviewFull(); captureErr == nil && strings.Contains(content, "LATE_HEADLESS_DIAGNOSTIC") {
+						waitForLaunchAckArtifactsGone(t, ackArtifactsBefore, 5*time.Second)
+						return
+					}
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+			if tc.wantError {
+				t.Fatalf("late nonzero completion was not recorded; session exists=%v", inst.Exists())
+			}
+			t.Fatalf("successful late completion did not remain a clean one-shot; session exists=%v", inst.Exists())
+		})
 	}
 }

@@ -11,8 +11,10 @@ import (
 // TestSyncSessionIDsFromTmux_Claude verifies that a CLAUDE_SESSION_ID in the tmux
 // environment is read into ClaudeSessionID and ClaudeDetectedAt is set.
 func TestSyncSessionIDsFromTmux_Claude(t *testing.T) {
-	skipIfNoTmuxServer(t)
-	skipIfNoClaudeBinary(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	inst := NewInstanceWithTool("test-sync-claude", "/tmp", "claude")
 	err := inst.Start()
@@ -48,8 +50,10 @@ func TestSyncSessionIDsFromTmux_Claude(t *testing.T) {
 // TestSyncSessionIDsFromTmux_AllTools verifies that all four tool env vars are read
 // into their respective fields.
 func TestSyncSessionIDsFromTmux_AllTools(t *testing.T) {
-	skipIfNoTmuxServer(t)
-	skipIfNoClaudeBinary(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	inst := NewInstanceWithTool("test-sync-all-tools", "/tmp", "claude")
 	err := inst.Start()
@@ -100,7 +104,10 @@ func TestSyncSessionIDsFromTmux_AllTools(t *testing.T) {
 // TestSyncSessionIDsFromTmux_NoOverwriteWithEmpty verifies that if a tmux session
 // does NOT have CLAUDE_SESSION_ID set, the existing ClaudeSessionID is preserved.
 func TestSyncSessionIDsFromTmux_NoOverwriteWithEmpty(t *testing.T) {
-	skipIfNoTmuxServer(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	inst := NewInstanceWithTool("test-sync-no-overwrite", "/tmp", "claude")
 	err := inst.Start()
@@ -110,6 +117,9 @@ func TestSyncSessionIDsFromTmux_NoOverwriteWithEmpty(t *testing.T) {
 	defer func() { _ = inst.Kill() }()
 
 	// Do NOT set CLAUDE_SESSION_ID in the tmux env — it should be absent.
+	if err := inst.tmuxSession.UnsetEnvironment("CLAUDE_SESSION_ID"); err != nil {
+		t.Fatalf("UnsetEnvironment failed: %v", err)
+	}
 	// Set an existing value on the instance.
 	const existingID = "existing-claude-id"
 	inst.ClaudeSessionID = existingID
@@ -124,8 +134,10 @@ func TestSyncSessionIDsFromTmux_NoOverwriteWithEmpty(t *testing.T) {
 // TestSyncSessionIDsFromTmux_OverwriteWithNew verifies that if tmux env has a
 // non-empty CLAUDE_SESSION_ID, it overwrites the existing value on the Instance.
 func TestSyncSessionIDsFromTmux_OverwriteWithNew(t *testing.T) {
-	skipIfNoTmuxServer(t)
-	skipIfNoClaudeBinary(t)
+	skipIfNoTmuxBinary(t)
+	home := t.TempDir()
+	setupStubClaudeOnPATH(t, home)
+	t.Setenv("HOME", home)
 
 	inst := NewInstanceWithTool("test-sync-overwrite", "/tmp", "claude")
 	err := inst.Start()

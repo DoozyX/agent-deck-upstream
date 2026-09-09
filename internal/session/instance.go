@@ -4898,17 +4898,182 @@ func (i *Instance) isBoundedCodexExec() bool {
 		return false
 	}
 	if shellwords.ExecutableBase(fields) == "codex" {
-		for _, field := range fields[1:] {
-			if field == "exec" {
-				return true
-			}
-		}
+		return isCodexExecArgs(fields)
 	}
 	if filepath.Base(fields[0]) == "bash" && len(fields) >= 3 && (fields[1] == "-c" || fields[1] == "-lc") {
 		inner, ok := shellwords.Split(fields[2])
-		return ok && shellwords.ExecutableBase(inner) == "codex" && len(inner) > 1 && inner[1] == "exec"
+		return ok && len(inner) > 0 && shellwords.ExecutableBase(inner) == "codex" && isCodexExecArgs(inner)
 	}
 	return false
+}
+
+// codexExecOptionArity describes the option shapes that matter while locating
+// Codex's subcommand. The list mirrors the current top-level and exec CLI
+// definitions, including aliases, so a value named "exec" cannot be mistaken
+// for the subcommand.
+type codexExecOptionArity uint8
+
+const (
+	codexExecFlag codexExecOptionArity = iota
+	codexExecValue
+	codexExecVariadicValue
+)
+
+var codexExecGlobalOptions = map[string]codexExecOptionArity{
+	// Shared options.
+	"--image":            codexExecVariadicValue,
+	"-i":                 codexExecVariadicValue,
+	"--model":            codexExecValue,
+	"-m":                 codexExecValue,
+	"--local-provider":   codexExecValue,
+	"--profile":          codexExecValue,
+	"-p":                 codexExecValue,
+	"--sandbox":          codexExecValue,
+	"-s":                 codexExecValue,
+	"--cd":               codexExecValue,
+	"-C":                 codexExecValue,
+	"--add-dir":          codexExecValue,
+	"--config":           codexExecValue,
+	"-c":                 codexExecValue,
+	"--color":            codexExecValue,
+	"--ask-for-approval": codexExecValue,
+	"-a":                 codexExecValue,
+
+	// Exec-only options.
+	"--thread-source":       codexExecValue,
+	"--output-schema":       codexExecValue,
+	"--output-last-message": codexExecValue,
+	"-o":                    codexExecValue,
+
+	// Top-level options and boolean shared/exec options.
+	"--remote":                codexExecValue,
+	"--remote-auth-token-env": codexExecValue,
+	"--enable":                codexExecValue,
+	"--disable":               codexExecValue,
+	"--strict-config":         codexExecFlag,
+	"--skip-git-repo-check":   codexExecFlag,
+	"--ephemeral":             codexExecFlag,
+	"--ignore-user-config":    codexExecFlag,
+	"--ignore-rules":          codexExecFlag,
+	"--json":                  codexExecFlag,
+	"--experimental-json":     codexExecFlag,
+	"--oss":                   codexExecFlag,
+	"--approve-for-me":        codexExecFlag,
+	"--not-so-yolo":           codexExecFlag,
+	"--dangerously-bypass-approvals-and-sandbox": codexExecFlag,
+	"--yolo":                          codexExecFlag,
+	"--dangerously-bypass-hook-trust": codexExecFlag,
+	"--worktree":                      codexExecFlag,
+	"--search":                        codexExecFlag,
+	"--no-alt-screen":                 codexExecFlag,
+	"--help":                          codexExecFlag,
+	"-h":                              codexExecFlag,
+	"--version":                       codexExecFlag,
+	"-V":                              codexExecFlag,
+}
+
+var codexExecTopLevelCommands = map[string]struct{}{
+	"agents": {}, "review": {}, "login": {}, "logout": {}, "mcp": {},
+	"plugin": {}, "mcp-server": {}, "app-server": {}, "remote-control": {},
+	"app": {}, "completion": {}, "update": {}, "doctor": {}, "sandbox": {},
+	"debug": {}, "apply": {}, "a": {}, "resume": {}, "queue": {}, "archive": {},
+	"delete": {}, "migrate-rollouts": {}, "unarchive": {}, "fork": {},
+	"cloud": {}, "exec-server": {}, "features": {}, "execpolicy": {}, "help": {},
+}
+
+// isCodexExecArgs parses the supported global options that Codex accepts
+// before its subcommand. Unknown options fail closed because guessing their
+// arity could turn a positional value into a false exec subcommand. Both
+// --name=value and attached short values are consumed by the option parser.
+// The short "e" alias is equivalent to exec.
+func isCodexExecArgs(fields []string) bool {
+	promptSeen := false
+	for idx := 1; idx < len(fields); idx++ {
+		field := fields[idx]
+		if field == "exec" || field == "e" {
+			return true
+		}
+		if field == "--" {
+			return false
+		}
+		if !codexExecLooksLikeOption(field) {
+			if _, known := codexExecTopLevelCommands[field]; known {
+				return false
+			}
+			if promptSeen {
+				return false
+			}
+			promptSeen = true
+			continue
+		}
+
+		option, inlineValue := codexExecOptionName(field)
+		arity, known := codexExecGlobalOptions[option]
+		if !known {
+			return false
+		}
+		if inlineValue && arity == codexExecFlag {
+			return false
+		}
+		if arity == codexExecFlag {
+			if option == "--help" || option == "-h" || option == "--version" || option == "-V" {
+				return false
+			}
+			continue
+		}
+		if !inlineValue {
+			if !codexExecConsumeValue(fields, &idx) {
+				return false
+			}
+		}
+		if arity == codexExecVariadicValue {
+			for idx+1 < len(fields) && !codexExecLooksLikeOption(fields[idx+1]) {
+				idx++
+			}
+		}
+	}
+	return false
+}
+
+// codexExecConsumeValue consumes the next token as a separate option value.
+// Iterating the slice keeps the bounds proof explicit to static analyzers.
+func codexExecConsumeValue(fields []string, idx *int) bool {
+	for nextIndex, value := range fields {
+		if nextIndex != *idx+1 {
+			continue
+		}
+		if codexExecLooksLikeOption(value) {
+			return false
+		}
+		*idx = nextIndex
+		return true
+	}
+	return false
+}
+
+// codexExecLooksLikeOption follows Clap's distinction between a lone "-",
+// which is a valid prompt/value, and an option-looking token such as "-m".
+func codexExecLooksLikeOption(field string) bool {
+	return len(field) > 1 && field[0] == '-'
+}
+
+// codexExecOptionName recognizes long --name=value and Clap's attached short
+// value forms, such as -mgpt-5 and -ckey=exec. A boolean option with an
+// attached value is still rejected by the caller.
+func codexExecOptionName(field string) (option string, inlineValue bool) {
+	if strings.HasPrefix(field, "--") {
+		if name, _, hasEquals := strings.Cut(field, "="); hasEquals {
+			return name, true
+		}
+		return field, false
+	}
+	if len(field) >= 2 {
+		short := field[:2]
+		if _, known := codexExecGlobalOptions[short]; known {
+			return short, len(field) > len(short)
+		}
+	}
+	return field, false
 }
 
 // adoptExplicitClaudeSessionID adopts an explicit `--session-id <uuid>` baked
@@ -5328,7 +5493,8 @@ func (i *Instance) Start() error {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+	i.tmuxSession.RunCommandAsInitialProcess = i.runCommandAsInitialProcess()
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative per-group/per-conductor skill+mcp loadout
@@ -5345,9 +5511,8 @@ func (i *Instance) Start() error {
 		i.recordTmuxStartFailure(command, err)
 		return fmt.Errorf("failed to start tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("initial session command did not launch: %w", err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
+		return err
 	}
 
 	// #1580: watch for a fast death of the initial process (broken command,
@@ -5431,7 +5596,7 @@ func (i *Instance) Start() error {
 	// New sessions start as STARTING - shows they're initializing
 	// After 5s grace period, status will be properly detected from tmux
 	if command != "" {
-		i.Status = StatusStarting
+		i.SetStatusThreadSafe(StatusStarting)
 	}
 
 	// Start async session ID detection for OpenCode
@@ -5670,7 +5835,7 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+	i.tmuxSession.RunCommandAsInitialProcess = i.runCommandAsInitialProcess()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative skill+mcp loadout before spawn — sister
@@ -5678,6 +5843,7 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	ApplyConfiguredLoadout(i)
 
 	i.preAcceptCursorWorkspaceTrust()
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 
 	// Start the tmux session
 	if err := i.tmuxSession.Start(command); err != nil {
@@ -5685,9 +5851,8 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 		i.recordTmuxStartFailure(command, err)
 		return send.DeliverySendFailed, fmt.Errorf("failed to start tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
-		return send.DeliverySendFailed, fmt.Errorf("initial session command did not launch: %w", err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
+		return send.DeliverySendFailed, err
 	}
 
 	// #1580: fast-death watcher (sister path to Start()).
@@ -5747,7 +5912,7 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	i.markStarted() // persisted stamp (issue #30 — cross-process freshness guard)
 
 	// New sessions start as STARTING
-	i.Status = StatusStarting
+	i.SetStatusThreadSafe(StatusStarting)
 
 	// Start async session ID detection for tools that persist IDs out-of-band.
 	if i.Tool == "opencode" {
@@ -6282,7 +6447,7 @@ func (i *Instance) UpdateStatus() error {
 		if i.tmuxSession == nil || !i.traceExists(trace) {
 			if i.IsArchived() {
 				i.Status = StatusStopped
-			} else if i.Status != StatusRunning && i.Status != StatusIdle {
+			} else if i.Status != StatusRunning && i.Status != StatusIdle && i.Status != StatusError && i.Status != StatusStopped {
 				i.Status = StatusStarting
 			}
 			return nil
@@ -9823,12 +9988,13 @@ func (i *Instance) restart(env map[string]string) error {
 	// Build tmux option overrides from config (e.g. allow-passthrough = "all").
 	// Sandbox sessions also get remain-on-exit for dead-pane detection.
 	i.tmuxSession.OptionOverrides = i.buildTmuxOptionOverrides()
-	i.tmuxSession.RunCommandAsInitialProcess = i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+	i.tmuxSession.RunCommandAsInitialProcess = i.runCommandAsInitialProcess()
 	i.applyLaunchSettingsFromConfig()
 
 	// Re-assert the declarative skill+mcp loadout before respawn — sister
 	// call to Start(); config edits land on the next restart this way.
 	ApplyConfiguredLoadout(i)
+	i.tmuxSession.AllowInitialProcessExit = i.expectsFastExit()
 
 	mcpLog.Debug("restart_starting_new_session", slog.String("command", command))
 
@@ -9842,10 +10008,9 @@ func (i *Instance) restart(env map[string]string) error {
 		i.Status = StatusError
 		return fmt.Errorf("failed to restart tmux session: %w", err)
 	}
-	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
-		i.recordTmuxStartFailure(command, err)
+	if err := i.acknowledgeInitialProcess(command); err != nil {
 		i.Status = StatusError
-		return fmt.Errorf("initial session command did not launch: %w", err)
+		return err
 	}
 
 	mcpLog.Debug("restart_start_succeeded")

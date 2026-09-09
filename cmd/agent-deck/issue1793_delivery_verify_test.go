@@ -256,6 +256,293 @@ func TestIssue1793_CodexActiveTransitionNeedsNoRecoveryEnter(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexWorkingPaneConfirmsSubmittedNoWaitSend(t *testing.T) {
+	const msg = "ISSUE1793 BABA CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("Codex Working pane after a submitted prompt = delivery %q, err %v; want submitted", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexTimedWorkingPaneConfirmsSubmitted(t *testing.T) {
+	const msg = "ISSUE1793 TIMED CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working (4s • esc to interrupt)\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("timed Codex Working pane = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("timed Working state must not receive recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexNormalWorkingPaneConfirmsSubmittedWithoutRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 NORMAL CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("normal Codex Working pane = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("normal Working state must not receive recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexSubmittedBodyContainingPromptLiteralDoesNotNeedRecovery(t *testing.T) {
+	const msg = "ISSUE1793 quote the literal codex> prompt in the report"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("submitted Codex body containing codex> = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("submitted body containing codex> must not receive duplicate recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexMultilineSubmittedBodyContainingPromptLiteralDoesNotNeedRecovery(t *testing.T) {
+	const msg = "ISSUE1793 first line\ninclude the literal codex> prompt\nfinal line"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("multiline submitted Codex body containing codex> = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("multiline submitted body containing codex> must not receive duplicate recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_ExecuteSendPublishesMultilineCodexSubmission(t *testing.T) {
+	const msg = "ISSUE1793 first line\ninclude the literal codex> prompt\nfinal line"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"waiting"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+	tun := testGuardTuning(sendRetryOptions{maxRetries: 3, checkDelay: 0})
+	result, err := executeSend(mock, "codex", msg, false, tun)
+	if err != nil {
+		t.Fatalf("command-facing multiline Codex send failed: %v", err)
+	}
+	fields := result.jsonFields()
+	if fields["delivery"] != deliverySubmitted || fields["submitted"] != true {
+		t.Fatalf("command-facing result = %#v, want submitted=true", fields)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("command-facing multiline submission must not receive recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexTimedWorkingDoesNotSubmitForeignDraftFromExistingTurn(t *testing.T) {
+	const msg = "ISSUE1793 PREEXISTING TURN DRAFT"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working (4s • esc to interrupt)\nprior request\n❯ " + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("pre-existing Working turn with an unsent draft must not submit: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("foreign draft must not receive recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexPayloadWorkingLineIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "working on the deployment plan"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("payload text beginning with working must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexUnrelatedWorkingLineNeedsThisBody(t *testing.T) {
+	const msg = "ISSUE1793 ATTRIBUTABLE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\nunrelated request\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("unrelated Working text must not submit this request: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexStaleWorkingBodyIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 STALE CODEX BODY"
+	pane := "• Working\n" + msg + "\n"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes:    []string{pane, pane},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("stale body and Working text must not submit again: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexBaselineWorkingIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 BASELINE WORKING CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"• Working\ncodex>\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a pre-existing Codex Working state must not submit this body: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexTimedBaselineWorkingIsNotNewSubmission(t *testing.T) {
+	const msg = "ISSUE1793 TIMED BASELINE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"• Working (4s • esc to interrupt)\nprior request\n",
+			"• Working (5s • esc to interrupt)\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a pre-existing timed Codex Working state must not submit this body: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexMultilinePayloadStartingWorkingIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "working\nISSUE1793 MULTILINE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"working\nISSUE1793 MULTILINE CODEX BODY\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("a payload line beginning with working must not impersonate Codex Working: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexAlternateWorkingTextIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "ISSUE1793 ALTERNATE CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"Working on another request\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("alternate UI text must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexDelayedWorkingBeforeBodyIsNotSubmissionEvidence(t *testing.T) {
+	const msg = "ISSUE1793 DELAYED CODEX BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\n",
+			"• Working\n" + msg + "\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("Working before this body must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexWorkingRequiresAttributableEnter(t *testing.T) {
+	const msg = "ISSUE1793 WORKING ENTER ATTRIBUTION BODY"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes:    []string{"codex>\n", "• Working\n" + msg + "\ncodex> foreign draft\n"},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if delivery == deliverySubmitted {
+		t.Fatalf("Working plus a foreign draft must not submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
+func TestIssue1793_CodexWorkingBodyMatchIsWhitespaceSafe(t *testing.T) {
+	const msg = "request with\nmultiple words"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"active"},
+		panes: []string{
+			"codex>\n",
+			"• Working\nrequest with\nmultiple words\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{
+		maxRetries: 3, checkDelay: 0, tool: "codex",
+	})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("whitespace-wrapped body with attributable Working line must submit: delivery=%q err=%v", delivery, err)
+	}
+}
+
 // TestIssue1793_ClaudePath_TypedButNeverSubmitted_IsNotSuccess is the Claude
 // half of the same defect. The Claude verification loop treated "the body is
 // visible in the pane" as delivery evidence and, at the end of its budget,
