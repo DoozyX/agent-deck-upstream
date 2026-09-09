@@ -8,11 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -238,6 +240,36 @@ func TestMCP_CreateAndDeleteSession_ValidationAndGuards(t *testing.T) {
 	}
 	if delegated.Load() != 0 {
 		t.Fatalf("invalid/guarded calls delegated=%d", delegated.Load())
+	}
+}
+
+func TestMCP_CreateSessionFailureLogsSafeDiagnosticFields(t *testing.T) {
+	logDir := t.TempDir()
+	logging.Init(logging.Config{LogDir: logDir})
+	t.Cleanup(func() { logging.Init(logging.Config{}) })
+
+	mut := &fakeMutator{createSessionFn: func(string, string, string, string, string, string) (string, error) {
+		return "", errors.New("start session: chdir /Users/doozyx/missing: no such file or directory")
+	}}
+	cs, _ := connectMCP(t, mcpTestDeps(t, mut))
+	_, isErr, err := callToolJSON(t, cs, "create_session", map[string]any{
+		"title": "secret title", "tool": "cursor", "projectPath": "/Users/doozyx/missing",
+	})
+	if !isErr || err == nil {
+		t.Fatalf("create_session failure: isErr=%v err=%v", isErr, err)
+	}
+	raw, readErr := os.ReadFile(logDir + "/debug.log")
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatalf("read log: %v", readErr)
+	}
+	got := string(raw)
+	for _, want := range []string{`"msg":"mcp_tool_failed"`, `"tool":"create_session"`, `"errorKind":"backend"`, `"sessionTool":"cursor"`, `"projectPath":"/Users/doozyx/missing"`, `no such file or directory`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log missing %q: %s", want, got)
+		}
+	}
+	if strings.Contains(got, "secret title") {
+		t.Fatalf("log exposed session title: %s", got)
 	}
 }
 
