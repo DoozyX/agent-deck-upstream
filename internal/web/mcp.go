@@ -23,7 +23,7 @@ func NewMCPHandler(deps MCPDependencies) http.Handler {
 	}, &mcpsdk.StreamableHTTPOptions{JSONResponse: true})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Fail closed: a missing Authorize seam must not bypass auth (Task 01 fix).
+		// Fail closed on nil or false Authorize (never bypass when the seam is missing).
 		if deps.Authorize == nil || !deps.Authorize(r) {
 			http.Error(w, ErrMCPUnauthorized.Error(), http.StatusUnauthorized)
 			return
