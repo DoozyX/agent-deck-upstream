@@ -126,6 +126,7 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 		{name: "sandbox command is not a root prompt", fields: []string{"codex", "sandbox", "exec"}, want: false},
 		{name: "debug command is not a root prompt", fields: []string{"codex", "debug", "exec"}, want: false},
 		{name: "apply command is not a root prompt", fields: []string{"codex", "apply", "exec"}, want: false},
+		{name: "apply alias is not a root prompt", fields: []string{"codex", "a", "exec"}, want: false},
 		{name: "fork command is not a root prompt", fields: []string{"codex", "fork", "exec"}, want: false},
 		{name: "cloud command is not a root prompt", fields: []string{"codex", "cloud", "exec"}, want: false},
 		{name: "features command is not a root prompt", fields: []string{"codex", "features", "exec"}, want: false},
