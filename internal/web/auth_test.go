@@ -29,6 +29,26 @@ func cancelledRequest(target string) *http.Request {
 	return req.WithContext(ctx)
 }
 
+func TestBearerTokenSchemeCaseInsensitive(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		header string
+		want   string
+	}{
+		{"canonical scheme", "Bearer secret", "secret"},
+		{"lowercase scheme", "bearer secret", "secret"},
+		{"mixed case scheme", "BeArEr secret", "secret"},
+		{"malformed scheme", "Bear secret", ""},
+		{"empty value", "Bearer ", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := bearerToken(tc.header); got != tc.want {
+				t.Fatalf("bearerToken(%q) = %q, want %q", tc.header, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestSSE_QueryTokenAcceptedOnMenuEvents(t *testing.T) {
 	srv := NewServer(Config{ListenAddr: "127.0.0.1:0", Token: "secret"})
 
