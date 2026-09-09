@@ -355,9 +355,10 @@ type Home struct {
 	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
 	// MCP preview data is fetched lazily after selection. GetMCPInfo can resolve
 	// config homes and read several files, so View must only read this cache.
-	mcpPreviewCache    map[string]*session.MCPInfo
-	mcpPreviewFetching map[string]bool
-	mcpPreviewCacheMu  sync.RWMutex
+	mcpPreviewCache      map[string]*session.MCPInfo
+	mcpPreviewFetching   map[string]bool
+	mcpPreviewGeneration map[string]uint64
+	mcpPreviewCacheMu    sync.RWMutex
 
 	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
 	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
@@ -1568,8 +1569,9 @@ type previewFetchedMsg struct {
 }
 
 type mcpInfoFetchedMsg struct {
-	sessionID string
-	info      *session.MCPInfo
+	sessionID  string
+	generation uint64
+	info       *session.MCPInfo
 }
 
 // remotePaneWatchTarget names the remote session whose pane the TUI asked
@@ -1897,6 +1899,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		previewCacheTime:          make(map[string]time.Time),
 		mcpPreviewCache:           make(map[string]*session.MCPInfo),
 		mcpPreviewFetching:        make(map[string]bool),
+		mcpPreviewGeneration:      make(map[string]uint64),
 		analyticsCache:            make(map[string]*session.SessionAnalytics),
 		geminiAnalyticsCache:      make(map[string]*session.GeminiSessionAnalytics),
 		analyticsCacheTime:        make(map[string]time.Time),
@@ -5061,9 +5064,7 @@ func (h *Home) invalidatePreviewCache(sessionID string) {
 
 	h.mcpPreviewCacheMu.Lock()
 	delete(h.mcpPreviewCache, sessionID)
-	// An in-flight result is still safe to apply: session IDs are stable and
-	// the result is keyed to this instance. Clearing the marker lets a newly
-	// selected session retry after a config/session change invalidated it.
+	h.mcpPreviewGeneration[sessionID]++
 	delete(h.mcpPreviewFetching, sessionID)
 	h.mcpPreviewCacheMu.Unlock()
 }
@@ -5352,10 +5353,11 @@ func (h *Home) fetchMCPInfo(inst *session.Instance) tea.Cmd {
 		return nil
 	}
 	h.mcpPreviewFetching[instanceID] = true
+	generation := h.mcpPreviewGeneration[instanceID]
 	h.mcpPreviewCacheMu.Unlock()
 
 	return func() tea.Msg {
-		return mcpInfoFetchedMsg{sessionID: instanceID, info: inst.GetMCPInfo()}
+		return mcpInfoFetchedMsg{sessionID: instanceID, generation: generation, info: inst.GetMCPInfo()}
 	}
 }
 
@@ -9253,6 +9255,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// retain the map entry and use its presence to prevent refetching on
 		// every preview debounce.
 		h.mcpPreviewCacheMu.Lock()
+		if msg.generation != h.mcpPreviewGeneration[msg.sessionID] {
+			h.mcpPreviewCacheMu.Unlock()
+			return h, nil
+		}
 		h.mcpPreviewCache[msg.sessionID] = msg.info
 		delete(h.mcpPreviewFetching, msg.sessionID)
 		h.mcpPreviewCacheMu.Unlock()
