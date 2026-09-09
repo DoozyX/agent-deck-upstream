@@ -19,6 +19,7 @@ type fakeMutator struct {
 	startSessionFn     func(id string) error
 	stopSessionFn      func(id string) error
 	restartSessionFn   func(id string) error
+	sendToSessionFn    func(id, message string) error
 	deleteSessionFn    func(id string) error
 	closeSessionFn     func(id string) error
 	archiveSessionFn   func(id string) error
@@ -58,6 +59,13 @@ func (f *fakeMutator) RestartSession(id string) error {
 		return fmt.Errorf("restartSession not configured")
 	}
 	return f.restartSessionFn(id)
+}
+
+func (f *fakeMutator) SendToSession(id, message string) error {
+	if f.sendToSessionFn == nil {
+		return fmt.Errorf("sendToSession not configured")
+	}
+	return f.sendToSessionFn(id, message)
 }
 
 func (f *fakeMutator) DeleteSession(id string) error {
