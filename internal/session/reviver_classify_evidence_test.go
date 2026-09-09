@@ -1,8 +1,10 @@
 package session
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // Issue #1705: a live conductor was restarted as if it were dead, and the
@@ -177,6 +179,38 @@ func TestReviver_Classify_RateLimitsUnchangedNonAliveEvidence(t *testing.T) {
 	}
 	if infoCount != 1 {
 		t.Fatalf("unchanged non-alive evidence emitted at INFO %d times, want 1", infoCount)
+	}
+}
+
+func TestReviverClassificationLogPrunesExpiredSessionChurn(t *testing.T) {
+	reviverClassificationLog.Lock()
+	originalStates := reviverClassificationLog.states
+	originalLastPruned := reviverClassificationLog.lastPruned
+	reviverClassificationLog.states = make(map[string]reviverClassificationLogState)
+	reviverClassificationLog.lastPruned = time.Time{}
+	reviverClassificationLog.Unlock()
+	t.Cleanup(func() {
+		reviverClassificationLog.Lock()
+		reviverClassificationLog.states = originalStates
+		reviverClassificationLog.lastPruned = originalLastPruned
+		reviverClassificationLog.Unlock()
+	})
+
+	started := time.Unix(1_000_000, 0)
+	for i := 0; i < 1_000; i++ {
+		inst := newReviverTestInstance(fmt.Sprintf("expired-%d", i), StatusError)
+		shouldLogReviverInfo(inst, inst.Title, true, false, ClassErrored, started)
+	}
+	fresh := newReviverTestInstance("fresh", StatusError)
+	shouldLogReviverInfo(fresh, fresh.Title, true, false, ClassErrored, started.Add(reviverClassificationLogStateTTL+time.Second))
+
+	reviverClassificationLog.Lock()
+	defer reviverClassificationLog.Unlock()
+	if got := len(reviverClassificationLog.states); got != 1 {
+		t.Fatalf("classification state count after churn expiry = %d, want 1", got)
+	}
+	if _, ok := reviverClassificationLog.states[fresh.ID]; !ok {
+		t.Fatal("fresh classification state was pruned")
 	}
 }
 

@@ -413,12 +413,19 @@ func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
 }
 
 func TestIsBuiltinToolNameCoversCanonicalTools(t *testing.T) {
-	for _, name := range []string{
-		"claude", "opencode", "gemini", "codex", "pi", "copilot",
-		"crush", "cursor", "hermes", "deepseek", "aider", "shell",
-	} {
-		if !IsBuiltinToolName(name) {
-			t.Errorf("IsBuiltinToolName(%q) = false, want true", name)
+	want := make(map[string]struct{}, len(builtinTools()))
+	for _, tool := range builtinTools() {
+		want[tool.Name] = struct{}{}
+		if !IsBuiltinToolName(tool.Name) {
+			t.Errorf("IsBuiltinToolName(%q) = false, want true", tool.Name)
+		}
+	}
+	if len(staticBuiltinToolNames) != len(want) {
+		t.Fatalf("static builtin lookup has %d names, canonical source has %d", len(staticBuiltinToolNames), len(want))
+	}
+	for name := range staticBuiltinToolNames {
+		if _, ok := want[name]; !ok {
+			t.Errorf("static builtin lookup contains non-canonical tool %q", name)
 		}
 	}
 	if IsBuiltinToolName("custom-tool") {
