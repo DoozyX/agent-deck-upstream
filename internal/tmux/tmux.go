@@ -278,9 +278,11 @@ func IsServerAlive() bool {
 // Instead of calling `tmux has-session` and `tmux display-message` for each session,
 // we call `tmux list-sessions` ONCE and cache both existence and activity timestamps
 var (
-	sessionCacheMu   sync.RWMutex
-	sessionCacheData map[string]int64 // session_name -> activity_timestamp (0 if not in cache)
-	sessionCacheTime time.Time
+	sessionCacheMu             sync.RWMutex
+	sessionCacheData           map[string]int64  // session_name -> activity_timestamp (0 if not in cache)
+	sessionCacheGenerations    map[string]uint64 // session_name -> registration generation
+	sessionCacheNextGeneration uint64
+	sessionCacheTime           time.Time
 )
 
 // sessionCacheTTL is the single TTL governing both sessionExistsFromCache
@@ -316,6 +318,7 @@ func RefreshSessionCache() {
 		if activities, windows, err := pm.RefreshAllActivities(); err == nil && len(activities) > 0 {
 			sessionCacheMu.Lock()
 			sessionCacheData = activities
+			sessionCacheGenerations = newSessionCacheGenerations(activities)
 			sessionCacheTime = time.Now()
 			sessionCacheMu.Unlock()
 
@@ -346,6 +349,7 @@ func RefreshSessionCache() {
 
 	sessionCacheMu.Lock()
 	sessionCacheData = newSessionCache
+	sessionCacheGenerations = newSessionCacheGenerations(newSessionCache)
 	sessionCacheTime = time.Now()
 	sessionCacheMu.Unlock()
 
@@ -589,7 +593,7 @@ func sessionExistsFromCache(name string) (bool, bool) {
 // registerSessionInCache adds a newly created session to the cache
 // This prevents the race condition where a new session isn't found
 // because the cache was refreshed before the session was created
-func registerSessionInCache(name string) {
+func registerSessionInCache(name string) uint64 {
 	sessionCacheMu.Lock()
 	defer sessionCacheMu.Unlock()
 
@@ -597,15 +601,34 @@ func registerSessionInCache(name string) {
 	if sessionCacheData == nil {
 		sessionCacheData = make(map[string]int64)
 	}
+	if sessionCacheGenerations == nil {
+		sessionCacheGenerations = make(map[string]uint64)
+	}
 
 	// Add session with current time as activity
 	sessionCacheData[name] = time.Now().Unix()
+	sessionCacheNextGeneration++
+	sessionCacheGenerations[name] = sessionCacheNextGeneration
+	return sessionCacheNextGeneration
 }
 
-func removeSessionFromCache(name string) {
+func removeSessionFromCacheIfGeneration(name string, generation uint64) {
 	sessionCacheMu.Lock()
 	defer sessionCacheMu.Unlock()
+	if sessionCacheGenerations[name] != generation {
+		return
+	}
 	delete(sessionCacheData, name)
+	delete(sessionCacheGenerations, name)
+}
+
+func newSessionCacheGenerations(data map[string]int64) map[string]uint64 {
+	generations := make(map[string]uint64, len(data))
+	for name := range data {
+		sessionCacheNextGeneration++
+		generations[name] = sessionCacheNextGeneration
+	}
+	return generations
 }
 
 // sessionActivityFromCache gets session activity timestamp from cache
@@ -2640,7 +2663,7 @@ func (s *Session) Start(command string) error {
 
 	// Register session in cache immediately to prevent race condition
 	// where Exists() returns false because cache was refreshed before session creation
-	registerSessionInCache(s.Name)
+	cacheGeneration := registerSessionInCache(s.Name)
 
 	// #1713: a tmux server whose OWN cwd was unlinked stops honouring -c and
 	// births every pane in that dead directory, where the pane's shell cannot
@@ -2808,7 +2831,7 @@ func (s *Session) Start(command string) error {
 					slog.String("error", cleanupErr.Error()),
 				)
 			} else {
-				removeSessionFromCache(ownedName)
+				removeSessionFromCacheIfGeneration(ownedName, cacheGeneration)
 			}
 			return fmt.Errorf("failed to send command: %w", err)
 		}
@@ -3017,7 +3040,9 @@ func launchAckProgress(ackPath, marker string) string {
 // every temporary file. The watcher captures the tmux name and immutable
 // session identity at launch. A missing, replaced, or superseded session ends
 // the watcher without invoking the callback; explicit Kill() is not a launch
-// failure.
+// failure. An identity probe that stays indeterminate through the bounded
+// retry policy also ends without consuming the marker, preserving it for
+// diagnosis rather than treating uncertainty as a launch failure.
 func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback func(exitCode int, diagnostic string)) {
 	ackPath := s.launchAckPath
 	sessionName := s.Name
@@ -3031,8 +3056,14 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 		return
 	}
 	go func() {
-		defer cleanupLaunchAckFiles(ackPath)
+		preserveAck := false
+		defer func() {
+			if !preserveAck {
+				cleanupLaunchAckFiles(ackPath)
+			}
+		}()
 		pollAttempt := 0
+		indeterminateAttempts := 0
 		for {
 			select {
 			case <-cancel:
@@ -3043,6 +3074,26 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 			switch probe.state {
 			case sessionIdentityMissing:
 				return
+			case sessionIdentityIndeterminate:
+				indeterminateAttempts++
+				if indeterminateAttempts >= launchAckIdentityMaxRetries {
+					// The marker is evidence about a process we cannot prove
+					// still belongs to this immutable session. Preserve it for
+					// diagnosis and never turn uncertainty into a failure.
+					preserveAck = true
+					return
+				}
+				timer := time.NewTimer(launchAckWatchDelay(pollAttempt))
+				select {
+				case <-cancel:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					return
+				case <-timer.C:
+				}
+				pollAttempt++
+				continue
 			case sessionIdentityOwned:
 				if !sessionIdentityMatches(sessionID, probe.identity) {
 					return
@@ -3070,8 +3121,9 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 }
 
 const (
-	launchAckWatchInitialDelay = 100 * time.Millisecond
-	launchAckWatchMaxDelay     = time.Second
+	launchAckWatchInitialDelay  = 100 * time.Millisecond
+	launchAckWatchMaxDelay      = time.Second
+	launchAckIdentityMaxRetries = 5
 )
 
 func launchAckWatchDelay(attempt int) time.Duration {

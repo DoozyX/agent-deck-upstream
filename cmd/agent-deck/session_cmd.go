@@ -3966,7 +3966,6 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					// that is still sitting in the composer.
 					if arrived && !recoveryAttempted && !codexWorkingSeenBeforeBody &&
 						!codexBaselineWorking && codexWorkingIndicator(content, message) &&
-						!strings.Contains(strings.ToLower(content), "codex>") &&
 						!send.HasUnsentComposerPrompt(content, message) &&
 						!attrib.EnterWouldSubmitForeignDraft(paneNow, tmux.StripANSI) {
 						return deliverySubmitted, nil
