@@ -4566,21 +4566,22 @@ func (i *Instance) isBoundedCodexExec() bool {
 	return false
 }
 
-// codexExecOptionArity describes the only two option shapes that matter while
-// locating Codex's subcommand: a flag or one value. The list mirrors the
-// current top-level and exec CLI definitions, including aliases, so a value
-// named "exec" cannot be mistaken for the subcommand.
+// codexExecOptionArity describes the option shapes that matter while locating
+// Codex's subcommand. The list mirrors the current top-level and exec CLI
+// definitions, including aliases, so a value named "exec" cannot be mistaken
+// for the subcommand.
 type codexExecOptionArity uint8
 
 const (
 	codexExecFlag codexExecOptionArity = iota
 	codexExecValue
+	codexExecVariadicValue
 )
 
 var codexExecGlobalOptions = map[string]codexExecOptionArity{
 	// Shared options.
-	"--image":            codexExecValue,
-	"-i":                 codexExecValue,
+	"--image":            codexExecVariadicValue,
+	"-i":                 codexExecVariadicValue,
 	"--model":            codexExecValue,
 	"-m":                 codexExecValue,
 	"--local-provider":   codexExecValue,
@@ -4636,6 +4637,7 @@ var codexExecGlobalOptions = map[string]codexExecOptionArity{
 // --name=value and attached short values are consumed by the option parser.
 // The short "e" alias is equivalent to exec.
 func isCodexExecArgs(fields []string) bool {
+	promptSeen := false
 	for idx := 1; idx < len(fields); idx++ {
 		field := fields[idx]
 		if field == "exec" || field == "e" {
@@ -4644,25 +4646,15 @@ func isCodexExecArgs(fields []string) bool {
 		if field == "--" {
 			return false
 		}
-		if !strings.HasPrefix(field, "-") {
-			return false
+		if !codexExecLooksLikeOption(field) {
+			if promptSeen {
+				return false
+			}
+			promptSeen = true
+			continue
 		}
 
-		option := field
-		inlineValue := false
-		if name, _, hasEquals := strings.Cut(field, "="); hasEquals {
-			option, inlineValue = name, true
-		} else if !strings.HasPrefix(field, "--") {
-			// Clap accepts a short option's value attached to the option, e.g.
-			// -mgpt-5. Match the known short name before treating it as unknown.
-			for short := range codexExecGlobalOptions {
-				if len(short) == 2 && strings.HasPrefix(short, "-") &&
-					strings.HasPrefix(field, short) && len(field) > len(short) {
-					option, inlineValue = short, true
-					break
-				}
-			}
-		}
+		option, inlineValue := codexExecOptionName(field)
 		arity, known := codexExecGlobalOptions[option]
 		if !known {
 			return false
@@ -4670,14 +4662,62 @@ func isCodexExecArgs(fields []string) bool {
 		if inlineValue && arity == codexExecFlag {
 			return false
 		}
-		if arity == codexExecValue && !inlineValue {
-			if idx+1 >= len(fields) {
+		if arity == codexExecFlag {
+			continue
+		}
+		if !inlineValue {
+			if !codexExecConsumeValue(fields, &idx) {
 				return false
 			}
-			idx++
+		}
+		if arity == codexExecVariadicValue {
+			for idx+1 < len(fields) && !codexExecLooksLikeOption(fields[idx+1]) {
+				idx++
+			}
 		}
 	}
 	return false
+}
+
+// codexExecConsumeValue consumes the next token as a separate option value.
+// Iterating the slice keeps the bounds proof explicit to static analyzers.
+func codexExecConsumeValue(fields []string, idx *int) bool {
+	for nextIndex, value := range fields {
+		if nextIndex != *idx+1 {
+			continue
+		}
+		if codexExecLooksLikeOption(value) {
+			return false
+		}
+		*idx = nextIndex
+		return true
+	}
+	return false
+}
+
+// codexExecLooksLikeOption follows Clap's distinction between a lone "-",
+// which is a valid prompt/value, and an option-looking token such as "-m".
+func codexExecLooksLikeOption(field string) bool {
+	return len(field) > 1 && field[0] == '-'
+}
+
+// codexExecOptionName recognizes long --name=value and Clap's attached short
+// value forms, such as -mgpt-5 and -ckey=exec. A boolean option with an
+// attached value is still rejected by the caller.
+func codexExecOptionName(field string) (option string, inlineValue bool) {
+	if strings.HasPrefix(field, "--") {
+		if name, _, hasEquals := strings.Cut(field, "="); hasEquals {
+			return name, true
+		}
+		return field, false
+	}
+	if len(field) >= 2 {
+		short := field[:2]
+		if _, known := codexExecGlobalOptions[short]; known {
+			return short, len(field) > len(short)
+		}
+	}
+	return field, false
 }
 
 // adoptExplicitClaudeSessionID adopts an explicit `--session-id <uuid>` baked

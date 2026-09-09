@@ -65,6 +65,8 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 		{name: "long value option", fields: []string{"codex", "--model", "gpt-5", "exec"}, want: true},
 		{name: "short value option", fields: []string{"codex", "-m", "gpt-5", "exec"}, want: true},
 		{name: "attached short value", fields: []string{"codex", "-mgpt-5", "exec"}, want: true},
+		{name: "attached short value with equals", fields: []string{"codex", "-ckey=exec", "exec"}, want: true},
+		{name: "attached short value without equals", fields: []string{"codex", "-ckeyexec", "exec"}, want: true},
 		{name: "name equals value", fields: []string{"codex", "--model=gpt-5", "exec"}, want: true},
 		{name: "all boolean families", fields: []string{"codex", "--strict-config", "--json", "--ephemeral", "--ignore-rules", "exec"}, want: true},
 		{name: "config value named exec", fields: []string{"codex", "--config", "exec", "--json", "task"}, want: false},
@@ -73,6 +75,14 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 		{name: "boolean equals form is not a value option", fields: []string{"codex", "--json=exec", "task", "exec"}, want: false},
 		{name: "each value option consumes exec", fields: []string{"codex", "--image", "exec"}, want: false},
 		{name: "short image consumes exec", fields: []string{"codex", "-i", "exec"}, want: false},
+		{name: "image consumes later exec", fields: []string{"codex", "--image", "foo", "exec"}, want: false},
+		{name: "short image consumes later exec", fields: []string{"codex", "-i", "foo", "exec"}, want: false},
+		{name: "image consumes prompt and later exec", fields: []string{"codex", "--image", "foo", "task", "exec"}, want: false},
+		{name: "image equals consumes later exec", fields: []string{"codex", "--image=foo", "exec"}, want: false},
+		{name: "short image equals consumes later exec", fields: []string{"codex", "-i=foo", "exec"}, want: false},
+		{name: "image missing before option", fields: []string{"codex", "--image", "--model", "exec"}, want: false},
+		{name: "image stops at later option", fields: []string{"codex", "--image", "foo", "--model", "gpt-5", "exec"}, want: true},
+		{name: "image accepts lone hyphen value", fields: []string{"codex", "--image", "-", "exec"}, want: false},
 		{name: "cwd consumes exec", fields: []string{"codex", "--cd", "exec"}, want: false},
 		{name: "short cwd consumes exec", fields: []string{"codex", "-C", "exec"}, want: false},
 		{name: "sandbox consumes exec", fields: []string{"codex", "--sandbox", "exec"}, want: false},
@@ -85,8 +95,14 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 		{name: "short last message consumes exec", fields: []string{"codex", "-o", "exec"}, want: false},
 		{name: "color consumes exec", fields: []string{"codex", "--color", "exec"}, want: false},
 		{name: "short config consumes exec", fields: []string{"codex", "-c", "exec"}, want: false},
+		{name: "missing model before option", fields: []string{"codex", "--model", "-m", "exec"}, want: false},
+		{name: "missing short model before option", fields: []string{"codex", "-m", "--image", "foo", "exec"}, want: false},
+		{name: "missing value at end", fields: []string{"codex", "--model"}, want: false},
+		{name: "lone hyphen prompt before exec", fields: []string{"codex", "-", "exec"}, want: true},
 		{name: "double dash terminates options", fields: []string{"codex", "--", "exec"}, want: false},
-		{name: "positional prompt is not subcommand", fields: []string{"codex", "task", "exec"}, want: false},
+		{name: "root prompt before exec", fields: []string{"codex", "task", "exec"}, want: true},
+		{name: "root prompt and option before exec", fields: []string{"codex", "task", "--model", "gpt-5", "exec"}, want: true},
+		{name: "two root positionals are not exec", fields: []string{"codex", "task", "other", "exec"}, want: false},
 		{name: "unknown option fails closed", fields: []string{"codex", "--future-option", "exec"}, want: false},
 	}
 	for _, tt := range tests {
@@ -97,6 +113,9 @@ func TestIssue1793_CodexExecArgsRecognizeSupportedGlobalOptions(t *testing.T) {
 		})
 	}
 	for _, option := range valueOptions {
+		if option.option == "--image" || option.option == "-i" {
+			continue
+		}
 		t.Run("value option preserves later exec: "+option.name, func(t *testing.T) {
 			fields := []string{"codex", option.option, "value", "exec"}
 			if !isCodexExecArgs(fields) {
