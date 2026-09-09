@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -77,6 +78,9 @@ func TestMCPToolInputSchemas_RequiredFieldsNoCommandOrURL(t *testing.T) {
 		if err := json.Unmarshal(raw, &schema); err != nil {
 			t.Fatalf("%s: decode schema: %v", tool.Name, err)
 		}
+		if schema["additionalProperties"] != false {
+			t.Fatalf("%s must set additionalProperties=false; got %#v", tool.Name, schema["additionalProperties"])
+		}
 		reqRaw, _ := schema["required"].([]any)
 		got := make([]string, 0, len(reqRaw))
 		for _, v := range reqRaw {
@@ -91,6 +95,40 @@ func TestMCPToolInputSchemas_RequiredFieldsNoCommandOrURL(t *testing.T) {
 				t.Fatalf("%s required[%d] = %q, want %q", tool.Name, i, got[i], required[i])
 			}
 		}
+	}
+}
+
+func TestFleetStatusSchema_RejectsAdditionalProperties(t *testing.T) {
+	var fleet MCPToolSpec
+	for _, tool := range MCPToolCatalog() {
+		if tool.Name == "fleet_status" {
+			fleet = tool
+			break
+		}
+	}
+	if fleet.Name == "" {
+		t.Fatal("fleet_status missing from catalog")
+	}
+	if fleet.InputSchema["additionalProperties"] != false {
+		t.Fatalf("fleet_status additionalProperties = %#v, want false", fleet.InputSchema["additionalProperties"])
+	}
+	raw, err := json.Marshal(fleet.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("unmarshal fleet_status schema: %v", err)
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		t.Fatalf("resolve fleet_status schema: %v", err)
+	}
+	if err := resolved.Validate(map[string]any{"command": "rm -rf /"}); err == nil {
+		t.Fatal("expected fleet_status schema to reject undeclared property command")
+	}
+	if err := resolved.Validate(map[string]any{}); err != nil {
+		t.Fatalf("empty object must be valid for fleet_status: %v", err)
 	}
 }
 
@@ -157,7 +195,13 @@ func TestClassifyMCPErrorKinds(t *testing.T) {
 		{ErrMCPRateLimited, MCPErrorRateLimited},
 		{ErrMCPBackend, MCPErrorBackend},
 		{errors.New("session not found: abc"), MCPErrorNotFound},
+		{errors.New("malformed tool arguments"), MCPErrorMalformed},
+		{errors.New("required property sessionId missing"), MCPErrorMalformed},
+		{errors.New("additional properties are not allowed"), MCPErrorMalformed},
 		{errors.New("boom"), MCPErrorBackend},
+		// Backend failures that merely contain "invalid" must stay backend.
+		{errors.New("invalid session state from backend"), MCPErrorBackend},
+		{errors.New("tmux returned invalid pane id"), MCPErrorBackend},
 	}
 	for _, tc := range cases {
 		if got := ClassifyMCPError(tc.err); got != tc.kind {
@@ -184,6 +228,26 @@ func TestNewMCPHandler_RejectsUnauthorized(t *testing.T) {
 	h.ServeHTTP(rr, req)
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status = %d, want 401; body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestNewMCPHandler_NilAuthorizeFailsClosed(t *testing.T) {
+	h := NewMCPHandler(MCPDependencies{
+		Loader:  stubMenuLoader{},
+		Mutator: &fakeMutator{},
+		// Authorize deliberately nil — must fail closed.
+		MutationsAllowed: func() bool { return true },
+		AllowMutation:    func() bool { return true },
+	})
+	req := httptest.NewRequest(http.MethodPost, MCPRoute, strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}`,
+	))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	rr := httptest.NewRecorder()
+	h.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("nil Authorize status = %d, want 401; body=%s", rr.Code, rr.Body.String())
 	}
 }
 
