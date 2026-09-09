@@ -1083,6 +1083,23 @@ func (i *Instance) expectsFastExit() bool {
 	return DeepSeekProfileMode(i.resolveDeepSeekProfile()) == deepSeekModeHeadless
 }
 
+// runCommandAsInitialProcess chooses the spawn shape for a tool command.
+// Interactive DeepSeek profiles must start under the pane's shell: the
+// acknowledgement wrapper uses setsid for ownership, which intentionally
+// removes the child from the controlling terminal and makes a TUI read EOF.
+// The shell-delivery path keeps the pane PTY while the immutable tmux session
+// identity still supplies cleanup ownership. One-shot DeepSeek and all other
+// existing tool paths retain their initial-process behavior.
+func (i *Instance) runCommandAsInitialProcess() bool {
+	if i == nil {
+		return false
+	}
+	if i.Tool == "deepseek" && i.deepSeekPromptDelivery() == DeepSeekPromptPane {
+		return false
+	}
+	return i.IsSandboxed() || i.Tool != "shell" || i.isBoundedCodexExec()
+}
+
 func (i *Instance) acknowledgeInitialProcess(command string) error {
 	ackErr := i.tmuxSession.AcknowledgeInitialProcess()
 	if ackErr == nil {

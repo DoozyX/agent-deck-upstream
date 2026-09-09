@@ -65,6 +65,18 @@ func TestStartCommandSpec_LaunchAs_Service_UsesServiceForm(t *testing.T) {
 		"-x", "173", "-y", "41"}, tmuxArgs)
 }
 
+func TestStartCommandSpec_LaunchAs_ServiceCarriesTmuxTmpdir(t *testing.T) {
+	const isolated = "/tmp/agent-deck-service-tmux"
+	t.Setenv("TMUX_TMPDIR", isolated)
+
+	s := &Session{Name: "service-env", WorkDir: "/tmp/project", LaunchAs: "service"}
+	launcher, args := s.startCommandSpec("/tmp/project", "")
+
+	require.Equal(t, "systemd-run", launcher)
+	assert.Contains(t, args, "--setenv=TMUX_TMPDIR="+isolated,
+		"service-mode tmux must receive the caller's isolated socket base")
+}
+
 func TestStartCommandSpec_CarriesCreationIdentityThroughLaunchers(t *testing.T) {
 	for _, launchAs := range []string{"direct", "scope", "service"} {
 		t.Run(launchAs+" captures created identity", func(t *testing.T) {
