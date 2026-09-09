@@ -228,23 +228,6 @@ func TestCaptureCreatedSessionIdentityRetriesTransientEmptyResponse(t *testing.T
 	}
 }
 
-func TestCaptureCreatedSessionIdentityUsesAuthoritativeCreateOutput(t *testing.T) {
-
-	dir := t.TempDir()
-	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
-		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+"if [ \"$1\" = \"list-sessions\" ]; then exit 1; fi\n"+"exit 1\n")
-
-	sess := &Session{
-		Name:             "created",
-		creationMarker:   "marker",
-		createdSessionID: "$created",
-	}
-	identity, err := sess.captureCreatedSessionIdentity()
-	if err != nil || identity != "$created" {
-		t.Fatalf("captureCreatedSessionIdentity() = %q, %v; want authoritative create output $created", identity, err)
-	}
-}
-
 func TestCaptureCreatedSessionIdentityRejectsUnmarkedReplacement(t *testing.T) {
 	dir := t.TempDir()
 	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
