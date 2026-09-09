@@ -45,6 +45,12 @@ type Event struct {
 	// WouldHave is present in observe mode: the action self-heal WOULD have taken
 	// had it been authorized. Empty when the decision was a skip.
 	WouldHave Action `json:"would_have,omitempty"`
+
+	// Repeat is how many consecutive IDENTICAL evaluations of this session were
+	// collapsed into this record (see CollapsingSink). 0/absent means the record
+	// stands for exactly the one read at TS. On a record that closes a run, TS is
+	// the last of those reads.
+	Repeat int `json:"repeat,omitempty"`
 }
 
 // EventSink is the durable audit destination. The default is an append-only
@@ -58,9 +64,30 @@ type EventSink interface {
 // targeted append (O_APPEND create), NEVER a full-file rewrite and NEVER
 // SaveInstances — it cannot wipe or truncate existing audit history (§3.5: no
 // destructive write primitive). The parent directory is created 0o700.
+//
+// The live file is SIZE-BOUNDED by rotation (rotate.go): past the segment
+// threshold it is renamed to a stamped sibling and gzipped, and the oldest
+// segments past the retention count are removed. Rotation preserves records
+// byte-for-byte — nothing is ever truncated or overwritten in place — so the
+// ≥1-week window is still reconstructable, but it must be read with
+// ForEachAuditEvent/AuditSegmentPaths rather than by opening the live path
+// alone.
 type NDJSONSink struct {
 	path string
 	mu   sync.Mutex
+
+	// Rotation dials. Fields rather than constants so a test can drive rolls
+	// without writing 128 MiB.
+	maxSegmentBytes  int64
+	retainedSegments int
+	// now is the clock for segment stamps (swapped in tests).
+	now func() time.Time
+	// lastStamp/stampSeq keep two rolls inside one second distinct. Guarded by mu.
+	lastStamp string
+	stampSeq  int
+	// rotations tracks in-flight background compressions, so a test (or a future
+	// shutdown path) can wait for them.
+	rotations sync.WaitGroup
 }
 
 // NewNDJSONSink returns a sink appending to path. The directory is created if
@@ -72,7 +99,12 @@ func NewNDJSONSink(path string) (*NDJSONSink, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("selfheal: mkdir audit dir: %w", err)
 	}
-	return &NDJSONSink{path: path}, nil
+	return &NDJSONSink{
+		path:             path,
+		maxSegmentBytes:  defaultMaxSegmentBytes,
+		retainedSegments: defaultRetainedSegments,
+		now:              segmentStampNow,
+	}, nil
 }
 
 // Path returns the audit file path (so callers/tests can report where it lands).
@@ -80,19 +112,25 @@ func (s *NDJSONSink) Path() string { return s.path }
 
 // Append writes one event as a single JSON line. O_APPEND guarantees the write
 // only ever extends the file; it never truncates or overwrites prior records.
+//
+// The size check and the write happen under the same lock as the rename that
+// rolls a full segment, so a concurrent Append can never interleave half a line
+// across the roll: every record lands whole, in exactly one segment.
 func (s *NDJSONSink) Append(e Event) error {
 	line, err := json.Marshal(e)
 	if err != nil {
 		return fmt.Errorf("selfheal: marshal event: %w", err)
 	}
+	line = append(line, '\n')
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.rotateIfNeededLocked(int64(len(line)))
 	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("selfheal: open audit file: %w", err)
 	}
 	defer f.Close()
-	if _, err := f.Write(append(line, '\n')); err != nil {
+	if _, err := f.Write(line); err != nil {
 		return fmt.Errorf("selfheal: append audit line: %w", err)
 	}
 	return nil

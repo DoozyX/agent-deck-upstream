@@ -155,10 +155,11 @@ func TestIssue1225_NudgeSendErrorIsHarmless(t *testing.T) {
 }
 
 // The PRODUCTION default wiring (not a test spy) is fully populated and routes
-// its idle probe through the conductor-scoped gate end-to-end: a conductor-
-// prefixed title is nudgeable only when idle, a busy conductor and a
-// non-conductor leaf are not. This guards against a future refactor silently
-// swapping defaultWakeNudgeWiring's isIdle for an unscoped probe.
+// its idle probe through the parent-idle gate end-to-end: any idle Claude or
+// Codex parent is nudgeable (this probe only runs for RESOLVED commit targets,
+// so every probed instance IS a parent of the completing child), while a busy
+// parent is not. This guards against a future refactor silently swapping
+// defaultWakeNudgeWiring's isIdle for an unscoped probe.
 func TestIssue1225_DefaultWiringUsesConductorIdleGate(t *testing.T) {
 	w := defaultWakeNudgeWiring()
 	if w == nil || w.nudger == nil || w.now == nil || w.isIdle == nil || w.send == nil {
@@ -170,29 +171,58 @@ func TestIssue1225_DefaultWiringUsesConductorIdleGate(t *testing.T) {
 	if w.isIdle(&Instance{ID: "c", Title: "conductor-x", Status: StatusRunning}) {
 		t.Fatal("default wiring must NOT nudge a busy conductor (send-keys would only queue)")
 	}
-	if w.isIdle(&Instance{ID: "l", Title: "worker", Status: StatusIdle}) {
-		t.Fatal("default wiring must NOT nudge a non-conductor leaf (no inbox drain → noise)")
+	if !w.isIdle(&Instance{ID: "p", Title: "bronze-crow-081ded03", Tool: "claude", Status: StatusIdle}) {
+		t.Fatal("default wiring must nudge an idle Claude parent regardless of title (the Stop-hook drain is title-agnostic)")
+	}
+	if !w.isIdle(&Instance{ID: "c", Title: "c", Tool: "codex", Status: StatusIdle}) {
+		t.Fatal("default wiring must nudge an idle Codex parent so it can continue orchestration")
 	}
 }
 
-// The production idle-probe is conductor-scoped (only conductors drain an inbox)
-// and only green when the pane is idle/waiting (not mid-turn).
+// The production idle-probe allows any Claude or Codex parent (plus a
+// conductor-titled parent on any tool), but only when the pane is idle/waiting
+// (not mid-turn).
 func TestIssue1225_ParentIsNudgeableIdle(t *testing.T) {
 	cases := []struct {
 		title  string
+		tool   string
 		status Status
 		want   bool
 	}{
-		{"conductor-x", StatusIdle, true},
-		{"conductor-x", StatusWaiting, true},
-		{"conductor-x", StatusRunning, false}, // busy: send-keys would only queue
-		{"worker", StatusIdle, false},         // non-conductor leaf: no inbox drain → noise
-		{"conductor-x", StatusError, false},
+		{"conductor-x", "claude", StatusIdle, true},
+		{"conductor-x", "claude", StatusWaiting, true},
+		{"conductor-x", "claude", StatusRunning, false}, // busy: send-keys would only queue
+		{"bronze-crow-1", "claude", StatusIdle, true},   // autonamed orchestrator: inbox drain is title-agnostic
+		{"worker", "claude", StatusWaiting, true},       // any Claude parent drains on Stop; nudge verifies deliverability
+		{"c", "codex", StatusIdle, true},                // Codex parents need a direct prompt, not a Claude inbox drain.
+		{"c", "codex", StatusWaiting, true},
+		{"c", "codex", StatusRunning, false},
+		{"conductor-x", "opencode", StatusIdle, true}, // conductor-titled parent on another tool keeps its wake
+		{"worker", "opencode", StatusIdle, false},     // no Stop-hook drain contract for other tools
+		{"conductor-x", "claude", StatusError, false},
 	}
 	for _, c := range cases {
-		p := &Instance{ID: "p", Title: c.title, Status: c.status}
+		p := &Instance{ID: "p", Title: c.title, Tool: c.tool, Status: c.status}
 		if got := parentIsNudgeableIdle(p); got != c.want {
 			t.Errorf("parentIsNudgeableIdle(title=%q,status=%q)=%v, want %v", c.title, c.status, got, c.want)
+		}
+	}
+}
+
+func TestParentNeedsStatusRefreshForCodexParent(t *testing.T) {
+	cases := []struct {
+		name   string
+		parent Instance
+		want   bool
+	}{
+		{"Claude conductor", Instance{Title: "conductor-work", Tool: "claude"}, true},
+		{"Codex parent", Instance{Title: "c", Tool: "codex"}, true},
+		{"ordinary leaf", Instance{Title: "worker", Tool: "claude"}, false},
+	}
+	for idx := range cases {
+		c := &cases[idx]
+		if got := parentNeedsStatusRefresh(&c.parent); got != c.want {
+			t.Errorf("parentNeedsStatusRefresh(%s) = %v, want %v", c.name, got, c.want)
 		}
 	}
 }

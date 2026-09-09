@@ -88,6 +88,9 @@ const (
 	SubstateIdleAtEmptyPrompt = tmux.SubstateIdleAtEmptyPrompt
 	SubstateModelUnavailable  = tmux.SubstateModelUnavailable
 	SubstateAuth401           = tmux.SubstateAuth401
+	SubstateAPIError          = tmux.SubstateAPIError
+	SubstateStalled           = tmux.SubstateStalled
+	SubstateAwaitingChoice    = tmux.SubstateAwaitingChoice
 	SubstateUsageLimit        = tmux.SubstateUsageLimit
 )
 
@@ -134,13 +137,14 @@ const (
 
 // Instance represents a single agent/shell session
 type Instance struct {
-	storageSnapshot *instanceStorageSnapshot
-
-	ID          string `json:"id"`
-	Title       string `json:"title"`
-	ProjectPath string `json:"project_path"`
-	GroupPath   string `json:"group_path"` // e.g., "projects/devops"
-	Order       int    `json:"order"`      // Position within group (for reorder persistence)
+	// PersistenceGeneration is the durable incarnation observed when this row
+	// was loaded. Storage CAS writes use it to reject prior-incarnation snapshots.
+	PersistenceGeneration int64
+	ID                    string `json:"id"`
+	Title                 string `json:"title"`
+	ProjectPath           string `json:"project_path"`
+	GroupPath             string `json:"group_path"` // e.g., "projects/devops"
+	Order                 int    `json:"order"`      // Position within group (for reorder persistence)
 	// Pin anchors this session to the top or bottom of its group, exempt from
 	// the status/recency sort (pin-sessions feature). PinNone is the default.
 	Pin                PinMode `json:"pin,omitempty"`
@@ -181,7 +185,7 @@ type Instance struct {
 	// handle (from a --quick / TUI-Q create). The TUI then displays the
 	// session's live Claude task description (tmux pane title) in place of the
 	// handle. Any explicit rename clears this so the user-chosen name is shown
-	// verbatim. See docs/superpowers/specs/2026-06-01-quick-session-claude-name-design.md.
+	// verbatim.
 	// Guarded by i.mu for runtime reads/writes; use GetAutoName/SetAutoName once
 	// an Instance is shared with background workers or the TUI render loop.
 	AutoName bool `json:"auto_name,omitempty"`
@@ -320,7 +324,14 @@ type Instance struct {
 	usageLimitedCached   bool
 	usageLimitSessionID  string
 	usageLimitScanGen    uint64
-	lastCodexProbeAt     time.Time // Rate-limits expensive Codex process-file probes
+	// usageLimitNotBeforeCached is when a resume may next be attempted for the
+	// memoised rejection: the reset moment parsed out of the rejection's own
+	// prose, or a fixed backoff when that prose is absent, unparseable or
+	// describes a window that demonstrably did not open. Keyed by the same
+	// usageLimitSessionID as the verdict and discarded with it on a rebind, so a
+	// new conversation can never inherit the old one's schedule.
+	usageLimitNotBeforeCached time.Time
+	lastCodexProbeAt          time.Time // Rate-limits expensive Codex process-file probes
 	// pendingCodexRestartWarning is consumed by UI/CLI after Restart() succeeds.
 	// It is intentionally transient and never persisted.
 	pendingCodexRestartWarning string `json:"-"`
@@ -458,13 +469,12 @@ type Instance struct {
 	// directly by users.
 	AutoLinkedChannels []string `json:"auto_linked_channels,omitempty"`
 
-	// WorkerScratchConfigDir is the ephemeral CLAUDE_CONFIG_DIR prepared
-	// for a non-conductor claude worker (issue #59, v1.7.68). The
-	// scratch dir copies the ambient profile's settings.json with the
-	// telegram plugin explicitly disabled, symlinks the rest of the
-	// profile, and is cleaned up on session stop/remove. Empty for
-	// conductor sessions, explicit telegram channel owners, and
-	// non-claude tools — they use the ambient profile as-is.
+	// WorkerScratchConfigDir holds the generated per-session Claude settings
+	// overlay (issue #59, v1.7.68). On macOS the stable account profile remains
+	// CLAUDE_CONFIG_DIR and this directory's settings.json is passed via
+	// --settings, avoiding a per-session Keychain identity. Other platforms
+	// retain the historical scratch CLAUDE_CONFIG_DIR behavior. Empty means no
+	// per-session settings isolation is needed.
 	WorkerScratchConfigDir string `json:"worker_scratch_config_dir,omitempty"`
 
 	// IdleTimeoutSecs is the auto-stop threshold (#1143). When > 0, a central
@@ -490,8 +500,17 @@ type Instance struct {
 	// for backwards compatibility with Claude fork targets.
 	ForkStartCommand string `json:"-"`
 
-	// ExtraArgs are user-supplied claude CLI tokens appended verbatim to every
-	// start/resume/fork command (e.g. ["--agent","reviewer","--model","opus"]).
+	// startedWithResume records whether the command the CURRENT start built
+	// resumes an existing conversation (`claude --resume <uuid>`, including
+	// the fork variant) rather than minting a fresh one. Only a resuming
+	// invocation can raise Claude's "Resume from summary" picker, so
+	// PostStartSync uses this to skip a 3s poll that a fresh session can
+	// never satisfy. Unexported and in-memory only: it describes one spawn,
+	// not the instance, and must never round-trip through storage.
+	startedWithResume bool
+
+	// ExtraArgs are user-supplied Claude or Codex CLI tokens appended to every
+	// supported start/resume/fork command (e.g. ["--sandbox","read-only"]).
 	// Each token is shellescape-quoted on emission so values with spaces
 	// survive the bash -c wrapper.
 	ExtraArgs []string `json:"extra_args,omitempty"`
@@ -609,9 +628,37 @@ type Instance struct {
 	// Not serialized - resets on load, but that's fine since we'll recheck on first poll
 	lastErrorCheck time.Time
 
+	// stall holds composer-dwell state for SubstateStalled detection (see
+	// stall.go). Derived and process-local: not serialized, and correctly
+	// starts empty after a reload since the dwell clock restarts on the next
+	// observation.
+	stall     *stallTracker
+	stallOnce sync.Once
+
 	// Tiered polling: skip expensive checks for idle sessions with no activity
 	lastIdleCheck     time.Time // When we last did a full check for an idle session
 	lastKnownActivity int64     // Last window_activity timestamp seen
+
+	// settledPoll gates the expensive tail of UpdateStatus (GetStatus's pane
+	// capture + the session-metadata sync) for sessions that are settled and
+	// producing nothing. See settled_poll.go.
+	settledPoll settledPollState
+
+	// lastMetaSyncActivity is the window_activity value the last session-metadata
+	// sync was based on. Unchanged activity means the tmux environment and the
+	// transcript tail cannot have moved, so the sync can wait.
+	lastMetaSyncActivity int64
+
+	// deadCheckStreak counts consecutive confirmations that this session's tmux
+	// session is gone. It escalates the recheck interval so a permanently dead
+	// session settles into a cheap steady state instead of paying a full probe
+	// on every 2s sweep forever.
+	deadCheckStreak int
+
+	// archivedErrorNormalizedAt records the ArchivedAt stamp whose archived+error
+	// state has already been reconciled against live tmux. The recheck-cache
+	// bypass for archived errors is a one-time normalization, not a per-tick job.
+	archivedErrorNormalizedAt time.Time
 
 	// lastStartTime tracks when Start() was called
 	// Used to provide grace period for tmux session creation (prevents error flash)
@@ -1075,8 +1122,13 @@ func (inst *Instance) IsWorktree() bool {
 }
 
 // SetParent sets the parent session ID
+//
+// Republishes the tmux role markers: the hook that reads them fires on
+// clear/compact/resume as well as startup, so a session re-parented while
+// live would otherwise be read with a stale marker on its next /clear.
 func (inst *Instance) SetParent(parentID string) {
 	inst.ParentSessionID = parentID
+	inst.refreshRoleEnv()
 }
 
 // SetParentWithPath sets both parent session ID and parent's project path
@@ -1084,12 +1136,14 @@ func (inst *Instance) SetParent(parentID string) {
 func (inst *Instance) SetParentWithPath(parentID, parentProjectPath string) {
 	inst.ParentSessionID = parentID
 	inst.ParentProjectPath = parentProjectPath
+	inst.refreshRoleEnv()
 }
 
 // ClearParent removes the parent session link
 func (inst *Instance) ClearParent() {
 	inst.ParentSessionID = ""
 	inst.ParentProjectPath = ""
+	inst.refreshRoleEnv()
 }
 
 // NewInstance creates a new session instance
@@ -1610,6 +1664,98 @@ func (i *Instance) ensureProfileEnv() {
 	if err := i.tmuxSession.SetEnvironment("AGENTDECK_PROFILE", sessionProfileEnvValue()); err != nil {
 		sessionLog.Warn("set_profile_failed", slog.String("error", err.Error()))
 	}
+	i.ensureSessionTempEnv()
+}
+
+// ensureSessionTempEnv makes shells and later tmux windows inherit the same
+// repository-owned temp root as the initial process command. The root itself
+// was prepared fail-closed before tmux startup; these host-side assignments are
+// the persistence complement to the inline export prefix.
+func (i *Instance) ensureSessionTempEnv() {
+	if i.tmuxSession == nil || i.IsSSH() {
+		return
+	}
+	tempDir := i.commandSessionTempDir()
+	for _, name := range []string{"TMPDIR", "TMP", "TEMP", "AGENT_DECK_SESSION_TMPDIR"} {
+		if err := i.tmuxSession.SetEnvironment(name, tempDir); err != nil {
+			sessionLog.Warn("set_session_temp_env_failed", slog.String("name", name), slog.String("error", err.Error()))
+		}
+	}
+}
+
+// ensureRoleEnv publishes this session's orchestration role into the tmux
+// session environment so in-session hooks can tell a dispatched child from an
+// interactive session by reading the environment alone — no DB lookup, and it
+// works from any shell inside the session.
+//
+// A parented session carries AGENTDECK_ROLE=child and AGENTDECK_PARENT_ID
+// (the parent's instance id). An unparented session carries neither: the vars
+// are actively removed rather than left alone, so a session that was
+// un-parented (ClearParent, or re-homed elsewhere) and then restarted stops
+// announcing itself as a child.
+//
+// Called alongside ensureProfileEnv at every spawn and respawn site, because
+// each respawn-pane branch in Restart() returns before the fallback recreate
+// path that would otherwise set it.
+//
+// Failures log at Warn here: every caller is a spawn or respawn site where the
+// tmux session was just created, so a set-environment failure is a genuine
+// fault worth surfacing in debug.log. The parent mutators use refreshRoleEnv
+// instead — see there for why they must not share this log level.
+func (i *Instance) ensureRoleEnv() {
+	i.publishRoleEnv(true)
+}
+
+// refreshRoleEnv republishes the markers from a parent mutator (SetParent,
+// SetParentWithPath, ClearParent), where the tmux session may legitimately not
+// exist: `launch` sets the parent long before Start(), and the group re-homing
+// paths run against archived or dead sessions. Both are ordinary, so a failed
+// set-environment is expected rather than a fault and logs at Debug.
+//
+// Why the log level and not a liveness guard: skipping the call outright needs
+// a reliable "is this session live" answer, and none is cheaply available.
+// tmuxSession is populated at construction (NewInstance), so a nil check cannot
+// distinguish not-yet-started from live; tmux.startupAt is zero for reconnected
+// sessions; Exists() is a subprocess, and these mutators run on the UI thread
+// where per-keystroke has-session calls are the documented nav-freeze class;
+// and ExistsCached() answers "false" from a cold cache at the seconds-old spawn
+// sites, which would silently disable the markers entirely. The two doomed
+// set-environment calls per parented launch therefore remain — they cost a
+// subprocess round-trip and nothing else, and no longer pollute the log this
+// repo diagnoses live incidents from.
+func (i *Instance) refreshRoleEnv() {
+	i.publishRoleEnv(false)
+}
+
+// publishRoleEnv does the work for both variants. expectLive selects the log
+// level for set failures; unset failures are always Debug, since an unparented
+// session with no tmux session is the common, uninteresting case.
+func (i *Instance) publishRoleEnv(expectLive bool) {
+	if i.tmuxSession == nil {
+		return
+	}
+	if i.ParentSessionID == "" {
+		if err := i.tmuxSession.UnsetEnvironment("AGENTDECK_ROLE"); err != nil {
+			sessionLog.Debug("unset_role_failed", slog.String("error", err.Error()))
+		}
+		if err := i.tmuxSession.UnsetEnvironment("AGENTDECK_PARENT_ID"); err != nil {
+			sessionLog.Debug("unset_parent_id_failed", slog.String("error", err.Error()))
+		}
+		return
+	}
+	logFailure := func(msg string, err error) {
+		if expectLive {
+			sessionLog.Warn(msg, slog.String("error", err.Error()))
+			return
+		}
+		sessionLog.Debug(msg, slog.String("error", err.Error()))
+	}
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_ROLE", "child"); err != nil {
+		logFailure("set_role_failed", err)
+	}
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_PARENT_ID", i.ParentSessionID); err != nil {
+		logFailure("set_parent_id_failed", err)
+	}
 }
 
 // ensureClaudeConfigDirEnv sets CLAUDE_CONFIG_DIR host-side on the instance's
@@ -1697,7 +1843,7 @@ func (i *Instance) logClaudeConfigResolution() {
 	)
 }
 
-// ValidateClaudeExtraArgToken rejects a single --extra-arg token that looks
+// ValidateExtraArgToken rejects a single --extra-arg token that looks
 // like a flag mashed together with its value (issue #1431b). Each --extra-arg
 // is shell-quoted as ONE argument, so `--extra-arg "--model opus"` reaches
 // claude as the literal single arg '--model opus' (embedded space) — an
@@ -1706,7 +1852,7 @@ func (i *Instance) logClaudeConfigResolution() {
 // whitespace is almost always two tokens the user meant to pass separately;
 // surfacing it as an error at spawn time beats the silent tmux death. Clean
 // flags ("--model") and clean values ("opus", "be concise") pass.
-func ValidateClaudeExtraArgToken(token string) error {
+func ValidateExtraArgToken(token string) error {
 	if strings.HasPrefix(token, "-") && strings.ContainsAny(token, " \t\n\r") {
 		return fmt.Errorf(
 			"--extra-arg %q looks like a flag and its value combined; pass them as separate --extra-arg tokens (e.g. --extra-arg \"--model\" --extra-arg \"opus\"), or use the first-class --model flag",
@@ -1716,8 +1862,14 @@ func ValidateClaudeExtraArgToken(token string) error {
 	return nil
 }
 
+// SupportsExtraArgs reports whether tool has a command builder that emits
+// persisted ExtraArgs on every lifecycle path.
+func SupportsExtraArgs(tool string) bool {
+	return IsClaudeCompatible(tool) || IsCodexCompatible(tool)
+}
+
 // extraArgsSupplyModel reports whether the persisted --extra-arg tokens already
-// carry a `--model` override. ValidateClaudeExtraArgToken forces flag and value
+// carry a `--model` override. ValidateExtraArgToken forces flag and value
 // into separate tokens, so a user-supplied model appears as a bare "--model"
 // (or "--model=..." form) token. When present we must NOT also inject
 // [claude].default_model, or the launch command would carry two --model flags.
@@ -1742,6 +1894,23 @@ func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
 
 func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName string) string {
 	var flags []string
+
+	// Claude Code 2.1.224+ exposes managed sessions to ListAgents/SendMessage
+	// by name. Give agent-deck sessions a stable, collision-resistant address,
+	// while preserving an operator's explicit --name from extra_args.
+	if !i.suppliesClaudeName() {
+		flags = append(flags, "--name "+shellescape.Quote(i.ClaudePeerName()))
+	}
+
+	// macOS Claude Code keys OAuth credentials by the literal
+	// CLAUDE_CONFIG_DIR. Pointing it at a worker scratch directory therefore
+	// forks the profile's rotating refresh token into a separate Keychain item.
+	// Keep CLAUDE_CONFIG_DIR on the stable account profile and load only the
+	// generated per-session settings overlay through Claude's supported flag.
+	if runtimeGOOS() == "darwin" && i.WorkerScratchConfigDir != "" {
+		settingsPath := filepath.Join(i.WorkerScratchConfigDir, "settings.json")
+		flags = append(flags, "--settings "+shellescape.Quote(settingsPath))
+	}
 
 	// Instance-level flags (not from ClaudeOptions)
 	// --add-dir: Grant subagent access to parent's project directory (for worktrees, etc.)
@@ -1781,7 +1950,7 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 	// command delegates flag assembly here, this single point keeps them all
 	// in lockstep.
 	// A user-supplied --model via --extra-arg (the form the
-	// ValidateClaudeExtraArgToken error message recommends) is an explicit
+	// ValidateExtraArgToken error message recommends) is an explicit
 	// override that must stand alone: the extra-arg tokens are appended verbatim
 	// below, so emitting any resolved --model here too would produce a duplicate
 	// --model on the command line. claude is last-wins so it would be harmless,
@@ -2101,26 +2270,74 @@ func (i *Instance) resolveCodexYoloFlag() string {
 }
 
 func (i *Instance) resolveCodexModelFlag() string {
+	if hasCodexExtraArgModel(i.ExtraArgs) {
+		return ""
+	}
 	opts := i.GetCodexOptions()
-	if opts != nil && strings.TrimSpace(opts.Model) != "" {
-		return " --model " + shellescape.Quote(strings.TrimSpace(opts.Model))
+	model := ""
+	if opts != nil {
+		model = strings.TrimSpace(opts.Model)
+	}
+	if model == "" {
+		if config, err := LoadUserConfig(); err == nil && config != nil {
+			model = strings.TrimSpace(config.GetGroupCodexModel(i.GroupPath))
+			if model == "" {
+				model = strings.TrimSpace(config.Codex.DefaultModel)
+			}
+		}
+	}
+	if model != "" {
+		return " --model " + shellescape.Quote(model)
 	}
 	return ""
 }
 
+func hasCodexExtraArgModel(args []string) bool {
+	for _, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
+			return true
+		}
+	}
+	return false
+}
+
 func (i *Instance) resolveCodexReasoningEffortFlag() string {
 	opts := i.GetCodexOptions()
-	if opts != nil && strings.TrimSpace(opts.ReasoningEffort) != "" {
-		value := "model_reasoning_effort=" + strings.TrimSpace(opts.ReasoningEffort)
+	effort := ""
+	if opts != nil {
+		effort = strings.TrimSpace(opts.ReasoningEffort)
+	}
+	if effort == "" {
+		if config, err := LoadUserConfig(); err == nil && config != nil {
+			effort = strings.TrimSpace(config.GetGroupCodexReasoningEffort(i.GroupPath))
+			if effort == "" {
+				effort = strings.TrimSpace(config.Codex.DefaultReasoningEffort)
+			}
+		}
+	}
+	if effort != "" {
+		value := "model_reasoning_effort=" + effort
 		return " --config " + shellescape.Quote(value)
 	}
 	return ""
 }
 
+func (i *Instance) resolveCodexExtraArgsFlag() string {
+	if len(i.ExtraArgs) == 0 {
+		return ""
+	}
+	quoted := make([]string, 0, len(i.ExtraArgs))
+	for _, tok := range i.ExtraArgs {
+		quoted = append(quoted, shellescape.Quote(tok))
+	}
+	return " " + strings.Join(quoted, " ")
+}
+
 func (i *Instance) resolveCodexCommand(baseCommand string) string {
 	command := strings.TrimSpace(baseCommand)
 	if i.Tool == "codex" && (command == "" || command == "codex") {
-		return GetCodexCommand()
+		return GetCodexCommandForInstance(i)
 	}
 	if command == "" {
 		return "codex"
@@ -2228,6 +2445,11 @@ func (i *Instance) codexHomeToExport() string {
 	if accountHome := strings.TrimSpace(i.accountCodexHomeDir()); accountHome != "" {
 		return accountHome
 	}
+	if config, err := LoadUserConfig(); err == nil && config != nil {
+		if groupHome := strings.TrimSpace(config.GetGroupCodexConfigDir(i.GroupPath)); groupHome != "" {
+			return groupHome
+		}
+	}
 	if isCodexHomeExplicit() {
 		return strings.TrimSpace(getCodexHomeDir())
 	}
@@ -2257,6 +2479,11 @@ func (i *Instance) codexHomeForCommand(command string) string {
 	if accountHome := strings.TrimSpace(i.accountCodexHomeDir()); accountHome != "" {
 		return accountHome
 	}
+	if config, err := LoadUserConfig(); err == nil && config != nil {
+		if groupHome := strings.TrimSpace(config.GetGroupCodexConfigDir(i.GroupPath)); groupHome != "" {
+			return groupHome
+		}
+	}
 	return getCodexHomeDir()
 }
 
@@ -2265,6 +2492,14 @@ func (i *Instance) getCodexHomeDir() string {
 		return getCodexHomeDir()
 	}
 	return i.codexHomeForCommand(i.resolveCodexCommand(i.Command))
+}
+
+// GetCodexConfigDirForInstance returns the effective CODEX_HOME for a session.
+func GetCodexConfigDirForInstance(i *Instance) string {
+	if i == nil {
+		return getCodexHomeDir()
+	}
+	return i.getCodexHomeDir()
 }
 
 // Codex stores sessions in ~/.codex/sessions/YYYY/MM/DD/*.jsonl
@@ -2306,6 +2541,7 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 	yoloFlag := i.resolveCodexYoloFlag()
 	modelFlag := i.resolveCodexModelFlag()
 	reasoningFlag := i.resolveCodexReasoningEffortFlag()
+	extraArgsFlag := i.resolveCodexExtraArgsFlag()
 	command := i.resolveCodexCommand(baseCommand)
 	// Must be the home this launch exports (above), not the process-wide one:
 	// the gates below decide whether a rollout exists, and looking in the wrong
@@ -2346,16 +2582,16 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 			slog.String("instance_id", i.ID),
 			slog.String("title", i.Title),
 			slog.String("sid", i.CodexSessionID))
-		return envPrefix + fmt.Sprintf("%s%s%s%s fork %s",
-			command, yoloFlag, modelFlag, reasoningFlag, i.CodexSessionID)
+		return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s",
+			command, yoloFlag, modelFlag, reasoningFlag, extraArgsFlag, i.CodexSessionID)
 	}
 
 	if i.CodexSessionID != "" {
-		return envPrefix + fmt.Sprintf("%s%s%s%s resume %s",
-			command, yoloFlag, modelFlag, reasoningFlag, i.CodexSessionID)
+		return envPrefix + fmt.Sprintf("%s%s%s%s%s resume %s",
+			command, yoloFlag, modelFlag, reasoningFlag, extraArgsFlag, i.CodexSessionID)
 	}
 
-	return envPrefix + command + yoloFlag + modelFlag + reasoningFlag
+	return envPrefix + command + yoloFlag + modelFlag + reasoningFlag + extraArgsFlag
 }
 
 // buildCodexCommandWithPrompt builds the Codex launch command with an initial
@@ -2379,6 +2615,12 @@ func (i *Instance) buildCodexCommand(baseCommand string) string {
 //     would not be the subcommand's prompt.
 //
 // In each of those cases the caller keeps the existing behaviour unchanged.
+//
+// A prompt too large to ride the tmux command line (tmuxCommandByteBudget) is
+// still embedded, but by reference: the body is spilled to a file and the
+// command reads it back at exec time. Inlining it would make tmux reject the
+// whole `new-session` with "command too long", which fails the launch outright
+// and leaves a dead session to archive.
 func (i *Instance) buildCodexCommandWithPrompt(baseCommand, prompt string) (string, bool) {
 	command := i.buildCodexCommand(baseCommand)
 	if strings.TrimSpace(prompt) == "" {
@@ -2397,7 +2639,82 @@ func (i *Instance) buildCodexCommandWithPrompt(baseCommand, prompt string) (stri
 	if i.CodexSessionID != "" {
 		return command, false
 	}
-	return command + " " + shellescape.Quote(prompt), true
+	inline := command + " " + shellescape.Quote(prompt)
+	if len(inline) <= tmuxCommandByteBudget {
+		return inline, true
+	}
+	// Over the budget the prompt cannot ride the tmux command line at all (see
+	// tmuxCommandByteBudget): tmux refuses the whole `new-session` with
+	// "command too long" and the launch fails, leaving a dead session behind.
+	// Hand the pane a path instead and let its shell read the body back at
+	// exec time, where the ceiling is ARG_MAX (~1 MB), not tmux's 16 KB.
+	if fileCommand, ok := i.codexPromptFileCommand(command, prompt); ok {
+		return fileCommand, true
+	}
+	// The prompt file could not be written (unwritable project, SSH pane whose
+	// shell would not see a host-side path). Typing is unreliable for a body
+	// this large, but it is the only transport left and it at least fails
+	// visibly rather than at the tmux boundary.
+	return command, false
+}
+
+// tmuxCommandByteBudget caps the command string a session may hand to
+// `tmux new-session`. tmux delivers a client command to its server as one imsg
+// and rejects anything over MAX_IMSGSIZE (16384 bytes, minus the imsg header
+// and the rest of the argv) with a bare "command too long" — measured on
+// tmux 3.x: a 16000-byte command is accepted, 17000 is refused. The budget sits
+// well under that line because prepareCommand still wraps this string
+// afterwards (env prefixes, `bash -c` quoting, SSH layering), and quoting a
+// command that already contains quotes can inflate it substantially.
+const tmuxCommandByteBudget = 12000
+
+// codexInitialPromptFile is the name of the oversize-prompt spill file inside
+// the session's repository temp root.
+const codexInitialPromptFile = "codex-initial-prompt.txt"
+
+// codexInitialPromptPath is where an oversize initial prompt is spilled. It
+// lives in the session's own repository temp root, which is git-excluded,
+// mode 0700, and removed with the session (CleanupRepositorySessionTemp).
+func (i *Instance) codexInitialPromptPath() string {
+	return filepath.Join(i.repositorySessionTempDir(), codexInitialPromptFile)
+}
+
+// codexPromptFileCommand spills prompt to codexInitialPromptPath and returns a
+// command that substitutes the file's contents as codex's positional prompt.
+// It reports false when the file cannot be used, leaving the caller on its
+// existing fallback.
+//
+// The pane-side form is `codex ... "$(cat '<path>')"`: the command substitution
+// is expanded by the shell tmux runs the command under, so the large body never
+// crosses the tmux socket. The double quotes keep it one operand, and
+// shellescape.Quote protects the path itself.
+//
+// A sandboxed session gets the in-container mount point
+// (commandSessionTempDir), which docker.WithSessionTemp binds to the same
+// directory this writes to. An SSH session gets nothing: the command runs on
+// another host where the path does not exist.
+func (i *Instance) codexPromptFileCommand(command, prompt string) (string, bool) {
+	if i == nil || i.IsSSH() {
+		return "", false
+	}
+	if err := i.prepareRepositorySessionTemp(); err != nil {
+		sessionLog.Warn("codex_prompt_file_temp_failed",
+			slog.String("instance_id", i.ID),
+			slog.String("error", err.Error()))
+		return "", false
+	}
+	if err := os.WriteFile(i.codexInitialPromptPath(), []byte(prompt), 0o600); err != nil {
+		sessionLog.Warn("codex_prompt_file_write_failed",
+			slog.String("instance_id", i.ID),
+			slog.String("error", err.Error()))
+		return "", false
+	}
+	panePath := filepath.Join(i.commandSessionTempDir(), codexInitialPromptFile)
+	sessionLog.Info("codex_prompt_spilled_to_file",
+		slog.String("instance_id", i.ID),
+		slog.Int("prompt_bytes", len(prompt)),
+		slog.String("path", logging.SanitizeValue(panePath)))
+	return command + ` "$(cat ` + shellescape.Quote(panePath) + `)"`, true
 }
 
 // piAgentDeckSessionDirExpr returns a target-shell expression for the Pi session
@@ -2473,6 +2790,9 @@ func (i *Instance) consumeForkStartCommand() string {
 		i.ForkStartCommand = ""
 	}
 	i.IsForkAwaitingStart = false
+	// A fork command carries `--resume <parent> --fork-session`, so it can
+	// raise the "Resume from summary" picker just like a plain resume.
+	i.startedWithResume = true
 	return command
 }
 
@@ -3310,7 +3630,7 @@ func decodeJSONStringField(raw map[string]json.RawMessage, key string) string {
 func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
 	exclude := make(map[string]bool)
 
-	tmuxSessions, err := tmux.ListAgentDeckSessions()
+	sessionIDs, err := loadCodexSessionIDs()
 	if err != nil {
 		return exclude
 	}
@@ -3320,14 +3640,11 @@ func (i *Instance) collectOtherCodexSessionIDs() map[string]bool {
 		myTmuxName = i.tmuxSession.Name
 	}
 
-	for _, sessName := range tmuxSessions {
+	for sessName, id := range sessionIDs {
 		if sessName == myTmuxName {
 			continue
 		}
-		other := &tmux.Session{Name: sessName}
-		if id, err := other.GetEnvironment("CODEX_SESSION_ID"); err == nil && id != "" {
-			exclude[id] = true
-		}
+		exclude[id] = true
 	}
 
 	return exclude
@@ -3398,9 +3715,9 @@ func (i *Instance) collectTmuxPaneProcessTreePIDs() ([]int, error) {
 		return nil, paneErr
 	}
 
-	// Single snapshot of the process table is substantially cheaper than
+	// Single cached snapshot of the process table is substantially cheaper than
 	// spawning pgrep once per node in deep process trees.
-	procTable, psErr := exec.Command("ps", "-eo", "pid=,ppid=").Output()
+	procTable, psErr := loadCodexProcessTable()
 	if psErr == nil {
 		allPIDs, treeErr := collectProcessTreePIDsFromTable(panePIDs, procTable)
 		if treeErr == nil {
@@ -4970,9 +5287,9 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 // SpawnAttempt helper) to preserve the structural-grep contract that
 // checks Start()'s body for the #745 IsForkAwaitingStart guard.
 func (i *Instance) Start() error {
-	if err := i.ValidateAccount(); err != nil {
-		return err
-	}
+	// Clear the per-spawn resume marker before this start decides between a
+	// fresh and a resuming command (see shouldAutoConfirmResumePicker).
+	i.resetResumeMarker()
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
 	if lockErr != nil {
@@ -5207,7 +5524,7 @@ func (i *Instance) Start() error {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
-	i.ensureInteractiveShellAccount()
+	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 
 	// Propagate tool session IDs into the tmux environment (host-side, works for both
@@ -5291,23 +5608,36 @@ func (i *Instance) Start() error {
 // Issue #1040: same per-instance spawn lock as Start() — a concurrent
 // `launch -m "..."` racing with a poller-triggered Start() must not
 // produce two parallel tmux sessions.
+// StartWithMessage starts the session and delivers an initial message,
+// returning an error when the message was not confirmed accepted. It is the
+// error-only face of StartWithMessageDelivery for callers that do not need to
+// report the classification; the failure semantics are identical, so no caller
+// can silently inherit the old "exhausted the budget, returned nil" behaviour
+// by using this form.
 func (i *Instance) StartWithMessage(message string) error {
-	if err := i.ValidateAccount(); err != nil {
-		return err
-	}
+	_, err := i.StartWithMessageDelivery(message)
+	return err
+}
+
+func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
+	// Clear the per-spawn resume marker before this start decides between a
+	// fresh and a resuming command (see shouldAutoConfirmResumePicker).
+	i.resetResumeMarker()
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
 	if lockErr != nil {
-		return lockErr
+		return send.DeliverySendFailed, lockErr
 	}
 	defer release()
 	if spawnedSince(i.ID, beforeLock) {
-		return nil
+		// A sibling launch already spawned this instance and delivered its
+		// own message; this call typed nothing, so it claims nothing.
+		return send.DeliveryUnverified, nil
 	}
 	defer recordInstanceSpawn(i.ID)
 
 	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
+		return send.DeliverySendFailed, fmt.Errorf("tmux session not initialized")
 	}
 
 	// Refuse a message this session has no way to receive, BEFORE spawning
@@ -5321,7 +5651,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// failure while leaving a running server behind is its own trap.
 	if message != "" {
 		if err := i.PromptDeliveryError(); err != nil {
-			return err
+			return send.DeliverySendFailed, err
 		}
 	}
 
@@ -5434,7 +5764,7 @@ func (i *Instance) StartWithMessage(message string) error {
 		// prompt represents — otherwise a fresh session has no status icon
 		// until the user types.
 		if _, err := i.seedHermesHookGeneration("running", true); err != nil {
-			return err
+			return send.DeliverySendFailed, err
 		}
 		command = i.buildHermesCommand(i.Command)
 	case i.Tool == "deepseek":
@@ -5447,7 +5777,7 @@ func (i *Instance) StartWithMessage(message string) error {
 			// headless still needs its recorded task.
 			dsCommand, dsErr := i.deepSeekStartCommand()
 			if dsErr != nil {
-				return dsErr
+				return send.DeliverySendFailed, dsErr
 			}
 			command = dsCommand
 			break
@@ -5469,7 +5799,7 @@ func (i *Instance) StartWithMessage(message string) error {
 		// #1924: leave a reason behind. Without this the session sits on
 		// StatusError with no tmux session and nothing to diagnose from.
 		i.recordPrepareFailure(command, err)
-		return err
+		return send.DeliverySendFailed, err
 	}
 	if containerName != "" {
 		i.SandboxContainer = containerName
@@ -5495,7 +5825,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	if err := i.tmuxSession.Start(command); err != nil {
 		// #1580: persist the tmux-level failure (sister path to Start()).
 		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("failed to start tmux session: %w", err)
+		return send.DeliverySendFailed, fmt.Errorf("failed to start tmux session: %w", err)
 	}
 	if err := i.acknowledgeInitialProcess(command); err != nil {
 		return err
@@ -5524,7 +5854,7 @@ func (i *Instance) StartWithMessage(message string) error {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
-	i.ensureInteractiveShellAccount()
+	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 
 	// Propagate tool session IDs into the tmux environment (host-side, works for both
@@ -5576,21 +5906,40 @@ func (i *Instance) StartWithMessage(message string) error {
 		return i.sendMessageWhenReady(message)
 	}
 
-	return nil
+	// Nothing was typed into a pane: either there was no message, or it rode
+	// the command line (codex, the DeepSeek headless profile) and IS the
+	// invocation. Both are as delivered as they can get.
+	return send.DeliverySubmitted, nil
 }
 
-// sendMessageWhenReady waits for the agent to be ready and sends the message.
-// Uses the shared WaitForAgentReady helper (same semantics as `session send`).
-func (i *Instance) sendMessageWhenReady(message string) error {
+// sendMessageWhenReady waits for the agent to be ready and sends the message,
+// returning the delivery classification (a send.Delivery* constant) alongside
+// any error. Uses the shared WaitForAgentReady helper (same semantics as
+// `session send`).
+//
+// The classification is the point. This function used to return a bare `error`
+// and, critically, `return nil` when its verification loop exhausted every
+// retry without ever seeing the agent accept the message — so a brief that was
+// never delivered was reported to the CLI as an unqualified success. That is
+// the "`success: true` is not evidence work started" failure: a child sitting
+// at ctx=0 with an empty composer while `session list` says `running`, paid
+// for independently across four orchestrated runs. `session send` has reported
+// this honestly since issue #1413; the spawn path now uses the same vocabulary
+// so a launch cannot claim more than it observed.
+func (i *Instance) sendMessageWhenReady(message string) (string, error) {
 	if i.tmuxSession == nil {
-		return fmt.Errorf("tmux session not initialized")
+		return send.DeliverySendFailed, fmt.Errorf("tmux session not initialized")
 	}
 
 	if err := send.WaitForAgentReady(i.tmuxSession, i.Tool, send.DefaultAgentReadyTimeout, send.PromptGates{
 		ClaudeComposer: IsClaudeCompatible(i.Tool),
 		CodexPrompt:    IsCodexCompatible(i.Tool),
 	}); err != nil {
-		return fmt.Errorf("timeout waiting for agent to be ready")
+		// Nothing was typed: the pane never became ready to receive it.
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "timeout waiting for agent to be ready",
+		}
 	}
 
 	// Pre-send provenance probe for the #1777 attribution gate: Claude
@@ -5606,7 +5955,11 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 	}
 
 	if err := i.tmuxSession.SendKeysAndEnter(message); err != nil {
-		return fmt.Errorf("failed to send message: %w", err)
+		return send.DeliverySendFailed, &send.DeliveryError{
+			Delivery: send.DeliverySendFailed,
+			Err:      err,
+			Detail:   "failed to send message",
+		}
 	}
 
 	// The verify loop below keys off Claude-specific signals (an
@@ -5614,18 +5967,44 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 	// Claude tools never surface those, so the loop false-negatives a
 	// delivered message and Enter-spams the composer; skip it for every
 	// non-Claude tool (#1238 — generalizes #1228's codex-only skip).
+	//
+	// Skipping verification is not the same as verifying success: the bytes
+	// went to the pane and nothing here can say whether the agent took them
+	// up. That is exactly DeliveryUnverified, and it is reported as such
+	// rather than as a confirmed submit. It is not an error — there is no
+	// evidence of failure either — so the launch still succeeds, but a
+	// caller reading `delivery` is told the truth.
 	if !UsesClaudeDeliveryVerify(i.Tool) {
-		return nil
+		return send.DeliveryUnverified, nil
 	}
 
 	// Verify the agent accepted Enter and began processing.
-	const verifyRetries = 50
+	//
+	// The budget scales with payload size: the flat 50 retries were the same
+	// fifteen seconds for a one-line nudge and a 13k-character brief, giving
+	// the largest bodies the least slack at exactly the size where submission
+	// failures were reported. A launch brief is almost always one of the large
+	// ones. See send.VerifyRetriesForPayload.
+	verifyRetries := send.VerifyRetriesForPayload(50, message)
 	const verifyDelay = 300 * time.Millisecond
 	const activeSuccessThreshold = 2
 	const waitingAfterActiveThreshold = 2
 	waitingNoMarkerChecks := 0
 	activeChecks := 0
 	sawActiveAfterSend := false
+	// sawBodyInPane records that the message was observed reaching the
+	// composer at least once. It separates "typed but never confirmed
+	// submitted" from "no evidence the bytes ever arrived" when the budget
+	// runs out — two different problems with two different remedies.
+	sawBodyInPane := false
+	// composerHoldingAtLastLook is the most recent observation of whether
+	// the composer was still holding our message. On exhaustion it is the
+	// difference between the strong claim (it is still sitting there
+	// unsent) and the weaker one (it arrived, then we lost track of it).
+	composerHoldingAtLastLook := false
+	// everCaptured guards against reporting a confident verdict when every
+	// single pane capture failed: that is a blind loop, not evidence.
+	everCaptured := false
 	// attrib is the #1777 attribution gate. EVERY bare Enter below —
 	// including the unsent-prompt branch, which used to press unconditionally
 	// whenever a "[Pasted text …]" marker appeared anywhere in the pane —
@@ -5645,8 +6024,13 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		captured, captureErr := i.tmuxSession.CapturePaneFresh()
 		paneNow := send.CaptureOutcome(captured, captureErr)
 		if paneNow.OK {
+			everCaptured = true
 			content := tmux.StripANSI(captured)
 			unsentPromptDetected = send.ComposerHoldsPasteMarker(captured, tmux.StripANSI) || send.HasUnsentComposerPrompt(content, message)
+			composerHoldingAtLastLook = unsentPromptDetected
+			if unsentPromptDetected {
+				sawBodyInPane = true
+			}
 		}
 		verifiedStatus, statusErr := i.tmuxSession.GetStatus()
 
@@ -5662,7 +6046,7 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 			waitingNoMarkerChecks = 0
 			activeChecks++
 			if activeChecks >= activeSuccessThreshold {
-				return nil
+				return send.DeliverySubmitted, nil
 			}
 			continue
 		}
@@ -5672,7 +6056,7 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 			if sawActiveAfterSend {
 				waitingNoMarkerChecks++
 				if waitingNoMarkerChecks >= waitingAfterActiveThreshold {
-					return nil
+					return send.DeliverySubmitted, nil
 				}
 			} else {
 				waitingNoMarkerChecks = 0
@@ -5689,7 +6073,43 @@ func (i *Instance) sendMessageWhenReady(message string) error {
 		}
 	}
 
-	return nil
+	// Budget exhausted with no accepted turn. Every branch below is a
+	// FAILURE — this is where the old code returned nil and let a launch
+	// report "(message sent)" over an undelivered brief.
+	return classifyExhaustedSpawnSend(everCaptured, composerHoldingAtLastLook, sawBodyInPane)
+}
+
+// classifyExhaustedSpawnSend names what the spawn-time verification loop
+// actually observed once its retry budget ran out, in the same vocabulary
+// `session send` uses. Split out so the classification is testable without
+// driving a real pane for 15 seconds.
+func classifyExhaustedSpawnSend(everCaptured, composerHoldingAtLastLook, sawBodyInPane bool) (string, error) {
+	switch {
+	case !everCaptured:
+		// Every capture failed. We have no observation at all, so the
+		// honest report is that nothing was ever confirmed — not a guess
+		// about where the bytes went.
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "message sent but the pane could not be read to confirm delivery",
+		}
+	case composerHoldingAtLastLook:
+		// The strongest claim: it is still sitting there, unsent.
+		return send.DeliveryTypedNotSubmitted, &send.DeliveryError{
+			Delivery: send.DeliveryTypedNotSubmitted,
+			Detail:   "message is still unsent in the composer after the Enter-retry budget",
+		}
+	case sawBodyInPane:
+		return send.DeliveryTyped, &send.DeliveryError{
+			Delivery: send.DeliveryTyped,
+			Detail:   "message reached the pane but the agent was never observed accepting it",
+		}
+	default:
+		return send.DeliveryNoEvidence, &send.DeliveryError{
+			Delivery: send.DeliveryNoEvidence,
+			Detail:   "no evidence the message was delivered or accepted",
+		}
+	}
 }
 
 // errorRecheckInterval - how often to recheck sessions that don't exist
@@ -5978,11 +6398,15 @@ func classifyTerminatedPane(exitCode int, haveExitCode bool, tool string) Status
 }
 
 func (i *Instance) UpdateStatus() error {
+	// Phase attribution for the background sweep's slow_sessions entries.
+	// Emits nothing unless this call exceeded updateStatusSlowThreshold.
+	trace := newUpdateStatusTrace()
+	defer trace.finish(i.ID, i.Title)
 	// #1846: flush any unpersisted last-activity evidence once the lock is
 	// released (declared before Lock so it runs after the Unlock defer).
 	// Cheap no-op unless the cold-load fold below (or an earlier
 	// UpdateHookStatus within the throttle window) left something behind.
-	defer i.persistLastActivity(false)
+	defer func() { done := trace.phase(&trace.persist); i.persistLastActivity(false); done() }()
 	i.mu.Lock()
 	defer i.mu.Unlock()
 
@@ -5996,8 +6420,10 @@ func (i *Instance) UpdateStatus() error {
 	// Don't block status detection once tmux session exists
 	if time.Since(graceTime) < 1500*time.Millisecond {
 		// Only skip if tmux session doesn't exist yet
-		if i.tmuxSession == nil || !i.tmuxSession.Exists() {
-			if i.Status != StatusRunning && i.Status != StatusIdle && i.Status != StatusError && i.Status != StatusStopped {
+		if i.tmuxSession == nil || !i.traceExists(trace) {
+			if i.IsArchived() {
+				i.Status = StatusStopped
+			} else if i.Status != StatusRunning && i.Status != StatusIdle && i.Status != StatusError && i.Status != StatusStopped {
 				i.Status = StatusStarting
 			}
 			return nil
@@ -6006,7 +6432,9 @@ func (i *Instance) UpdateStatus() error {
 	}
 
 	if i.tmuxSession == nil {
-		if i.neverStarted() {
+		if i.IsArchived() {
+			i.Status = StatusStopped
+		} else if i.neverStarted() {
 			// A session that was added but never started has no tmux yet; it is
 			// not an error, just not-yet-running. Keep it idle (✕ → ○).
 			i.Status = StatusIdle
@@ -6023,14 +6451,36 @@ func (i *Instance) UpdateStatus() error {
 	// Optimization: Skip expensive Exists() check for sessions already in error/stopped status
 	// Ghost sessions (in JSON but not in tmux) only get rechecked every 30 seconds
 	// This reduces subprocess spawns from 74/sec to ~5/sec for 28 ghost sessions
-	if (i.Status == StatusError || i.Status == StatusStopped) && !i.lastErrorCheck.IsZero() &&
-		time.Since(i.lastErrorCheck) < errorRecheckInterval {
+	// The interval ESCALATES with each confirmation that the session is gone
+	// (30s -> 5min, deadRecheckDelay). A session whose pane has been confirmed
+	// dead for an hour cannot become interesting by being probed 120 times an
+	// hour; the escalation gives it a cheap steady state while a freshly dead
+	// session still rechecks quickly.
+	//
+	// Archived errors bypass the cache so the live tmux state decides whether
+	// the existing missing-pane archive guard should normalize them to stopped.
+	// That is a ONE-TIME reconciliation per archive event, not a per-tick job:
+	// it is keyed on the ArchivedAt stamp, so archiving (or re-archiving) re-arms
+	// it exactly once and the session then rechecks on the normal escalating
+	// cadence. Before this, an archived+error session paid a full probe on every
+	// sweep, forever.
+	if (i.Status == StatusError || i.Status == StatusStopped) &&
+		!i.archivedErrorNormalizationDueLocked() && !i.lastErrorCheck.IsZero() &&
+		time.Since(i.lastErrorCheck) < deadRecheckDelay(i.deadCheckStreak) {
 		return nil // Skip - still in error/stopped, checked recently
 	}
 
+	// Reaching here means the full probe is running, which is exactly what the
+	// archived+error bypass above exists to reach. Stamp it now, whatever the
+	// probe concludes: the reconciliation is owed once per archive event, not
+	// once per sweep.
+	i.archivedErrorNormalizedAt = i.ArchivedAt
+
 	// Check if tmux session exists
-	if !i.tmuxSession.Exists() {
-		if i.neverStarted() {
+	if !i.traceExists(trace) {
+		if i.IsArchived() {
+			i.Status = StatusStopped
+		} else if i.neverStarted() {
 			// Added but never started: no tmux session was ever created, so an
 			// absent tmux is expected — classify as idle, not error (✕ → ○).
 			i.Status = StatusIdle
@@ -6038,6 +6488,7 @@ func (i *Instance) UpdateStatus() error {
 			// tmux session is non-nil here, so the exit-status probe can block;
 			// applyTerminatedPaneStatus drops i.mu for the query and keeps the
 			// stopped-state guard on write.
+			done := trace.phase(&trace.terminated)
 			i.applyTerminatedPaneStatus()
 			// Attribute the death to authentication when the pane's last live
 			// sample showed a credential banner: the fleet-death case, which no
@@ -6045,8 +6496,10 @@ func (i *Instance) UpdateStatus() error {
 			// exit-code verdict above — a 401 exit can be a clean exit(0), and it
 			// still must not be auto-restarted.
 			i.refreshAuthHoldOnDeathLocked()
+			done()
 		}
 		i.lastErrorCheck = time.Now() // Record when we confirmed error/stopped
+		i.deadCheckStreak++           // escalate the recheck for a session that stays gone
 		return nil
 	}
 
@@ -6055,8 +6508,10 @@ func (i *Instance) UpdateStatus() error {
 		i.Status = StatusRunning
 	}
 
-	// Session exists - clear error check timestamp
+	// Session exists - clear error check timestamp and the dead-recheck
+	// escalation, so a session that dies again rechecks promptly.
 	i.lastErrorCheck = time.Time{}
+	i.deadCheckStreak = 0
 
 	// Tiered polling: skip expensive checks for idle sessions with no new activity
 	if i.Status == StatusIdle {
@@ -6073,7 +6528,10 @@ func (i *Instance) UpdateStatus() error {
 	// COLD LOAD: CLI doesn't run StatusFileWatcher, so hookStatus is always empty.
 	// Read the hook file from disk once to give CLI the same fast path as the TUI.
 	if i.hookStatus == "" && (IsClaudeCompatible(i.Tool) || IsCodexCompatible(i.Tool) || i.Tool == "gemini" || i.Tool == "hermes" || i.Tool == "cursor") {
-		if hs := readHookStatusFile(i.ID); hs != nil {
+		hookRead := trace.phase(&trace.hookFile)
+		hs := readHookStatusFile(i.ID)
+		hookRead()
+		if hs != nil {
 			i.hookStatus = hs.Status
 			i.hookEvent = hs.Event
 			i.hookLastUpdate = hs.UpdatedAt
@@ -6143,7 +6601,9 @@ func (i *Instance) UpdateStatus() error {
 				bgWorkPending := false
 				if i.tmuxSession != nil && IsClaudeCompatible(i.Tool) {
 					i.mu.Unlock()
+					done := trace.phase(&trace.bgWork)
 					bgWorkPending = i.tmuxSession.BackgroundWorkPending()
+					done()
 					i.mu.Lock()
 					if i.Status == StatusStopped {
 						return nil
@@ -6207,7 +6667,9 @@ func (i *Instance) UpdateStatus() error {
 			if gatewayURL := GetHermesGatewayURL(); gatewayURL != "" {
 				if time.Since(i.hermesGatewayCheckedAt) > 30*time.Second {
 					i.mu.Unlock()
+					done := trace.phase(&trace.gateway)
 					reachable := IsHermesGatewayReachable(gatewayURL)
+					done()
 					i.mu.Lock()
 					// Mirror the stale-stop guard from the tmux path: a concurrent
 					// Kill() may have published StatusStopped while we were unlocked.
@@ -6257,9 +6719,32 @@ func (i *Instance) UpdateStatus() error {
 		}
 	}
 
+	// SETTLED-SESSION GATE. Everything below this point is the expensive tail of
+	// UpdateStatus: GetStatus captures the pane and classifies it, and the
+	// session-metadata sync at the end reads the tmux environment and tails the
+	// transcript. Measured across a live 43-session profile those two are 13%
+	// and 78% of all UpdateStatus time, and both ran on every 2s sweep for every
+	// running/waiting session — which is why a completed agent parked at
+	// "waiting" cost 190-570ms per sweep indefinitely.
+	//
+	// Placed AFTER the hook and SSE fast paths on purpose: those carry the live
+	// status transitions and must never be delayed. What is gated here is only
+	// the tmux-derived sample, and it is gated on signal rather than on a timer —
+	// new pane output or the user attaching opens it on the very next call.
+	// See settled_poll.go.
+	if i.Status == StatusIdle || i.Status == StatusWaiting {
+		if i.settledPoll.shouldSkip(i.tmuxSession.GetCachedWindowActivity(), i.tmuxSession.IsAcknowledged(), time.Now()) {
+			return nil
+		}
+	} else {
+		i.settledPoll.reset()
+	}
+
 	// Release lock for potentially slow tmux calls (GetStatus calls CapturePane)
 	i.mu.Unlock()
+	done := trace.phase(&trace.getStatus)
 	status, err := i.tmuxSession.GetStatus()
+	done()
 	i.mu.Lock()
 
 	// Issue #953: a concurrent Kill() may have published StatusStopped
@@ -6419,23 +6904,28 @@ func (i *Instance) UpdateStatus() error {
 	// rate-limit it to reduce intermittent render/key handling stalls under load.
 	if i.Status == StatusRunning || i.Status == StatusWaiting {
 		interval := 2 * time.Second
-		// Bootstrap unknown IDs faster for newly-started sessions.
+		// Bootstrap unknown IDs faster for newly-started sessions. A bootstrapping
+		// session also bypasses the no-new-output gate below: it has to resolve
+		// its id before there is any activity to correlate against.
+		bootstrap := false
 		switch {
 		case IsClaudeCompatible(i.Tool):
 			if i.ClaudeSessionID == "" {
 				interval = 500 * time.Millisecond
+				bootstrap = true
 			}
 		case i.Tool == "gemini":
 			if i.GeminiSessionID == "" {
 				interval = 500 * time.Millisecond
+				bootstrap = true
 			}
 		case IsCodexCompatible(i.Tool):
 			if i.CodexSessionID == "" {
 				interval = 500 * time.Millisecond
+				bootstrap = true
 			}
 		}
-		if i.lastSessionMetaSync.IsZero() || time.Since(i.lastSessionMetaSync) >= interval {
-			i.lastSessionMetaSync = time.Now()
+		if i.sessionMetaSyncDueLocked(interval, bootstrap, time.Now()) {
 
 			// Update Claude session tracking (non-blocking, best-effort)
 			i.UpdateClaudeSession(nil)
@@ -7235,6 +7725,37 @@ func (i *Instance) PostStartSync(maxWait time.Duration) {
 	// OpenCode/Codex: async detection already started by Start(), skip here
 }
 
+// resetResumeMarker clears the per-spawn resume marker. Every start path
+// calls this before it decides between a fresh and a resuming command, so a
+// long-lived in-memory Instance that resumed once cannot leave the marker
+// set for a later fresh start.
+func (i *Instance) resetResumeMarker() {
+	i.startedWithResume = false
+}
+
+// markResumeIntent records whether the command just built actually resumes an
+// existing transcript. Note this is NOT the same as "buildClaudeResumeCommand
+// ran": every agent-deck launch mints a UUID up front and routes through that
+// helper, but it emits a bare `claude --session-id <uuid>` when no JSONL
+// exists yet. Only the `--resume` form can raise the summary picker.
+func (i *Instance) markResumeIntent(resumingExistingTranscript bool) {
+	i.startedWithResume = resumingExistingTranscript
+}
+
+// shouldAutoConfirmResumePicker reports whether the picker poll is worth
+// running for the start that just happened. autoResumeEnabled carries the
+// [claude].auto_resume_summary setting.
+//
+// The poll costs the full autoResumeOptions.Timeout whenever no picker shows
+// up, because autoResolveClaudeResumePicker only returns early on a match.
+// Claude raises that picker exclusively for `claude --resume` on a
+// long-running conversation, so a fresh session pays 3s of CapturePaneFresh
+// subprocesses for an outcome that is impossible by construction — on every
+// `agent-deck launch`. Gate on the marker so only resuming starts pay it.
+func (i *Instance) shouldAutoConfirmResumePicker(autoResumeEnabled bool) bool {
+	return autoResumeEnabled && i.startedWithResume
+}
+
 // autoConfirmClaudeResumePicker handles the "Resume from summary" picker that
 // claude --resume shows on long-running sessions (>~250k tokens). Without
 // this, an unattended conductor sits frozen on the picker indefinitely.
@@ -7244,7 +7765,8 @@ func (i *Instance) autoConfirmClaudeResumePicker() {
 		return
 	}
 	cfg, _ := LoadUserConfig()
-	if cfg != nil && !cfg.Claude.GetAutoResumeSummary() {
+	autoResumeEnabled := cfg == nil || cfg.Claude.GetAutoResumeSummary()
+	if !i.shouldAutoConfirmResumePicker(autoResumeEnabled) {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -8877,9 +9399,7 @@ func (i *Instance) RestartWithEnv(env map[string]string) error {
 }
 
 func (i *Instance) restart(env map[string]string) error {
-	if err := i.ValidateAccount(); err != nil {
-		return err
-	}
+	i.resetResumeMarker()
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
 	if lockErr != nil {
@@ -8983,6 +9503,11 @@ func (i *Instance) restart(env map[string]string) error {
 		}
 		mcpLog.Debug("respawn_pane_claude", slog.String("command", resumeCmd))
 
+		// This fast path returns before the fallback restart path below.
+		// Reconcile here as well so config changes and deleted managed links
+		// are applied before the resumed process reads its Claude home.
+		ApplyConfiguredLoadout(i)
+
 		// #1822 F2: assert AGENTDECK_PROFILE / CLAUDE_CONFIG_DIR host-side
 		// BEFORE respawn-pane, not after. tmux applies the session environment
 		// to a process at the moment it starts it, so setting it after
@@ -8991,6 +9516,7 @@ func (i *Instance) restart(env map[string]string) error {
 		// previously. This branch also returns before the fallback recreate
 		// path that would otherwise (re)assert it.
 		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.ensureClaudeConfigDirEnv()
 
 		// Use respawn-pane for atomic restart
@@ -9003,6 +9529,10 @@ func (i *Instance) restart(env map[string]string) error {
 
 		mcpLog.Debug("respawn_pane_claude_succeeded")
 
+		// Re-assert AGENTDECK_PROFILE host-side: this respawn branch returns
+		// before the fallback recreate path that would otherwise set it.
+		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.ClaudeSessionID)
 
@@ -9046,6 +9576,7 @@ func (i *Instance) restart(env map[string]string) error {
 		// process, so asserting it after RespawnPane only affects the next
 		// spawn, not the one just started.
 		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.ensureClaudeConfigDirEnv()
 
 		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
@@ -9055,6 +9586,11 @@ func (i *Instance) restart(env map[string]string) error {
 
 		sessionLog.Info("restart_gemini_respawn_succeeded")
 
+		// Re-assert AGENTDECK_PROFILE host-side: gemini's rebuilt resume command
+		// carries no inline AGENTDECK_PROFILE prefix, and this branch returns
+		// before the fallback recreate path that would otherwise set it.
+		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.GeminiSessionID)
 
@@ -9103,6 +9639,7 @@ func (i *Instance) restart(env map[string]string) error {
 		// fallback recreate path that would otherwise set it. Must run
 		// BEFORE RespawnPane — see the Claude branch above for why.
 		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.ensureClaudeConfigDirEnv()
 
 		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
@@ -9117,6 +9654,11 @@ func (i *Instance) restart(env map[string]string) error {
 
 		sessionLog.Info("restart_opencode_respawn_succeeded")
 
+		// Re-assert AGENTDECK_PROFILE host-side: opencode's rebuilt resume command
+		// carries no inline AGENTDECK_PROFILE prefix, and this branch returns
+		// before the fallback recreate path that would otherwise set it.
+		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		// Persist .sid sidecar so hook events after restart can be correlated
 		if i.OpenCodeSessionID != "" {
 			WriteHookSessionAnchor(i.ID, i.OpenCodeSessionID)
@@ -9177,6 +9719,7 @@ func (i *Instance) restart(env map[string]string) error {
 		// path that would otherwise set it. Must run BEFORE RespawnPane —
 		// see the Claude branch above for why.
 		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.ensureClaudeConfigDirEnv()
 
 		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
@@ -9191,6 +9734,11 @@ func (i *Instance) restart(env map[string]string) error {
 
 		sessionLog.Info("restart_codex_respawn_succeeded")
 
+		// Re-assert AGENTDECK_PROFILE host-side as a belt-and-suspenders to the
+		// inline prefix buildCodexCommand already injects; this branch returns
+		// before the fallback recreate path that would otherwise set it.
+		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		// Persist .sid sidecar so hook events after restart can be correlated
 		WriteHookSessionAnchor(i.ID, i.CodexSessionID)
 
@@ -9218,6 +9766,7 @@ func (i *Instance) restart(env map[string]string) error {
 		// #1822 F2: must run BEFORE RespawnPane — see the Claude branch above
 		// for why (tmux applies session env at process start, not after).
 		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.ensureClaudeConfigDirEnv()
 
 		if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
@@ -9226,6 +9775,8 @@ func (i *Instance) restart(env map[string]string) error {
 		}
 
 		sessionLog.Info("restart_cursor_respawn_succeeded")
+		i.ensureProfileEnv()
+		i.ensureRoleEnv()
 		i.sweepDuplicateToolSessions()
 		i.CaptureLoadedMCPs()
 		i.Status = StatusWaiting
@@ -9270,6 +9821,7 @@ func (i *Instance) restart(env map[string]string) error {
 			// and this branch returns before the fallback recreate path. Must run
 			// BEFORE RespawnPane — see the Claude branch above for why.
 			i.ensureProfileEnv()
+			i.ensureRoleEnv()
 			i.ensureClaudeConfigDirEnv()
 
 			if err := i.tmuxSession.RespawnPane(resumeCmd); err != nil {
@@ -9286,8 +9838,8 @@ func (i *Instance) restart(env map[string]string) error {
 			i.loadCustomPatternsFromConfig() // Reload custom patterns
 			i.Status = StatusWaiting
 			return nil
+			// toolDef vanished or id emptied between checks — fall through to recreate.
 		}
-		// toolDef vanished or id emptied between checks — fall through to recreate.
 	}
 
 	mcpLog.Debug("restart_fallback_recreate")
@@ -9456,7 +10008,7 @@ func (i *Instance) restart(env map[string]string) error {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
-	i.ensureInteractiveShellAccount()
+	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 
 	// Propagate all known tool session IDs to the tmux environment (host-side).
@@ -9651,6 +10203,13 @@ func (i *Instance) buildClaudeResumeCommand() string {
 	// buildClaudeResumeCommand call — NOT sync.Once'd. See CONTEXT Decision 2.
 	// Every Start / StartWithMessage / Restart dispatch that routes through
 	// this helper produces exactly one "resume: id=<id> reason=<why>" line.
+
+	// The picker can only appear when this command actually carries --resume
+	// over a transcript that exists; a `--session-id <uuid>` with no JSONL
+	// starts an empty conversation. Record which one this is so PostStartSync
+	// can skip a poll that cannot succeed.
+	i.markResumeIntent(useResume)
+
 	if useResume {
 		sessionLog.Info("resume: id="+safeSID+" reason=conversation_data_present",
 			slog.String("instance_id", safeInstID),
@@ -10059,12 +10618,9 @@ func (i *Instance) buildClaudeForkCommandForTarget(target *Instance, opts *Claud
 		opts = NewClaudeOptions(userConfig)
 	}
 
-	// Build extra flags from options (for fork, we use ToArgsForFork which excludes session mode)
-	launchName := target.ClaudeLaunchName()
-	if extraArgsSupplyName(i.ExtraArgs) || extraArgsSelectSession(i.ExtraArgs) {
-		launchName = ""
-	}
-	extraFlags := i.buildClaudeExtraFlagsWithName(opts, launchName)
+	// Build flags from the TARGET so the fork receives its own deterministic
+	// Claude peer name rather than colliding with the parent in ListAgents.
+	extraFlags := target.buildClaudeExtraFlags(opts)
 
 	// Pre-generate UUID for forked session to avoid shell uuidgen dependency.
 	// CLAUDE_SESSION_ID is propagated via host-side SetEnvironment after tmux start.
@@ -10134,9 +10690,11 @@ func (i *Instance) CreateForkedInstanceWithOptions(
 	// the fork they silently drop on the fork's first restart
 	// (buildClaudeResumeCommand reads the fork's own ExtraArgs) and a
 	// fork-of-a-fork never sees them at all. Mirrors how ClaudeOptions are
-	// persisted via SetClaudeOptions further down. Copied, not aliased.
+	// persisted via SetClaudeOptions further down. The parent's --name is the
+	// sole exception: a fork is a distinct peer and needs its own address.
+	// Copied, not aliased.
 	if len(i.ExtraArgs) > 0 {
-		forked.ExtraArgs = append([]string(nil), i.ExtraArgs...)
+		forked.ExtraArgs = extraArgsForFork(i.ExtraArgs)
 	}
 
 	cmd, err := i.buildClaudeForkCommandForTarget(forked, opts)
@@ -10390,6 +10948,7 @@ func (i *Instance) buildCodexForkCommandForTarget(target *Instance, baseCommand 
 	yoloFlag := target.resolveCodexYoloFlag()
 	modelFlag := target.resolveCodexModelFlag()
 	reasoningFlag := target.resolveCodexReasoningEffortFlag()
+	extraArgsFlag := target.resolveCodexExtraArgsFlag()
 	command := target.resolveCodexCommand(baseCommand)
 	if codexHome := target.codexHomeToExport(); codexHome != "" {
 		if err := os.MkdirAll(codexHome, 0o755); err != nil {
@@ -10399,7 +10958,7 @@ func (i *Instance) buildCodexForkCommandForTarget(target *Instance, baseCommand 
 		}
 		envPrefix += "CODEX_HOME=" + shellescape.Quote(codexHome) + " "
 	}
-	return envPrefix + fmt.Sprintf("%s%s%s%s fork %s", command, yoloFlag, modelFlag, reasoningFlag, shellescape.Quote(i.CodexSessionID)), nil
+	return envPrefix + fmt.Sprintf("%s%s%s%s%s fork %s", command, yoloFlag, modelFlag, reasoningFlag, extraArgsFlag, shellescape.Quote(i.CodexSessionID)), nil
 }
 
 // CreateForkedCodexInstanceWithOptions creates a forked Codex instance. Mirrors
@@ -10423,6 +10982,7 @@ func (i *Instance) CreateForkedCodexInstanceWithOptions(
 	forked.tmuxSession.SetGroupPath(forked.GroupPath)
 	forked.Tool = i.Tool
 	forked.Wrapper = i.Wrapper
+	forked.ExtraArgs = append([]string(nil), i.ExtraArgs...)
 	// #1929: a fork runs against the parent's thread, so it must run under the
 	// parent's account. Without this the fork resolves its own codex home
 	// through the default chain and `codex fork <parent-sid>` cannot find the
@@ -10505,7 +11065,20 @@ func (i *Instance) Substate() Substate {
 	if tmuxSess == nil {
 		return SubstateNone
 	}
-	return tmuxSess.GetSubstate()
+	// promoteStalled refines an idle-at-empty-prompt or api-error verdict into
+	// SubstateStalled when the composer is in fact holding an unchanging
+	// draft. It needs a second (cache-backed) pane read, so it only runs on
+	// the two verdicts that can be wrong this way (stall.go).
+	return promoteStalled(tmuxSess.GetSubstate(), tmuxSess, i.stallTracker())
+}
+
+// stallTracker returns this instance's lazily-created dwell state for stall
+// detection. Process-local and derived; never persisted.
+func (i *Instance) stallTracker() *stallTracker {
+	i.stallOnce.Do(func() {
+		i.stall = &stallTracker{}
+	})
+	return i.stall
 }
 
 // CachedSubstate returns the last substate computed by a prior status check
@@ -10527,7 +11100,48 @@ func (i *Instance) CachedSubstate() Substate {
 	if tmuxSess == nil {
 		return SubstateNone
 	}
-	return tmuxSess.CachedSubstate()
+	cached := tmuxSess.CachedSubstate()
+	// Apply the stall refinement from dwell state a previous Substate() call
+	// already established. This is an in-memory time comparison only — it adds
+	// no pane capture, so the render hot path stays as cheap as it was. If no
+	// caller has ever observed this session's composer, the tracker is empty
+	// and the cached verdict passes through unchanged.
+	if cached == SubstateIdleAtEmptyPrompt && i.stallTracker().stalled(stallClock()) {
+		return SubstateStalled
+	}
+	return cached
+}
+
+// DisplaySubstate is CachedSubstate for RENDERING surfaces only: it applies the
+// same in-memory stall refinement to an api-error verdict that promoteStalled
+// applies on the live path, so a pane holding a transport banner AND an
+// unchanging operator draft shows the stalled glyph rather than the transport
+// one. Like CachedSubstate it captures nothing, so the render hot path is
+// unchanged.
+//
+// It is a SEPARATE accessor rather than a widening of CachedSubstate, and the
+// difference is load-bearing. CachedSubstate is what buildSelfHealCandidate
+// reads (selfheal_pass.go), and self-heal must keep seeing a drafted api-error
+// session AS api-error: that is what carries it to the composer-draft branch and
+// produces the `held_composer_draft` audit record. Promoted to stalled it would
+// instead audit as skip_healthy — the protection would still hold, but the
+// record explaining WHY would vanish. Rendering has no such stake; it only needs
+// to describe the pane, and 🧊 ("someone's text is sitting in there") is the
+// accurate description.
+func (i *Instance) DisplaySubstate() Substate {
+	return promoteDisplaySubstate(i.CachedSubstate(), i.stallTracker().stalled(stallClock()))
+}
+
+// promoteDisplaySubstate is DisplaySubstate's decision, split out so it can be
+// pinned without standing up a live tmux pane. Only the api-error base is
+// promoted here: CachedSubstate already refines the idle base, and every other
+// substate (auth-401, model-unavailable, running) is describing the pane
+// accurately as it stands.
+func promoteDisplaySubstate(cached Substate, stalled bool) Substate {
+	if cached == SubstateAPIError && stalled {
+		return SubstateStalled
+	}
+	return cached
 }
 
 // SetAcknowledgedFromShared applies an acknowledgment from another TUI instance
@@ -11562,6 +12176,21 @@ func (i *Instance) wrapLaunchShell(command string) string {
 // All code paths that launch or respawn a tmux pane should use this instead of calling
 // applyWrapper/wrapForSandbox/wrapIgnoreSuspend individually.
 func (i *Instance) prepareCommand(cmd string) (string, string, error) {
+	if IsClaudeCompatible(i.Tool) {
+		if _, _, err := ResolveInstanceClaudeHomeSkills(i); err != nil {
+			return "", "", fmt.Errorf("unsafe Claude group skill loadout: %w", err)
+		}
+	}
+	if IsCodexCompatible(i.Tool) {
+		if _, _, err := ResolveInstanceCodexHomeSkills(i); err != nil {
+			return "", "", fmt.Errorf("unsafe Codex group skill loadout: %w", err)
+		}
+	}
+	if !i.IsSSH() {
+		if err := i.prepareRepositorySessionTemp(); err != nil {
+			return "", "", fmt.Errorf("prepare repository session temp: %w", err)
+		}
+	}
 	// Exit-to-shell wrap FIRST, on the bare agent command, so the agent's own
 	// `exec ` launcher is still visible to neutralise and the trailing shell
 	// exec stays the outermost statement before any user-wrapper / bash -c /
@@ -11586,6 +12215,11 @@ func (i *Instance) prepareCommand(cmd string) (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
+	// The temp environment belongs to the complete host-side launch command,
+	// not the placeholder substituted into a user wrapper. Prefixing before
+	// applyWrapper makes executable wrappers such as
+	// "agent-deck run-task -- {command}" receive "export" as their command.
+	wrapped = i.buildSessionTempExportPrefix() + wrapped
 
 	// Wrap the fully-substituted command under bash -c when a wrapper is
 	// configured. This keeps shell metacharacters (&&, $(), inline env) in the
@@ -11741,11 +12375,16 @@ func ensureContainerRunning(
 	// container once if those paths are not writable.
 	cacheWritable := sandboxCacheDirsWritable(ctx, ctr)
 	tmpExecutable := sandboxTmpExecutable(ctx, ctr)
-	if !cacheWritable || !tmpExecutable {
+	sessionTempMounted, mountErr := ctr.HasMount(ctx, sandboxSessionTempDir)
+	if mountErr != nil {
+		return fmt.Errorf("checking sandbox session temp mount: %w", mountErr)
+	}
+	if !cacheWritable || !tmpExecutable || !sessionTempMounted {
 		sessionLog.Warn(
 			"sandbox_recreating_for_runtime_compat",
 			slog.Bool("cache_writable", cacheWritable),
 			slog.Bool("tmp_executable", tmpExecutable),
+			slog.Bool("session_temp_mounted", sessionTempMounted),
 		)
 		if rmErr := ctr.Remove(ctx, true); rmErr != nil {
 			return fmt.Errorf("removing incompatible sandbox container: %w", rmErr)
@@ -11807,6 +12446,7 @@ func buildSandboxConfig(
 		docker.WithCPULimit(cpuLimit),
 		docker.WithMemoryLimit(memLimit),
 		docker.WithAgentConfigs(bindMounts, homeMounts),
+		docker.WithSessionTemp(inst.repositorySessionTempDir(), sandboxSessionTempDir),
 	}
 
 	// Bridge in-container hook-handler status writes to a PER-INSTANCE host dir.

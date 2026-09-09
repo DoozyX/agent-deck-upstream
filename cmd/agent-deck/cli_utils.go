@@ -160,11 +160,16 @@ func normalizeArgs(fs *flag.FlagSet, args []string) []string {
 	})
 
 	var flags, positional []string
+	terminated := false
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 
-		// "--" terminates flag processing
+		// "--" terminates flag processing. It is re-emitted before the
+		// positionals below: dropping it made flag.Parse read a dash-leading
+		// positional (a filename like "-weird", a passthrough token) as an
+		// undefined flag, which is the very thing "--" was written to prevent.
 		if arg == "--" {
+			terminated = true
 			positional = append(positional, args[i+1:]...)
 			break
 		}
@@ -188,6 +193,9 @@ func normalizeArgs(fs *flag.FlagSet, args []string) []string {
 		} else {
 			positional = append(positional, arg)
 		}
+	}
+	if terminated {
+		flags = append(flags, "--")
 	}
 	return append(flags, positional...)
 }
@@ -530,6 +538,55 @@ func shouldInheritParentGroup(explicitGroupProvided, inheritGroupFlag bool, path
 	return pathIsLinkedWorktree()
 }
 
+// validateWorktreeCrossGroup rejects a likely agent-synthesized group path for
+// a parented linked-worktree child. Explicit placement remains authoritative in
+// every other launch shape, and --allow-cross-group is the deliberate escape
+// hatch for the rare linked-worktree child that belongs outside its parent.
+func validateWorktreeCrossGroup(explicitGroupProvided, allowCrossGroup, parentAttached, pathIsLinkedWorktree bool, requestedGroup, parentGroup string) error {
+	if !explicitGroupProvided || allowCrossGroup || !parentAttached || !pathIsLinkedWorktree {
+		return nil
+	}
+	if requestedGroup == parentGroup {
+		return nil
+	}
+	return fmt.Errorf(
+		"linked-worktree group %q conflicts with parent group %q; omit --group to inherit the parent group, or pass --allow-cross-group for deliberate cross-group placement",
+		requestedGroup, parentGroup,
+	)
+}
+
+// parentLinkWouldCycle reports whether assigning childID's parent to parentID
+// would create (or enter) a cycle. Parent links are orchestration ownership as
+// well as UI hierarchy, so valid handoff chains may be deeper than one level.
+func parentLinkWouldCycle(childID, parentID string, instances []*session.Instance) bool {
+	parents := make(map[string]string, len(instances))
+	for _, inst := range instances {
+		if inst != nil {
+			parents[inst.ID] = inst.ParentSessionID
+		}
+	}
+
+	seen := make(map[string]bool, len(instances))
+	for id := parentID; id != ""; id = parents[id] {
+		if id == childID || seen[id] {
+			return true
+		}
+		seen[id] = true
+	}
+	return false
+}
+
+// shouldWarnOrphanWorktreeGroup decides whether a `launch` should warn that a
+// linked-worktree child is about to land in its branch-leaf cwd-derived group,
+// detached from any conductor group. This happens when no parent attached (an
+// auto-parent miss, or an intentional --no-parent that forgot -g) and no
+// explicit -g was given: the empty group falls through to the path-derived
+// branch leaf. A real (non-worktree) conductor child keeps its cwd-derived
+// project group (#972) and must NOT warn, so the linked-worktree check gates it.
+func shouldWarnOrphanWorktreeGroup(parentAttached, explicitGroupProvided, pathIsLinkedWorktree bool) bool {
+	return !parentAttached && !explicitGroupProvided && pathIsLinkedWorktree
+}
+
 // resolveAddPath resolves the user-provided positional path arg for `agent-deck add`.
 // Also used by `agent-deck session move` (#1706): both take a user-supplied
 // positional project path and must resolve it the same way.
@@ -680,6 +737,13 @@ const (
 	// ErrCodeDeliveryFailed: `session send` typed the message but could not
 	// confirm submission (delivery=typed_not_submitted, issue #1413).
 	ErrCodeDeliveryFailed = "DELIVERY_FAILED"
+	// ErrCodeQueueFull: `session send --queue-if-busy` could not append the
+	// message because the durable per-session runtime queue reached capacity.
+	ErrCodeQueueFull = "QUEUE_FULL"
+	// ErrCodeStaleOutput: `session output --require-fresh` found a response
+	// older than the last message delivered to the session — the agent has not
+	// answered the newest request, so the content belongs to a previous turn.
+	ErrCodeStaleOutput = "STALE_OUTPUT"
 )
 
 // ResolveSession finds a session by flexible matching (title, ID prefix, or path)
@@ -805,8 +869,17 @@ func ResolveSession(identifier string, instances []*session.Instance) (*session.
 	return nil, fmt.Sprintf("session '%s' not found", identifier), ErrCodeNotFound
 }
 
-// GetCurrentSessionID detects the current agent-deck session from tmux environment
-// Returns session ID or empty string if not in an agent-deck session
+// GetCurrentSessionID detects the current agent-deck session from tmux and
+// returns its instance ID, or "" if not inside an agent-deck session.
+//
+// The trailing token of the tmux session NAME (agentdeck_<title>_<shortid>) is
+// a random uniqueness suffix from generateShortID() — NOT the instance ID — so
+// it can never resolve against the instance list (and could prefix-match a
+// different session). The authoritative id lives in the tmux SESSION
+// environment, written by Instance.SetEnvironment("AGENTDECK_INSTANCE_ID", id)
+// at every spawn. We read it back with `tmux show-environment`, which recovers
+// the real id even when the calling process env dropped it (subagent shell,
+// scrubbed env) — the case that silently orphaned auto-parented children.
 func GetCurrentSessionID() string {
 	// Check if we're in tmux
 	if os.Getenv("TMUX") == "" {
@@ -818,22 +891,59 @@ func GetCurrentSessionID() string {
 	if err != nil {
 		return ""
 	}
-
-	sessionName := strings.TrimSpace(string(output))
-
-	// Parse agent-deck session name: agentdeck_<title>_<id>
-	if !strings.HasPrefix(sessionName, "agentdeck_") {
+	if !strings.HasPrefix(strings.TrimSpace(string(output)), "agentdeck_") {
 		return ""
 	}
 
-	// Extract ID (last part after final underscore)
-	parts := strings.Split(sessionName, "_")
-	if len(parts) < 3 {
+	// Recover the authoritative instance id from the tmux session environment.
+	// `tmux show-environment AGENTDECK_INSTANCE_ID` prints "KEY=value" when set,
+	// or "-KEY" / an error when unset.
+	envOut, err := tmuxProbeBounded("show-environment", "AGENTDECK_INSTANCE_ID")
+	if err != nil {
 		return ""
 	}
+	return parseInstanceIDFromTmuxEnv(string(envOut))
+}
 
-	// ID is the last part
-	return parts[len(parts)-1]
+// isManagedSessionInvocation reports whether this command originated inside an
+// Agent Deck-managed session. The injected environment IDs are authoritative;
+// the tmux lookup recovers the identity when a child process scrubbed them.
+func isManagedSessionInvocation() bool {
+	if strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")) != "" ||
+		strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")) != "" {
+		return true
+	}
+	return strings.TrimSpace(GetCurrentSessionID()) != ""
+}
+
+func managedSessionGroupCreationRestricted(cfg *session.UserConfig) bool {
+	return cfg != nil && cfg.GroupDefaults.ManualCreationOnly && isManagedSessionInvocation()
+}
+
+func requireExistingGroupForManagedSession(cfg *session.UserConfig, tree *session.GroupTree, groupPath string) error {
+	if !managedSessionGroupCreationRestricted(cfg) || strings.TrimSpace(groupPath) == "" {
+		return nil
+	}
+	if tree != nil {
+		if _, exists := tree.Groups[groupPath]; exists {
+			return nil
+		}
+	}
+	return fmt.Errorf("group %q does not exist; group creation is restricted to the user, so create it outside an Agent Deck-managed session", groupPath)
+}
+
+// parseInstanceIDFromTmuxEnv extracts the AGENTDECK_INSTANCE_ID value from the
+// output of `tmux show-environment AGENTDECK_INSTANCE_ID`. tmux prints
+// "AGENTDECK_INSTANCE_ID=<id>" when the var is set in the session env, and
+// "-AGENTDECK_INSTANCE_ID" (leading dash = removed/unset) or nothing when it is
+// not. Only the "KEY=value" form yields an id; everything else returns "".
+func parseInstanceIDFromTmuxEnv(output string) string {
+	for _, line := range strings.Split(output, "\n") {
+		if id, ok := strings.CutPrefix(strings.TrimSpace(line), "AGENTDECK_INSTANCE_ID="); ok {
+			return strings.TrimSpace(id)
+		}
+	}
+	return ""
 }
 
 // ResolveSessionOrCurrent resolves a session by identifier, or uses current session if empty
@@ -898,12 +1008,18 @@ func SubstateLabel(sub session.Substate) string {
 		return "model unavailable"
 	case session.SubstateAuth401:
 		return "auth (login)"
+	case session.SubstateAPIError:
+		return "api unreachable (transport)"
 	case session.SubstateUsageLimit:
 		return "usage limit"
 	case session.SubstateIdleAtEmptyPrompt:
 		return "idle at prompt"
 	case session.SubstateRunning:
 		return "working"
+	case session.SubstateStalled:
+		return "stalled (composer not accepting Enter)"
+	case session.SubstateAwaitingChoice:
+		return "waiting on you (prompt on screen)"
 	default:
 		return ""
 	}

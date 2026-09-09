@@ -31,7 +31,10 @@ func TestAllTestMainsIsolateTmuxSocket(t *testing.T) {
 
 	testMainRe := regexp.MustCompile(`(?m)^func TestMain\s*\(`)
 	isolateRe := regexp.MustCompile(`IsolateTmuxSocket`)
-	isolateHomeRe := regexp.MustCompile(`IsolateHome`)
+	// IsolatePackageHome is IsolateHome with a named prefix; both satisfy the
+	// requirement. Note "IsolatePackageHome" does NOT contain the substring
+	// "IsolateHome", so the alternation is load-bearing.
+	isolateHomeRe := regexp.MustCompile(`Isolate(Package)?Home`)
 
 	var offenders []string
 	var homeOffenders []string
@@ -191,6 +194,94 @@ func TestNoTestMainLeaksCleanupBehindOsExit(t *testing.T) {
 			strings.Join(offenders, "\n  - "),
 		)
 	}
+}
+
+// TestTestMainsDoNotRunTestsInsideOsExitBoundary keeps cleanup in a helper that
+// returns an exit code to TestMain. Calling m.Run directly in TestMain makes
+// every cleanup path a hand-written afterthought and recreates the exact shape
+// that previously leaked temp homes and tmux sockets when an os.Exit path was
+// introduced later. A runTestMain helper is the one canonical place where
+// deferred cleanup is guaranteed to finish before TestMain calls os.Exit.
+func TestTestMainsDoNotRunTestsInsideOsExitBoundary(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed — cannot locate repo root")
+	}
+	repoRoot := filepath.Clean(filepath.Join(filepath.Dir(thisFile), "..", ".."))
+
+	var offenders []string
+	err := filepath.WalkDir(repoRoot, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", ".claude", ".worktrees", ".planning", "vendor", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return readErr
+		}
+		if !strings.Contains(string(data), "func TestMain") {
+			return nil
+		}
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, path, data, 0)
+		if parseErr != nil {
+			return parseErr
+		}
+		for _, decl := range file.Decls {
+			fn, isFunc := decl.(*ast.FuncDecl)
+			if !isFunc || fn.Name.Name != "TestMain" || fn.Body == nil {
+				continue
+			}
+			if testMainCallsMRun(fn.Body) {
+				rel, _ := filepath.Rel(repoRoot, path)
+				offenders = append(offenders, rel)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk repo root %q: %v", repoRoot, err)
+	}
+	if len(offenders) > 0 {
+		t.Fatalf(
+			"The following TestMain functions call m.Run directly:\n  - %s\n\n"+
+				"Keep TestMain as `os.Exit(runTestMain(m))` (after any explicit helper-process "+
+				"dispatch), and put all setup plus deferred cleanup in runTestMain. This makes "+
+				"bare `go test` cleanup survive future os.Exit/error-path changes. See "+
+				"cmd/agent-deck/testmain_test.go for the canonical pattern.",
+			strings.Join(offenders, "\n  - "),
+		)
+	}
+}
+
+func testMainCallsMRun(body *ast.BlockStmt) bool {
+	callsMRun := false
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch node := n.(type) {
+		case *ast.FuncLit:
+			return false
+		case *ast.CallExpr:
+			sel, ok := node.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Run" {
+				return true
+			}
+			ident, ok := sel.X.(*ast.Ident)
+			if ok && ident.Name == "m" {
+				callsMRun = true
+			}
+		}
+		return true
+	})
+	return callsMRun
 }
 
 // testMainBodyDefersBehindOsExit reports whether a TestMain body contains both a

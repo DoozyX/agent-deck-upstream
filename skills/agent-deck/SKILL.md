@@ -71,8 +71,10 @@ What agent-deck does, at the noun level (independent of which surface — CLI / 
 | **State persistence** | `state.json` + `task-log.md` + `LEARNINGS.md` + `HANDOFF.md` survive Claude Code compaction/restart | CLI ✅ |
 | **GitHub pipeline oversight** | Conductor-driven release flow: PR merge → tag → goreleaser → release | CLI ✅ |
 | **Remote sessions** | SSH-based remote register / list / attach across hosts | CLI ✅ |
+| **Cross-machine artifacts** | Union a repo's `.agent-deck/<run-id>/` trees between hosts (`artifacts sync`) | CLI ✅ |
 | **Session sharing** | Export / import a Claude conversation for handoff between developers | CLI ✅ |
 | **Consult another agent** | Launch a Codex / Gemini sub-agent for a second opinion | CLI ✅ |
+| **Claude peer messaging** | Deterministic peer names plus native `ListAgents`/`SendMessage` routing with `session send` fallback | Claude tool + CLI fallback ✅ |
 | **Profile-scoped operation** | `-p <profile>` separation between personal and work auth | CLI ✅ · TUI ✅ |
 | **Self-improvement** | Analyze your conductor's own transcripts → surface bugs / patterns / capabilities, file GH issues with privacy guards | CLI ✅ |
 
@@ -112,10 +114,14 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 | `agent-deck add -t "Name" -c claude /path` | Create session |
 | `agent-deck launch . -c claude --account <name>` | Create and start a session under a named account slot |
 | `agent-deck accounts [--json]` | List configured named account slots |
+| `agent-deck usage --all [--json]` | Advisory live Claude/Codex quota snapshot; query only when it informs a launch decision |
 | `agent-deck session start/stop/restart <name>` | Control session |
 | `agent-deck session send <name> "message"` | Send message |
 | `agent-deck session send <name> --message-file <file>` | Send message from file (`-` = stdin); no shell quoting. Also on `launch`/`session start` |
+| `agent-deck session nudge <name> "message"` | Send only if the session can receive it; verifies submission (exit code is the contract) |
 | `agent-deck session output <name>` | Get last response |
+| `agent-deck session output <name> --pane` | Live pane render — what the session is showing *right now* |
+| `agent-deck session output <name> --json --require-fresh` | Exit 3 while the last response predates the last message sent |
 | `agent-deck session children --json` | Child sessions' live status + asserted completions (non-blocking, read-only) |
 | `agent-deck session current [-q\|--json]` | Auto-detect current session |
 | `agent-deck session fork <name>` | Fork Claude/Pi conversation |
@@ -127,6 +133,7 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 | `agent-deck try <name>` | Scratch session in a dated experiment folder |
 | `agent-deck worktree list` | List worktrees with sessions |
 | `agent-deck worktree cleanup` | Find orphaned worktrees/sessions |
+| `agent-deck artifacts sync <remote>` | Union this machine's run artifacts with a remote's (never deletes, never overwrites) |
 | `agent-deck feedback` | Submit feedback (opens rating prompt + optional comment) |
 
 **Status:** `●` running | `◐` waiting | `○` idle | `✕` error
@@ -147,6 +154,7 @@ The script auto-detects current session/profile and creates a child session.
 |------|---------|----------|
 | **Fire & forget** | (no --wait) | Default. Tell user: "Ask me to check when ready" |
 | **On-demand** | `agent-deck session output "Title"` | User asks to check |
+| **Mid-turn** | `agent-deck session output "Title" --pane` | Child is still working or stuck at a prompt — the last message is the previous turn's |
 | **Blocking** | `--wait` flag | Need immediate result |
 
 ### Fanning out several children?
@@ -293,6 +301,19 @@ agent-deck remove "Codex Review" && agent-deck remove "Gemini Arch"
 ## Peer (Root) Sessions vs Sub-Agents
 
 **The default — sub-agent linkage:** `agent-deck launch` and `agent-deck add`, when invoked from *inside* an existing agent-deck session, automatically link the new session as a child of the calling session (sets `parent_session_id`, inherits the parent's group when `-g` is omitted, and grants `--add-dir` to the parent's project path). This is usually what you want for short-lived work sessions (plan / verify / release / consult).
+
+**Never synthesize a group from filesystem components.** For a linked-worktree
+child, pass `--parent <id>` and omit `--group`; agent-deck detects the worktree
+and inherits the parent's group. A conflicting explicit group is rejected unless
+the launch also passes `--allow-cross-group`, which is reserved for deliberate
+cross-group placement.
+
+After launch, verify the persisted relationship instead of assuming the command
+landed where intended:
+
+```bash
+agent-deck list --json | jq '.[] | select(.title=="task-name") | {group, parent_session_id}'
+```
 
 **When the default is wrong — root-level peer sessions:** if you are creating a session that should stand independently at the root — a peer conductor, a standalone project session, a session that should outlive the current one, or anything that semantically is NOT a child of the calling session — pass the `-no-parent` flag.
 
@@ -708,6 +729,22 @@ For trivial mechanical actions where the action IS its own verification (and the
 
 The verifier requirement attaches to claims about external mutable state: PRs, releases, comments, deployments, bulk operations.
 
+## Where files live
+
+Two locations, split by one question: would this file still mean anything if the
+project were deleted tomorrow?
+
+- **Project artifacts** → `<project-root>/.agent-deck/` — handoff prompts
+  (`handoff/<session-id>/PROMPT.md`), designs, orchestrate runs, `skills.toml`,
+  per-session `tmp/`. `<project-root>` is the repository's **main worktree**, so
+  every worktree of a repo shares one tree. Kept out of `git status` via the
+  user's global git excludes; agent-deck never edits a tracked `.gitignore`.
+- **Machine state** → `$XDG_DATA_HOME/agent-deck/` — `state.db`, config, logs,
+  hooks, inboxes, locks, agent homes, conductor/watcher state. Keyed by session
+  id and read without a project checkout necessarily existing.
+
+Full table and the lint test that enforces it: `docs/data-locations.md`.
+
 ## Configuration
 
 **File:** `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`; legacy `~/.agent-deck/config.toml` still honored)
@@ -870,24 +907,59 @@ agent-deck manages **interactive agent sessions**. It is not a supervisor for al
 
 ## Known Gotchas (v1.7.0+)
 
-Friction points discovered during real usage. Work around them per the patterns below.
+Friction points discovered during real usage. Some are covered by a supported
+command now — reach for that, not for raw tmux; the rest carry an explicit
+workaround.
 
-### `session send --no-wait` can leave prompts typed-but-not-submitted
+### Never `tmux send-keys` an Enter after `session send`
 
-On a freshly-launched Claude session, `agent-deck session send --no-wait <id> "..."` may paste the message into the input buffer before Claude is fully ready, leaving it TYPED but not SUBMITTED. Classic race.
+The typed-but-not-submitted race is handled inside the send path — do not
+hand-roll it. `session send` and `session nudge` share one verified pipeline:
+composer-draft guard ([#1409](https://github.com/asheshgoplani/agent-deck/issues/1409)),
+bounded Enter retries with submit verification
+([#1413](https://github.com/asheshgoplani/agent-deck/issues/1413)), and
+gated-composer `Escape`+`Enter` recovery. A message left sitting in the
+composer is reported as a **failure** (`"delivery": "typed_not_submitted"`,
+`"success": false`, non-zero exit), never as a success.
 
-**Workaround (always safe):**
 ```bash
-agent-deck -p <profile> session send <id> "..." --no-wait -q
-sleep 3
-# Get the tmux session name and send Enter to submit
-TMUX=$(agent-deck -p <profile> session show --json <id> | jq -r .tmux_session)
-tmux send-keys -t "$TMUX" Enter
+agent-deck session send <id> "..." --json      # .submitted / .delivery are the proof
+agent-deck session nudge <id> "..."            # supervisors: exit code is the contract
 ```
 
-The Enter is idempotent — if already submitted, it's just a no-op newline. Use this pattern every time you `session send --no-wait` to a freshly-launched session.
+A blind `tmux send-keys ... Enter` on top of that is worse than redundant: the
+send path may already have parked a draft or be mid-retry, so the extra Enter
+can submit a *foreign* composer draft or double-submit yours. Whatever the
+pane state, `session nudge` is the safe entry point — it refuses on a stalled
+or unreachable target (exit 1), skips a busy one (exit 0, `"delivered": false`),
+and only types when the session can actually accept a turn.
 
-**Alternative:** omit `--no-wait` so the built-in 60s readiness wait kicks in before submitting.
+If you genuinely need the raw pane — an interrupt (`C-c`), a composer clear
+(`C-u`), a dialog dismiss (`Escape`) — none of those are sends and none are
+covered here; attach with `session attach <id>` or drive tmux deliberately,
+knowing you are outside the verified path.
+
+### Reading a child mid-turn: `session output --pane`, not `tmux capture-pane`
+
+`session output <id>` returns the last completed **assistant message**. While a
+child is still working, or is sitting at an interactive prompt, that message is
+the *previous* turn's — on a session whose conversation was resumed it can be
+days old, with no visible hint that it is stale. Reaching for
+`tmux capture-pane` at that point is the usual reflex; the CLI already covers it:
+
+```bash
+agent-deck session output <id> --pane | tail -40      # live pane render, full UI
+agent-deck session output <id> --json --require-fresh # exit 3 = child has not answered yet
+```
+
+`--pane` returns up to 2000 lines of scrollback with ANSI intact, so pipe it to
+`tail -N` for the part you want — and it captures through the session's own tmux
+socket, which a bare `tmux capture-pane` cannot do for socket-isolated sessions.
+
+`--json` also carries `"stale": true` and `"last_sent_at"`, so a supervisor can
+tell "not answered yet" from "answered" without parsing pane text. Use `--pane`
+for *what the child is showing right now* (a permission prompt, a login screen,
+a hung tool call) and plain `session output` for *what the child last said*.
 
 ### Replacing the binary while agent-deck is running (`text file busy`)
 
@@ -925,6 +997,27 @@ agent-deck add -t rc-server -c "bash -c 'exec claude remote-control --name X'" /
 ```
 
 The wrapped form injects nothing and runs the command verbatim. Trade-off: the session is opaque to claude session-id tracking / resume-on-restart — fine for server-style subcommands, which have no conversation to resume. Extra *flags* (e.g. `-c "claude --model opus"`) are unaffected — the wrapper-suffix path handles those correctly.
+
+### Run artifacts on a second machine
+
+Run artifacts — `<main-worktree>/.agent-deck/<run-id>/` and `.agent-deck/handoff/<session-id>/` — are project artifacts kept out of git on purpose, so **nothing carries them between machines on its own**. A run recorded on one host is invisible on every other one, `remote drain` included: that pulls completion *records*, never files.
+
+```bash
+agent-deck artifacts sync m1                  # this repo, both directions
+agent-deck artifacts sync m1 --all --dry-run  # every root in the registry, plan only
+agent-deck artifacts sync m1 --json           # scriptable
+```
+
+It is a **union**: pulls what is missing here, pushes what is missing there, and never deletes and never overwrites. What to know before relying on it:
+
+- **Conflicts are reported, not resolved.** Same path, different content on both sides ⇒ it moves in neither direction and the command exits `4`. Everything else still transfers.
+- **A root the remote does not have is skipped with a reason** — never treated as an empty remote tree, which would push a whole local history into a path that is not that repo over there.
+- **Remote paths are the local path remapped through `$HOME`** (`~alice/src/app` → `~bob/src/app`). A root outside `$HOME` is skipped.
+- **Both machines need a build that has the `artifacts` verb.** An older remote is reported as a version error naming `agent-deck remote update`.
+- **`tmp/` and `skills.toml` are never synced** (per-checkout by design), but *other* machine-local state that lives inside a run directory still is — an in-flight run's `.conductor-id`, `.watchdog-id`, `heartbeat.log` and `.poll-raw.json` will travel. **Prefer syncing a run that has finished**; nothing is overwritten, but a live run's coordination files are meaningless on the other host.
+- Exit codes: `0` synced (already-converged says so explicitly), `2` usage/unknown remote, `3` remote unreachable, `4` conflicts.
+
+Full flags and security behavior: [Artifacts Commands](references/cli-reference.md#artifacts-commands).
 
 ### Cross-machine config drift (macOS ↔ Linux)
 

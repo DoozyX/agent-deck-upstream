@@ -5,13 +5,140 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/git"
+	"github.com/asheshgoplani/agent-deck/internal/send"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/vcs"
 )
+
+// resolveGroupSelectorToPath maps a user-provided -g/--group selector onto an
+// existing group path so a bare leaf name lands in the group the user meant.
+//
+// `launch -g api` used to be taken as a literal path, creating a stray
+// top-level `api` group beside the existing `work/api` and detaching the child
+// from its siblings. `add -g api` already resolved the leaf name, so the two
+// commands disagreed on what the same flag meant.
+//
+// Order:
+//  1. Exact path match — always wins, so a real top-level `api` stays reachable
+//     even when a nested `work/api` also exists.
+//  2. Normalized path match (lowercased, spaces hyphenated), mirroring the
+//     sanitizing that group creation applies.
+//  3. Unique case-insensitive leaf-name match.
+//
+// A selector matching nothing is returned unchanged: that is how -g deliberately
+// creates a new group. An ambiguous leaf (two groups sharing it) errors rather
+// than guessing, since guessing silently files the session in the wrong group.
+func resolveGroupSelectorToPath(existingPaths []string, selector string) (string, error) {
+	if selector == "" {
+		return selector, nil
+	}
+
+	for _, path := range existingPaths {
+		if path == selector {
+			return path, nil
+		}
+	}
+
+	normalized := strings.ToLower(strings.ReplaceAll(selector, " ", "-"))
+	for _, path := range existingPaths {
+		if path == normalized {
+			return path, nil
+		}
+	}
+
+	var matches []string
+	for _, path := range existingPaths {
+		leaf := path
+		if idx := strings.LastIndex(path, "/"); idx >= 0 {
+			leaf = path[idx+1:]
+		}
+		if strings.EqualFold(leaf, selector) {
+			matches = append(matches, path)
+		}
+	}
+
+	switch len(matches) {
+	case 0:
+		return selector, nil
+	case 1:
+		return matches[0], nil
+	default:
+		sort.Strings(matches)
+		return "", fmt.Errorf("group %q is ambiguous: matches %s — pass the full path",
+			selector, strings.Join(matches, ", "))
+	}
+}
+
+// groupPathsFrom collects every group path already known to the profile, from
+// both stored group rows and the paths sessions reference. Instance paths matter
+// because a group can exist only implicitly: NewGroupTreeWithGroups invents a
+// Group for any GroupPath missing from the stored rows.
+func groupPathsFrom(instances []*session.Instance, groups []*session.GroupData) []string {
+	seen := make(map[string]bool)
+	var paths []string
+	add := func(path string) {
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		paths = append(paths, path)
+	}
+	for _, g := range groups {
+		if g != nil {
+			add(g.Path)
+		}
+	}
+	for _, inst := range instances {
+		if inst != nil {
+			add(inst.GroupPath)
+		}
+	}
+	return paths
+}
+
+// deriveLaunchGroup resolves a project path through the deck's declarative
+// group roots before falling back to the legacy parent-folder heuristic.
+// Longest-path matching is intentional: a configured nested repository such
+// as uniqcast/content-manager must beat its enclosing uniqcast root.
+func deriveLaunchGroup(projectPath string, instances []*session.Instance, groups []*session.GroupData, cfg *session.UserConfig) string {
+	cleanProject, err := filepath.Abs(projectPath)
+	if err != nil {
+		cleanProject = filepath.Clean(projectPath)
+	}
+
+	bestGroup := ""
+	bestLen := -1
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	session.ReconcileDeclarativeGroups(groupTree, cfg)
+	for _, group := range groupTree.GroupList {
+		if group == nil || strings.TrimSpace(group.Path) == "" || strings.TrimSpace(group.DefaultPath) == "" {
+			continue
+		}
+		cleanRoot, absErr := filepath.Abs(group.DefaultPath)
+		if absErr != nil {
+			cleanRoot = filepath.Clean(group.DefaultPath)
+		}
+		rel, relErr := filepath.Rel(cleanRoot, cleanProject)
+		if relErr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if len(cleanRoot) > bestLen {
+			bestGroup = group.Path
+			bestLen = len(cleanRoot)
+		}
+	}
+	if bestGroup != "" {
+		return bestGroup
+	}
+
+	return session.CanonicalizeGroupPath(
+		groupPathsFrom(instances, groups), session.GroupPathForProject(projectPath))
+}
 
 // assertDoneInstruction is appended to a child's initial message so it ends its
 // final turn with the #1186 completion sentinel. The completion ledger and the
@@ -29,6 +156,14 @@ func applyAssertDone(message string, enabled bool) string {
 		return message
 	}
 	return message + assertDoneInstruction
+}
+
+// defaultAssertDoneForTool reports whether a child tool gets the completion
+// sentinel by default. Both Claude and Codex support parented orchestration;
+// without the sentinel, a completed child is indistinguishable from an ordinary
+// idle turn to the parent.
+func defaultAssertDoneForTool(tool string) bool {
+	return session.IsClaudeCompatible(tool) || session.IsCodexCompatible(tool)
 }
 
 // handleLaunch combines add + start + optional send into a single command.
@@ -57,6 +192,7 @@ func handleLaunch(profile string, args []string) {
 	// detached from the parent. Opt-in so #972 (conductor children -> project
 	// group) is preserved by default. Used by the fleet skill.
 	inheritGroup := fs.Bool("inherit-group", false, "Place the child in the parent session's group instead of the cwd-derived group (auto-applied for git worktree children; use this to force it for non-worktree paths)")
+	allowCrossGroup := fs.Bool("allow-cross-group", false, "Allow a parented linked-worktree child to use an explicit group different from its parent")
 	noTransitionNotify := fs.Bool("no-transition-notify", false, "Suppress transition event notifications to parent session")
 	// #697: conductor-friendly title lock. Prevents Claude's session name
 	// from overwriting the agent-deck title. An explicit -t/--title already
@@ -78,6 +214,7 @@ func handleLaunch(profile string, args []string) {
 	newBranch := fs.Bool("b", false, "Create new branch (use with --worktree)")
 	newBranchLong := fs.Bool("new-branch", false, "Create new branch")
 	worktreeLocation := fs.String("location", "", "Worktree location: sibling, subdirectory, or custom path")
+	worktreeBase := fs.String("base", "", "Base revision for a new git worktree branch (requires -w and -b)")
 
 	// MCP flag
 	var mcpFlags []string
@@ -105,13 +242,13 @@ func handleLaunch(profile string, args []string) {
 	})
 	noChannelLink := fs.Bool("no-channel-link", false, "Disable auto-link between --plugin entries with emits_channel=true and --channel")
 
-	// Extra claude CLI tokens - repeatable; mirrors handleAdd's --extra-arg.
+	// Extra Claude or Codex CLI tokens - repeatable; mirrors handleAdd's --extra-arg.
 	// Each invocation contributes one already-tokenised arg; feeds
-	// Instance.ExtraArgs which buildClaudeExtraFlags shellescapes and appends.
+	// Instance.ExtraArgs which the Claude/Codex builders shellescape and append.
 	// Persisted plaintext in state.db — do NOT pass secrets like API keys.
 	var extraArgFlags []string
-	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
-		if err := session.ValidateClaudeExtraArgToken(s); err != nil {
+	fs.Func("extra-arg", "Extra Claude or Codex CLI token (can specify multiple times); persisted plaintext — no secrets", func(s string) error {
+		if err := session.ValidateExtraArgToken(s); err != nil {
 			return err
 		}
 		extraArgFlags = append(extraArgFlags, s)
@@ -158,6 +295,7 @@ func handleLaunch(profile string, args []string) {
 		fmt.Println("  agent-deck launch . -c \"codex --dangerously-bypass-approvals-and-sandbox\"")
 		fmt.Println("  agent-deck launch . -g ard --no-parent -c claude -m \"Run review\"")
 		fmt.Println("  agent-deck launch . -c claude -w feature/new -b -m \"Start work\"")
+		fmt.Println("  agent-deck launch . -c codex -w feature/fix -b --base dev -m \"Fix issue\"")
 	}
 
 	// Reject an omitted --account value before either reordering pass can bind
@@ -170,7 +308,7 @@ func handleLaunch(profile string, args []string) {
 	}
 
 	// Reorder args: move path to end so flags are parsed correctly
-	args = reorderArgsForFlagParsing(args)
+	args = reorderArgsForFlagParsing(fs, args)
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
@@ -226,11 +364,11 @@ func handleLaunch(profile string, args []string) {
 
 	// --assert-done: append the completion-sentinel instruction so the child
 	// reliably reports back via the ledger / parent inbox. Default-on for
-	// Claude children (a completion signal nobody requests is useless);
+	// Claude and Codex children (a completion signal nobody requests is useless);
 	// --no-assert-done always wins.
 	assertDoneTool := firstNonEmpty(sessionCommandTool, detectTool(sessionCommandInput))
 	assertDoneOn := *assertDone
-	if !*assertDone && !*noAssertDone && session.IsClaudeCompatible(assertDoneTool) {
+	if !*assertDone && !*noAssertDone && defaultAssertDoneForTool(assertDoneTool) {
 		assertDoneOn = true
 	}
 	if *noAssertDone {
@@ -244,6 +382,10 @@ func handleLaunch(profile string, args []string) {
 		wtBranch = *worktreeBranchLong
 	}
 	createNewBranch := *newBranch || *newBranchLong
+	if *worktreeBase != "" && (wtBranch == "" || !createNewBranch) {
+		out.Error("--base requires -w/--worktree and -b/--new-branch", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
 
 	// Validate --resume-session requires Claude
 	if *resumeSession != "" {
@@ -263,6 +405,36 @@ func handleLaunch(profile string, args []string) {
 			out.Error("--resume-session must be a bare Claude conversation UUID "+
 				"(8-4-4-4-12 lowercase hex, e.g. 91fd7978-1a2b-3c4d-5e6f-7a8b9c0d1e2f)", ErrCodeInvalidOperation)
 			os.Exit(1)
+		}
+	}
+
+	launchPolicyCfg, _ := session.LoadUserConfig()
+	var launchPolicyTree *session.GroupTree
+	var launchPolicyInstances []*session.Instance
+	var launchPolicyGroups []*session.GroupData
+	if managedSessionGroupCreationRestricted(launchPolicyCfg) {
+		policyStorage, policyInstances, policyGroups, policyErr := loadSessionData(profile)
+		if policyErr != nil {
+			out.Error(policyErr.Error(), ErrCodeNotFound)
+			os.Exit(1)
+		}
+		launchPolicyInstances = policyInstances
+		launchPolicyGroups = policyGroups
+		launchPolicyTree = session.NewGroupTreeWithGroups(policyInstances, policyGroups)
+		if session.ReconcileDeclarativeGroups(launchPolicyTree, launchPolicyCfg) {
+			if policyErr := policyStorage.SaveGroupsOnly(launchPolicyTree); policyErr != nil {
+				_ = policyStorage.Close()
+				out.Error(fmt.Sprintf("failed to persist declarative groups: %v", policyErr), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
+		_ = policyStorage.Close()
+		if explicitGroupProvided {
+			resolvedGroup := resolveGroupPathForAdd(launchPolicyTree, sessionGroup)
+			if policyErr := requireExistingGroupForManagedSession(launchPolicyCfg, launchPolicyTree, resolvedGroup); policyErr != nil {
+				out.Error(policyErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
 		}
 	}
 
@@ -303,6 +475,32 @@ func handleLaunch(profile string, args []string) {
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
+		if launchPolicyTree != nil && !explicitGroupProvided {
+			var policyParent *session.Instance
+			if sessionParent != "" {
+				var errMsg string
+				policyParent, errMsg, _ = ResolveSession(sessionParent, launchPolicyInstances)
+				if policyParent == nil {
+					out.Error(errMsg, ErrCodeNotFound)
+					os.Exit(1)
+				}
+			} else if !*noParent {
+				var unresolved string
+				policyParent, unresolved = resolveAutoParentInstanceChecked(launchPolicyInstances)
+				if policyParent == nil && unresolved != "" {
+					out.Error(fmt.Sprintf("automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session", unresolved), ErrCodeNotFound)
+					os.Exit(1)
+				}
+			}
+			candidateGroup := deriveLaunchGroup(worktreePath, launchPolicyInstances, launchPolicyGroups, launchPolicyCfg)
+			if policyParent != nil {
+				candidateGroup = policyParent.GroupPath
+			}
+			if policyErr := requireExistingGroupForManagedSession(launchPolicyCfg, launchPolicyTree, candidateGroup); policyErr != nil {
+				out.Error(policyErr.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
+		}
 
 		// Check for an existing worktree for this branch before creating a new one
 		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
@@ -321,9 +519,27 @@ func handleLaunch(profile string, args []string) {
 
 			// Sparse state is inherited from `path` (the directory the user
 			// launched from), never from backend.RepoDir() — see #1708.
-			setupErr, err := createWorktreeWithSetup(backend, worktreePath, wtBranch,
-				git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path),
-				os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			createOpts := git.SparseInheritOptions(wtSettings.InheritSparseCheckout(), path)
+			var setupErr, err error
+			if *worktreeBase != "" {
+				if backend.Type() != vcs.TypeGit {
+					out.Error("--base is currently supported only for git worktrees", ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				baseCommit, resolveErr := git.ResolveCommit(path, *worktreeBase)
+				if resolveErr != nil {
+					out.Error(fmt.Sprintf("invalid worktree base: %v", resolveErr), ErrCodeInvalidOperation)
+					os.Exit(1)
+				}
+				setupErr, err = git.CreateWorktreeAtStartPointWithSetup(repoRoot, worktreePath, wtBranch, baseCommit,
+					createOpts, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+				if err == nil {
+					fmt.Fprintf(os.Stderr, "Verified worktree base: %s (%s)\n", *worktreeBase, baseCommit)
+				}
+			} else {
+				setupErr, err = createWorktreeWithSetup(backend, worktreePath, wtBranch,
+					createOpts, os.Stdout, os.Stderr, session.GetWorktreeSettings().SetupTimeout())
+			}
 			if err != nil {
 				out.Error(fmt.Sprintf("failed to create worktree: %v", err), ErrCodeInvalidOperation)
 				os.Exit(1)
@@ -338,10 +554,23 @@ func handleLaunch(profile string, args []string) {
 	}
 
 	// Load sessions
-	storage, instances, _, err := loadSessionData(profile)
+	storage, instances, groups, err := loadSessionData(profile)
 	if err != nil {
 		out.Error(err.Error(), ErrCodeNotFound)
 		os.Exit(1)
+	}
+
+	// Map an explicit -g onto an existing group before anything consumes it, so
+	// a bare leaf name (`-g baba`) lands in the group the user meant
+	// (`doozyx/baba`) instead of creating a stray top-level namesake. `add`
+	// already did this; launch took the selector literally.
+	if explicitGroupProvided {
+		resolved, resolveErr := resolveGroupSelectorToPath(groupPathsFrom(instances, groups), sessionGroup)
+		if resolveErr != nil {
+			out.Error(resolveErr.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		sessionGroup = resolved
 	}
 
 	// Resolve parent session if specified.
@@ -350,27 +579,35 @@ func handleLaunch(profile string, args []string) {
 	// land in the project group (e.g. `agent-deck`) instead of the
 	// conductor's own group (`conductor`). The parent group is now a
 	// fallback for path mappings that produce no group.
-	cwdDerivedGroup := session.GroupPathForProject(path)
+	// The derived group carries the casing the filesystem uses, which is not
+	// the casing the group was declared with (~/DoozyX/Uniqcast → "Uniqcast"
+	// beside the real "uniqcast"). Snap it onto the existing group the same
+	// way an explicit -g selector is resolved above.
+	launchGroupCfg, _ := session.LoadUserConfig()
+	cwdDerivedGroup := deriveLaunchGroup(path, instances, groups, launchGroupCfg)
 	// A worktree child auto-inherits its parent's group (issue: fleets fanned
 	// into worktrees scattered into junk per-branch / `worktrees` groups, or
 	// a deliberately-named group, detached from the parent). `path` is already
 	// the final worktree path here (the -w branch above reassigns it before
 	// this point). git.IsLinkedWorktree returns false for main working trees,
 	// so #972's conductor children (separate real repos) keep cwd-derived group.
-	// The thunk defers the git probe until shouldInheritParentGroup needs it.
-	inheritParentGroup := shouldInheritParentGroup(explicitGroupProvided, *inheritGroup, func() bool {
-		return git.IsLinkedWorktree(path)
-	})
+	// pathIsLinkedWorktree memoizes the (process-spawning) git probe so the
+	// group-inherit decision and the orphan-worktree guard below share one call.
+	var worktreeProbed, worktreeResult bool
+	pathIsLinkedWorktree := func() bool {
+		if !worktreeProbed {
+			worktreeResult = git.IsLinkedWorktree(path)
+			worktreeProbed = true
+		}
+		return worktreeResult
+	}
+	inheritParentGroup := shouldInheritParentGroup(explicitGroupProvided, *inheritGroup, pathIsLinkedWorktree)
 	var parentInstance *session.Instance
 	if sessionParent != "" {
 		var errMsg string
 		parentInstance, errMsg, _ = ResolveSession(sessionParent, instances)
 		if parentInstance == nil {
 			out.Error(errMsg, ErrCodeNotFound)
-			os.Exit(1)
-		}
-		if parentInstance.IsSubSession() {
-			out.Error("cannot create sub-session of a sub-session (single level only)", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
@@ -381,11 +618,46 @@ func handleLaunch(profile string, args []string) {
 			out.Error(fmt.Sprintf("automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session", unresolvedParent), ErrCodeNotFound)
 			os.Exit(1)
 		}
-		if parentInstance != nil && !parentInstance.IsSubSession() {
+		if parentInstance != nil {
 			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, parentInstance.GroupPath, explicitGroupProvided, inheritParentGroup)
 		} else {
-			parentInstance = nil
+			sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, "", explicitGroupProvided, inheritParentGroup)
 		}
+	} else {
+		sessionGroup = resolveGroupSelection(sessionGroup, cwdDerivedGroup, "", explicitGroupProvided, inheritParentGroup)
+	}
+
+	if parentInstance != nil {
+		if err := validateWorktreeCrossGroup(
+			explicitGroupProvided, *allowCrossGroup, true, pathIsLinkedWorktree(),
+			sessionGroup, parentInstance.GroupPath,
+		); err != nil {
+			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+
+	// Orphan-worktree guard: a linked-worktree child with no explicit -g and no
+	// parent attached silently lands in its branch-leaf cwd-derived group (the
+	// empty sessionGroup falls through to NewInstance's path-derived group),
+	// detached from any conductor group. This is almost always an auto-parent
+	// miss — the launch ran in a shell without the conductor's
+	// AGENTDECK_INSTANCE_ID (e.g. issued from a subagent, not the conductor's
+	// own pane) — or a --no-parent launch that forgot the required -g. Warn
+	// loudly so the stray group is caught at launch, not discovered later. A
+	// real (non-worktree) conductor child keeps its cwd-derived project group
+	// (#972) and never trips this, since pathIsLinkedWorktree is false for it.
+	if shouldWarnOrphanWorktreeGroup(parentInstance != nil, explicitGroupProvided, pathIsLinkedWorktree()) {
+		strayGroup := sessionGroup
+		if strayGroup == "" {
+			strayGroup = cwdDerivedGroup
+		}
+		fmt.Fprintf(os.Stderr,
+			"Warning: worktree child has no parent session; landing in cwd-derived group %q (the branch leaf), detached from any conductor group.\n"+
+				"  Auto-parenting found no conductor (is AGENTDECK_INSTANCE_ID set in this shell?).\n"+
+				"  Attach it with --parent <conductor-id>, or place it explicitly with -g <group>.\n"+
+				"  Repair an already-launched stray with: agent-deck group move <id> <group>\n",
+			strayGroup)
 	}
 
 	// Default title to folder name
@@ -421,7 +693,7 @@ func handleLaunch(profile string, args []string) {
 		os.Exit(1)
 	}
 	instances = freshInstances
-	groups := freshGroups
+	groups = freshGroups
 
 	launchDecision := decideAddTitle(instances, sessionTitle, localLocation(path), userProvidedTitle)
 	if launchDecision.Duplicate != nil {
@@ -441,6 +713,11 @@ func handleLaunch(profile string, args []string) {
 	} else {
 		newInstance = session.NewInstance(sessionTitle, path)
 	}
+	// NewInstance derives the group off the project path when sessionGroup is
+	// empty (no parent, no -g), which bypasses the canonicalization applied to
+	// cwdDerivedGroup above.
+	newInstance.GroupPath = session.CanonicalizeGroupPath(
+		groupPathsFrom(instances, groups), newInstance.GroupPath)
 
 	// Socket-isolation CLI override (issue #687 phase 1, v1.7.50).
 	// Matches `agent-deck add --tmux-socket`. Whitespace-only flag falls
@@ -473,6 +750,15 @@ func handleLaunch(profile string, args []string) {
 	// opt-outs for auto-named sessions.
 	if shouldLockTitle(userProvidedTitle, *titleLock, *noTitleSync) {
 		newInstance.TitleLocked = true
+	}
+
+	// The mirror of the lock: no explicit title means the handle is
+	// machine-generated, so the deck should display Claude's task description
+	// instead of it. Without this, every `launch`ed session (orchestrate
+	// children included) was stuck showing a folder/adjective-noun handle no
+	// matter what work it was doing. Same contract as `add`.
+	if !userProvidedTitle {
+		newInstance.SetAutoName(true)
 	}
 
 	// #1133: explicit opt-in for inheriting the conductor's telegram env.
@@ -516,10 +802,10 @@ func handleLaunch(profile string, args []string) {
 		newInstance.PluginChannelLinkDisabled = true
 	}
 
-	// Apply --extra-arg flags (claude only; mirror of handleAdd).
+	// Apply --extra-arg flags for builders that support persisted tokens.
 	if len(extraArgFlags) > 0 {
-		if newInstance.Tool != "claude" {
-			out.Error("--extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args", ErrCodeInvalidOperation)
+		if !session.SupportsExtraArgs(newInstance.Tool) {
+			out.Error("--extra-arg only supported for Claude- or Codex-compatible sessions", ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 		newInstance.ExtraArgs = extraArgFlags
@@ -625,6 +911,14 @@ func handleLaunch(profile string, args []string) {
 	maxC := session.GroupMaxConcurrent(tree, newInstance.GroupPath)
 	if session.ShouldQueue(instances, newInstance.GroupPath, maxC) {
 		newInstance.Status = session.StatusQueued
+		// The prompt must outlive the queueing. resolveMessageInput has already
+		// consumed --message-file (and drained stdin for "-"), so the caller
+		// cannot re-supply it; without this the session starts later on an empty
+		// composer and the operator has to re-send by hand.
+		if err := session.SaveQueuedMessage(newInstance.ID, initialMessage); err != nil {
+			out.Error(fmt.Sprintf("failed to persist queued prompt: %v", err), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
 		// v1.9.x issue #1031: same targeted single-row pattern as the
 		// initial insert above — saveSessionData → SaveWithGroups is
 		// the load-modify-write rewrite that loses sibling launches'
@@ -640,9 +934,16 @@ func handleLaunch(profile string, args []string) {
 			"status":         "queued",
 			"group":          newInstance.GroupPath,
 			"max_concurrent": maxC,
+			// Tells an automated caller its prompt was retained rather than
+			// silently dropped — the queued path used to look identical either way.
+			"queued_message": initialMessage != "",
 		}
 		addModelInfoJSON(queuedJSON, newInstance.LaunchModelInfo())
-		out.Success(fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC), queuedJSON)
+		msg := fmt.Sprintf("Queued session: %s (group at cap %d)", newInstance.Title, maxC)
+		if initialMessage != "" {
+			msg += "; its prompt will be delivered on start"
+		}
+		out.Success(msg, queuedJSON)
 		return
 	}
 
@@ -686,9 +987,32 @@ func handleLaunch(profile string, args []string) {
 	// --no-wait loses nothing.
 	promptRidesArgv := initialMessage != "" && newInstance.PromptRidesCommandLine()
 
+	// startDelivery is how this launch actually delivered the initial prompt,
+	// in the `session send` vocabulary. It rides into the JSON payload below so
+	// a caller can tell "the child is working on my brief" from "the child
+	// exists and the brief went nowhere" — the distinction `success: true`
+	// alone never made, and the reason a lost brief could sit undetected for
+	// four heartbeats while `session list` reported `running`.
+	startDelivery := ""
 	if initialMessage != "" && (!*noWait || promptRidesArgv) {
-		if err := newInstance.StartWithMessage(initialMessage); err != nil {
-			out.Error(fmt.Sprintf("failed to start session: %v", err), ErrCodeInvalidOperation)
+		delivery, err := newInstance.StartWithMessageDelivery(initialMessage)
+		startDelivery = delivery
+		if err != nil {
+			// The session may well be up — the failure is the message, not
+			// the spawn — so report the id and the classification, not just
+			// "failed to start". A caller that gets a session id back can
+			// redeliver with `session send`; one that gets a bare error
+			// cannot.
+			out.ErrorWithData(
+				launchDeliveryFailureMessageFor(newInstance.Title, delivery, initialMessage, err),
+				ErrCodeDeliveryFailed,
+				map[string]interface{}{
+					"session_id": newInstance.ID,
+					"id":         newInstance.ID,
+					"title":      newInstance.Title,
+					"delivery":   delivery,
+					"submitted":  send.DeliveryMeansSubmitted(delivery),
+				})
 			os.Exit(1)
 		}
 	} else {
@@ -741,13 +1065,27 @@ func handleLaunch(profile string, args []string) {
 			// delivered form (#1855), so the recovery retry needs the same
 			// provenance or its attribution gate withholds it forever.
 			pasteFreeBeforeSend := composerPasteFree(tmuxSess)
-			if _, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
-				maxRetries:                  8,
+			noWaitDelivery, err := sendWithRetryTarget(tmuxSess, initialMessage, skipClaudeDeliveryVerify(newInstance.Tool), sendRetryOptions{
+				// Scaled with the payload for the same reason executeSend
+				// scales its budget: a launch brief is almost always one of
+				// the large bodies, and 8 looks at 150ms is 1.2 seconds.
+				maxRetries:                  send.VerifyRetriesForPayload(8, initialMessage),
 				checkDelay:                  150 * time.Millisecond,
 				tool:                        newInstance.Tool,
 				composerPasteFreeBeforeSend: pasteFreeBeforeSend,
-			}); err != nil {
-				out.Error(fmt.Sprintf("failed to send initial message: %v", err), ErrCodeInvalidOperation)
+			})
+			startDelivery = noWaitDelivery
+			if err != nil {
+				out.ErrorWithData(
+					launchDeliveryFailureMessageFor(newInstance.Title, noWaitDelivery, initialMessage, err),
+					ErrCodeDeliveryFailed,
+					map[string]interface{}{
+						"session_id": newInstance.ID,
+						"id":         newInstance.ID,
+						"title":      newInstance.Title,
+						"delivery":   noWaitDelivery,
+						"submitted":  send.DeliveryMeansSubmitted(noWaitDelivery),
+					})
 				os.Exit(1)
 			}
 			verifyPromptConsumedAfterLaunchAttributed(
@@ -787,6 +1125,14 @@ func handleLaunch(profile string, args []string) {
 	if initialMessage != "" {
 		jsonData["message"] = initialMessage
 		jsonData["message_pending"] = *noWait
+		// Same two keys `session send --json` publishes, with the same
+		// meaning: `submitted` is true only for a confirmed accepted turn.
+		// A launch that could not verify submission reports `unverified`
+		// here rather than letting `success: true` imply more than was seen.
+		if startDelivery != "" {
+			jsonData["delivery"] = startDelivery
+			jsonData["submitted"] = send.DeliveryMeansSubmitted(startDelivery)
+		}
 	}
 	if len(mcpFlags) > 0 {
 		jsonData["mcps"] = mcpFlags
@@ -802,9 +1148,15 @@ func handleLaunch(profile string, args []string) {
 
 	msg := fmt.Sprintf("Launched session: %s", newInstance.Title)
 	if initialMessage != "" {
-		if *noWait {
+		// "(message sent)" was the human-readable half of the same
+		// overclaim: it was printed whether or not anything confirmed the
+		// agent took the message up. Say what was actually observed.
+		switch {
+		case startDelivery == send.DeliveryUnverified:
+			msg += " (message sent, submission unverified)"
+		case *noWait:
 			msg += " (message sent with --no-wait)"
-		} else {
+		default:
 			msg += " (message sent)"
 		}
 	}

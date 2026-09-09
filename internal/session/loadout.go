@@ -4,18 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 )
 
 // ApplyConfiguredLoadout materializes the declarative per-group /
-// per-conductor skill, plugin, and MCP loadout
-// ([groups.X.claude].skills/.plugins/.mcps and the conductor mirror) for a
-// claude-compatible session, by
-// driving the existing project-skills attach machinery and local .mcp.json
-// writer — exactly as if the user had run `skill attach` / `mcp attach` by
-// hand. Called at session create (add/launch) and re-asserted before every
+// per-conductor skill, plugin, and MCP loadout for Claude sessions, and the
+// per-group skill, native plugin, and MCP loadout for Codex sessions.
+// Declarative skills use the resolved CLAUDE_CONFIG_DIR/skills or
+// CODEX_HOME/skills directory;
+// explicit skill attach remains project-scoped. Called at session create
+// (add/launch) and
+// re-asserted before every
 // Start/StartWithMessage/Restart spawn, so a config edit takes effect on
 // the next start and a healthy state is a cheap no-op.
 //
@@ -26,26 +26,27 @@ import (
 //   - target exists as a real dir or foreign symlink (not manifest-managed)
 //     → skip + warning, never clobber; a human-placed dir beats config
 //   - entry not resolvable in the skill-source registry → skip + warning
-//   - removing an entry from the config list does NOT detach — subtraction
-//     is a deliberate `skill detach` (a config typo must not strip a live
-//     session's skills)
+//   - removing an entry from the config list does NOT detach
 //
 // MCP entries are [mcps.X] catalog names appended to the session's local
-// .mcp.json (never removed); unknown names skip + warn.
+// configuration (or the selected CODEX_HOME/config.toml for Codex), never
+// removed; unknown names skip + warn.
 //
-// The effective lists are the union of the group ancestor chain and, for
-// conductor sessions, the conductor block (group floor + conductor extras).
+// The effective Claude lists are the union of the group ancestor chain and,
+// for conductor sessions, the conductor block (group floor + conductor
+// extras). Codex uses its group ancestor chain only; native plugins are healed
+// in the selected CODEX_HOME when their config entries disappear.
 //
 // Returns the warnings (also slog-warned) so CLI call sites can print them;
 // a nil return means nothing to do or everything healthy. Failures never
 // block the spawn — the loadout is provisioning, not a launch gate.
 func ApplyConfiguredLoadout(inst *Instance) []string {
-	if inst == nil || !IsClaudeCompatible(inst.Tool) {
+	if inst == nil || (!IsClaudeCompatible(inst.Tool) && !IsCodexCompatible(inst.Tool)) {
 		return nil
 	}
-	if inst.ProjectPath == "" || inst.SSHHost != "" {
-		// No local project path to materialize into (SSH sessions run on a
-		// remote working dir agent-deck cannot symlink into).
+	if inst.SSHHost != "" {
+		// SSH sessions run against a remote home and project directory that
+		// this local process cannot safely materialize into.
 		return nil
 	}
 
@@ -61,20 +62,22 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		return nil
 	}
 
-	skills := unionLoadoutEntries(
-		config.GetGroupClaudeSkills(inst.GroupPath),
-		config.GetConductorClaudeSkills(conductorNameFromInstance(inst)),
-	)
-	plugins := unionLoadoutEntries(
-		config.GetGroupClaudePlugins(inst.GroupPath),
-		config.GetConductorClaudePlugins(conductorNameFromInstance(inst)),
-	)
-	mcps := unionLoadoutEntries(
-		config.GetGroupClaudeMCPs(inst.GroupPath),
-		config.GetConductorClaudeMCPs(conductorNameFromInstance(inst)),
-	)
-	if len(skills) == 0 && len(plugins) == 0 && len(mcps) == 0 {
-		return nil
+	var skills, plugins, mcps []string
+	var skillHome string
+	var skillResolutionErr error
+	if IsClaudeCompatible(inst.Tool) {
+		skillHome, skills, skillResolutionErr = ResolveInstanceClaudeHomeSkills(inst)
+		plugins = unionLoadoutEntries(
+			config.GetGroupClaudePlugins(inst.GroupPath),
+			config.GetConductorClaudePlugins(conductorNameFromInstance(inst)),
+		)
+		mcps = unionLoadoutEntries(
+			config.GetGroupClaudeMCPs(inst.GroupPath),
+			config.GetConductorClaudeMCPs(conductorNameFromInstance(inst)),
+		)
+	} else {
+		skillHome, skills, skillResolutionErr = ResolveInstanceCodexHomeSkills(inst)
+		mcps = config.GetGroupCodexMCPs(inst.GroupPath)
 	}
 
 	var warnings []string
@@ -86,18 +89,64 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 			slog.String("group", sanitizeLoadoutWarning(inst.GroupPath)),
 			slog.String("detail", w))
 	}
+	if skillResolutionErr != nil {
+		label := "Codex"
+		if IsClaudeCompatible(inst.Tool) {
+			label = "Claude"
+		}
+		warn("%s home skills: %v", label, skillResolutionErr)
+		skills = nil
+	}
+	if IsCodexCompatible(inst.Tool) {
+		codexHome, err := ResolveInstanceCodexHome(inst)
+		if err != nil {
+			warn("Codex managed settings: %v", err)
+		} else {
+			model := config.GetGroupCodexModel(inst.GroupPath)
+			if strings.TrimSpace(model) == "" {
+				model = config.Codex.DefaultModel
+			}
+			effort := config.GetGroupCodexReasoningEffort(inst.GroupPath)
+			if strings.TrimSpace(effort) == "" {
+				effort = config.Codex.DefaultReasoningEffort
+			}
+			if err := ApplyCodexManagedSettings(codexHome, model, effort); err != nil {
+				warn("Codex managed settings: %v", err)
+			}
+			if err := ApplyCodexTUISettings(codexHome, config.Codex.TUI); err != nil {
+				warn("Codex TUI defaults: %v", err)
+			}
+			if err := ReconcileGroupCodexPlugins(inst.GroupPath, codexHome); err != nil {
+				warn("Codex plugins: %v", err)
+			}
+		}
+	}
+	if len(skills) == 0 && len(plugins) == 0 && len(mcps) == 0 {
+		return warnings
+	}
 
-	attachedSkill := false
 	for _, entry := range skills {
-		attachment, err := AttachSkillToProject(inst.ProjectPath, inst.Tool, entry, "")
+		var attachment *ProjectSkillAttachment
+		var err error
+		switch {
+		case IsClaudeCompatible(inst.Tool):
+			attachment, err = AttachSkillToClaudeHome(skillHome, entry, "")
+		case IsCodexCompatible(inst.Tool):
+			attachment, err = AttachSkillToCodexHome(skillHome, entry, "")
+		}
+		healthy := func() bool {
+			if IsClaudeCompatible(inst.Tool) {
+				return healthyManagedClaudeHomeSkillAttachment(skillHome, entry)
+			}
+			return healthyManagedCodexHomeSkillAttachment(skillHome, entry)
+		}
 		switch {
 		case err == nil:
-			attachedSkill = true
 			sessionLog.Info("loadout_skill_attached",
 				slog.String("session", sanitizeLoadoutWarning(inst.Title)),
 				slog.String("skill", sanitizeLoadoutWarning(entry)),
 				slog.String("target", sanitizeLoadoutWarning(attachment.TargetPath)))
-		case errors.Is(err, ErrSkillAlreadyAttached) && healthyManagedSkillAttachment(inst.ProjectPath, entry):
+		case errors.Is(err, ErrSkillAlreadyAttached) && healthy():
 			// Healthy manifest-managed floor — nothing to do.
 		case errors.Is(err, ErrSkillAlreadyAttached):
 			warn("skill %q: existing target is not a healthy manifest-managed attachment", entry)
@@ -112,6 +161,12 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 			// is not managed", "target already managed by …") and IO errors.
 			warn("skill %q: %v", entry, err)
 		}
+	}
+
+	if inst.ProjectPath == "" {
+		// Home skills do not need a project, but Claude plugins/MCPs and Codex
+		// MCPs retain their existing project/session attachment boundaries.
+		return warnings
 	}
 
 	// Catalog plugins are persisted on the instance and resolved by the
@@ -136,15 +191,14 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 
 	// Project-scope plugins only load when the cwd's realpath is trusted in
 	// ~/.claude.json (projects[<realpath>].hasTrustDialogAccepted). Seed it
-	// here — the same one-key trust the conductor setup pre-accepts
-	// (PreAcceptClaudeTrust) — so a materialized skill loadout, which is what
-	// carries plugins/hooks, actually loads instead of being silently skipped
-	// at spawn. Only when plugins were materialized (mcps load via .mcp.json
-	// regardless of trust). Keyed by realpath: Claude resolves the cwd through
-	// symlinks, and agent homes are commonly reached via synced/symlinked paths.
+	// here — the same one-key trust the conductor setup pre-accepts — so
+	// configured plugins/hooks load instead of being silently skipped. MCPs
+	// load via .mcp.json regardless of trust. Keyed by realpath: Claude resolves
+	// the cwd through symlinks, and agent homes are commonly reached via synced
+	// or symlinked paths.
 	// Empirically one key is sufficient; hasCompletedProjectOnboarding is not
 	// required for plugin loading.
-	if attachedSkill && inst.Tool == "claude" {
+	if len(plugins) > 0 && inst.Tool == "claude" {
 		trustDir := inst.ProjectPath
 		if real, err := filepath.EvalSymlinks(trustDir); err == nil {
 			trustDir = real
@@ -165,6 +219,9 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 			info = &MCPInfo{}
 		}
 		current := info.Local()
+		if IsCodexCompatible(inst.Tool) {
+			current = info.Global
+		}
 		attached := make(map[string]bool, len(current))
 		for _, name := range current {
 			attached[name] = true
@@ -188,7 +245,7 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		}
 		if added {
 			if err := inst.WriteLocalMCPConfig(newLocal); err != nil {
-				warn("mcp loadout: failed to write local .mcp.json: %v", err)
+				warn("mcp loadout: failed to write MCP configuration: %v", err)
 			} else {
 				inst.InvalidateProjectMCPIntegrationsCache()
 			}
@@ -214,51 +271,6 @@ func sanitizeLoadoutWarning(value string) string {
 			return r
 		}
 	}, value)
-}
-
-// healthyManagedSkillAttachment verifies that ErrSkillAlreadyAttached came
-// from the manifest-managed target and, for symlink mode, that the link still
-// resolves to the recorded source. A foreign replacement must never be
-// accepted as a healthy declarative floor.
-func healthyManagedSkillAttachment(projectPath, skillID string) bool {
-	// The project path can reach here from operator input (the web
-	// create-session request body carries it). Instance project paths are
-	// always absolute and clean, so refuse relative or dot-dot forms
-	// outright before any filesystem access (CodeQL go/path-injection).
-	if !filepath.IsAbs(projectPath) || strings.Contains(projectPath, "..") {
-		return false
-	}
-	manifest, err := LoadProjectSkillsManifest(projectPath)
-	if err != nil {
-		return false
-	}
-	for _, attachment := range manifest.Skills {
-		if normalizeSkillToken(skillIDForAttachment(attachment)) != normalizeSkillToken(skillID) {
-			continue
-		}
-		// Same audit-M3 containment guard as safeRemoveManagedTarget: a
-		// tampered manifest TargetPath that is absolute, non-managed, or
-		// "../"-escaping is refused before any filesystem access.
-		target := resolveTargetPath(projectPath, attachment.TargetPath)
-		skillDir, dirOK := managedProjectSkillsDirForTarget(attachment.TargetPath)
-		if !dirOK {
-			return false
-		}
-		base := filepath.Join(projectPath, filepath.FromSlash(skillDir))
-		if !isContainedIn(base, target) {
-			return false
-		}
-		if _, err := os.Lstat(target); err != nil {
-			return false
-		}
-		if attachment.Mode != "symlink" {
-			return true
-		}
-		actual, actualErr := filepath.EvalSymlinks(target)
-		expected, expectedErr := filepath.EvalSymlinks(attachment.SourcePath)
-		return actualErr == nil && expectedErr == nil && actual == expected
-	}
-	return false
 }
 
 // unionLoadoutEntries merges loadout lists preserving order (group floor

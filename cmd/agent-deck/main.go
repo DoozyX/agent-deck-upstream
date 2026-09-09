@@ -51,7 +51,16 @@ const (
 	tableColIDDisplay = 12
 )
 
-// init sets up color profile for consistent terminal colors across environments
+// init sets up color profile for consistent terminal colors across environments.
+//
+// Nothing here may resolve a HOME-derived path. Go runs package init before
+// TestMain, so an init() that resolves one lands on the developer's real
+// ~/.config/agent-deck no matter what testutil.IsolateHome() does afterwards —
+// the escape the agentpaths S4 guard exists to catch (2026-06-04 data-loss
+// incident). Path-dependent setup belongs in main(), which test binaries never
+// call. initColorProfile reads only env vars, so it is safe here;
+// initUpdateSettings loads config.toml and is called from main() instead.
+// Pinned by TestInitDoesNotResolveRealHomePaths.
 func init() {
 	initColorProfile()
 }
@@ -279,6 +288,13 @@ func main() {
 		// resolve consistently across all command paths in this process.
 		_ = os.Setenv("AGENTDECK_PROFILE", profile)
 	}
+
+	// Reads config.toml, so it cannot live in init(): that would resolve a
+	// HOME-derived path before a test binary's TestMain can isolate HOME. Here
+	// it also runs after the profile is known, alongside the other
+	// config-dependent setup below. See the init() comment above.
+	initUpdateSettings()
+
 	// Extract global --allow-repo-scripts before subcommand dispatch (mirrors
 	// -p/--profile above). One-shot, non-persisted bypass of the worktree
 	// script consent gate for non-interactive callers (CI) that can't answer
@@ -403,8 +419,14 @@ func main() {
 		case "accounts":
 			handleAccounts(args[1:])
 			return
+		case "usage":
+			handleUsage(profile, args[1:])
+			return
 		case "conductor":
 			handleConductor(profile, args[1:])
+			return
+		case "config":
+			handleConfig(args[1:])
 			return
 		case "agents":
 			handleAgents(profile, args[1:])
@@ -421,6 +443,8 @@ func main() {
 		case "openclaw", "oc":
 			handleOpenClaw(profile, args[1:])
 			return
+		case "artifacts":
+			os.Exit(runArtifacts(os.Stdout, os.Stderr, os.Stdin, args[1:]))
 		case "remote":
 			handleRemote(profile, args[1:])
 			return
@@ -454,7 +478,7 @@ func main() {
 			handleMigratePaths(args[1:])
 			return
 		case "hook-handler":
-			handleHookHandler()
+			handleHookHandlerArgs(args[1:])
 			return
 		case "codex-notify":
 			handleCodexNotify()
@@ -479,6 +503,9 @@ func main() {
 			return
 		case "notify-daemon":
 			handleNotifyDaemon(args[1:])
+			return
+		case "desktop-notifications":
+			handleDesktopNotifications(args[1:])
 			return
 		case "run-task":
 			handleRunTask(args[1:])
@@ -1047,8 +1074,14 @@ func main() {
 		p.Send(ui.MaintenanceCompleteMsg{Result: result})
 	})
 
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Error: %v\n", err)
+	_, runErr := p.Run()
+	// The TUI pins terminal autowrap off for the whole session (#607 drift
+	// class, see internal/ui/autowrap.go). DECAWM is a global terminal mode and
+	// is NOT restored by leaving the alternate screen, so hand the shell back a
+	// wrapping terminal on every exit path, error included.
+	ui.RestoreAutowrap(os.Stdout)
+	if runErr != nil {
+		fmt.Printf("Error: %v\n", runErr)
 		os.Exit(1)
 	}
 }
@@ -1069,9 +1102,9 @@ var commandRegistry = map[string]bool{
 	"uninstall": true, "migrate-paths": true, "hook-handler": true,
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
-	"run-task": true, "inbox": true, "feedback": true, "creds-refresh": true, "telemetry": true,
-	"debug-dump": true, "version": true, "--version": true, "-v": true,
-	"help": true, "--help": true, "-h": true,
+	"desktop-notifications": true,
+	"run-task":              true, "inbox": true, "feedback": true, "creds-refresh": true,
+	"debug-dump": true, "version": true, "help": true,
 }
 
 // extractProfileFlag extracts the global -p or --profile flag from args,
@@ -1219,44 +1252,42 @@ func extractSelectFlag(args []string) (string, []string) {
 // and the wrong arg ended up as the parent value. We now match flag
 // names by their normalized form (dashes stripped from the left) so
 // `-parent` and `--parent` behave identically here too.
-func reorderArgsForFlagParsing(args []string) []string {
+//
+// Which flags take a value is read from fs, never from a hand-maintained
+// list. The list version was wrong for every flag nobody remembered to add
+// to it: `--base dev --title X` demoted "dev" to a positional, which left
+// `--base --title` adjacent, so flag.Parse bound --base="--title" and made
+// the title X the project path ("path does not exist: X"). --account had the
+// same bug (#1928) and --base/--idle-timeout inherited it; deriving the set
+// from the FlagSet that will parse these args makes the class impossible.
+func reorderArgsForFlagParsing(fs *flag.FlagSet, args []string) []string {
 	if len(args) == 0 {
 		return args
 	}
 
-	// Known flag *names* (no leading dashes) that take a value.
-	// Note: -b/--new-branch are boolean flags (no value), so not included here.
-	valueFlagNames := map[string]bool{
-		"t": true, "title": true,
-		"g": true, "group": true,
-		"c": true, "cmd": true,
-		"m": true, "message": true, "message-file": true,
-		"p": true, "parent": true,
-		"mcp":            true,
-		"channel":        true,
-		"plugin":         true,
-		"extra-arg":      true,
-		"wrapper":        true,
-		"model":          true,
-		"w":              true,
-		"worktree":       true,
-		"location":       true,
-		"resume-session": true,
-		"sandbox-image":  true,
-		"ssh":            true,
-		"remote-path":    true,
-		"tmux-socket":    true,
-		// #928 follow-up: account was missing here, so `--account work` had its
-		// value stripped off as a positional and reordered away from the flag.
-		// That mis-parse predates the #1923 guard; the guard only made it loud.
-		"account": true,
-	}
+	// A registered flag takes a value unless it is boolean. Names are stored
+	// without leading dashes, matching the normalization below.
+	takesValue := make(map[string]bool)
+	fs.VisitAll(func(f *flag.Flag) {
+		bf, ok := f.Value.(interface{ IsBoolFlag() bool })
+		takesValue[f.Name] = !(ok && bf.IsBoolFlag())
+	})
 
 	var flags []string
 	var positional []string
+	terminated := false
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
+
+		// "--" ends flag processing; everything after it is positional. The
+		// separator is re-emitted below so a later pass (normalizeArgs, then
+		// flag.Parse) does not re-read a dash-leading positional as a flag.
+		if arg == "--" {
+			terminated = true
+			positional = append(positional, args[i+1:]...)
+			break
+		}
 
 		// Check if it's a flag
 		if strings.HasPrefix(arg, "-") && arg != "-" {
@@ -1269,7 +1300,7 @@ func reorderArgsForFlagParsing(args []string) []string {
 
 			// Normalize "-foo" / "--foo" to "foo" for lookup.
 			name := strings.TrimLeft(arg, "-")
-			if valueFlagNames[name] && i+1 < len(args) {
+			if takesValue[name] && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
 			}
@@ -1280,6 +1311,9 @@ func reorderArgsForFlagParsing(args []string) []string {
 	}
 
 	// Return flags first, then positional args
+	if terminated {
+		flags = append(flags, "--")
+	}
 	return append(flags, positional...)
 }
 
@@ -1429,14 +1463,13 @@ func handleAdd(profile string, args []string) {
 	})
 	noChannelLink := fs.Bool("no-channel-link", false, "Disable auto-link between --plugin entries with emits_channel=true and --channel (RFC §4.7)")
 
-	// Extra claude CLI tokens - repeatable; each invocation is one already-
+	// Extra Claude or Codex CLI tokens - repeatable; each invocation is one already-
 	// tokenised arg (e.g. --extra-arg --agent --extra-arg reviewer).
 	// Persisted on Instance.ExtraArgs (plaintext — do NOT pass secrets) and
-	// appended verbatim to every claude Start/Restart/Fork command via
-	// buildClaudeExtraFlags.
+	// appended safely to supported Claude/Codex lifecycle commands.
 	var extraArgFlags []string
-	fs.Func("extra-arg", "Extra claude CLI token (can specify multiple times); requires -c claude; persisted plaintext — no secrets", func(s string) error {
-		if err := session.ValidateClaudeExtraArgToken(s); err != nil {
+	fs.Func("extra-arg", "Extra Claude or Codex CLI token (can specify multiple times); persisted plaintext — no secrets", func(s string) error {
+		if err := session.ValidateExtraArgToken(s); err != nil {
 			return err
 		}
 		extraArgFlags = append(extraArgFlags, s)
@@ -1533,7 +1566,7 @@ func handleAdd(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	args = reorderArgsForFlagParsing(args)
+	args = reorderArgsForFlagParsing(fs, args)
 
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
@@ -1632,11 +1665,6 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 			return // unreachable, satisfies staticcheck SA5011
 		}
-		// Sub-sessions cannot have sub-sessions (single level only)
-		if parentInstance.IsSubSession() {
-			fmt.Printf("Error: cannot create sub-session of a sub-session (single level only)\n")
-			os.Exit(1)
-		}
 		// handleAdd resolves `path` AFTER this block (see below), so the
 		// cwd-derived group is not available here. Passing "" preserves
 		// handleAdd's existing behavior; the #972 cwd-over-parent priority
@@ -1649,16 +1677,20 @@ func handleAdd(profile string, args []string) {
 			fmt.Printf("Error: automatic parent %q could not be resolved; use --parent with a valid session or --no-parent for an intentional top-level session\n", unresolvedParent)
 			os.Exit(1)
 		}
-		if parentInstance != nil && !parentInstance.IsSubSession() {
+		if parentInstance != nil {
 			sessionGroup = resolveGroupSelection(sessionGroup, "", parentInstance.GroupPath, explicitGroupProvided, false)
-		} else {
-			parentInstance = nil
 		}
 	}
 
 	// Resolve group selector to a canonical path when possible.
 	if sessionGroup != "" {
 		sessionGroup = resolveGroupPathForAdd(groupTree, sessionGroup)
+	}
+	addCfg, _ := session.LoadUserConfig()
+	storage.SetGroupCreationRestricted(managedSessionGroupCreationRestricted(addCfg))
+	if err := requireExistingGroupForManagedSession(addCfg, groupTree, sessionGroup); err != nil {
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
 	}
 
 	if explicitPathProvided {
@@ -1749,6 +1781,13 @@ func handleAdd(profile string, args []string) {
 			os.Exit(1)
 		}
 	}
+	if sessionGroup == "" && wtBranch == "" {
+		derivedGroup := groupTree.CanonicalGroupPath(session.GroupPathForProject(path))
+		if err := requireExistingGroupForManagedSession(addCfg, groupTree, derivedGroup); err != nil {
+			fmt.Printf("Error: %v\n", err)
+			os.Exit(1)
+		}
+	}
 
 	// Handle worktree creation
 	var worktreePath, worktreeRepoRoot, worktreeType string
@@ -1815,6 +1854,13 @@ func handleAdd(profile string, args []string) {
 			SessionID: git.GeneratePathID(),
 			Template:  wtSettings.Template(),
 		})
+		if sessionGroup == "" {
+			derivedGroup := groupTree.CanonicalGroupPath(session.GroupPathForProject(worktreePath))
+			if err := requireExistingGroupForManagedSession(addCfg, groupTree, derivedGroup); err != nil {
+				fmt.Printf("Error: %v\n", err)
+				os.Exit(1)
+			}
+		}
 
 		// Check for an existing worktree for this branch before creating a new one
 		if existingPath, err := backend.GetWorktreeForBranch(wtBranch); err == nil && existingPath != "" {
@@ -1942,11 +1988,17 @@ func handleAdd(profile string, args []string) {
 	} else {
 		newInstance = session.NewInstance(sessionTitle, path)
 	}
+	// A group derived from the project path carries the filesystem's casing
+	// ("Uniqcast"), not the declared group's ("uniqcast"); snap it back.
+	newInstance.GroupPath = groupTree.CanonicalGroupPath(newInstance.GroupPath)
 
-	// Quick mode generated a machine-named adjective-noun handle; mark it so the
-	// TUI shows Claude's live task description in place of the random name. This
-	// mirrors the exact condition used above to generate sessionTitle.
-	if isQuick && !userProvidedTitle {
+	// No -t/--title means the handle above is machine-generated — either the
+	// quick-mode adjective-noun name or a folder-derived one. Mark it auto-named
+	// so the deck shows Claude's task description in place of the handle. Only
+	// an explicit title opts out; that is the "autogenerated names for all
+	// sessions unless explicitly started with a fixed name" contract, and it is
+	// the same condition shouldLockTitle uses in `launch`.
+	if !userProvidedTitle {
 		newInstance.SetAutoName(true)
 	}
 
@@ -2015,11 +2067,10 @@ func handleAdd(profile string, args []string) {
 		newInstance.PluginChannelLinkDisabled = true
 	}
 
-	// Apply --extra-arg flags (claude only for now — these are passed to the
-	// claude binary via buildClaudeExtraFlags; other tools have their own builders).
+	// Apply --extra-arg flags for builders that support persisted tokens.
 	if len(extraArgFlags) > 0 {
-		if newInstance.Tool != "claude" {
-			fmt.Println("Error: --extra-arg only supported for claude sessions (use -c claude); claude is the only tool whose builder appends user extra args")
+		if !session.SupportsExtraArgs(newInstance.Tool) {
+			fmt.Println("Error: --extra-arg only supported for Claude- or Codex-compatible sessions")
 			os.Exit(1)
 		}
 		newInstance.ExtraArgs = extraArgFlags
@@ -2303,14 +2354,15 @@ func resolveConfiguredDefaultPath(defaultPath string) string {
 func handleList(profile string, args []string) {
 	fs := flag.NewFlagSet("list", flag.ExitOnError)
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
+	includeGroups := fs.Bool("include-groups", false, "Include saved groups in a JSON snapshot")
 	allProfiles := fs.Bool("all", false, "List sessions from all profiles")
+	archivedOnly := fs.Bool("archived", false, "List archived sessions only")
+	includeArchived := fs.Bool("include-archived", false, "Include archived sessions")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck list [options]")
 		fmt.Println()
-		fmt.Println("List all sessions.")
-		fmt.Println("ACCOUNT shows the quoted stored account slot, not a resolved account or login identity.")
-		fmt.Println(`JSON always includes the raw "account" string, including "" when no slot is stored.`)
+		fmt.Println("List active sessions. Archived sessions are excluded by default.")
 		fmt.Println()
 		fmt.Println("Options:")
 		fs.PrintDefaults()
@@ -2324,9 +2376,13 @@ func handleList(profile string, args []string) {
 	if err := fs.Parse(normalizeArgs(fs, args)); err != nil {
 		os.Exit(1)
 	}
+	if *archivedOnly && *includeArchived {
+		fmt.Println("Error: --archived and --include-archived cannot be used together")
+		os.Exit(1)
+	}
 
 	if *allProfiles {
-		handleListAllProfiles(*jsonOutput)
+		handleListAllProfiles(*jsonOutput, *archivedOnly, *includeArchived)
 		return
 	}
 	ensureTmuxInPathOrExit()
@@ -2337,22 +2393,104 @@ func handleList(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	instances, _, err := storage.LoadWithGroups()
+	instances, groups, err := loadInstancesForList(storage, *archivedOnly, *includeArchived)
 	if err != nil {
 		fmt.Printf("Error: failed to load sessions: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(instances) == 0 {
+	if len(instances) == 0 && !(*jsonOutput && *includeGroups) {
 		fmt.Printf("No sessions found in profile '%s'.\n", storage.Profile())
 		return
 	}
 
 	if *jsonOutput {
+		// JSON output for scripting
+		type sessionJSON struct {
+			ID                string    `json:"id"`
+			ParentSessionID   string    `json:"parent_session_id,omitempty"`
+			ParentProjectPath string    `json:"parent_project_path,omitempty"`
+			Title             string    `json:"title"`
+			Path              string    `json:"path"`
+			Group             string    `json:"group"`
+			Tool              string    `json:"tool"`
+			Command           string    `json:"command,omitempty"`
+			ModelID           string    `json:"model_id,omitempty"`
+			Model             string    `json:"model,omitempty"`
+			ModelVersion      string    `json:"model_version,omitempty"`
+			Status            string    `json:"status"`
+			Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
+			TmuxSession       string    `json:"tmux_session,omitempty"`
+			Profile           string    `json:"profile"`
+			CreatedAt         time.Time `json:"created_at"`
+			SSHHost           string    `json:"ssh_host,omitempty"`
+			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+			Channels          []string  `json:"channels,omitempty"`
+			ExtraArgs         []string  `json:"extra_args,omitempty"`
+			Color             string    `json:"color,omitempty"` // issue #391
+			Archived          bool      `json:"archived"`
+			ArchivedAt        time.Time `json:"archived_at,omitempty"`
+			PeerName          string    `json:"peer_name,omitempty"`
+			PeerCandidate     bool      `json:"peer_messaging_candidate,omitempty"`
+			// Deliberately NOT omitempty: `ls --json` used to carry no parent
+			// field at all, so `.parent_id` read null for every session and a
+			// conductor verifying that a child parented could not tell "not
+			// parented" from "this view never had the answer". An always-present
+			// key makes "" mean unparented and a MISSING key mean the binary
+			// predates this fix.
+			ParentID string `json:"parent_id"`
+		}
 		// Warm tmux pane-title cache + load hook statuses so the CLI
 		// reports the same Status the TUI and /api/menu do (issue #610).
 		session.RefreshInstancesForCLIStatus(instances)
-		output, err := buildListJSON(storage.Profile(), instances)
+		sessions := make([]sessionJSON, len(instances))
+		for i, inst := range instances {
+			_ = inst.UpdateStatus()
+			parentProjectPath := listParentProjectPath(inst, instances)
+			sj := sessionJSON{
+				ID:                inst.ID,
+				ParentSessionID:   inst.ParentSessionID,
+				ParentProjectPath: parentProjectPath,
+				Title:             inst.Title,
+				Path:              inst.ProjectPath,
+				Group:             inst.GroupPath,
+				Tool:              inst.Tool,
+				Command:           inst.Command,
+				Status:            StatusString(inst.Status),
+				Substate:          string(inst.Substate()),
+				Profile:           storage.Profile(),
+				CreatedAt:         inst.CreatedAt,
+				SSHHost:           inst.SSHHost,
+				SSHRemotePath:     inst.SSHRemotePath,
+				Channels:          inst.Channels,
+				ExtraArgs:         inst.ExtraArgs,
+				Color:             inst.Color,
+				Archived:          inst.IsArchived(),
+				ArchivedAt:        inst.ArchivedAt,
+				ParentID:          inst.ParentSessionID,
+			}
+			if inst.PeerMessagingCandidate() {
+				sj.PeerName = inst.ClaudePeerName()
+				sj.PeerCandidate = true
+			}
+			if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
+				sj.TmuxSession = tmuxSess.Name
+			}
+			if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
+				sj.ModelID = modelInfo.ModelID
+				sj.Model = modelInfo.ModelID
+				sj.ModelVersion = modelInfo.Version
+			}
+			sessions[i] = sj
+		}
+		var payload any = sessions
+		if *includeGroups {
+			payload = struct {
+				Sessions []sessionJSON        `json:"sessions"`
+				Groups   []*session.GroupData `json:"groups"`
+			}{Sessions: sessions, Groups: groups}
+		}
+		output, err := json.MarshalIndent(payload, "", "  ")
 		if err != nil {
 			fmt.Printf("Error: failed to format JSON output: %v\n", err)
 			os.Exit(1)
@@ -2382,89 +2520,19 @@ func handleList(profile string, args []string) {
 	printUpdateNotice()
 }
 
-// buildListJSON is the body of `list --json`: every session with its status
-// refreshed, as the indented array the CLI prints, trailing newline included.
-// handleList prints it and the remote agent's change probe (#2177) pushes it,
-// so a listing that arrives by push is byte-identical to one that was
-// fetched. Callers warm the status caches first
-// (session.RefreshInstancesForCLIStatus); an empty profile yields "[]".
-func buildListJSON(profileName string, instances []*session.Instance) ([]byte, error) {
-	type sessionJSON struct {
-		ID                string    `json:"id"`
-		ParentSessionID   string    `json:"parent_session_id,omitempty"`
-		ParentProjectPath string    `json:"parent_project_path,omitempty"`
-		Title             string    `json:"title"`
-		Path              string    `json:"path"`
-		Group             string    `json:"group"`
-		Tool              string    `json:"tool"`
-		Account           string    `json:"account"`
-		Command           string    `json:"command,omitempty"`
-		ModelID           string    `json:"model_id,omitempty"`
-		Model             string    `json:"model,omitempty"`
-		ModelVersion      string    `json:"model_version,omitempty"`
-		Status            string    `json:"status"`
-		Substate          string    `json:"substate,omitempty"` // Honest Status v2: additive refinement
-		TmuxSession       string    `json:"tmux_session,omitempty"`
-		Profile           string    `json:"profile"`
-		CreatedAt         time.Time `json:"created_at"`
-		SSHHost           string    `json:"ssh_host,omitempty"`
-		SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
-		Channels          []string  `json:"channels,omitempty"`
-		ExtraArgs         []string  `json:"extra_args,omitempty"`
-		Color             string    `json:"color,omitempty"` // issue #391
-		Archived          bool      `json:"archived"`
-		ArchivedAt        time.Time `json:"archived_at,omitempty"`
-		// LastActivityAt lets a remote caller (session.RemoteSessionInfo)
-		// apply the local recency filter (session.TimeFilterMode) to this
-		// session, the same way it applies to a local one.
-		LastActivityAt string `json:"last_activity_at,omitempty"`
+func loadInstancesForList(storage *session.Storage, archivedOnly, includeArchived bool) ([]*session.Instance, []*session.GroupData, error) {
+	switch {
+	case archivedOnly:
+		return storage.LoadArchivedWithGroups()
+	case includeArchived:
+		return storage.LoadWithGroups()
+	default:
+		return storage.LoadActiveWithGroups()
 	}
-	sessions := make([]sessionJSON, len(instances))
-	for i, inst := range instances {
-		_ = inst.UpdateStatus()
-		parentProjectPath := listParentProjectPath(inst, instances)
-		sj := sessionJSON{
-			ID:                inst.ID,
-			ParentSessionID:   inst.ParentSessionID,
-			ParentProjectPath: parentProjectPath,
-			Title:             inst.Title,
-			Path:              inst.ProjectPath,
-			Group:             inst.GroupPath,
-			Tool:              inst.Tool,
-			Account:           inst.Account,
-			Command:           inst.Command,
-			Status:            StatusString(inst.Status),
-			Substate:          string(inst.Substate()),
-			Profile:           profileName,
-			CreatedAt:         inst.CreatedAt,
-			SSHHost:           inst.SSHHost,
-			SSHRemotePath:     inst.SSHRemotePath,
-			Channels:          inst.Channels,
-			ExtraArgs:         inst.ExtraArgs,
-			Color:             inst.Color,
-			Archived:          inst.IsArchived(),
-			ArchivedAt:        inst.ArchivedAt,
-			LastActivityAt:    inst.DisplayLastActivityTime().Format(time.RFC3339Nano),
-		}
-		if tmuxSess := inst.GetTmuxSession(); tmuxSess != nil {
-			sj.TmuxSession = tmuxSess.Name
-		}
-		if modelInfo := inst.LaunchModelInfo(); modelInfo.ModelID != "" {
-			sj.ModelID = modelInfo.ModelID
-			sj.Model = modelInfo.ModelID
-			sj.ModelVersion = modelInfo.Version
-		}
-		sessions[i] = sj
-	}
-	output, err := json.MarshalIndent(sessions, "", "  ")
-	if err != nil {
-		return nil, err
-	}
-	return append(output, '\n'), nil
 }
 
 // handleListAllProfiles lists sessions from all profiles
-func handleListAllProfiles(jsonOutput bool) {
+func handleListAllProfiles(jsonOutput, archivedOnly, includeArchived bool) {
 	profiles, err := session.ListProfiles()
 	if err != nil {
 		fmt.Printf("Error: failed to list profiles: %v\n", err)
@@ -2491,6 +2559,9 @@ func handleListAllProfiles(jsonOutput bool) {
 			CreatedAt         time.Time `json:"created_at"`
 			SSHHost           string    `json:"ssh_host,omitempty"`
 			SSHRemotePath     string    `json:"ssh_remote_path,omitempty"`
+			ParentID          string    `json:"parent_id"` // see handleList
+			PeerName          string    `json:"peer_name,omitempty"`
+			PeerCandidate     bool      `json:"peer_messaging_candidate,omitempty"`
 		}
 		var allSessions []sessionJSON
 
@@ -2499,12 +2570,12 @@ func handleListAllProfiles(jsonOutput bool) {
 			if err != nil {
 				continue
 			}
-			instances, _, err := storage.LoadWithGroups()
+			instances, _, err := loadInstancesForList(storage, archivedOnly, includeArchived)
 			if err != nil {
 				continue
 			}
 			for _, inst := range instances {
-				allSessions = append(allSessions, sessionJSON{
+				row := sessionJSON{
 					ID:                inst.ID,
 					ParentSessionID:   inst.ParentSessionID,
 					ParentProjectPath: listParentProjectPath(inst, instances),
@@ -2518,7 +2589,13 @@ func handleListAllProfiles(jsonOutput bool) {
 					CreatedAt:         inst.CreatedAt,
 					SSHHost:           inst.SSHHost,
 					SSHRemotePath:     inst.SSHRemotePath,
-				})
+					ParentID:          inst.ParentSessionID,
+				}
+				if inst.PeerMessagingCandidate() {
+					row.PeerName = inst.ClaudePeerName()
+					row.PeerCandidate = true
+				}
+				allSessions = append(allSessions, row)
 			}
 		}
 
@@ -2538,7 +2615,7 @@ func handleListAllProfiles(jsonOutput bool) {
 		if err != nil {
 			continue
 		}
-		instances, _, err := storage.LoadWithGroups()
+		instances, _, err := loadInstancesForList(storage, archivedOnly, includeArchived)
 		if err != nil {
 			continue
 		}
@@ -2639,6 +2716,12 @@ func handleRemove(profile string, args []string) {
 
 	removedID := inst.ID
 	removedTitle := inst.Title
+	queueTx, err := session.BeginRuntimeQueueTransaction(removedID)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to lock runtime queue for %s: %v", removedID, err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	defer queueTx.Release()
 
 	// Snapshot service-unit ownership BEFORE teardown (issue #1721): the
 	// pid of the tmux server generation this session belongs to is only
@@ -2646,18 +2729,40 @@ func handleRemove(profile string, args []string) {
 	// the unit we may stop later is the one we actually retired.
 	serviceUnitOwnership := inst.ServiceUnitOwnership()
 
-	// Always attempt to kill the tmux session, even if Exists() returns false.
-	// The saved status may be stale (e.g., "error" in DB but tmux session still alive).
-	// KillAndWait is safe to call on non-existent sessions (returns error which we handle).
-	// Uses the synchronous variant so the SIGTERM→SIGKILL escalation finishes
-	// before this short-lived CLI exits — otherwise SIGHUP-immune claude
-	// processes survive as orphans (issue #59, v1.7.68).
-	if err := inst.KillAndWait(); err != nil {
-		// Only warn if the session actually existed (ignore "not found" errors)
-		if inst.Exists() && !*jsonOutput {
-			fmt.Printf("Warning: failed to kill tmux session: %v\n", err)
-			fmt.Println("Session removed from Agent Deck but may still be running in tmux")
+	// Rebuild and commit the durable lifecycle transition before teardown.
+	newInstances := make([]*session.Instance, 0, len(instances)-1)
+	for _, s := range instances {
+		if s.ID != removedID {
+			newInstances = append(newInstances, s)
 		}
+	}
+	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
+	removePayload := session.LifecycleIntentPayload(inst, inst.WorktreePath, "")
+	removeIntent, err := session.PrepareLifecycleIntent(storage, removedID, session.LifecycleIntentRemove, removePayload)
+	if err != nil {
+		out.Error(fmt.Sprintf("failed to prepare removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := storage.RemoveSessionAndVerify(removedID, newInstances, groupTree, removeIntent.Token); err != nil {
+		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := queueTx.Discard(); err != nil {
+		out.Error(fmt.Sprintf("failed to discard runtime queue: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := session.AdvanceLifecycleIntent(storage, removeIntent, "row-deleted", removePayload); err != nil {
+		out.Error(fmt.Sprintf("failed to advance removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	// Keep the intent live until process teardown is confirmed below.
+	if err := inst.KillAndWait(); err != nil && inst.Exists() {
+		out.Error(fmt.Sprintf("session removed but process teardown failed: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := session.CompleteLifecycleIntent(storage, removeIntent); err != nil {
+		out.Error(fmt.Sprintf("failed to complete removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
 
 	// v1.7.21+: if this session was spawned via LaunchAs=service, the
@@ -2687,7 +2792,7 @@ func handleRemove(profile string, args []string) {
 		}
 	}
 
-	// Rebuild instance list without the deleted session and persist groups.
+	// The row is already durably absent; teardown below cannot strand a live row.
 	// v1.9.1 (#909): the rm path now uses RemoveSessionAndVerify which
 	//   1. issues a targeted DELETE (busy-retried in statedb),
 	//   2. saves groups WITHOUT rewriting the instances table (SaveGroupsOnly,
@@ -2697,19 +2802,6 @@ func handleRemove(profile string, args []string) {
 	//      resurrection by a concurrent SaveInstances rewrite.
 	// On persistent failure the CLI exits 1 instead of falsely printing
 	// "✓ Removed".
-	newInstances := make([]*session.Instance, 0, len(instances)-1)
-	for _, s := range instances {
-		if s.ID != removedID {
-			newInstances = append(newInstances, s)
-		}
-	}
-	groupTree := session.NewGroupTreeWithGroups(newInstances, groups)
-
-	if err := storage.RemoveSessionAndVerify(removedID, newInstances, groupTree); err != nil {
-		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
-		os.Exit(1)
-	}
-
 	// Best-effort post-removal cleanup for transition-notifier state
 	// (issue #910). Failures are warned but do not block the rm — the
 	// SQLite removal is the user-visible contract.
@@ -3690,6 +3782,7 @@ func printHelp() {
 	fmt.Println("  web              Start TUI with web UI server running alongside")
 	fmt.Println("  remote           Manage remote agent-deck instances")
 	fmt.Println("  conductor        Manage conductor meta-agent orchestration")
+	fmt.Println("  config           Inspect resolved configuration")
 	fmt.Println("  agents           List adopted agents, grouped by machine")
 	fmt.Println("  agent            Adopt and inspect agent definitions")
 	fmt.Println("  telegram-doctor  Audit channel-owning sessions for telegram drops (#1138)")

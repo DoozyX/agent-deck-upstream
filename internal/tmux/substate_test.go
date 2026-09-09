@@ -36,6 +36,11 @@ func TestClassifySubstate_ModelUnavailable(t *testing.T) {
 			name:    "model unavailable lowercase variant",
 			content: "The model is currently unavailable, retrying...\n❯ ",
 		},
+		{
+			name: "selected model at capacity banner",
+			content: "⚠ Selected model is at capacity. Please try a different model.\n" +
+				"\n❯ ",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -43,6 +48,38 @@ func TestClassifySubstate_ModelUnavailable(t *testing.T) {
 				t.Errorf("got %q, want %q for %s", got, SubstateModelUnavailable, tc.name)
 			}
 		})
+	}
+}
+
+// The capacity banner is emitted by Codex, so the classifier must not discard
+// it at the non-Claude tool gate before self-heal can see it.
+func TestClassifySubstate_CodexCapacity(t *testing.T) {
+	d := NewPromptDetector("codex")
+	content := "⚠ Selected model is at capacity. Please try a different model.\n\n" +
+		"› Summarize recent commits\n\n" +
+		"  gpt-5.6-luna max · Ready · Full Access"
+	if got := d.ClassifySubstate(content); got != SubstateModelUnavailable {
+		t.Fatalf("got %q, want %q", got, SubstateModelUnavailable)
+	}
+}
+
+func TestClassifySubstate_CodexWorkingWinsOverStaleCapacity(t *testing.T) {
+	d := NewPromptDetector("codex")
+	content := "⚠ Selected model is at capacity. Please try a different model.\n\n" +
+		"• Working (31s • esc to interrupt)\n\n" +
+		"› Implement feature"
+	if got := d.ClassifySubstate(content); got != SubstateRunning {
+		t.Fatalf("got %q, want %q", got, SubstateRunning)
+	}
+}
+
+func TestClassifySubstate_CodexCapacityIgnoresPromptAndQuotedHistory(t *testing.T) {
+	d := NewPromptDetector("codex")
+	content := "⎿ Earlier output: Selected model is at capacity.\n" +
+		"› selected model is at capacity\n" +
+		"  gpt-5.6-luna max · Ready · Full Access"
+	if got := d.ClassifySubstate(content); got != SubstateNone {
+		t.Fatalf("prompt or quoted capacity prose must not be an outage: got %q", got)
 	}
 }
 

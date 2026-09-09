@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/desknotify"
+	"github.com/asheshgoplani/agent-deck/internal/desktopnotify"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 const (
@@ -35,12 +38,13 @@ type hookTransitionCandidate struct {
 	Timestamp time.Time
 }
 
-type TransitionDaemon struct {
-	notifier *TransitionNotifier
+type desktopDoneObservation struct {
+	Signal    DoneSignal
+	UpdatedAt time.Time
+}
 
-	// deskNotifier alerts the OPERATOR (not a parent session) when a session
-	// needs input. Distinct from notifier above, which is parent-keyed and so
-	// cannot reach a top-level session. Opt-in via [notifications] desktop.
+type TransitionDaemon struct {
+	notifier     *TransitionNotifier
 	deskNotifier *desknotify.Notifier
 
 	hookWatcher *StatusFileWatcher
@@ -50,11 +54,13 @@ type TransitionDaemon struct {
 	lastStatus  map[string]map[string]string
 	initialized map[string]bool
 
-	// lastDone tracks the most recently emitted completion sentinel per
-	// (profile, instance) so a finished event (issue #1186) is emitted once
-	// per distinct completion. Re-reading the same done-bearing hook file
-	// across polls — or a later identical Stop — does not re-fire.
+	// lastDone tracks legacy parent-notifier completion delivery separately
+	// from desktop delivery so one channel cannot consume the other's retry.
 	lastDone map[string]map[string]DoneSignal
+	// lastDesktopDone tracks desktop completions that were either delivered or
+	// intentionally suppressed for a parented child. Unlike legacy delivery,
+	// desktop event identity includes the hook timestamp.
+	lastDesktopDone map[string]map[string]desktopDoneObservation
 
 	// lastTurn tracks, per (profile, instance), the last COMPLETED TURN recorded
 	// into the drainable ledgers. Keyed by status + the transcript signal, so a
@@ -78,6 +84,19 @@ type TransitionDaemon struct {
 	// next poll retries.
 	lastDoneScan map[string]map[string]time.Time
 
+	// desktopNotificationBaselineReady tracks each enabled lifecycle. Desktop
+	// dispatch is withheld until the current lifecycle has successfully stored
+	// its observed baseline, preventing old state from becoming a backlog.
+	desktopNotificationBaselineReady map[string]bool
+	// desktopNotificationBaselineSeededThisPass suppresses delivery on the
+	// exact pass that establishes a baseline (including false → true config
+	// changes). A transition observed at that boundary is indistinguishable
+	// from existing state and must remain quiet.
+	desktopNotificationBaselineSeededThisPass map[string]bool
+	// desktopNotificationBaselineErr is retained per profile for diagnostics;
+	// failures are also logged and retried on every subsequent poll.
+	desktopNotificationBaselineErr map[string]error
+
 	// lastInboxTTLSweep tracks the most recent SweepInboxByTTL call so
 	// the daemon runs it at most once per inboxTTLSweepInterval. Zero
 	// means "never run" — the first SyncOnce pass will perform it.
@@ -94,43 +113,40 @@ type TransitionDaemon struct {
 	// every few seconds. Accessed only from the single-threaded Run loop.
 	lastProbeStall map[string]time.Time
 
-	// lastDesktopNotify records the status a desktop notification was last
-	// raised for, per (profile, instance), so the notification is EDGE
-	// triggered rather than level triggered.
-	//
-	// The snapshot path is naturally edge-triggered: ShouldNotifyTransition
-	// requires from==running and prev is refreshed each pass, so a session that
-	// stays waiting is skipped. The hook-candidate path is NOT.
-	// terminalHookTransitionCandidate accepts any hook file updated within
-	// hookFreshWindow (45s), so a session that stops and stays waiting yields a
-	// candidate on every poll for that whole window. The transition notifier's
-	// own 90s dedup sits DOWNSTREAM in NotifyTransition and cannot cover a
-	// desktop call placed before it. Without this map one answered prompt would
-	// raise roughly 15-22 banners at a 2-3s poll interval.
-	//
-	// Accessed only from the single-threaded Run loop, like lastProbeStall.
-	lastDesktopNotify map[string]string
+	// observeSelfHealInputs is a test seam for the exact instance slice handed
+	// to self-heal. Production leaves it nil; keeping it on the daemon avoids a
+	// package-global callback that could race with concurrent daemon tests.
+	observeSelfHealInputs func([]*Instance)
 
-	// desktopWG tracks in-flight desktop notifications, which are dispatched
-	// off the poll loop so a wedged notifier binary cannot stall session
-	// monitoring. Only tests wait on it.
-	desktopWG sync.WaitGroup
+	// observeTransitionEmission is a test seam at the daemon/notifier boundary.
+	// Production leaves it nil; tests use it to prove a persisted gate prevents
+	// the notifier call itself rather than relying on the notifier's own guard.
+	observeTransitionEmission func(TransitionNotificationEvent)
+	// beforeNotifierCommit is a test seam after daemon revalidation and before
+	// the notifier acquires the archive/event serialization boundary.
+	beforeNotifierCommit      func(TransitionNotificationEvent)
+	loadTransitionInstanceRow func(string, string) (*statedb.InstanceRow, error)
+	lastDesktopNotify         map[string]string
+	desktopWG                 sync.WaitGroup
 }
 
 func NewTransitionDaemon() *TransitionDaemon {
 	return &TransitionDaemon{
-		notifier:       NewTransitionNotifier(),
-		deskNotifier:   desknotify.New(),
-		storages:       map[string]*Storage{},
-		lastStatus:     map[string]map[string]string{},
-		initialized:    map[string]bool{},
-		lastDone:       map[string]map[string]DoneSignal{},
-		lastTurn:       map[string]map[string]string{},
-		turnLiveCheck:  func(inst *Instance) bool { return inst.Exists() },
-		lastDoneScan:   map[string]map[string]time.Time{},
-		lastProbeStall: map[string]time.Time{},
-
-		lastDesktopNotify: map[string]string{},
+		notifier:                         NewTransitionNotifier(),
+		deskNotifier:                     desknotify.New(),
+		storages:                         map[string]*Storage{},
+		lastStatus:                       map[string]map[string]string{},
+		initialized:                      map[string]bool{},
+		lastDone:                         map[string]map[string]DoneSignal{},
+		lastTurn:                         map[string]map[string]string{},
+		turnLiveCheck:                    func(inst *Instance) bool { return inst.Exists() },
+		lastDesktopDone:                  map[string]map[string]desktopDoneObservation{},
+		lastDoneScan:                     map[string]map[string]time.Time{},
+		lastProbeStall:                   map[string]time.Time{},
+		desktopNotificationBaselineReady: map[string]bool{},
+		desktopNotificationBaselineSeededThisPass: map[string]bool{},
+		desktopNotificationBaselineErr:            map[string]error{},
+		lastDesktopNotify:                         map[string]string{},
 	}
 }
 
@@ -389,6 +405,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	if err != nil {
 		return notifyPollSlow
 	}
+	instances = FilterInstancesByArchive(instances, false)
 
 	byID := make(map[string]*Instance, len(instances))
 	hookCandidates := make(map[string]hookTransitionCandidate, len(instances))
@@ -430,7 +447,9 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		if db != nil {
 			if rows, err := db.ReadAllStatuses(); err == nil {
 				for id, row := range rows {
-					statuses[id] = normalizeStatusString(row.Status)
+					if _, active := byID[id]; active {
+						statuses[id] = normalizeStatusString(row.Status)
+					}
 				}
 			}
 		}
@@ -480,12 +499,19 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 		}
 	}
 
-	// Self-heal Stage 1 (observe-only): evaluate every instance through the
-	// profile's observe engine, logging what it WOULD do and taking ZERO action.
-	// Runs every poll (including the first) so the dwell/confirm clocks start
-	// immediately. Reuses the instances/hookStatuses already loaded above — no
-	// extra capture, no new goroutine (F3). Disabled-by-config → cheap no-op.
-	d.runSelfHealObservePass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
+	// Self-heal: evaluate every instance through the profile's engine. In every
+	// mode but "resume" this logs what it WOULD do and takes ZERO action; in
+	// "resume" it may deliver ONE continuation prompt to a confirmed api-error /
+	// usage-limit candidate whose composer is empty. Runs every poll (including
+	// the first) so the dwell/confirm clocks start immediately. Reuses the
+	// instances/hookStatuses already loaded above — no new goroutine (F3).
+	// Disabled-by-config → cheap no-op.
+	if d.observeSelfHealInputs != nil {
+		d.observeSelfHealInputs(instances)
+	}
+	d.runSelfHealPass(profile, instances, statuses, hookStatuses, db, time.Now().UTC())
+
+	d.prepareDesktopNotificationBaseline(profile, byID, statuses, hookCandidates, hookStatuses)
 
 	// Runs on EVERY pass, the first scan included — see the FIRST SCAN note on
 	// recordTerminalTurns for why suppressing it would recreate the field bug.
@@ -493,7 +519,7 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 
 	if !d.initialized[profile] {
 		// Cover fast transitions that completed before we observed a running snapshot.
-		d.emitHookTransitionCandidates(profile, byID, nil, statuses, hookCandidates)
+		d.emitHookTransitionCandidates(profile, byID, nil, statuses, hookCandidates, nil)
 		d.emitDoneSignals(profile, byID, hookStatuses)
 		d.lastStatus[profile] = copyStatusMap(statuses)
 		d.initialized[profile] = true
@@ -501,24 +527,34 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 	}
 
 	prev := d.lastStatus[profile]
+	revalidationFailures := map[string]bool{}
 	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
 	for id, to := range statuses {
-		d.clearDesktopEdgeIfRunning(profile, id, to)
-
 		from := normalizeStatusString(prev[id])
-		if !ShouldNotifyTransition(from, to) {
+		inst := byID[id]
+		desktopDispatch := d.desktopNotificationDispatchReady(profile) && from != normalizeStatusString(to) && inst != nil
+		legacyDispatch := ShouldNotifyTransition(from, to) && notifyEnabled
+		if !desktopDispatch && !legacyDispatch {
 			continue
 		}
-		inst := byID[id]
-
-		// Desktop notification runs BEFORE (and independently of) the
-		// parent-routing gate below. That gate drops a session with no
-		// ParentSessionID, which is exactly the top-level session whose
-		// operator has no other out-of-TUI signal. Gating the two together
-		// would reproduce the hole this exists to close.
-		d.notifyDesktop(profile, inst, to)
-
-		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+		currentInst, err := d.currentTransitionInstance(profile, inst)
+		if err != nil {
+			revalidationFailures[id] = true
+			continue
+		}
+		if currentInst == nil {
+			continue
+		}
+		// Desktop alerts intentionally do not share the legacy parent-notifier
+		// predicate: an already-waiting session can transition to error and
+		// must still raise an actionable desktop alert.
+		if desktopDispatch {
+			dispatchDesktopNotification(currentInst, desktopnotify.SourceEvent{
+				SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath,
+				ToStatus: to, Timestamp: time.Now(),
+			})
+		}
+		if !legacyDispatch {
 			continue
 		}
 		event := TransitionNotificationEvent{
@@ -536,13 +572,114 @@ func (d *TransitionDaemon) syncProfile(profile string) time.Duration {
 			// this hot path heavier than the transcript-stat dedup signal above.
 			Substate: string(inst.CachedSubstate()),
 		}
+		if d.observeTransitionEmission != nil {
+			d.observeTransitionEmission(event)
+		}
+		if d.beforeNotifierCommit != nil {
+			d.beforeNotifierCommit(event)
+		}
 		_ = d.notifier.NotifyTransition(event)
 	}
-	d.emitHookTransitionCandidates(profile, byID, prev, statuses, hookCandidates)
-	d.emitDoneSignals(profile, byID, hookStatuses)
+	d.emitHookTransitionCandidates(profile, byID, prev, statuses, hookCandidates, revalidationFailures)
+	d.emitDoneSignals(profile, byID, hookStatuses, revalidationFailures)
 
-	d.lastStatus[profile] = copyStatusMap(statuses)
+	nextStatus := copyStatusMap(statuses)
+	for id := range revalidationFailures {
+		if previous, ok := prev[id]; ok {
+			nextStatus[id] = previous
+		} else {
+			delete(nextStatus, id)
+		}
+	}
+	d.lastStatus[profile] = nextStatus
 	return choosePollInterval(statuses)
+}
+
+func (d *TransitionDaemon) prepareDesktopNotificationBaseline(profile string, byID map[string]*Instance, statuses map[string]string, candidates map[string]hookTransitionCandidate, hookStatuses map[string]*HookStatus) {
+	d.desktopNotificationBaselineSeededThisPass[profile] = false
+	if !GetDesktopNotificationsSettings().Enabled {
+		d.desktopNotificationBaselineReady[profile] = false
+		delete(d.desktopNotificationBaselineErr, profile)
+		return
+	}
+	if d.desktopNotificationBaselineReady[profile] {
+		return
+	}
+	if err := d.seedDesktopNotificationBaseline(profile, byID, statuses, candidates, hookStatuses); err != nil {
+		d.desktopNotificationBaselineErr[profile] = err
+		sessionLog.Warn("desktop_notification_baseline_failed", "profile", profile, "error", err)
+		return
+	}
+	d.desktopNotificationBaselineReady[profile] = true
+	d.desktopNotificationBaselineSeededThisPass[profile] = true
+	delete(d.desktopNotificationBaselineErr, profile)
+}
+
+func (d *TransitionDaemon) desktopNotificationDispatchReady(profile string) bool {
+	return d.desktopNotificationBaselineReady[profile] && !d.desktopNotificationBaselineSeededThisPass[profile]
+}
+
+func (d *TransitionDaemon) seedDesktopNotificationBaseline(profile string, byID map[string]*Instance, statuses map[string]string, candidates map[string]hookTransitionCandidate, hookStatuses map[string]*HookStatus) error {
+	var baselineErr error
+	baseline := func(source desktopnotify.SourceEvent) {
+		if err := desktopNotificationBaseline(source); err != nil {
+			baselineErr = errors.Join(baselineErr, err)
+		}
+	}
+	for id, status := range statuses {
+		if inst := byID[id]; inst != nil {
+			baseline(desktopnotify.SourceEvent{SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath, ToStatus: status})
+		}
+	}
+	for id, candidate := range candidates {
+		if inst := byID[id]; inst != nil {
+			baseline(desktopnotify.SourceEvent{SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath, ToStatus: candidate.ToStatus, Timestamp: candidate.Timestamp})
+		}
+	}
+	for id, hook := range hookStatuses {
+		if inst := byID[id]; inst != nil {
+			if signal, ok := d.doneSignalFor(profile, id, hook); ok {
+				baseline(desktopnotify.SourceEvent{SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath, Kind: transitionKindFinished, DoneStatus: signal.Status, Summary: signal.Summary, Timestamp: hook.UpdatedAt})
+			}
+		}
+	}
+	return baselineErr
+}
+
+// currentTransitionInstance revalidates mutable notification gates and parent
+// linkage from SQLite at the emission boundary. syncProfile's Instance values
+// are snapshots; on lookup failure we fail closed for this pass.
+func (d *TransitionDaemon) currentTransitionInstance(profile string, inst *Instance) (*Instance, error) {
+	if !instanceAcceptsTransitionEvents(inst) {
+		return nil, nil
+	}
+	var row *statedb.InstanceRow
+	var err error
+	if d.loadTransitionInstanceRow != nil {
+		row, err = d.loadTransitionInstanceRow(profile, inst.ID)
+	} else {
+		storage := d.getStorage(profile)
+		if storage == nil || storage.GetDB() == nil {
+			return nil, fmt.Errorf("transition storage unavailable")
+		}
+		row, err = storage.GetDB().LoadInstanceByID(inst.ID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return nil, nil
+	}
+	current := &Instance{
+		ID:                 inst.ID,
+		ParentSessionID:    row.ParentSessionID,
+		NoTransitionNotify: row.NoTransitionNotify,
+		ArchivedAt:         row.ArchivedAt,
+	}
+	if !instanceAcceptsTransitionEvents(current) {
+		return nil, nil
+	}
+	return current, nil
 }
 
 // recordTerminalTurns records EVERY completed turn into the drainable ledgers,
@@ -688,15 +825,16 @@ func (d *TransitionDaemon) recordTerminalTurns(
 
 // emitDoneSignals turns a worker-printed completion sentinel (persisted into
 // the hook status file by the Stop-hook handler, issue #1186) into a distinct
-// "finished" event delivered to the parent. Per-task idempotency is enforced
-// via d.lastDone: the same sentinel re-read across polls — or repeated on a
-// later identical Stop — fires at most once. A genuinely new completion
-// (different status/summary) fires again. Stale hook files (older than
-// hookFreshWindow) are ignored so a daemon restart doesn't replay a long-dead
-// completion. When the hook's own scan was inconclusive (transcript not
-// flushed at Stop time), the hook file carries the transcript path instead of
-// done fields and the daemon finishes the scan here — see doneSignalFor.
-func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Instance, hookStatuses map[string]*HookStatus) {
+// "finished" event delivered to the parent. Legacy per-task idempotency uses
+// the sentinel payload in d.lastDone. Desktop idempotency additionally uses
+// the hook timestamp, matching the persistent desktop event identity, so a
+// later completion may reuse the same status and summary. Stale hook files
+// (older than hookFreshWindow) are ignored so a daemon restart doesn't replay
+// a long-dead completion. When the hook's own scan was inconclusive
+// (transcript not flushed at Stop time), the hook file carries the transcript
+// path instead of done fields and the daemon finishes the scan here — see
+// doneSignalFor.
+func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Instance, hookStatuses map[string]*HookStatus, retryMaps ...map[string]bool) {
 	if len(hookStatuses) == 0 {
 		return
 	}
@@ -709,12 +847,43 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 		if !ok {
 			continue
 		}
-		if prev, ok := d.lastDone[profile][id]; ok && prev == sig {
-			continue // already emitted this exact completion
-		}
-
 		inst := byID[id]
-		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+		desktopDispatch := d.initialized[profile] && d.desktopNotificationDispatchReady(profile)
+		legacyDispatch := notifyEnabled
+		desktopObserved := d.desktopDoneObserved(profile, id, sig, hs.UpdatedAt)
+		legacyObserved := doneSignalObserved(d.lastDone, profile, id, sig)
+		if (!desktopDispatch || desktopObserved) && (!legacyDispatch || legacyObserved) {
+			continue
+		}
+		if !desktopDispatch && !legacyDispatch {
+			continue
+		}
+		currentInst, err := d.currentTransitionInstance(profile, inst)
+		if err != nil {
+			if len(retryMaps) > 0 && retryMaps[0] != nil {
+				retryMaps[0][id] = true
+			}
+			continue
+		}
+		if currentInst == nil {
+			continue
+		}
+		desktopSuppressed := false
+		var desktopErr error
+		if desktopDispatch && !desktopObserved {
+			desktopSuppressed, desktopErr = sendDesktopNotification(currentInst, desktopnotify.SourceEvent{
+				SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath,
+				Kind: transitionKindFinished, DoneStatus: sig.Status, Summary: sig.Summary, Timestamp: hs.UpdatedAt,
+			})
+		}
+		if desktopSuppressed {
+			// Suppression is the terminal outcome for a parented child. Remember
+			// the completion now so promotion cannot replay it as top-level work.
+			d.recordDesktopDoneObserved(profile, id, sig, hs.UpdatedAt)
+		} else if desktopDispatch && desktopErr == nil {
+			d.recordDesktopDoneObserved(profile, id, sig, hs.UpdatedAt)
+		}
+		if !legacyDispatch || legacyObserved {
 			continue
 		}
 
@@ -726,12 +895,11 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 			DoneSummary:    sig.Summary,
 			Timestamp:      hs.UpdatedAt,
 		}
-		_ = d.notifier.NotifyFinished(event)
-
-		if d.lastDone[profile] == nil {
-			d.lastDone[profile] = map[string]DoneSignal{}
+		if d.beforeNotifierCommit != nil {
+			d.beforeNotifierCommit(event)
 		}
-		d.lastDone[profile][id] = sig
+		_ = d.notifier.NotifyFinished(event)
+		d.recordDoneObserved(profile, id, sig)
 
 		// Record the completion to the non-destructive ledger so a parent can
 		// query `session children` without consuming the delivery event.
@@ -745,6 +913,36 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 			FinishedAt: hs.UpdatedAt,
 		})
 	}
+}
+
+func (d *TransitionDaemon) recordDoneObserved(profile, id string, sig DoneSignal) {
+	if d.lastDone == nil {
+		d.lastDone = map[string]map[string]DoneSignal{}
+	}
+	if d.lastDone[profile] == nil {
+		d.lastDone[profile] = map[string]DoneSignal{}
+	}
+	d.lastDone[profile][id] = sig
+}
+
+func (d *TransitionDaemon) recordDesktopDoneObserved(profile, id string, sig DoneSignal, updatedAt time.Time) {
+	if d.lastDesktopDone == nil {
+		d.lastDesktopDone = map[string]map[string]desktopDoneObservation{}
+	}
+	if d.lastDesktopDone[profile] == nil {
+		d.lastDesktopDone[profile] = map[string]desktopDoneObservation{}
+	}
+	d.lastDesktopDone[profile][id] = desktopDoneObservation{Signal: sig, UpdatedAt: updatedAt}
+}
+
+func (d *TransitionDaemon) desktopDoneObserved(profile, id string, sig DoneSignal, updatedAt time.Time) bool {
+	prev, ok := d.lastDesktopDone[profile][id]
+	return ok && prev.Signal == sig && prev.UpdatedAt.Equal(updatedAt)
+}
+
+func doneSignalObserved(observed map[string]map[string]DoneSignal, profile, id string, sig DoneSignal) bool {
+	prev, ok := observed[profile][id]
+	return ok && prev == sig
 }
 
 // doneSignalFor resolves a hook status into a completion sentinel, or reports
@@ -858,6 +1056,10 @@ func (d *TransitionDaemon) shutdown() {
 	if d.notifier != nil {
 		d.notifier.Flush()
 	}
+	// Same reason for the self-heal audit: a collapsed run owes a closing record
+	// with its suppressed count, and exiting without it truncates each session's
+	// last run in the observe window.
+	d.selfheal.flushSinks()
 	for _, s := range d.storages {
 		if s != nil {
 			_ = s.Close()
@@ -951,8 +1153,7 @@ func readHookStatusFile(instanceID string) *HookStatus {
 	// No-follow + size-bounded read for both the scoped (sandbox) and flat
 	// (non-sandbox) paths: a container could symlink or oversize its <id>.json
 	// to read a host file or OOM the shared notify-daemon that polls this.
-	statusPath := hookStatusFilePath(instanceID)
-	data, err := readStatusFileNoFollow(statusPath)
+	data, err := readStatusFileNoFollow(hookStatusFilePath(instanceID))
 	if err != nil || len(data) == 0 {
 		return nil
 	}
@@ -1011,6 +1212,7 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 	prev map[string]string,
 	current map[string]string,
 	candidates map[string]hookTransitionCandidate,
+	revalidationFailures map[string]bool,
 ) {
 	if len(candidates) == 0 {
 		return
@@ -1018,7 +1220,7 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 	notifyEnabled := GetNotificationsSettings().GetTransitionEventsEnabled()
 	for id, candidate := range candidates {
 		inst := byID[id]
-		if !notifyEnabled || !instanceAcceptsTransitionEvents(inst) {
+		if inst == nil {
 			continue
 		}
 		// Issue #1214: the completion wrapper owns a task worker's terminal
@@ -1053,13 +1255,44 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 		if ShouldNotifyTransition(fromSnapshot, normalizeStatusString(current[id])) {
 			continue
 		}
-
-		// Desktop-notify here too, AFTER the veto above so the two emission
-		// paths cannot double-fire for one transition. This path covers a
-		// transition fast enough that no `running` snapshot was ever observed
-		// (a short prompt answered between polls), which is the common case
-		// for an interactive agent, so omitting it would miss most alerts.
-		d.notifyDesktop(profile, inst, to)
+		desktopDispatch := d.initialized[profile] && d.desktopNotificationDispatchReady(profile)
+		legacyDispatch := notifyEnabled
+		if !desktopDispatch && !legacyDispatch {
+			continue
+		}
+		currentInst, err := d.currentTransitionInstance(profile, inst)
+		if err != nil {
+			if revalidationFailures != nil {
+				revalidationFailures[id] = true
+			}
+			continue
+		}
+		if currentInst == nil {
+			continue
+		}
+		// This fresh hook candidate bypassed the snapshot transition path, so
+		// send its equivalent desktop event here. The snapshot duplicate guard
+		// above keeps each transition to one alert source.
+		if desktopDispatch {
+			event := desktopnotify.SourceEvent{
+				SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath,
+				ToStatus: to, Timestamp: candidate.Timestamp,
+			}
+			suppressed, _ := sendDesktopNotification(currentInst, event)
+			if suppressed {
+				// Hook candidates remain fresh for 45 seconds. Persist a parented
+				// candidate as observed so promoting the session during that window
+				// cannot turn it into a delayed top-level alert.
+				if err := desktopNotificationBaseline(event); err != nil {
+					d.desktopNotificationBaselineReady[profile] = false
+					d.desktopNotificationBaselineErr[profile] = err
+					sessionLog.Warn("desktop_notification_suppressed_candidate_baseline_failed", "profile", profile, "instance_id", id, "error", err)
+				}
+			}
+		}
+		if !legacyDispatch {
+			continue
+		}
 
 		event := TransitionNotificationEvent{
 			ChildSessionID: id,
@@ -1069,6 +1302,12 @@ func (d *TransitionDaemon) emitHookTransitionCandidates(
 			ToStatus:       to,
 			Timestamp:      candidate.Timestamp,
 			LastOutputHash: transitionEventOutputHash(inst),
+		}
+		if d.observeTransitionEmission != nil {
+			d.observeTransitionEmission(event)
+		}
+		if d.beforeNotifierCommit != nil {
+			d.beforeNotifierCommit(event)
 		}
 		_ = d.notifier.NotifyTransition(event)
 	}
@@ -1087,6 +1326,95 @@ func isRecordableTurnStatus(status string) bool {
 func isNotifyTerminalStatus(status string) bool {
 	s := normalizeStatusString(status)
 	return s == string(StatusWaiting) || s == string(StatusError) || s == string(StatusIdle) || s == string(StatusStopped)
+}
+
+func (d *TransitionDaemon) clearDesktopEdgeIfRunning(profile, instanceID, toStatus string) {
+	if d == nil || d.lastDesktopNotify == nil || !releasesDesktopEdge(toStatus) {
+		return
+	}
+	delete(d.lastDesktopNotify, profile+"|"+instanceID)
+}
+
+func releasesDesktopEdge(status string) bool {
+	switch normalizeStatusString(status) {
+	case string(StatusRunning), string(StatusIdle), string(StatusStarting):
+		return true
+	default:
+		return false
+	}
+}
+
+func (d *TransitionDaemon) notifyDesktop(profile string, inst *Instance, toStatus string) {
+	if d == nil || d.deskNotifier == nil || !desktopNotificationAllowed(inst) || !GetNotificationsSettings().GetDesktopEnabled() || !desknotify.ShouldNotify(toStatus) || inst.NoTransitionNotify {
+		return
+	}
+	key := profile + "|" + inst.ID
+	if d.lastDesktopNotify[key] == toStatus {
+		return
+	}
+	if d.lastDesktopNotify == nil {
+		d.lastDesktopNotify = map[string]string{}
+	}
+	d.lastDesktopNotify[key] = toStatus
+	notif := desknotify.Notification{SessionTitle: inst.Title, Profile: profile, ToStatus: toStatus}
+	d.desktopWG.Add(1)
+	go func() {
+		defer d.desktopWG.Done()
+		backend := d.deskNotifier.Notify(notif)
+		if backend != "" {
+			sessionLog.Debug("desktop_notification_sent", slog.String("instance_id", inst.ID), slog.String("to_status", toStatus), slog.String("backend", backend))
+		}
+		decision, reason := "sent", backend
+		if backend == "" {
+			decision, reason = "skipped", "no_backend"
+		}
+		auditNotification(NotificationAuditRecord{
+			Src: "deck-desknotify", Decision: decision, Reason: reason,
+			IID: inst.ID, Name: inst.Title, Profile: profile,
+			Project: inst.ProjectPath, Parent: inst.ParentSessionID, ToStatus: toStatus,
+		})
+	}()
+}
+
+func desktopNotificationAllowed(inst *Instance) bool {
+	if inst == nil {
+		return false
+	}
+	parentID := strings.TrimSpace(inst.ParentSessionID)
+	return parentID == "" || parentID == strings.TrimSpace(inst.ID)
+}
+
+func dispatchDesktopNotification(inst *Instance, event desktopnotify.SourceEvent) {
+	_, _ = sendDesktopNotification(inst, event)
+}
+
+// sendDesktopNotification is the single choke point for the GUI-helper
+// channel, so it is also where every decision is audited (see
+// notification_audit.go): a suppression that is never recorded is invisible
+// when the notification stream is reviewed later.
+func sendDesktopNotification(inst *Instance, event desktopnotify.SourceEvent) (suppressed bool, err error) {
+	if !desktopNotificationAllowed(inst) {
+		auditDesktopEvent("deck-desktop", inst, event, "suppressed", "parented_child", nil)
+		return true, nil
+	}
+	err = desktopNotificationSender(event)
+	decision, reason := "sent", ""
+	switch {
+	case err != nil:
+		decision = "error"
+	case !GetDesktopNotificationsSettings().Enabled:
+		// The transport no-ops when the feature is off; recording that as
+		// "sent" would make the audit lie about what reached the screen.
+		decision, reason = "skipped", "desktop_disabled"
+	}
+	auditDesktopEvent("deck-desktop", inst, event, decision, reason, err)
+	return false, err
+}
+
+func (d *TransitionDaemon) waitDesktopNotifications() {
+	if d != nil {
+		d.desktopWG.Wait()
+	}
 }
 
 func terminalHookTransitionCandidate(tool string, hs *HookStatus) (hookTransitionCandidate, bool) {
@@ -1163,116 +1491,4 @@ func isCodexTerminalHookEvent(event string) bool {
 		strings.Contains(canon, "fail") ||
 		strings.Contains(canon, "abort") ||
 		strings.Contains(canon, "cancel")
-}
-
-// clearDesktopEdgeIfRunning drops a session's desktop edge record once it has
-// moved on from the state the operator was alerted about, so its NEXT prompt
-// notifies again. See releasesDesktopEdge for which statuses count.
-//
-// Without this the edge record set by notifyDesktop would persist for the life
-// of the process and the FIRST prompt in a session would be the only one that
-// ever alerted, which is a worse failure than the banner spam the edge record
-// exists to prevent.
-func (d *TransitionDaemon) clearDesktopEdgeIfRunning(profile, instanceID, toStatus string) {
-	if d == nil || d.lastDesktopNotify == nil {
-		return
-	}
-	if !releasesDesktopEdge(toStatus) {
-		return
-	}
-	delete(d.lastDesktopNotify, profile+"|"+instanceID)
-}
-
-// releasesDesktopEdge reports whether a status means the session has moved on
-// from whatever the operator was last alerted about, so its next prompt should
-// alert again.
-//
-// Re-arming on running alone is not enough. The hook-candidate dispatch site
-// exists precisely for turns too fast for a running snapshot to be observed, so
-// the sequence waiting -> (answered, agent finishes fast) -> idle -> waiting can
-// occur with the daemon never seeing running. Keyed on running only, the edge
-// record stays pinned at "waiting" and the SECOND genuine prompt is suppressed:
-// a silently dropped alert, which is the exact failure this feature exists to
-// remove, and a worse outcome than the banner spam the edge prevents.
-//
-// idle and starting are therefore releases too: both mean "not currently
-// asking the operator for anything". The attention statuses (waiting, error)
-// are deliberately NOT releases, because holding the edge while a session sits
-// in one of them is what stops per-poll spam.
-func releasesDesktopEdge(status string) bool {
-	switch normalizeStatusString(status) {
-	case string(StatusRunning), string(StatusIdle), string(StatusStarting):
-		return true
-	default:
-		return false
-	}
-}
-
-// notifyDesktop raises an OS notification for a session that needs the
-// operator. No-op unless [notifications] desktop is enabled, and best-effort
-// after that: a status poll must never fail or stall because a notifier did.
-func (d *TransitionDaemon) notifyDesktop(profile string, inst *Instance, toStatus string) {
-	if d == nil || d.deskNotifier == nil || inst == nil {
-		return
-	}
-	if !GetNotificationsSettings().GetDesktopEnabled() {
-		return
-	}
-	// Narrower than the parent-routing status set: see desknotify.ShouldNotify.
-	if !desknotify.ShouldNotify(toStatus) {
-		return
-	}
-	// Honour the per-session opt-out the parent path already respects, so one
-	// noisy session can be silenced without disabling notifications globally.
-	if inst.NoTransitionNotify {
-		return
-	}
-	// Edge-trigger: notify once per entry into a status, not once per poll
-	// while the session sits in it. Required because the hook-candidate call
-	// site re-derives a candidate for the whole 45s hookFreshWindow. Keyed on
-	// the status too, so waiting -> error still alerts.
-	key := profile + "|" + inst.ID
-	if d.lastDesktopNotify[key] == toStatus {
-		return
-	}
-	if d.lastDesktopNotify == nil {
-		d.lastDesktopNotify = map[string]string{}
-	}
-	d.lastDesktopNotify[key] = toStatus
-
-	// Dispatch OFF the poll loop. Notify shells out to a notifier binary and
-	// bounds itself at 3s, but that bound is per invocation and nothing wraps
-	// this call: statusProbeBudget and syncPassBudget cover status probes, not
-	// this. N sessions transitioning in one pass would otherwise serialize into
-	// N x 3s of blocking in a single-threaded loop that has a documented freeze
-	// history (see statusProbeBudget). Fire-and-forget is safe because the
-	// result is already advisory: Notify never returns an error, and no caller
-	// branches on whether a banner appeared. The edge record above is written
-	// BEFORE the goroutine starts, so suppression does not depend on it.
-	notif := desknotify.Notification{
-		SessionTitle: inst.Title,
-		Profile:      profile,
-		ToStatus:     toStatus,
-	}
-	instanceID := inst.ID
-	d.desktopWG.Add(1)
-	go func() {
-		defer d.desktopWG.Done()
-		if backend := d.deskNotifier.Notify(notif); backend != "" {
-			sessionLog.Debug("desktop_notification_sent",
-				slog.String("instance_id", instanceID),
-				slog.String("to_status", toStatus),
-				slog.String("backend", backend))
-		}
-	}()
-}
-
-// waitDesktopNotifications blocks until every in-flight desktop notification
-// has finished. Exists so tests can assert on delivery without racing the
-// fire-and-forget dispatch; production never needs to wait.
-func (d *TransitionDaemon) waitDesktopNotifications() {
-	if d == nil {
-		return
-	}
-	d.desktopWG.Wait()
 }

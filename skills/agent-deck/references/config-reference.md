@@ -5,6 +5,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 ## Table of Contents
 
 - [Top-Level](#top-level)
+- [[quick_create] Section](#quick_create-section)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
 - [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
@@ -19,6 +20,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[worktree] Section](#worktree-section)
 - [[fork] Section](#fork-section)
 - [[conductor] Section](#conductor-section)
+- [[orchestrate] Section](#orchestrate-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[interval_hooks.*] Section](#interval_hooks-section)
@@ -27,7 +29,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[global_search] Section](#global_search-section)
 - [[notifications] Section](#notifications-section)
 - [[performance] Section](#performance-section)
-- [[tmux] Section](#tmux-section)
+- [[desktop_notifications] Section](#desktop_notifications-section)
 - [Skills Registry (Outside config.toml)](#skills-registry-outside-configtoml)
 - [[mcp_pool] Section](#mcp_pool-section)
 - [[mcps.*] Section](#mcps-section)
@@ -52,13 +54,44 @@ group_sort   = "creation" # within-group order: "creation" (default) or "actiona
 | `push_title` | bool | `true` | Pass the exact deck title as `--name <title>` on supported Claude start/restart/resume commands. Case, punctuation, Unicode and long names are preserved; invalid UTF-8, control/bidirectional-control characters and line separators omit the default. An explicit `--name`/`-n` override wins. Missing settings default to enabled; configuration read/parse errors disable automatic naming. A deck rename applies on the next supported startup. No running prompt receives input. |
 | `group_sort` | string | `"creation"` | Order of sessions within a group. `"creation"` (default) keeps the order sessions were created in, and respects the `K`/`J` manual reorder. `"actionable"` restores the issue #857 sort that surfaces the most recently actionable sessions (error → waiting → running → idle → stopped, then recency) to the top of each group. Pin and Maestro rows are unaffected by this setting. |
 
-### Startup naming boundaries
+## [desktop_notifications] Section
 
-Claude Code 2.1.261 documents `-n, --name <name>` in its installed CLI help. The normal Claude command builder, including configured Claude command aliases that forward the same arguments, passes the name to the same startup process as its conversation ID and account environment. Forks receive the child's title. Existing account and worker-scratch selection remains in the startup builder; naming does not consult any account's session registry.
+macOS-only actionable desktop notifications. This feature is disabled unless explicitly enabled. Agent Deck emits only completion, attention-needed, and error events; clicking a banner focuses and attaches the referenced session through the normal `session focus <id> --attach` command.
 
-Automatic names are omitted for other agents, arbitrary per-session custom commands, unbound continue/resume-picker modes, and extra arguments that override conversation selection. Custom commands and older Claude versions must support their own explicit naming arguments; agent-deck does not probe or emulate them through a running prompt. Configure `push_title = false` for a Claude version without `--name` support. Configured aliases must forward Claude's documented arguments and preserve their intended account selection.
+```toml
+[desktop_notifications]
+enabled = true
+```
 
-Safe live rename remains a separate deliverable requiring an agent-side acknowledgement protocol. This startup behavior does not establish full naming parity or resolve every concern in #2088; that issue remains open. Existing inbound title reconciliation is unchanged.
+Run `agent-deck desktop-notifications helper` from the logged-in GUI session, then use `agent-deck desktop-notifications doctor` to verify the private helper socket and action routing. Existing Claude hooks, `terminal-notifier` scripts, and LaunchAgents are never modified automatically.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled` | bool | `false` | Enable the macOS desktop-notification transport. |
+
+## Alternate quick-create
+
+Configures an optional second, no-dialog quick-create action. Normal
+quick-create (`N` by default) keeps its existing contextual behavior.
+
+```toml
+default_tool = "claude"
+
+[hotkeys]
+quick_create_alternate = "ctrl+n"
+```
+
+`quick_create_alternate` is unbound by default. Binding `ctrl+n` replaces the
+overview's Emacs-style move-down chord; Down Arrow and `j` continue to navigate.
+The primary is `default_tool` (Claude when unset). The alternate is inferred as
+the first visible, installed, non-shell entry in the existing picker order that
+differs from the primary. If the context is already the alternate, the action
+selects the primary. It reuses contextual path, group, and automatic naming,
+clears inherited tool-specific options, never opens the new-session dialog, and
+is local-only.
+
+The deprecated `[quick_create].alternate_tool` key remains parseable but is
+ignored and produces a warning.
 
 ## [shell] Section
 
@@ -182,7 +215,7 @@ env_file   = "~/.agent-deck/groups/work.env"
 command    = "claude-wrapper"        # Per-group claude command/wrapper
 model      = "claude-sonnet-4-6"     # Model default for sessions in this group
 env        = { AGENT_ROLE = "work", CLAUDE_CODE_EFFORT_LEVEL = "high" }
-skills     = ["my-store/loom"]       # Managed project-skill symlinks
+skills     = ["my-store/loom"]       # Managed CLAUDE_CONFIG_DIR/skills entries
 plugins    = ["octopus"]             # Top-level [plugins.X] catalog keys
 mcps       = ["memory"]              # Declarative loadout ([mcps.X] catalog names)
 
@@ -197,7 +230,7 @@ mcps       = ["memory"]              # Declarative loadout ([mcps.X] catalog nam
 | `command` | string | Claude command/wrapper for these sessions. Resolution: conductor > group (ancestor-walking) > `[claude].command` > `"claude"`. Like the global `command`, a non-`"claude"` value suppresses the `CLAUDE_CONFIG_DIR=` spawn prefix (the wrapper is assumed to handle it). |
 | `model` | string | Model default for these sessions. Resolution: explicit per-session model (`--model`, dialog) > conductor > group (ancestor-walking) > no flag (Claude's own default). Empty falls through — the global `default_model` remains a new-session-dialog prefill only. Resolved at every start/restart, so config edits apply without re-creating sessions. |
 | `env` | inline table | Env vars exported in the spawn command AFTER the `env_file` source — an inline key deterministically wins over the same key from the file. Merge order per key: ancestor groups (root-first) → exact group → conductor. Parent-only keys persist through the merge. |
-| `skills` | array | Declarative project skills (`"<source>/<name>"` entries against the skill-source registry). Materialized at session create and re-asserted before every start/restart. Attach-only floor: config removal never detaches and foreign targets are never clobbered. Workspace trust is seeded only after an attachment succeeds. |
+| `skills` | array | Declarative Claude-home skills (`"<source>/<name>"` entries against the skill-source registry). Materialized under the effective `CLAUDE_CONFIG_DIR/skills` at session create and re-asserted before every start/restart. Attach-only floor: config removal never detaches and foreign targets are never clobbered. |
 | `plugins` | array | Top-level `[plugins.X]` catalog keys appended to `Instance.Plugins`. Existing manual plugin selections are preserved. Catalog refusal and validation rules remain authoritative. |
 | `mcps` | array | Declarative MCP loadout (`[mcps.X]` catalog names appended to the session's local `.mcp.json`). Same attach-only floor semantics; unknown catalog names skip with a warning. |
 
@@ -209,18 +242,137 @@ agent-deck group show work --resolved
 agent-deck group show work --resolved --json
 ```
 
+Claude group and conductor skill ownership is recorded at
+`<CLAUDE_CONFIG_DIR>/.agent-deck/skills.toml`; declarative skills do not modify
+repositories. Explicit `agent-deck skill attach` remains project-scoped at
+`<project>/.claude/skills` with its project ownership manifest. Any groups or
+conductors sharing one physical Claude home must resolve the same declarative
+skill set; otherwise agent-deck blocks launch and requires standardized skills
+or a distinct `config_dir`. Symlink and case-insensitive filesystem aliases
+count as one home, missing case-only paths are treated conservatively as one
+prospective home, and a path containing `..` is rejected.
+
+## Per-group Codex loadouts
+
+Codex groups can select an isolated `CODEX_HOME`, declaratively materialize
+group skills into that home's `skills` directory, or append catalog MCPs to
+that home's `config.toml`:
+
+```toml
+[groups."work".codex]
+config_dir = "~/.agent-deck/codex/work"
+env_file = "~/.agent-deck/groups/work-codex.env"
+command = "codex"
+model = "gpt-5.6-terra"
+reasoning_effort = "medium"
+skills = ["team/review"]
+mcps = ["context7"]
+plugins = ["agent-deck@team"]
+```
+
+Native Codex plugins are deliberately not installed during session startup.
+After configuring the group's Codex marketplace, sync them explicitly:
+
+```bash
+agent-deck group codex sync work
+```
+
+The command runs `codex plugin add` with the group's `CODEX_HOME`; repeated
+syncs are safe to run and any marketplace/authentication errors are reported.
+
+Codex group skills are reconciled automatically at session create and before
+start/restart. Their ownership manifest lives at
+`<CODEX_HOME>/.agent-deck/skills.toml`; repositories are not modified. Explicit
+`agent-deck skill attach` remains project-scoped at `<project>/.agents/skills`.
+If a child group needs additional skills, give it a distinct `config_dir`.
+Agent-deck rejects divergent skill sets that resolve to one shared home rather
+than leaking child-only tools into sibling sessions, and rejects a command-level
+`CODEX_HOME` that differs from the configured home. Symlink and case-insensitive
+filesystem aliases count as the same physical home for these checks. Homes
+containing a `..` path component are rejected. Existing repo-local links from
+older versions are left intact because their original manual versus
+declarative intent is unknown; detach those explicitly after verifying the
+home-scoped copy.
+
+## Global loadout floors
+
+Entries that belong in every group can be declared once on `[claude]` or
+`[codex]` instead of repeated in each group stanza:
+
+```toml
+[claude]
+skills = ["shared/port-registry"]
+plugins = ["agent-deck"]
+mcps = ["context7"]
+
+[codex]
+skills = ["shared/port-registry"]
+marketplaces = ["/srv/marketplaces/team"]
+plugins = ["andrej-karpathy-skills@karpathy-skills"]
+```
+
+The global list resolves as the **outermost ancestor**, so the effective
+loadout is `(global ∪ root group ∪ … ∪ leaf group)`, root-first and
+deduplicated. Two consequences worth knowing:
+
+- Sessions with **no group at all** still receive the floor. That is the point
+  of a floor, and it is the one way a loadout reaches an ungrouped session.
+- A group **cannot subtract** from the floor. Omitting an entry from a group
+  list does not remove it, matching the existing attach-only rule that removing
+  an entry from config.toml never detaches it.
+
+Codex home skills still require an isolated `config_dir`. When only the global
+floor contributes skills and no group in the chain declares a `config_dir`, the
+skills are skipped quietly rather than failing the spawn — there would be no
+per-group home to materialize them into, and writing them to the shared default
+home would leak the floor across unrelated sessions.
+
+## Diagnosing drift: `config doctor`
+
+`config.toml` declares; the agent homes on disk contain. Those diverge silently,
+because provisioning is an attach-only floor applied at session create/start:
+a new entry does not materialize until the next session in that group starts,
+and a removed entry is never detached. `agent-deck config doctor` reports the
+gap:
+
+```bash
+agent-deck config doctor              # human-readable, grouped by check
+agent-deck config doctor --json       # machine-readable
+agent-deck config doctor --quiet      # errors and warnings only
+agent-deck config doctor --check tool-asymmetry
+```
+
+Checks, by severity:
+
+| Check | Severity | Catches |
+|---|---|---|
+| `codex-notify-missing` | error | A Codex home with no root-level `notify`, so sessions never report turn completion. Also catches a `notify` key nested inside another table (`[tui]`), which parses as `tui.notify` and silently never fires — grep cannot see TOML table scope. |
+| `unknown-catalog-ref` | error | A loadout naming an `[mcps.X]` / `[plugins.X]` key that does not exist. |
+| `home-unreadable` | error | A configured home that is missing or unparseable. An *inferred* `~/.claude` that does not exist is not reported — that just means Claude is unused here. |
+| `declared-not-materialized` | warn | Declared for a group but absent from the home. Expected right after a config edit; converges on next session start or `agent-deck group codex sync`. |
+| `tool-asymmetry` | warn | Declared for one tool but not the other in a group that declares both. A group declaring only one side has expressed no opinion about the other and stays quiet. |
+| `marketplace-source-conflict` | warn | One marketplace name resolving to different sources across homes, so the same plugin selector means different code. |
+| `undeclared-in-home` | info | Present in a home but declared nowhere. Hand-installing is legitimate; the doctor makes it visible rather than forbidding it. |
+
+The command is read-only and never repairs. Exit status is 1 when any
+error-severity finding is present, so it can gate a sync script; warnings and
+info never fail the run.
+
 ## [group_defaults] Section
 
-Defaults stamped onto **newly-created** groups. Existing groups are unaffected.
+Defaults for **newly-created** groups plus policy controlling who may create
+them. Existing groups are unaffected by creation defaults.
 
 ```toml
 [group_defaults]
-max_concurrent = 3   # new groups cap at 3 concurrent sessions
+max_concurrent = 3          # new groups cap at 3 concurrent sessions
+manual_creation_only = true # managed agent sessions may use existing groups only
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_concurrent` | int | `1` (serial) | `max_concurrent` for new groups created via `group create`, the TUI/web create dialogs, and the launch/session auto-create paths. `0` = unlimited, `1` = serial, `N` = cap. Unset keeps the built-in serial default. An explicit `group create --max-concurrent N` flag overrides this per group; existing groups keep their stored value. |
+| `manual_creation_only` | bool | `false` | When `true`, CLI commands run inside an Agent Deck-managed session may target existing groups but fail if they would create a group explicitly or automatically. Create groups from the main TUI, web UI, declarative `[groups]` config, or a normal terminal outside Agent Deck. |
 
 ## [gemini] Section
 
@@ -268,16 +420,24 @@ Codex CLI integration settings.
 [codex]
 command = "codex"  # Codex CLI command or alias
 yolo_mode = true   # Enable --yolo (bypass approvals and sandbox)
+default_model = "gpt-5.6"               # Used unless a session/group overrides it
+default_reasoning_effort = "high"       # Used unless a session/group overrides it
 env_file = "~/.codex.env"
-command = "codex"
+
+[codex.tui]
+status_line = ["model-with-reasoning", "context-used", "git-branch"]
+status_line_use_colors = true
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `codex` | Codex CLI command or alias to launch built-in Codex sessions. Examples: `codex-v2`, `CODEX_HOME=~/.codex-work codex`. |
 | `yolo_mode` | bool | `false` | Maps to `codex --yolo` (`--dangerously-bypass-approvals-and-sandbox`). Can be overridden per-session. |
+| `default_model` | string | `""` | Default passed to Codex as `--model` when no explicit session or group model is set. Agent Deck reconciles it into the selected group `CODEX_HOME/config.toml`. |
+| `default_reasoning_effort` | string | `""` | Default passed as `--config model_reasoning_effort=…` when no explicit session or group value is set. Agent Deck reconciles it into the selected group home. |
 | `env_file` | string | `""` | A .env file sourced for Codex sessions only. See [Path Resolution](#path-resolution). |
-| `command` | string | `"codex"` | Override the binary/invocation. |
+| `tui.status_line` | array | unset | Ordered footer items merged into every resolved group `CODEX_HOME/config.toml`. Set `[]` to hide the footer. |
+| `tui.status_line_use_colors` | bool | unset | Enables or disables status-line colors in every resolved group home. |
 
 ## [copilot] Section
 
@@ -451,6 +611,32 @@ dir = ""   # Override the base conductor directory (default: <data-dir>/conducto
 > **Note:** Each conductor's `heartbeat.sh` honors `[conductor].dir` and self-heals — when you change `dir`, the script content is auto-refreshed by the migration that runs on the next `agent-deck conductor list` / `status` / `setup` / `teardown`. The surface that goes **stale** is the daemon, not the script: the launchd heartbeat plist (and the Linux systemd unit) bakes absolute script/log paths at install time and is regenerated only by `agent-deck conductor setup`. After changing `dir`, re-run `agent-deck conductor setup <name>` per conductor to regenerate and reload the daemon. (A `conductor migrate-dir` helper to automate this is planned.) A `conductor list`/`status` after a dir change will flag a stale heartbeat daemon in its `[migrated]` output.
 
 > **Note:** The Telegram/Slack/Discord bridge daemon (`bridge.py`) now honors `[conductor].dir`: the Go side injects the resolved override into the daemon environment as `AGENT_DECK_CONDUCTOR_DIR`, and the bridge prefers it over its XDG/legacy resolver (#1350). Caveat: the daemon's environment is frozen at install time, so if you change `[conductor].dir` after the bridge is set up, regenerate the bridge daemon (re-run conductor setup, or the planned `conductor migrate-dir`) for the daemon to pick up the new directory.
+
+## [orchestrate] Section
+
+Controls how the `agent-deck:orchestrate` workflow chooses tools for child
+sessions.
+
+```toml
+default_tool = "codex"
+
+[orchestrate]
+tool_strategy = "auto"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `tool_strategy` | string | `""` (legacy) | `"default"` uses the top-level `default_tool` for every non-explicit orchestrated launch. `"auto"` lets the conductor mix locally installed, non-hidden tools by role and task, falling back to `default_tool` when no connector is clearly better. An omitted value preserves the workflow's historical explicit choices. |
+
+Inspect the policy and the locally available auto-selection candidates:
+
+```bash
+agent-deck config orchestrate
+```
+
+Tool availability reuses Agent Deck's existing registry and command lookup.
+It detects installation, not provider authentication. Explicit workflow tool
+choices continue to override this strategy.
 
 ## [logs] Section
 
@@ -752,11 +938,12 @@ agent-deck skill source remove team
 ```
 
 **Declarative per-group/per-conductor loadout:** `[groups.X.claude].skills`,
-`.plugins`, and `.mcps` (and the conductor mirror) list entries that agent-deck attaches
-automatically — at session create (`add` / `launch`) and re-asserted before
-every start/restart — through this same registry and attach machinery,
-exactly as if `skill attach` / `mcp attach` had been run by hand. The
-loadout is an attach-only floor:
+`.plugins`, and `.mcps` (and the conductor mirror) list entries that agent-deck
+attaches automatically at session create (`add` / `launch`) and re-asserts
+before every start/restart. Claude skills use the selected
+`CLAUDE_CONFIG_DIR`, Codex group skills use the selected `CODEX_HOME`, and
+explicit attachments remain project-scoped. The loadout is an attach-only
+floor:
 
 - already attached and healthy → no-op; a deleted symlink re-materializes
 - a real directory or foreign symlink at the target → skip + warning,
@@ -766,8 +953,10 @@ loadout is an attach-only floor:
   deliberate `skill detach`
 
 Skill-store entries may be plain directory skills (`SKILL.md`) or full Claude
-Code plugins (`.claude-plugin/plugin.json`); both materialize as project
-skills. SSH sessions are skipped (no local project path). See
+Code plugins (`.claude-plugin/plugin.json`). Declarative skills materialize in
+the selected agent home; explicit attachments materialize in the project. SSH
+sessions are skipped because the local process cannot safely modify a remote
+home or project. See
 [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides).
 
 ## [mcp_pool] Section

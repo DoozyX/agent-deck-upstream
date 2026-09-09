@@ -101,6 +101,8 @@ agent-deck web                    # Start web UI on http://127.0.0.1:8420
 | `Enter` | Attach to session |
 | `Ctrl+Q` | Detach from session |
 | `n` | New session |
+| `N` | Contextual quick-create |
+| configured (for example `Ctrl+N`) | Alternate quick-create inferred from visible installed tools |
 | `f` / `F` | Fork (quick / dialog) |
 | `A` / `Shift+U` | Archive / unarchive session |
 | `^` | Show archived sessions |
@@ -194,11 +196,55 @@ Override any group by adding a `[groups."<name>".claude]` table to `$XDG_CONFIG_
 [groups."conductor".claude]
 config_dir = "~/.claude-team"
 env_file = "~/git/work/.envrc"
+skills = ["team/review"]
 ```
 
-Lookup priority: `env > group > profile > global > default`. The `env_file` is `source`d into the tmux pane before `claude` (or the custom command) execs, so any exports it contains become part of the session environment.
+Declarative group and conductor skills are reconciled into
+`$CLAUDE_CONFIG_DIR/skills`, with ownership recorded at
+`$CLAUDE_CONFIG_DIR/.agent-deck/skills.toml`; repositories are not modified.
+Explicit `agent-deck skill attach` remains project-scoped. Groups and
+conductors sharing one physical Claude home must resolve the same declarative
+skill set or select distinct `config_dir` values. Symlink and case-insensitive
+filesystem aliases count as the same home, and paths containing `..` are
+rejected.
+
+Instance lookup priority is `account > conductor > group > env > profile >
+global > default`. The `env_file` is `source`d into the tmux pane before
+`claude` (or the custom command) execs, so any exports it contains become part
+of the session environment.
 
 Human-watchable verification: `bash scripts/verify-per-group-claude-config.sh`. The harness creates two throwaway groups, launches one normal and one custom-command session, and prints a pass/fail table.
+
+#### Per-group Codex config and plugins
+
+Codex groups can use separate `CODEX_HOME` directories. Marketplace sources
+and plugins inherit through parent groups and are installed explicitly:
+
+```toml
+[groups."work".codex]
+config_dir = "~/.agent-deck/codex/work"
+skills = ["team/review"]
+mcps = ["context7"]
+marketplaces = ["/path/to/team-marketplace"]
+plugins = ["agent-deck@team"]
+```
+
+The selected home is used for the session's Codex config, inherited group
+skills (`$CODEX_HOME/skills`), and MCP entries. Explicit `skill attach`
+remains project-scoped under `.agents/skills`. A child group that declares
+additional skills must select its own `config_dir`; otherwise those skills
+would leak to siblings sharing the inherited home and agent-deck blocks the
+unsafe launch. A command-level `CODEX_HOME` must match the configured home when
+group skills are present. Filesystem aliases such as symlinked paths or
+case variants on a case-insensitive volume count as the same home for both checks.
+Codex homes containing a `..` path component are rejected.
+Native marketplaces and plugins are synced explicitly, so startup never
+mutates a user's Codex installation:
+
+```bash
+agent-deck group codex sync work
+agent-deck group show work --resolved --json
+```
 
 #### Per-conductor Claude config (v1.5.4)
 
@@ -269,7 +315,7 @@ Groups carry real policy — `max_concurrent` (serial vs. bounded parallelism), 
 - **Create a new group when something policy-shaped differs** from the parent group — a different concurrency cap, working directory, or Claude account. If nothing enforced differs, the thing you have is a topic, not a group; carry it in the title and parent linkage instead.
 - **Don't rely on titles or group names as machine keys.** Both are user-editable; a script or agent matching on either is relying on something that can change under it.
 
-There's no automated warning or enforcement for group sprawl yet — this is a documented convention, not a gate. See [`docs/design/2026-07-26-session-identity-and-group-purpose.md`](docs/design/2026-07-26-session-identity-and-group-purpose.md) for the fuller design writeup (task-identity field, group `--purpose`, advisory sprawl warning) if you hit a concrete gap this section doesn't cover.
+There's no automated warning or enforcement for group sprawl yet — this is a documented convention, not a gate.
 
 ### MCP Socket Pool
 
@@ -322,6 +368,7 @@ Multiple agents can work on the same repo without conflicts. Each worktree is an
 
 - `agent-deck add . -c claude --worktree feature/a --new-branch` creates a session in a new worktree
 - `agent-deck add . --worktree feature/b -b --location subdirectory` places the worktree under `.worktrees/` inside the repo
+- `agent-deck launch . --worktree feature/c --new-branch --base dev -c claude` creates the branch from an explicit, resolved `dev` commit instead of the invoking checkout's current branch
 - `agent-deck worktree finish "My Session"` merges the branch, removes the worktree, and deletes the session
 - `agent-deck worktree cleanup` finds and removes orphaned worktrees
 
@@ -635,6 +682,24 @@ agent-deck session set-transition-notify worker on
 
 Suppression only affects dispatch — the parent link itself is unchanged. Deferred/retried events also honour the flag (guard is in `transition_notifier.dispatch` as well as both daemon entry points).
 
+### macOS actionable desktop notifications
+
+Desktop alerts are opt-in and independent of the parent-session notification stream. They notify only when a session completes, needs attention, or enters an error state; clicking a banner runs the existing `session focus <id> --attach` route for that session and profile.
+
+```toml
+[desktop_notifications]
+enabled = true
+```
+
+Start the native helper once from your logged-in macOS session, then inspect readiness with doctor:
+
+```bash
+agent-deck desktop-notifications helper
+agent-deck desktop-notifications doctor
+```
+
+The helper keeps a private local socket and persistent deduplication state. Enabling or restarting it does not replay older session states. Agent Deck never changes existing Claude hooks, `terminal-notifier` scripts, or LaunchAgents; after verifying banners and click routing, retire any old bridge manually to avoid duplicates.
+
 **Heartbeat-driven monitoring**: heartbeats still run on the configured interval (default 15 minutes) as a secondary safety net. If a conductor response includes `NEED:`, the bridge forwards that alert to Telegram and/or Slack.
 
 **Telegram conductor topology (v1.7.22+)**: each conductor bot must own exactly one channel-owning session. Activate telegram per-session via `--channels plugin:telegram@claude-plugins-official` and inject `TELEGRAM_STATE_DIR` via `[conductors.<name>.claude].env_file` in `$XDG_CONFIG_HOME/agent-deck/config.toml`. Do NOT set `enabledPlugins."telegram@claude-plugins-official"=true` in a profile's `settings.json` — that leaks a poller to every claude session under the profile. agent-deck emits warnings (`GLOBAL_ANTIPATTERN`, `DOUBLE_LOAD`, `WRAPPER_DEPRECATED`) when it detects these setups. Full guidance: [Telegram conductor topology](skills/agent-deck/SKILL.md#telegram-conductor-topology-v1722).
@@ -914,6 +979,8 @@ agent-deck remote update dev      # specific remote
 
 A conductor that launches workers on another host does not get their completions for free: transition notifications are parent-linked, and a `parent_session_id` cannot point across machines. `remote drain <name>` closes that gap by pulling — it reads the remote's records over the same SSH path (consuming nothing there) and writes them into the local inbox, safe to run on every heartbeat and safe to repeat.
 
+Run **artifacts** do not travel with those records. `.agent-deck/<run-id>/` and `.agent-deck/handoff/` are project artifacts kept out of git on purpose, so a run recorded on one host is invisible on every other one. `agent-deck artifacts sync <name>` closes that as a union — it pulls what is missing here, pushes what is missing there, and never deletes and never overwrites; a path that differs on both sides is reported as a conflict and moved in neither direction (exit `4`), and a root the remote does not have is skipped with a reason instead of being treated as an empty tree. Add `--all` for every project root in the registry, `--dry-run` to see the plan.
+
 Remote configuration is stored under `[remotes]` in `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/agent-deck/config.toml`). `remote list`, `remote sessions` and `remote drain` support `--json` output for scripting. See the [Remote Commands reference](skills/agent-deck/references/cli-reference.md#remote-commands) for flags, security behavior, and examples.
 
 Pressing `n` on a remote group or session opens the full new-session dialog in **remote mode**: path suggestions come from the remote host, the remote session's group is pre-filled, and the create routes over SSH with your chosen tool — sessions are never accidentally created on localhost.
@@ -977,6 +1044,8 @@ The browser UI includes the live Command Center, session terminal, costs, archiv
 
 | Guide | What's Inside |
 |-------|---------------|
+| [Conductor](docs/conductor/) | What a conductor is, channel pairing, state files, multi-conductor setups |
+| [Self-heal](docs/self-heal.md) | Supervision pass: modes, caps, the `resume` action, reading the audit, deployment gotchas |
 | [Skills](documentation/SKILLS.md) | User-level vs pool skills, authoring, attach/detach, when to use which tier |
 | [Watchdog](documentation/WATCHDOG.md) | Optional Python daemon that auto-restarts critical sessions and nudges stuck children |
 | [Watchers](documentation/WATCHERS.md) | Event-forwarding framework: doorbell model, built-in adapters, custom watchers, gotchas |
@@ -987,6 +1056,7 @@ The browser UI includes the live Command Center, session terminal, costs, archiv
 |-------|---------------|
 | [CLI Reference](skills/agent-deck/references/cli-reference.md) | Commands, flags, scripting examples |
 | [Configuration](skills/agent-deck/references/config-reference.md) | config.toml, MCP setup, custom tools, socket pool, skills registry paths, docker |
+| [Data Locations](docs/data-locations.md) | What lives in `<project-root>/.agent-deck/` vs the machine-global data dir, and why |
 | [Docker Sandbox](skills/agent-deck/references/sandbox.md) | Containers, overlays, custom images, troubleshooting |
 | [TUI Reference](skills/agent-deck/references/tui-reference.md) | Keyboard shortcuts, status indicators, navigation |
 | [Troubleshooting](skills/agent-deck/references/troubleshooting.md) | Common issues, debugging, recovery, uninstalling |

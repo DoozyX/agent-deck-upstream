@@ -38,6 +38,64 @@ const (
 	// status "error". Built on the #1400 error-banner detection.
 	SubstateAuth401 Substate = "auth-401"
 
+	// SubstateAPIError marks a TRANSPORT failure banner: Claude could not reach
+	// the API at all ("API Error: Unable to connect to API (ENOTFOUND)").
+	//
+	// Unlike SubstateAuth401 this is RECOVERABLE. Field evidence 2026-08-07: a
+	// DNS failure wedged 3 of 32 live sessions for 16, 18 and 39 minutes; the
+	// network had recovered long before anyone noticed, and one continuation
+	// prompt resumed all three on the first attempt. The panes were never
+	// frozen — they repainted and accepted keystrokes — so every content-only
+	// heuristic read them as a healthy empty prompt.
+	//
+	// Pairs with status IDLE or WAITING, never "error": nothing maps a transport
+	// banner to StatusError (claudeErrorBannerSubstrings holds only the 401 /
+	// login / socket-closed shapes), and that is deliberate — a 401 is terminal
+	// and this is not. Anything keyed off this substate must therefore gate on
+	// idle/waiting, exactly like SubstateStalled does.
+	//
+	// A pane in this state whose composer holds an unchanging operator draft is
+	// promoted to SubstateStalled after StallDwell (see promoteStalled in
+	// internal/session/stall.go): the banner alone is recoverable by one
+	// continuation prompt, but text a human typed is not ours to submit.
+	SubstateAPIError Substate = "api-error"
+
+	// SubstateStalled marks the wedge SubstateIdleAtEmptyPrompt was always
+	// meant to be distinguished from: a session that LOOKS idle but is not.
+	// Its composer holds unsent text that has not changed for the stall dwell
+	// while nothing is running — the signature of a turn state machine that
+	// never returned to idle after a transport failure ("API Error: Unable to
+	// connect to API (ConnectionRefused)"). The pane still renders and still
+	// accepts keystrokes, so every content-only heuristic reads it as a
+	// healthy prompt; only the ABSENCE of progress over time distinguishes it.
+	//
+	// Pairs with status "idle"/"waiting". Reporting only — a supervisor should
+	// escalate rather than nudge, because a gated composer swallows nudges.
+	// The automatic Escape+Enter recovery deliberately lives in the send path
+	// instead, where the text in the composer is known to be ours.
+	SubstateStalled Substate = "stalled"
+
+	// SubstateAwaitingChoice marks a pane showing a MODAL SELECTION that only a
+	// human can resolve: a tool permission dialog, or an AskUserQuestion
+	// decision menu the agent raised for its operator.
+	//
+	// It exists because such a pane is indistinguishable from a healthy empty
+	// prompt to every coarse observer — same "waiting" status, same
+	// idle-at-empty-prompt verdict — and that blindness is actively
+	// destructive rather than merely uninformative. An automated sender reads
+	// the menu's rendering out of the composer region as if it were an
+	// operator draft, Ctrl+C's it away (dismissing the question), sends, and
+	// types the option list back as literal text. Field evidence 2026-08-20:
+	// an orchestrate conductor's own heartbeat ate two decision prompts in 45
+	// minutes, so the run stalled for over an hour behind a question its human
+	// was never shown.
+	//
+	// Pairs with status "waiting"/"idle". Ranked ABOVE idle-at-empty-prompt,
+	// which would otherwise absorb it (hasClaudePrompt matches dialog text).
+	// Anything that sends unattended must refuse this substate and escalate to
+	// a human — the prompt is the human's to answer, not a supervisor's.
+	SubstateAwaitingChoice Substate = "awaiting-choice"
+
 	// SubstateUsageLimit marks a session whose plan usage window is exhausted:
 	// the pane is healthy and accepts input, but every submitted turn is
 	// rejected until the window resets. Pairs with status "idle"/"waiting" —
@@ -57,6 +115,7 @@ const (
 var modelUnavailableSubstrings = []string{
 	"is currently unavailable",
 	"model is currently unavailable",
+	"Selected model is at capacity",
 }
 
 // crunchedNoopMarker matches the "Crunched for 0s" zero-work completion the
@@ -65,8 +124,9 @@ var modelUnavailableSubstrings = []string{
 const crunchedNoopMarker = "Crunched for 0s"
 
 // ClassifySubstate returns the additive Substate for the given pane content.
-// Claude-only (the heuristics are Claude Code renderings); other tools return
-// SubstateNone.
+// Most heuristics are Claude-only. Codex additionally exposes the exact model
+// capacity banner and its unambiguous active-work cue so self-heal can safely
+// distinguish a current capacity stop from a stale banner after recovery.
 //
 // Precedence (most-actionable first). With only a fixed text window and no
 // timestamps, a stale line and a current line cannot be ordered perfectly; this
@@ -83,10 +143,25 @@ const crunchedNoopMarker = "Crunched for 0s"
 //     no-op: if the session is crunching NOW, an older "Crunched for 0s" /
 //     "unavailable" line is stale. Deliberately does NOT treat a bare "✶" as a
 //     cue, so the no-op completion line's decorative asterisk does not match.
-//  3. model-unavailable — the Fable-down no-op loop with no live busy cue.
-//  4. idle-at-empty-prompt — sitting at the prompt with nothing happening.
-//  5. none      — no distinct refinement.
+//  3. api-error — a TRANSPORT failure banner ("Unable to connect to API"). AFTER
+//     busy on purpose: a transport error is recoverable, so a live spinner means
+//     the session already came back and must not be prompted.
+//  4. model-unavailable — the Fable-down no-op loop with no live busy cue.
+//  5. awaiting-choice — a modal selection (permission dialog / AskUserQuestion)
+//     that only a human can resolve. Before idle-at-empty-prompt, which would
+//     otherwise absorb it: hasClaudePrompt matches dialog text as a prompt.
+//  6. idle-at-empty-prompt — sitting at the prompt with nothing happening.
+//  7. none      — no distinct refinement.
 func (d *PromptDetector) ClassifySubstate(content string) Substate {
+	if d.tool == "codex" {
+		if d.hasClaudeBusyIndicator(content) {
+			return SubstateRunning
+		}
+		if hasCodexCapacityBanner(content) {
+			return SubstateModelUnavailable
+		}
+		return SubstateNone
+	}
 	if d.tool != "claude" {
 		return SubstateNone
 	}
@@ -105,7 +180,18 @@ func (d *PromptDetector) ClassifySubstate(content string) Substate {
 		return SubstateRunning
 	}
 
-	// 3. Model-unavailable no-op loop (Fable down) with no live busy cue: the
+	// 3. TRANSPORT failure banner. Ordered AFTER busy, unlike auth-401: a
+	//    credential failure is terminal and stops the spinner, but a transport
+	//    error is not — the session may already have recovered, in which case a
+	//    live spinner is the truth. The cost of a false api-error is injecting a
+	//    prompt into a working session, and that asymmetry sets the ordering.
+	//    Scoped to the recent tail, so a banner scrolled up into history stops
+	//    matching.
+	if hasClaudeAPIErrorBanner(content) {
+		return SubstateAPIError
+	}
+
+	// 4. Model-unavailable no-op loop (Fable down) with no live busy cue: the
 	//    "Crunched for 0s" / "is currently unavailable" line is the actionable
 	//    signal. Scan the recent tail so a stale line scrolled far up does not
 	//    match.
@@ -113,12 +199,40 @@ func (d *PromptDetector) ClassifySubstate(content string) Substate {
 		return SubstateModelUnavailable
 	}
 
-	// 4. Sitting at the input prompt with no busy/error signal = genuinely idle.
+	// 5. A modal selection waiting on a human. Checked BEFORE the idle prompt:
+	//    hasClaudePrompt matches permission-dialog text too, so idle would
+	//    swallow this verdict and leave "a human must answer" unobservable.
+	if PaneAwaitsChoice(content) {
+		return SubstateAwaitingChoice
+	}
+
+	// 6. Sitting at the input prompt with no busy/error signal = genuinely idle.
 	if d.hasClaudePrompt(content) {
 		return SubstateIdleAtEmptyPrompt
 	}
 
 	return SubstateNone
+}
+
+// hasCodexCapacityBanner recognizes the rendered capacity banner without
+// treating user input or quoted scrollback as a live outage.
+func hasCodexCapacityBanner(content string) bool {
+	lines := strings.Split(content, "\n")
+	checked := 0
+	for i := len(lines) - 1; i >= 0 && checked < 15; i-- {
+		line := strings.TrimSpace(StripANSI(lines[i]))
+		if line == "" {
+			continue
+		}
+		checked++
+		if hasAnyPrefix(line, append(claudeQuotedLinePrefixes, "›")) {
+			continue
+		}
+		if strings.Contains(strings.ToLower(line), "selected model is at capacity") {
+			return true
+		}
+	}
+	return false
 }
 
 // hasClaudeBusyIndicator reports whether the recent pane tail shows Claude

@@ -252,10 +252,10 @@ func atomicAppendInboxLineLocked(path string, line []byte) error {
 	return writeFileDurable(path, data, 0o644)
 }
 
-func maxInt() int { return int(^uint(0) >> 1) }
+func platformMaxInt() int { return int(^uint(0) >> 1) }
 
 func checkedInboxAppendCapacity(existingLen, lineLen int) (int, error) {
-	if existingLen < 0 || lineLen < 0 || existingLen > maxInt()-1 || lineLen > maxInt()-existingLen-1 {
+	if existingLen < 0 || lineLen < 0 || existingLen > platformMaxInt()-1 || lineLen > platformMaxInt()-existingLen-1 {
 		return 0, fmt.Errorf("inbox append too large: existing=%d line=%d", existingLen, lineLen)
 	}
 	return existingLen + lineLen + 1, nil

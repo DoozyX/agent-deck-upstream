@@ -176,7 +176,7 @@ func TestRegression_ForkSecondStartDoesNotReuseForkCommandAsCustomCommand(t *tes
 
 func TestCodexForkStartDispatchConsumesAwaitingStart(t *testing.T) {
 	requireCodexForkStartGuard(t, "Start")
-	requireCodexForkStartGuard(t, "StartWithMessage")
+	requireCodexForkStartGuard(t, "StartWithMessageDelivery")
 }
 
 // TestOpenCodeForkStartDispatchConsumesAwaitingStart guards the OpenCode arm of
@@ -185,7 +185,7 @@ func TestCodexForkStartDispatchConsumesAwaitingStart(t *testing.T) {
 // whose script self-deletes (so a restart would reference a missing file).
 func TestOpenCodeForkStartDispatchConsumesAwaitingStart(t *testing.T) {
 	requireOpenCodeForkStartGuard(t, "Start")
-	requireOpenCodeForkStartGuard(t, "StartWithMessage")
+	requireOpenCodeForkStartGuard(t, "StartWithMessageDelivery")
 }
 
 func requireOpenCodeForkStartGuard(t *testing.T, funcName string) {
@@ -248,10 +248,10 @@ func requireCodexForkStartGuard(t *testing.T, funcName string) {
 // rebind the child to an older same-project rollout — including the parent it
 // just forked from — propagating the wrong codex_session_id. The fork-first-start
 // branch must therefore stamp CodexStartedAt itself, in both Start() and
-// StartWithMessage().
+// StartWithMessageDelivery() (the delivery-returning body behind StartWithMessage).
 func TestCodexForkStartStampsStartedAt(t *testing.T) {
 	requireCodexForkAwaitingStartStampsStartedAt(t, "Start")
-	requireCodexForkAwaitingStartStampsStartedAt(t, "StartWithMessage")
+	requireCodexForkAwaitingStartStampsStartedAt(t, "StartWithMessageDelivery")
 }
 
 func requireCodexForkAwaitingStartStampsStartedAt(t *testing.T, funcName string) {

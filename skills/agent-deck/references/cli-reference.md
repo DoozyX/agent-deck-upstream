@@ -15,6 +15,7 @@ Complete reference for all agent-deck CLI commands.
 - [Group Commands](#group-commands)
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
+- [Artifacts Commands](#artifacts-commands)
 - [Codex Hook Commands](#codex-hook-commands)
 - [DeepSeek Commands](#deepseek-commands)
 - [Conductor Commands](#conductor-commands)
@@ -83,10 +84,12 @@ agent-deck launch . -c claude --account work -m "Review this module"
 agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
 agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
+agent-deck launch . -w feature/a -b --base dev -c claude  # new branch explicitly based on dev
 ```
 
 Notes:
 - `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
+- `--base <revision>` requires `-w/--worktree` and `-b/--new-branch`. It resolves the revision to an immutable commit before creating the worktree and prints the verified base revision and sha.
 - `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
 - `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
 
@@ -311,10 +314,25 @@ approval: that path sends composer text followed by Enter.
 ### session output
 
 ```bash
-agent-deck session output [id|title] [--json] [-q]
+agent-deck session output [id|title] [--json] [-q] [--require-fresh]
 ```
 
 Get the last response from a session. Transcript-backed extraction is tool-dependent; use `--pane` for a raw tmux capture when structured output is unavailable.
+
+**Staleness.** "Last response" is only an answer to your last message if it is
+newer than it. When the newest response predates the last message delivered to
+the session (the `last_sent_at` clock `session send` stamps), the content
+belongs to a previous turn — the session has not answered you yet. That case is
+reported rather than left for you to infer:
+
+- `--json` → `"stale": true` plus `"last_sent_at"`
+- human/`-q` → a warning on stderr (stdout stays byte-identical for pipes)
+- `--require-fresh` → exit code 3 instead of returning the old turn
+
+```bash
+agent-deck session send worker "next task" && \
+  agent-deck session output worker -q --require-fresh   # exits 3 until it answers
+```
 
 ### session set-parent / unset-parent
 
@@ -713,6 +731,52 @@ agent-deck remote update dev      # update specific remote
 ```
 
 SSH uses OpenSSH host-key verification and `BatchMode=yes`; unknown or changed hosts fail instead of prompting. Authenticate with an SSH agent or configured key and establish trust in `known_hosts` before registering a remote. `remote update` verifies the downloaded archive against the release checksums before deployment.
+
+## Artifacts Commands
+
+Sync **run artifacts** — `<main-worktree>/.agent-deck/<run-id>/` and `.agent-deck/handoff/<session-id>/` — between machines over the same registered-remote SSH path `remote drain` uses.
+
+Those files are project artifacts kept out of git on purpose (see `docs/data-locations.md`), so nothing else carries them across hosts: a run recorded on one machine is invisible on every other one.
+
+### artifacts sync
+
+```bash
+agent-deck artifacts sync <remote|user@host> [--all] [--dry-run] [--json]
+```
+
+| Option | Description |
+| --- | --- |
+| `--all` | Every project root in the session registry, not just the current one. Roots are folded to their main worktree, so two worktrees of one repo count once |
+| `--dry-run` | Report the plan; transfer nothing |
+| `--json` | Emit `{remote, repos[], pulled, pushed, conflicts, dry_run}` |
+
+A **union**, not a mirror: it pulls what is missing here, pushes what is missing there, and **never deletes and never overwrites**. Divergence between two machines running the same work is almost purely additive, so adding is the whole operation.
+
+- **Conflicts are reported, not resolved.** A path that exists on both sides with different content moves in neither direction and the command exits `4`. Everything not in conflict still transfers.
+- **A root the remote does not have is skipped with a reason**, never treated as an empty remote tree — pushing a whole local history into a path that is not that repo on the far side is the failure that would cause.
+- **Remote paths are the local path remapped through `$HOME`.** `~alice/src/app` on this machine is `~bob/src/app` on the remote. A root outside `$HOME` has no mapping and is skipped.
+- **`tmp/` and `skills.toml` are never synced**: a session's TMPDIR and a checkout's skill attachments are machine-local by design.
+- **Symlinks, devices and permission bits are out of scope**; regular files and the directories holding them are what move.
+- Exit codes: `0` synced (an already-converged pair says so explicitly), `2` usage or unknown remote, `3` remote unreachable or unable to read its own manifest, `4` conflicts found.
+
+### artifacts manifest / pack / unpack / home
+
+```bash
+agent-deck artifacts manifest --root <absolute-path>   # JSON manifest; read-only
+agent-deck artifacts pack --root <absolute-path>       # file list on stdin, tar on stdout
+agent-deck artifacts unpack --root <absolute-path>     # tar on stdin; skips paths that exist
+agent-deck artifacts home                              # this machine's home directory
+```
+
+These are the primitives `artifacts sync` runs on the far side over SSH; they are plain local operations, so the transport carries no logic of its own. `unpack` refuses any member that is absolute, contains `..`, or falls outside `.agent-deck/<top-level-dir>/` — a tar arriving from another host is not trusted. A remote running a build without the `artifacts` verb is reported as a version error naming `agent-deck remote update`.
+
+### Examples
+
+```bash
+agent-deck artifacts sync m1                     # this repo, both directions
+agent-deck artifacts sync m1 --all --dry-run     # every known root, plan only
+agent-deck artifacts sync worker@box-b --json    # unregistered destination, scriptable
+```
 
 ## Codex Hook Commands
 

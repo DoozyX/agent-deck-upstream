@@ -19,6 +19,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -93,6 +94,58 @@ func TestIssue1112_RemoteFetchSessions_PreservesWaitingStatus(t *testing.T) {
 	}
 	if got := sessions[0].Status; got != "waiting" {
 		t.Errorf("Status=%q, want %q — remote status RPC must propagate waiting (#1112 bug 1)", got, "waiting")
+	}
+}
+
+func TestRemoteFetchSessionsParsesSnapshotEnvelope(t *testing.T) {
+	payload := []byte(`{"sessions":[{"id":"abc","title":"build","status":"waiting"}],"groups":[]}`)
+	runner, _ := stubbedRunner(payload)
+
+	sessions, err := runner.FetchSessions(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSessions: %v", err)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "abc" {
+		t.Fatalf("snapshot sessions = %+v, want session abc", sessions)
+	}
+}
+
+func TestRemoteFetchSnapshotPreservesSavedGroups(t *testing.T) {
+	payload := []byte(`{"sessions":[],"groups":[{"name":"empty","path":"work/empty","expanded":true,"order":2}]}`)
+	runner, lastArgs := stubbedRunner(payload)
+
+	snapshot, err := runner.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSnapshot: %v", err)
+	}
+	if len(snapshot.Groups) != 1 || snapshot.Groups[0].Path != "work/empty" {
+		t.Fatalf("snapshot groups = %+v, want work/empty", snapshot.Groups)
+	}
+	if got := strings.Join(*lastArgs, " "); got != "list --json --include-groups" {
+		t.Fatalf("ssh argv = %q, want list --json --include-groups", got)
+	}
+}
+
+func TestRemoteFetchSnapshotFallsBackToLegacySessionList(t *testing.T) {
+	calls := 0
+	runner := &SSHRunner{
+		Host:          "test-host",
+		AgentDeckPath: "/usr/local/bin/agent-deck",
+		runFn: func(ctx context.Context, args ...string) ([]byte, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.New("flag provided but not defined: -include-groups")
+			}
+			return []byte(`[{"id":"legacy","title":"build","status":"idle"}]`), nil
+		},
+	}
+
+	snapshot, err := runner.FetchSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("FetchSnapshot: %v", err)
+	}
+	if calls != 2 || len(snapshot.Sessions) != 1 || snapshot.Sessions[0].ID != "legacy" {
+		t.Fatalf("legacy fallback calls=%d snapshot=%+v", calls, snapshot)
 	}
 }
 

@@ -52,6 +52,10 @@ func handleGroup(profile string, args []string) {
 	}
 
 	canonical, ok := groupVerbCanonical(args[0])
+	if args[0] == "codex" {
+		handleGroupCodex(profile, args[1:])
+		return
+	}
 	if !ok {
 		fmt.Printf("Unknown group command: %s\n", args[0])
 		fmt.Println()
@@ -87,7 +91,8 @@ func printGroupHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  list              List all groups with session counts")
-	fmt.Println("  show <name>       Show one group; --resolved adds the effective claude config (alias: info)")
+	fmt.Println("  show <name>       Show one group; --resolved adds effective Claude and Codex config (alias: info)")
+	fmt.Println("  codex sync <name> Sync inherited Codex marketplaces and plugins into the group home")
 	fmt.Println("  create <name>     Create a new group")
 	fmt.Println("  update <name>     Update group settings")
 	fmt.Println("  delete <name>     Delete a group (aliases: rm, remove)")
@@ -98,6 +103,7 @@ func printGroupHelp() {
 	fmt.Println("Examples:")
 	fmt.Println("  agent-deck group list")
 	fmt.Println("  agent-deck group show work --resolved        # Verify the effective [groups.\"work\".claude] config")
+	fmt.Println("  agent-deck group codex sync work")
 	fmt.Println("  agent-deck group create mobile")
 	fmt.Println("  agent-deck group create ios --parent mobile")
 	fmt.Println("  agent-deck group update mobile --default-path /path/to/repo")
@@ -508,9 +514,75 @@ func handleGroupShow(profile string, args []string) {
 		}
 		fmt.Fprintf(&b, "  plugins:    %s\n", orNone(strings.Join(res.Plugins, ", ")))
 		fmt.Fprintf(&b, "  mcps:       %s\n", orNone(strings.Join(res.MCPs, ", ")))
+
+		codex := session.ResolveGroupCodex(groupPath)
+		jsonData["codex"] = codex
+		b.WriteString("\nCodex config (resolved for a session in this group):\n")
+		fmt.Fprintf(&b, "  config_dir: %s  [%s]\n", orNone(codex.ConfigDir), codex.ConfigDirSource)
+		fmt.Fprintf(&b, "  env_file:   %s  [%s]\n", orNone(codex.EnvFile), codex.EnvFileSource)
+		fmt.Fprintf(&b, "  command:    %s  [%s]\n", codex.Command, codex.CommandSource)
+		fmt.Fprintf(&b, "  skills:     %s\n", orNone(strings.Join(codex.Skills, ", ")))
+		fmt.Fprintf(&b, "  marketplaces: %s\n", orNone(strings.Join(codex.Marketplaces, ", ")))
+		fmt.Fprintf(&b, "  plugins:    %s\n", orNone(strings.Join(codex.Plugins, ", ")))
+		fmt.Fprintf(&b, "  mcps:       %s\n", orNone(strings.Join(codex.MCPs, ", ")))
 	}
 
 	out.Print(b.String(), jsonData)
+}
+
+// handleGroupCodex manages explicit, potentially side-effecting Codex actions.
+func handleGroupCodex(profile string, args []string) {
+	if len(args) == 0 || args[0] != "sync" || len(args) != 2 {
+		fmt.Println("Usage: agent-deck group codex sync <name>")
+		os.Exit(1)
+	}
+	name := args[1]
+	storage, err := session.NewStorageWithProfile(profile)
+	if err != nil {
+		fmt.Printf("failed to initialize storage: %v\n", err)
+		os.Exit(1)
+	}
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		fmt.Printf("failed to load sessions: %v\n", err)
+		os.Exit(1)
+	}
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	groupPath := normalizeGroupPath(name)
+	if _, exists := groupTree.Groups[groupPath]; !exists {
+		for path, g := range groupTree.Groups {
+			if strings.EqualFold(g.Name, name) {
+				groupPath = path
+				break
+			}
+		}
+	}
+	if _, exists := groupTree.Groups[groupPath]; !exists {
+		fmt.Printf("group '%s' not found\n", name)
+		os.Exit(2)
+	}
+	if err := session.SyncGroupCodexPlugins(groupPath); err != nil {
+		fmt.Printf("failed to sync Codex plugins for %s: %v\n", groupPath, err)
+		os.Exit(1)
+	}
+	fmt.Printf("Synced configured Codex plugins for %s\n", groupPath)
+
+	// Home skills are otherwise attached only at session create/start, so a
+	// newly declared skill would stay absent until someone happened to start a
+	// session in this group. Sync the whole home in one command instead.
+	skillProblems, err := session.SyncGroupCodexHomeSkills(groupPath)
+	if err != nil {
+		fmt.Printf("failed to sync Codex home skills for %s: %v\n", groupPath, err)
+		os.Exit(1)
+	}
+	if len(skillProblems) > 0 {
+		fmt.Printf("Codex home skills for %s completed with %d problem(s):\n", groupPath, len(skillProblems))
+		for _, p := range skillProblems {
+			fmt.Printf("  - %s\n", p)
+		}
+	} else {
+		fmt.Printf("Synced configured Codex home skills for %s\n", groupPath)
+	}
 }
 
 // orNone renders an empty string as "(none)" for human-readable output.
@@ -619,6 +691,12 @@ func handleGroupCreate(profile string, args []string) {
 		os.Exit(1)
 	}
 
+	cfg, _ := session.LoadUserConfig()
+	if managedSessionGroupCreationRestricted(cfg) {
+		out.Error("group creation is restricted to the user; create the group outside an Agent Deck-managed session", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+
 	// Load sessions and groups
 	storage, err := session.NewStorageWithProfile(profile)
 	if err != nil {
@@ -637,7 +715,6 @@ func handleGroupCreate(profile string, args []string) {
 
 	// Seed the new-group default from [group_defaults].max_concurrent. An
 	// explicit --max-concurrent flag still wins (applied post-create below).
-	cfg, _ := session.LoadUserConfig()
 	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 
 	var newGroup *session.Group
@@ -1074,6 +1151,7 @@ func handleGroupMove(profile string, args []string) {
 
 	// Seed the new-group default in case the move target must be auto-created.
 	cfg, _ := session.LoadUserConfig()
+	storage.SetGroupCreationRestricted(managedSessionGroupCreationRestricted(cfg))
 	groupTree.DefaultMaxConcurrent = cfg.GroupDefaults.MaxConcurrent
 
 	// Try to match an existing group by exact name first, then case-insensitive
@@ -1099,6 +1177,10 @@ func handleGroupMove(profile string, args []string) {
 			}
 		}
 		if !matched {
+			if err := requireExistingGroupForManagedSession(cfg, groupTree, targetGroupPath); err != nil {
+				out.Error(err.Error(), ErrCodeInvalidOperation)
+				os.Exit(1)
+			}
 			// No existing group found - CreateGroup normalizes the path
 			created := groupTree.CreateGroup(targetGroupPath)
 			targetGroupPath = created.Path
@@ -1337,44 +1419,28 @@ func truncateGroupName(s string, max int) string {
 	return s[:max-3] + "..."
 }
 
-// reorderGroupArgs reorders arguments so flags come before positional args
-// This fixes Go's flag package limitation where flags after positional args are ignored
-// e.g., "ios --parent mobile" becomes "--parent mobile ios"
+// reorderGroupArgs is a no-op pass-through kept only so the group handlers read
+// uniformly; normalizeArgs (called immediately after, on the same args) does the
+// hoisting of flags ahead of positionals that Go's flag package needs.
+//
+// It used to do that hoisting itself, using a HARDCODED map of which flags take
+// a value: --parent, --default-path, --position, -p. Every other value-taking
+// flag was treated as a boolean, so its value was orphaned into the positional
+// list and the flag then swallowed whatever positional followed it. That is how
+// `group update <name> --max-concurrent 12` became `--max-concurrent <name> 12`:
+// the group name was parsed as the int, the command exited 2 printing the usage
+// block that documents the very form it had just rejected, and only the
+// `--max-concurrent=12` form worked.
+//
+// The allowlist was the defect, not its contents — a flag added to any group
+// subcommand later is silently broken in its space-separated form until someone
+// remembers a map in an unrelated function. normalizeArgs derives the same
+// question ("does this flag take a value?") from the FlagSet itself via
+// IsBoolFlag, so it cannot drift, and it additionally honours the `--`
+// terminator and a bare `-`. Reordering twice is what produced the mis-parse;
+// reordering once, correctly, is the whole fix.
 func reorderGroupArgs(args []string) []string {
-	if len(args) == 0 {
-		return args
-	}
-
-	// Known flags that take a value
-	valueFlags := map[string]bool{
-		"--parent":       true,
-		"--default-path": true,
-		"--position":     true,
-		"-p":             true,
-	}
-
-	var flags []string
-	var positional []string
-
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-
-		// Check if it's a flag
-		if strings.HasPrefix(arg, "-") {
-			flags = append(flags, arg)
-
-			// Check if this flag takes a value (and value is separate)
-			if !strings.Contains(arg, "=") && valueFlags[arg] && i+1 < len(args) {
-				i++
-				flags = append(flags, args[i])
-			}
-		} else {
-			positional = append(positional, arg)
-		}
-	}
-
-	// Return flags first, then positional args
-	return append(flags, positional...)
+	return args
 }
 
 // handleGroupChange implements issue #447: reparent an entire group (and its

@@ -60,6 +60,33 @@ func rowStatusGlyph(status session.Status, substate session.Substate, archived b
 		}
 	}
 
+	// Two substates pair with idle/waiting, NOT error, and both look perfectly
+	// healthy in a single frame — quiet pane, visible prompt — which is exactly
+	// why each needs its own glyph. Rendered as a plain "○"/"◐" they are
+	// indistinguishable from a session that is simply done, and an operator
+	// scanning the list has no reason to look closer.
+	//
+	// "❓" = awaiting-choice: a permission dialog or a decision menu is on
+	// screen and only a human can resolve it. Without its own glyph it renders
+	// as an ordinary idle "○" and nobody looks — which is how a run sat blocked
+	// for over an hour behind a question its user was never shown (2026-08-20).
+	// "🧊" = stalled: the composer holds text it cannot submit.
+	// "🌐" = the API is unreachable (transport). RECOVERABLE, and it reads
+	// nothing like a credential failure — an operator must not go hunting for a
+	// login when the network is what broke. Deliberately NOT under StatusError:
+	// no status derivation maps a transport banner to error, so a glyph gated
+	// there would never render.
+	if status == session.StatusIdle || status == session.StatusWaiting {
+		switch substate {
+		case session.SubstateStalled:
+			icon = "🧊"
+		case session.SubstateAPIError:
+			icon = "🌐"
+		case session.SubstateAwaitingChoice:
+			icon = "❓"
+		}
+	}
+
 	// A stopped session can ALSO need auth: an agent that exits on a 401 may exit
 	// cleanly (exit 0), which the exit-code classifier reads as stopped (■). That
 	// is the silent-decay shape of the 2026-07-26 fleet death — sessions quietly

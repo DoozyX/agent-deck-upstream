@@ -15,13 +15,17 @@ import (
 
 const codexTrustLevelTrusted = "trusted"
 
+// codexConfigLock remains an alias for callers and tests written before the
+// shared config lock was introduced.
+type codexConfigLock = ConfigFileLock
+
 // acquireCodexConfigLock serializes mutations to a Codex config.toml.
 //
 // This is an alias over the shared AcquireConfigFileLock (config_file_lock.go),
 // not a second implementation. It used to be a private copy of the same
 // mutex-plus-flock rule; the copy is what let the MCP writers ship without any
 // serialization at all, because there was no obvious shared thing to reach for.
-func acquireCodexConfigLock(configPath string) (*ConfigFileLock, error) {
+func acquireCodexConfigLock(configPath string) (*codexConfigLock, error) {
 	return AcquireConfigFileLock(configPath)
 }
 

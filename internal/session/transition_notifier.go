@@ -284,7 +284,7 @@ func instanceAcceptsTransitionEvents(inst *Instance) bool {
 	if inst == nil {
 		return false
 	}
-	if inst.NoTransitionNotify {
+	if inst.NoTransitionNotify || inst.IsArchived() {
 		return false
 	}
 	return true
@@ -328,7 +328,7 @@ func (n *TransitionNotifier) NotifyTransition(event TransitionNotificationEvent)
 
 	// Issue #1225: commit the transition to the parent's durable outbox instead
 	// of gating delivery on the parent being idle.
-	committed, transient, reason := n.commitEventToInbox(event)
+	committed, transient, reason := n.commitEventToInboxAtArchiveBoundary(event)
 	if committed {
 		n.markNotified(event)
 		event.DeliveryResult = transitionDeliveryCommitted
@@ -378,7 +378,7 @@ func (n *TransitionNotifier) NotifyFinished(event TransitionNotificationEvent) T
 	// the removed pre-filter dropped both, silently killing legitimate parented
 	// completions.
 	// Issue #1225: commit the finished event to the parent's durable outbox.
-	committed, transient, reason := n.commitEventToInbox(event)
+	committed, transient, reason := n.commitEventToInboxAtArchiveBoundary(event)
 	if committed {
 		event.DeliveryResult = transitionDeliveryCommitted
 		return event
@@ -408,13 +408,22 @@ func resolveParentNotificationTarget(child *Instance, byID map[string]*Instance)
 	if parent.ID == child.ID {
 		return nil
 	}
-	if isConductorSessionTitle(parent.Title) {
+	if parentNeedsStatusRefresh(parent) {
 		_ = parent.UpdateStatus()
 		if !isLiveSessionStatus(parent.Status) {
 			return nil
 		}
 	}
 	return parent
+}
+
+// parentNeedsStatusRefresh identifies parent tools whose live status controls
+// whether an event-driven wake can safely be delivered. Claude conductors drain
+// their inbox on a turn boundary; Codex parents receive an explicit completion
+// prompt. Both must be re-probed here so a stale persisted "running" state does
+// not suppress a legitimate idle wake.
+func parentNeedsStatusRefresh(parent *Instance) bool {
+	return parent != nil && (isConductorSessionTitle(parent.Title) || IsCodexCompatible(parent.Tool))
 }
 
 func isLiveSessionStatus(status Status) bool {
@@ -508,7 +517,18 @@ func transitionEventOutputHash(inst *Instance) string {
 // on a genuine new turn. Returns "" when no transcript is resolvable (e.g.
 // non-Claude tools), which routes the caller to the legacy 90s window.
 func transitionContentSignal(inst *Instance) string {
-	path := inst.GetJSONLPath()
+	if inst == nil || !IsClaudeCompatible(inst.Tool) || inst.ClaudeSessionID == "" {
+		return ""
+	}
+	// Transcript placement follows the instance's group/profile/account
+	// config. Using the process-global Claude directory here makes grouped
+	// children look transcript-less, degrading Stop-edge dedup to the coarse
+	// 90-second fallback and replaying one logical turn to the parent.
+	path := resolveClaudeTranscriptPath(
+		GetClaudeConfigDirForInstance(inst),
+		inst.ProjectPath,
+		inst.ClaudeSessionID,
+	)
 	if path == "" {
 		return ""
 	}

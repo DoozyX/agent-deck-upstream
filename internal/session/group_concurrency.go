@@ -24,16 +24,16 @@ func IsAtCap(running, max int) bool {
 	return running >= max
 }
 
-// CountRunningInGroup returns the number of instances in the given group whose
-// status is StatusRunning. Queued, stopped, and other-group instances are not
-// counted.
+// CountRunningInGroup returns the number of active instances in the given
+// group whose status is StatusRunning. Queued, stopped, archived, and
+// other-group instances are not counted.
 func CountRunningInGroup(instances []*Instance, groupPath string) int {
 	n := 0
 	for _, inst := range instances {
 		if inst == nil {
 			continue
 		}
-		if inst.GroupPath == groupPath && inst.Status == StatusRunning {
+		if inst.GroupPath == groupPath && inst.Status == StatusRunning && !inst.IsArchived() {
 			n++
 		}
 	}
