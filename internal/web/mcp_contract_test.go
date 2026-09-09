@@ -197,9 +197,14 @@ func TestClassifyMCPErrorKinds(t *testing.T) {
 		{errors.New("session not found: abc"), MCPErrorNotFound},
 		{errors.New("malformed tool arguments"), MCPErrorMalformed},
 		{errors.New("required property sessionId missing"), MCPErrorMalformed},
+		{errors.New("required: missing properties: [\"sessionId\"]"), MCPErrorMalformed},
 		{errors.New("additional properties are not allowed"), MCPErrorMalformed},
+		// Singular form must classify as malformed (not only the plural phrasing).
+		{errors.New(`additional property "command" is not allowed`), MCPErrorMalformed},
+		{errors.New(`unexpected additional properties ["command"]`), MCPErrorMalformed},
 		{errors.New("boom"), MCPErrorBackend},
 		// Backend failures that merely contain "invalid" must stay backend.
+		// (Supersedes any interim wording that mapped bare "invalid" to malformed.)
 		{errors.New("invalid session state from backend"), MCPErrorBackend},
 		{errors.New("tmux returned invalid pane id"), MCPErrorBackend},
 	}
@@ -208,6 +213,64 @@ func TestClassifyMCPErrorKinds(t *testing.T) {
 			t.Fatalf("ClassifyMCPError(%v) = %v, want %v", tc.err, got, tc.kind)
 		}
 	}
+}
+
+func TestClassifyMCPError_JSONSchemaResolvedForms(t *testing.T) {
+	resolve := func(t *testing.T, name string) *jsonschema.Resolved {
+		t.Helper()
+		var spec MCPToolSpec
+		for _, tool := range MCPToolCatalog() {
+			if tool.Name == name {
+				spec = tool
+				break
+			}
+		}
+		if spec.Name == "" {
+			t.Fatalf("%s missing from catalog", name)
+		}
+		raw, err := json.Marshal(spec.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var schema jsonschema.Schema
+		if err := json.Unmarshal(raw, &schema); err != nil {
+			t.Fatal(err)
+		}
+		resolved, err := schema.Resolve(nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resolved
+	}
+
+	t.Run("required_missing_properties", func(t *testing.T) {
+		err := resolve(t, "session_details").Validate(map[string]any{})
+		if err == nil {
+			t.Fatal("expected missing sessionId validation error")
+		}
+		if !strings.Contains(err.Error(), "required: missing properties:") {
+			t.Fatalf("unexpected validator wording: %v", err)
+		}
+		if got := ClassifyMCPError(err); got != MCPErrorMalformed {
+			t.Fatalf("ClassifyMCPError(%v) = %v, want malformed", err, got)
+		}
+	})
+
+	t.Run("singular_additional_property", func(t *testing.T) {
+		// Drive the real schema once, then assert the singular message form
+		// (validators may pluralize; the classifier must accept singular too).
+		err := resolve(t, "fleet_status").Validate(map[string]any{"command": "x"})
+		if err == nil {
+			t.Fatal("expected additional-properties validation error")
+		}
+		if got := ClassifyMCPError(err); got != MCPErrorMalformed {
+			t.Fatalf("ClassifyMCPError(resolved %v) = %v, want malformed", err, got)
+		}
+		singular := errors.New(`additional property "command" is not allowed`)
+		if got := ClassifyMCPError(singular); got != MCPErrorMalformed {
+			t.Fatalf("ClassifyMCPError(%v) = %v, want malformed", singular, got)
+		}
+	})
 }
 
 func TestNewMCPHandler_RejectsUnauthorized(t *testing.T) {

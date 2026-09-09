@@ -125,8 +125,10 @@ func ClassifyMCPError(err error) MCPErrorKind {
 		return MCPErrorRateLimited
 	case strings.Contains(msg, "malformed"),
 		strings.Contains(msg, "required property"),
+		strings.Contains(msg, "missing properties"), // jsonschema-go: "required: missing properties: [...]"
 		strings.Contains(msg, "additional properties"),
-		strings.Contains(msg, "additional property"):
+		strings.Contains(msg, "additional property"),
+		strings.Contains(msg, "unexpected additional"):
 		return MCPErrorMalformed
 	default:
 		return MCPErrorBackend
