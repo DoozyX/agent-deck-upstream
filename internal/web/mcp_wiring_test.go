@@ -214,6 +214,33 @@ func TestServer_MCPRoute_SupportsCORSPreflight(t *testing.T) {
 	}
 }
 
+func TestServer_MCPRoute_ToolsListOmitsUnsupportedCacheFields(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, MCPNoAuth: true, WebMutations: true})
+	initRec := postMCP(t, srv.Handler(), MCPRoute, "", mcpInitializeBody(), "")
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("initialize status=%d body=%s, want 200", initRec.Code, initRec.Body.String())
+	}
+	sessionID := initRec.Header().Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("initialize did not return Mcp-Session-Id")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, MCPRoute, strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	for _, unsupported := range []string{`"ttlMs"`, `"cacheScope"`} {
+		if strings.Contains(rec.Body.String(), unsupported) {
+			t.Errorf("tools/list contains unsupported field %s: %s", unsupported, rec.Body.String())
+		}
+	}
+}
+
 func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
 	previousTimeout := mcpSessionTimeout
 	mcpSessionTimeout = 50 * time.Millisecond
