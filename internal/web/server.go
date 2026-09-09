@@ -304,6 +304,12 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 
+	// Dedicated Streamable HTTP MCP endpoint (/mcp). Enabled only when a
+	// bearer token is configured: authorizeRequest short-circuits to allow
+	// when Token is empty, so tokenless MCP would otherwise be an open
+	// loopback surface. Keep /api/mcps catalog/session routes above separate.
+	s.registerMCPRoute(mux)
+
 	handler := withRecover(s.csrfProtect(mux))
 
 	s.httpServer = &http.Server{

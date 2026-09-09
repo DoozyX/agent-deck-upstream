@@ -172,6 +172,10 @@ func buildWebServerFromOptions(profile string, options webCommandOptions, menuDa
 	// registered but answer 503, which is the pre-existing behaviour and adds
 	// no unauthenticated surface. See TestBuildWebServer_MCPRoutesAuth for the
 	// endpoint-by-endpoint regression matrix.
+	//
+	// The dedicated Streamable HTTP /mcp endpoint is gated the same way inside
+	// web.NewServer (Config.Token): it is mounted only when resolveWebToken
+	// yielded a non-empty bearer. Do not duplicate auth here.
 	if resolvedToken != "" {
 		server.SetMCPManager(web.NewDefaultMCPManager())
 	}
