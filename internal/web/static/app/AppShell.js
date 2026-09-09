@@ -27,7 +27,7 @@ import { SkillsPane } from './panes/SkillsPane.js'
 import { Icon, ICONS } from './icons.js'
 import { menuModelSignal } from './dataModel.js'
 import {
-  selectedIdSignal, createSessionDialogSignal, confirmDialogSignal,
+  selectedIdSignal, selectedRemoteSignal, selectLocalSession, createSessionDialogSignal, confirmDialogSignal,
   groupNameDialogSignal, mutationsEnabledSignal, infoDrawerOpenSignal,
   profilesSignal, systemStatsSignal,
   toolFilterSignal, visibleToolsSignal, toolFilterFallbackSignal,
@@ -50,6 +50,22 @@ import { apiFetch, authHeaders } from './api.js'
 import { shortcutsOverlaySignal } from './state.js'
 
 function WorkHead() {
+  const remote = selectedRemoteSignal.value
+  if (remote) {
+    const s = remote.session
+    return html`
+      <div class="work-head">
+        <div class="path">
+          <span class="kind">REMOTE</span>
+          <span class="seg">${remote.remote} /</span>
+          <span class="cur">${s.title}</span>
+        </div>
+        <span class=${`status-chip ${s.status}`}><span class="d"/>${s.status}</span>
+        <span class="spacer"/>
+      </div>
+    `
+  }
+
   const { sessions } = menuModelSignal.value
   const selected = selectedIdSignal.value
   const session = sessions.find(s => s.id === selected) || sessions[0]
@@ -210,6 +226,10 @@ export function AppShell() {
     // session list from menuModelSignal. Stable across SSE updates because
     // we resolve by ID, not by array index in a possibly-stale snapshot.
     const moveFocus = (delta) => {
+      // Same guard as focusedSession(): while a remote session is attached,
+      // j/k must not walk into the local list — selectLocalSession would clear
+      // selectedRemoteSignal and silently tear the remote terminal down.
+      if (selectedRemoteSignal.value) return
       const sessions = (menuModelSignal.value?.sessions) || []
       if (sessions.length === 0) return
       const curId = selectedIdSignal.value
@@ -221,10 +241,17 @@ export function AppShell() {
         // j/k navigation. Activating the terminal hands focus to xterm.js,
         // which swallows subsequent keypresses (issue #780 review).
         // The TUI's `enter` key is what opens; j/k just moves focus.
-        selectedIdSignal.value = next.id
+        selectLocalSession(next.id)
       }
     }
     const focusedSession = () => {
+      // A remote session selection clears selectedIdSignal (mutually
+      // exclusive, see state.js selectLocalSession/selectRemoteSession), so
+      // without this guard every local-session shortcut below (Enter, D,
+      // rename, Shift+Enter) would fall through to sessions[0] and act on
+      // an unrelated local session instead of doing nothing — destructive
+      // for 'D'. None of these shortcuts have a remote-session equivalent.
+      if (selectedRemoteSignal.value) return null
       const sessions = (menuModelSignal.value?.sessions) || []
       const id = selectedIdSignal.value
       return sessions.find(s => s.id === id) || sessions[0] || null
@@ -281,7 +308,7 @@ export function AppShell() {
         const s = focusedSession()
         if (s) {
           e.preventDefault()
-          selectedIdSignal.value = s.id
+          selectLocalSession(s.id)
           activeTabSignal.value = 'terminal'
         }
       } else if (e.key === 'n' && mutationsEnabledSignal.value) {

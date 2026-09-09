@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -352,6 +353,30 @@ type mockSendRetryTarget struct {
 	sendEnterCalls   int32
 	sendCtrlCCalls   int32
 	sendChunkedCalls int32
+	namedKeys        []string
+	namedKeyMu       sync.Mutex
+}
+
+// SendNamedKey records the named keys the send path forwards. The
+// gated-composer recovery (Escape+Enter) asserts against this.
+func (m *mockSendRetryTarget) SendNamedKey(key string) error {
+	m.namedKeyMu.Lock()
+	defer m.namedKeyMu.Unlock()
+	m.namedKeys = append(m.namedKeys, key)
+	return nil
+}
+
+// namedKeyCount returns how many times key was forwarded.
+func (m *mockSendRetryTarget) namedKeyCount(key string) int {
+	m.namedKeyMu.Lock()
+	defer m.namedKeyMu.Unlock()
+	n := 0
+	for _, k := range m.namedKeys {
+		if k == key {
+			n++
+		}
+	}
+	return n
 }
 
 func (m *mockSendRetryTarget) SendKeysChunked(_ string) error {
@@ -429,6 +454,48 @@ func TestSendWithRetryTarget_StopsWhenActive(t *testing.T) {
 	}
 	if atomic.LoadInt32(&mock.sendEnterCalls) != 0 {
 		t.Fatalf("expected 0 SendEnter calls, got %d", mock.sendEnterCalls)
+	}
+}
+
+// A message sent while Claude is already mid-turn is accepted into Claude's
+// own queue rather than starting a second active transition. The queue receipt
+// is positive acceptance evidence; reporting issue-#876 no_evidence here tells
+// callers to retry and double-queues the message.
+func TestSendWithRetryTarget_NewQueuedMessageReceiptIsSubmitted(t *testing.T) {
+	mock := &mockSendRetryTarget{
+		statuses: []string{"running"},
+		panes: []string{
+			"working on the current turn\n",
+			"working on the current turn\n❯ Press up to edit queued messages\n",
+		},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, "STOP REVIEWING AND WRITE YOUR VERDICT FILE NOW", false, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, verifyDelivery: true,
+	})
+	if err != nil {
+		t.Fatalf("a newly visible Claude queue receipt confirms acceptance: %v", err)
+	}
+	if delivery != deliverySubmitted {
+		t.Fatalf("delivery: want %q, got %q", deliverySubmitted, delivery)
+	}
+}
+
+func TestSendWithRetryTarget_PreExistingQueueReceiptIsNotEvidence(t *testing.T) {
+	const queuedPane = "working on the current turn\n❯ Press up to edit queued messages\n"
+	mock := &mockSendRetryTarget{
+		statuses: []string{"running"},
+		panes:    []string{queuedPane},
+	}
+
+	delivery, err := sendWithRetryTarget(mock, "a second message that vanished", false, sendRetryOptions{
+		maxRetries: 4, checkDelay: 0, verifyDelivery: true, queuedReceiptBeforeSend: true,
+	})
+	if err == nil {
+		t.Fatal("a queue marker that predates this send must not certify it")
+	}
+	if delivery == deliverySubmitted {
+		t.Fatal("stale queue marker must not report submitted")
 	}
 }
 

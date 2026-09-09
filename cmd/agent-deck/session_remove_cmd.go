@@ -1,9 +1,11 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -24,6 +26,7 @@ func handleSessionRemove(profile string, args []string) {
 	force := fs.Bool("force", false, "Remove even when the session is running/waiting/idle; with --all-errored, also include pinned sessions (destructive)")
 	allErrored := fs.Bool("all-errored", false, "Remove every unpinned session currently in the 'error' state (bulk); pinned sessions are skipped unless --force is given")
 	pruneWorktree := fs.Bool("prune-worktree", false, "Also kill the process and remove any git worktree (destructive)")
+	cascade := fs.Bool("cascade", false, "Also remove every live autonomous continuation ('(cont.)') descended from this session, transitively")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session remove <id|title> [options]")
@@ -31,6 +34,10 @@ func handleSessionRemove(profile string, args []string) {
 		fmt.Println()
 		fmt.Println("Remove a session from the registry. By default only stopped or")
 		fmt.Println("errored sessions may be removed; use --force to bypass.")
+		fmt.Println()
+		fmt.Println("A session that handed off to an autonomous continuation cannot be")
+		fmt.Println("removed on its own: removal would leave the '(cont.)' running with")
+		fmt.Println("nothing pointing at it. Pass --cascade to retire the whole chain.")
 		fmt.Println()
 		fmt.Println("This is registry-only by default: Claude transcripts under")
 		fmt.Println("~/.claude/projects/ are preserved. Pass --prune-worktree to also")
@@ -85,19 +92,35 @@ func handleSessionRemove(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	// Always kill the tmux scope + its process tree before deleting the
-	// registry row (issue #59, v1.7.68). Previously Kill() was only
-	// called inside pruneSessionWorktree, so `session remove --force`
-	// on a running session left the claude child running as an orphan
-	// — observed on the maintainer's host as a 33-hour orphan claude
-	// process with a since-deleted AGENTDECK_INSTANCE_ID.
+	// A retired session's continuations must not outlive it. The autonomous
+	// context-budget handoff forks a "(cont.)" that inherits the SOURCE's
+	// parent, so it is a sibling of the session it replaced and disappears
+	// from any "what did I just retire" check made by title or by parent.
+	// Twice in one run that left a continuation running loose in a shared
+	// worktree — once a reviewer holding write authority, alongside a live
+	// implementer committing from the same tree.
 	//
-	// KillAndWait runs the SIGTERM→SIGKILL escalation synchronously so
-	// the kill completes before this short-lived CLI exits.
-	_ = inst.KillAndWait()
+	// Refusing is the default rather than cascading silently: removing more
+	// sessions than the operator named is the kind of surprise that has to be
+	// asked for, while leaving one running is the failure actually observed.
+	live := liveContinuationClosure(removeContinuationStateDB(storage), inst.ID, instancesByID(instances))
+	if len(live) > 0 && !*cascade {
+		out.ErrorWithData(
+			continuationBlockMessage(inst.Title, live),
+			ErrCodeInvalidOperation,
+			map[string]interface{}{
+				"id":            inst.ID,
+				"title":         inst.Title,
+				"continuations": continuationRows(live),
+			})
+		os.Exit(1)
+	}
 
-	if *pruneWorktree {
-		pruneSessionWorktree(inst)
+	queueTx, err := session.BeginRuntimeQueueTransaction(inst.ID)
+	if err != nil {
+		lockErr := fmt.Errorf("failed to lock runtime queue for %s: %w", inst.ID, err)
+		out.Error(lockErr.Error(), ErrCodeInvalidOperation)
+		os.Exit(1)
 	}
 
 	// v1.9.1 (#909): RemoveSessionAndVerify replaces the
@@ -107,21 +130,142 @@ func handleSessionRemove(profile string, args []string) {
 	// reports success but row stays" failure noted in the bug report.
 	instances = dropInstance(instances, inst.ID)
 	groupTree := session.NewGroupTreeWithGroups(instances, groups)
-	if err := storage.RemoveSessionAndVerify(inst.ID, instances, groupTree); err != nil {
+	removePayload := session.LifecycleIntentPayload(inst, inst.WorktreePath, "")
+	removeIntent, err := session.PrepareLifecycleIntent(storage, inst.ID, session.LifecycleIntentRemove, removePayload)
+	if err != nil {
+		queueTx.Release()
+		out.Error(fmt.Sprintf("failed to prepare removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := commitRuntimeQueueRemoval(queueTx, func() error {
+		return sessionRemovePersist(storage, inst.ID, instances, groupTree, removeIntent.Token)
+	}); err != nil {
+		queueTx.Release()
 		out.Error(fmt.Sprintf("failed to remove session: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
+	}
+	if err := session.AdvanceLifecycleIntent(storage, removeIntent, "row-deleted", removePayload); err != nil {
+		queueTx.Release()
+		out.Error(fmt.Sprintf("failed to advance removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	queueTx.Release()
+	if err := inst.KillAndWait(); err != nil && inst.Exists() {
+		out.Error(fmt.Sprintf("session removed but process teardown failed: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if err := session.CompleteLifecycleIntent(storage, removeIntent); err != nil {
+		out.Error(fmt.Sprintf("failed to complete removal: %v", err), ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	if *pruneWorktree {
+		pruneSessionWorktree(inst)
 	}
 
 	// Best-effort transition-notifier cleanup for issue #910 — see the
 	// matching block in handleRemove for rationale.
 	_, _ = session.SweepInboxesForChildSession(inst.ID)
 	_, _ = session.RemoveNotifyStateRecord(inst.ID)
+	// Drop any prompt this session was queued with, so it cannot be delivered
+	// to a later session that happens to reuse the id.
+	session.DiscardQueuedMessage(inst.ID)
 
-	out.Success(fmt.Sprintf("Removed session: %s", inst.Title), map[string]interface{}{
+	payload := map[string]interface{}{
 		"success": true,
 		"id":      inst.ID,
 		"title":   inst.Title,
-	})
+	}
+	summary := fmt.Sprintf("Removed session: %s", inst.Title)
+
+	// Cascade after the source is gone. Order matters: if a continuation
+	// removal fails, the source is already retired and the failure names
+	// exactly which sessions are still live, so the operator is never left
+	// guessing which half of the chain went.
+	if len(live) > 0 {
+		removed, failures := removeContinuationChain(storage, live, *pruneWorktree)
+		payload["continuations_removed"] = removed
+		if len(failures) > 0 {
+			payload["continuations_failed"] = failures
+			out.ErrorWithData(
+				fmt.Sprintf("removed session '%s' but %d of its %d continuations could not be removed: %s",
+					inst.Title, len(failures), len(live), strings.Join(failures, "; ")),
+				ErrCodeInvalidOperation, payload)
+			os.Exit(1)
+		}
+		summary = fmt.Sprintf("Removed session: %s (+%d continuation(s))", inst.Title, len(removed))
+	}
+
+	out.Success(summary, payload)
+}
+
+// removeContinuationChain retires each live continuation of an
+// already-removed source, returning the rows that went and a description of
+// each that did not.
+//
+// Each removal reloads the session list. A cascade kills panes as it goes and
+// the chain can be several links long, so reusing the pre-cascade snapshot
+// would hand RemoveSessionAndVerify a stale instance set — the same
+// resurrect-the-row hazard #909 closed for the single-session path.
+func removeContinuationChain(storage *session.Storage, live []*session.Instance, pruneWorktree bool) ([]map[string]interface{}, []string) {
+	var removed []map[string]interface{}
+	var failures []string
+
+	for _, cont := range live {
+		row := map[string]interface{}{"id": cont.ID, "title": cont.Title}
+		if err := removeOneContinuation(storage, cont, pruneWorktree); err != nil {
+			failures = append(failures, fmt.Sprintf("%s (%s): %v", cont.ID, cont.Title, err))
+			continue
+		}
+		removed = append(removed, row)
+	}
+	return removed, failures
+}
+
+// removeOneContinuation performs the same registry removal the single-session
+// path performs, for one continuation. --force is implied: a continuation is
+// running by definition (that is why it must not be orphaned), so the
+// stopped/error status gate would reject every one of them.
+func removeOneContinuation(storage *session.Storage, cont *session.Instance, pruneWorktree bool) error {
+	instances, groups, err := storage.LoadWithGroups()
+	if err != nil {
+		return fmt.Errorf("reload sessions: %w", err)
+	}
+
+	queueTx, err := session.BeginRuntimeQueueTransaction(cont.ID)
+	if err != nil {
+		return fmt.Errorf("lock runtime queue: %w", err)
+	}
+	defer queueTx.Release()
+
+	instances = dropInstance(instances, cont.ID)
+	groupTree := session.NewGroupTreeWithGroups(instances, groups)
+	payload := session.LifecycleIntentPayload(cont, cont.WorktreePath, "")
+	intent, err := session.PrepareLifecycleIntent(storage, cont.ID, session.LifecycleIntentRemove, payload)
+	if err != nil {
+		return fmt.Errorf("prepare removal: %w", err)
+	}
+	if err := commitRuntimeQueueRemoval(queueTx, func() error {
+		return sessionRemovePersist(storage, cont.ID, instances, groupTree, intent.Token)
+	}); err != nil {
+		return fmt.Errorf("remove: %w", err)
+	}
+	if err := session.AdvanceLifecycleIntent(storage, intent, "row-deleted", payload); err != nil {
+		return fmt.Errorf("advance removal: %w", err)
+	}
+	if err := cont.KillAndWait(); err != nil && cont.Exists() {
+		return fmt.Errorf("process teardown: %w", err)
+	}
+	if err := session.CompleteLifecycleIntent(storage, intent); err != nil {
+		return fmt.Errorf("complete removal: %w", err)
+	}
+	if pruneWorktree {
+		pruneSessionWorktree(cont)
+	}
+
+	_, _ = session.SweepInboxesForChildSession(cont.ID)
+	_, _ = session.RemoveNotifyStateRecord(cont.ID)
+	session.DiscardQueuedMessage(cont.ID)
+	return nil
 }
 
 // isRemovableStatus returns true for states where a session can be removed
@@ -200,47 +344,176 @@ func bulkRemoveSessions(
 	doomed []*session.Instance,
 	pruneWorktree bool,
 ) []removedSessionRow {
-	doomedIDs := make(map[string]bool, len(doomed))
-	for _, inst := range doomed {
-		doomedIDs[inst.ID] = true
-	}
-
 	removed := make([]removedSessionRow, 0, len(doomed))
 	removedIDs := make([]string, 0, len(doomed))
+	queueTxs := make([]*session.RuntimeQueueTransaction, 0, len(doomed))
+	removeIntents := make([]session.LifecycleIntentHandle, 0, len(doomed))
+	remaining := append([]*session.Instance(nil), instances...)
 	for _, inst := range doomed {
+		queueTx, err := session.BeginRuntimeQueueTransaction(inst.ID)
+		if err != nil {
+			cleanupErr := finalizeCommittedBulkRemovals(storage, removedIDs, queueTxs, removeIntents)
+			out.Error(fmt.Sprintf("failed to lock runtime queue for %s: %v", inst.ID, errors.Join(err, cleanupErr)), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		nextRemaining := dropInstance(remaining, inst.ID)
+		groupTree := session.NewGroupTreeWithGroups(nextRemaining, groups)
+		removePayload := session.LifecycleIntentPayload(inst, inst.WorktreePath, "")
+		removeIntent, err := session.PrepareLifecycleIntent(storage, inst.ID, session.LifecycleIntentRemove, removePayload)
+		if err != nil {
+			queueTx.Release()
+			cleanupErr := finalizeCommittedBulkRemovals(storage, removedIDs, queueTxs, removeIntents)
+			out.Error(fmt.Sprintf("failed to prepare removal %s: %v", inst.ID, errors.Join(err, cleanupErr)), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		if err := bulkSessionRemovePersist(storage, inst.ID, nextRemaining, groupTree, removeIntent.Token); err != nil {
+			queueTx.Release()
+			cleanupErr := finalizeCommittedBulkRemovals(storage, removedIDs, queueTxs, removeIntents)
+			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, errors.Join(err, cleanupErr)), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		if err := session.AdvanceLifecycleIntent(storage, removeIntent, "row-deleted", removePayload); err != nil {
+			queueTx.Release()
+			cleanupErr := finalizeCommittedBulkRemovals(storage, removedIDs, queueTxs, removeIntents)
+			out.Error(fmt.Sprintf("failed to advance removal %s: %v", inst.ID, errors.Join(err, cleanupErr)), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		remaining = nextRemaining
 		_ = inst.KillAndWait()
 		if pruneWorktree {
 			pruneSessionWorktree(inst)
 		}
-		if err := storage.DeleteInstance(inst.ID); err != nil {
-			out.Error(fmt.Sprintf("failed to remove session %s: %v", inst.ID, err), ErrCodeInvalidOperation)
-			os.Exit(1)
-		}
 		removedIDs = append(removedIDs, inst.ID)
 		removed = append(removed, map[string]interface{}{"id": inst.ID, "title": inst.Title})
+		queueTxs = append(queueTxs, queueTx)
+		removeIntents = append(removeIntents, removeIntent)
 	}
 
-	remaining := make([]*session.Instance, 0, len(instances)-len(removedIDs))
-	for _, inst := range instances {
-		if !doomedIDs[inst.ID] {
-			remaining = append(remaining, inst)
-		}
-	}
-	groupTree := session.NewGroupTreeWithGroups(remaining, groups)
-	if err := storage.SaveGroupsOnly(groupTree); err != nil {
-		out.Error(fmt.Sprintf("failed to save session state: %v", err), ErrCodeInvalidOperation)
+	// A concurrent full-table writer can resurrect an early removal after its
+	// per-item verification while later items are still being processed. Sweep
+	// only the successfully committed IDs once more. Failed/unattempted sessions
+	// never enter removedIDs; a committed prefix is fully finalized even when a
+	// later item fails, so its now-unreachable queues cannot become orphans.
+	if err := finalizeCommittedBulkRemovals(storage, removedIDs, queueTxs, removeIntents); err != nil {
+		out.Error(fmt.Sprintf("failed to verify bulk session removal: %v", err), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
-
-	for _, id := range removedIDs {
-		if exists, _ := storage.InstanceExists(id); exists {
-			_ = storage.DeleteInstance(id)
-		}
-		// Best-effort transition-notifier cleanup (issue #910).
-		_, _ = session.SweepInboxesForChildSession(id)
-		_, _ = session.RemoveNotifyStateRecord(id)
-	}
 	return removed
+}
+
+const bulkFinalVerifyAttempts = 6
+
+func finalizeCommittedBulkRemovals(storage *session.Storage, removedIDs []string, queueTxs []*session.RuntimeQueueTransaction, intents []session.LifecycleIntentHandle) error {
+	if len(removedIDs) != len(queueTxs) || len(removedIDs) != len(intents) {
+		releaseRuntimeQueueTransactions(queueTxs)
+		return fmt.Errorf("bulk removal requires one-to-one ids, queue transactions, and lifecycle intents: ids=%d queues=%d intents=%d", len(removedIDs), len(queueTxs), len(intents))
+	}
+	intentByID := make(map[string]session.LifecycleIntentHandle, len(intents))
+	for _, intent := range intents {
+		if intent.InstanceID == "" || intent.Token == "" {
+			releaseRuntimeQueueTransactions(queueTxs)
+			return fmt.Errorf("bulk removal requires one-to-one lifecycle identity: empty instance id or token")
+		}
+		if _, duplicate := intentByID[intent.InstanceID]; duplicate {
+			releaseRuntimeQueueTransactions(queueTxs)
+			return fmt.Errorf("bulk removal requires one-to-one lifecycle identity: duplicate intent for %q", intent.InstanceID)
+		}
+		intentByID[intent.InstanceID] = intent
+	}
+	for _, id := range removedIDs {
+		if _, ok := intentByID[id]; !ok {
+			releaseRuntimeQueueTransactions(queueTxs)
+			return fmt.Errorf("bulk removal requires one-to-one lifecycle identity: no intent for %q", id)
+		}
+	}
+	if len(removedIDs) == 0 {
+		return nil
+	}
+	for pass := 0; pass < bulkFinalVerifyAttempts; pass++ {
+		for _, id := range removedIDs {
+			if err := bulkSessionReverifyPersist(storage, id, nil, nil, intentByID[id].Token); err != nil {
+				releaseRuntimeQueueTransactions(queueTxs)
+				return fmt.Errorf("reverify %s: %w", id, err)
+			}
+		}
+
+		tokens := make([]string, 0, len(removedIDs))
+		for _, id := range removedIDs {
+			tokens = append(tokens, intentByID[id].Token)
+		}
+		absent, observeErr := bulkObserveAbsent(storage, removedIDs, tokens, func() error {
+			var discardErr error
+			for i, tx := range queueTxs {
+				if err := bulkQueueDiscard(tx); err != nil {
+					discardErr = errors.Join(discardErr, fmt.Errorf("discard queue for %s: %w", removedIDs[i], err))
+				}
+			}
+			return discardErr
+		})
+		if observeErr != nil && !absent {
+			releaseRuntimeQueueTransactions(queueTxs)
+			return fmt.Errorf("observe removed ids: %w", observeErr)
+		}
+		if absent {
+			releaseRuntimeQueueTransactions(queueTxs)
+			var intentErr error
+			for _, intent := range intents {
+				intentErr = errors.Join(intentErr, session.CompleteLifecycleIntent(storage, intent))
+			}
+			return errors.Join(observeErr, intentErr, cleanupCommittedBulkRemovals(removedIDs))
+		}
+	}
+	releaseRuntimeQueueTransactions(queueTxs)
+	return fmt.Errorf("removed rows kept reappearing after %d verification passes", bulkFinalVerifyAttempts)
+}
+
+func cleanupCommittedBulkRemovals(ids []string) error {
+	var cleanupErr error
+	for _, id := range ids {
+		if _, err := bulkSweepInboxes(id); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("sweep inboxes for %s: %w", id, err))
+		}
+		if _, err := bulkRemoveNotifyState(id); err != nil {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("remove notify state for %s: %w", id, err))
+		}
+		bulkDiscardQueuedMessage(id)
+	}
+	return cleanupErr
+}
+
+func releaseRuntimeQueueTransactions(txs []*session.RuntimeQueueTransaction) {
+	for _, tx := range txs {
+		tx.Release()
+	}
+}
+
+var (
+	sessionRemovePersist = func(storage *session.Storage, id string, remaining []*session.Instance, tree *session.GroupTree, token string) error {
+		return storage.RemoveSessionAndVerify(id, remaining, tree, token)
+	}
+	bulkSessionRemovePersist = func(storage *session.Storage, id string, remaining []*session.Instance, tree *session.GroupTree, token string) error {
+		return storage.RemoveSessionAndVerify(id, remaining, tree, token)
+	}
+	bulkSessionReverifyPersist = func(storage *session.Storage, id string, remaining []*session.Instance, tree *session.GroupTree, token string) error {
+		return storage.DeleteInstance(id, token)
+	}
+	bulkObserveAbsent = func(storage *session.Storage, ids, tokens []string, confirmed func() error) (bool, error) {
+		return storage.WithInstancesAbsent(ids, confirmed, tokens...)
+	}
+	bulkQueueDiscard         = func(tx *session.RuntimeQueueTransaction) error { return tx.Discard() }
+	bulkSweepInboxes         = session.SweepInboxesForChildSession
+	bulkRemoveNotifyState    = session.RemoveNotifyStateRecord
+	bulkDiscardQueuedMessage = session.DiscardQueuedMessage
+)
+
+func commitRuntimeQueueRemoval(tx *session.RuntimeQueueTransaction, persistRemoval func() error) error {
+	if err := persistRemoval(); err != nil {
+		return fmt.Errorf("persist removal: %w", err)
+	}
+	if err := tx.Discard(); err != nil {
+		return fmt.Errorf("discard runtime queue: %w", err)
+	}
+	return nil
 }
 
 // pruneSessionWorktree kills the session and removes its git worktree (if any).

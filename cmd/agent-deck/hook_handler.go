@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +21,8 @@ import (
 
 var hookHandlerLog = logging.ForComponent(logging.CompSession)
 
+var marshalStopHookDecision = json.Marshal
+
 // maxHookPayloadSize limits the size of JSON payloads read from stdin
 // to prevent denial-of-service via oversized input.
 const maxHookPayloadSize = 1 << 20 // 1 MB
@@ -27,8 +30,16 @@ const maxHookPayloadSize = 1 << 20 // 1 MB
 // validInstanceID matches UUID-style instance IDs to prevent path traversal.
 var validInstanceID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
-// hookPayload represents the JSON payload Claude Code sends to hooks via stdin.
-// Only the fields we need are decoded; unknown fields are ignored.
+type hookProtocol uint8
+
+const (
+	hookProtocolGeneric hookProtocol = iota
+	hookProtocolClaude
+	hookProtocolCodex
+)
+
+// hookPayload represents the common lifecycle payload agents send via stdin.
+// Only the fields Agent Deck uses are decoded; unknown fields are ignored.
 type hookPayload struct {
 	HookEventName  string          `json:"hook_event_name"`
 	SessionID      string          `json:"session_id"`
@@ -175,13 +186,21 @@ func mapEventToStatus(event string) string {
 	}
 }
 
-// handleHookHandler processes a Claude Code hook event.
-// Reads JSON from stdin, maps the event to a status, and writes a status file.
-// Always exits 0 to avoid blocking Claude Code.
+// handleHookHandler preserves the original no-argument entry point used by
+// tests and third-party integrations. With no source signal, Claude remains
+// the backwards-compatible default.
 func handleHookHandler() {
+	handleHookHandlerArgs(nil)
+}
+
+// handleHookHandlerArgs processes a lifecycle hook from any supported agent.
+// Status and cwd synchronization are shared; protocol-specific responses are
+// emitted only for agents that understand them. It always exits 0 so a broken
+// notification integration cannot block the underlying agent.
+func handleHookHandlerArgs(args []string) {
 	instanceID := os.Getenv("AGENTDECK_INSTANCE_ID")
 	if instanceID == "" {
-		// No instance ID means this Claude session isn't managed by agent-deck.
+		// No instance ID means this session isn't managed by agent-deck.
 		// Exit silently without error.
 		return
 	}
@@ -201,6 +220,7 @@ func handleHookHandler() {
 	if err := json.Unmarshal(data, &payload); err != nil {
 		return
 	}
+	protocol := resolveHookProtocol(hookSourceArg(args), os.Getenv("AGENTDECK_TOOL"), payload.Source)
 
 	// Issue #1233: gracefully degrade when the session's working directory
 	// (PROJECT_DIR / cwd) has been renamed or removed out from under a running
@@ -253,15 +273,23 @@ func handleHookHandler() {
 		writeHookStatus(instanceID, status, sessionID, payload.HookEventName, payload.Cwd)
 	}
 
+	// Working-directory synchronization is agent-neutral. Every lifecycle
+	// adapter reports cwd through the same payload field.
+	applyHookCwdSync(instanceID, payload.Cwd)
+
+	// Everything below speaks Claude's hook response protocol or consumes
+	// Claude-specific transcript data. In particular, Codex must not drain the
+	// durable inbox and emit {decision:"block"}: Codex does not understand that
+	// response, so doing so would silently lose child completion events.
+	if protocol != hookProtocolClaude {
+		return
+	}
+
 	// #572: Sync agent-deck title from Claude Code's --name / /rename value.
 	// Event-driven so user-facing rename lands within one hook tick; silent
 	// no-op when no name is set (sessions started without --name keep the
 	// existing agent-deck adjective-noun title).
 	applyClaudeTitleSync(instanceID, sessionID)
-
-	// Propagate Claude Code's /cd working-directory change (v2.1.169+) so the
-	// TUI/web display and transcript lookups track the current cwd.
-	applyClaudeCwdSync(instanceID, payload.Cwd)
 
 	// Write cost event if this hook contains usage data
 	logCostDebug("hook event=%s instance=%s status=%s", payload.HookEventName, instanceID, status)
@@ -305,12 +333,145 @@ func handleHookHandler() {
 	// the maintainer note in the PR. Emitting here is harmless under the legacy
 	// async install (Claude ignores stdout) and activates once sync lands.
 	if isStopHookEvent(payload.HookEventName) {
-		if dec, blocked, derr := session.DrainForStopHook(instanceID, resolveStopHookActive(payload)); derr == nil && blocked {
-			if out, mErr := json.Marshal(dec); mErr == nil {
-				fmt.Println(string(out))
-			}
+		if err := emitStopHookDecision(instanceID, resolveStopHookActive(payload), os.Stdout); err != nil {
+			hookHandlerLog.Warn("stop_hook_delivery_failed",
+				slog.String("instance", instanceID),
+				slog.String("error", err.Error()),
+			)
 		}
 	}
+}
+
+func emitStopHookDecision(instanceID string, stopHookActive bool, writer io.Writer) (retErr error) {
+	queueTx, err := session.BeginRuntimeQueueTransaction(instanceID)
+	if err != nil {
+		return fmt.Errorf("begin Stop-hook delivery lease: %w", err)
+	}
+	defer queueTx.Release()
+	dec, blocked, err := session.StageForStopHook(instanceID, stopHookActive)
+	if err != nil || !blocked {
+		return err
+	}
+	deliveryCommitted := false
+	responseWritten := dec.StopBlockResponseWritten
+	defer func() {
+		if !deliveryCommitted && !responseWritten {
+			if rollbackErr := session.RollbackStopHookDelivery(instanceID, dec.StopBlockToken); rollbackErr != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("rollback Stop-hook reservation: %w", rollbackErr))
+			}
+		}
+	}()
+	out, err := marshalStopHookDecision(dec)
+	if err != nil {
+		return fmt.Errorf("marshal Stop-hook response: %w", err)
+	}
+	out = append(out, '\n')
+	if dec.RuntimeQueueAckToken != "" {
+		if !responseWritten {
+			if err := writeStopHookResponse(writer, out); err != nil {
+				return err
+			}
+			if err := session.MarkStopHookResponseWritten(instanceID, dec.StopBlockToken); err != nil {
+				return fmt.Errorf("record Stop-hook response write: %w", err)
+			}
+			responseWritten = true
+		}
+		if err := session.AcknowledgeStopHookDelivery(instanceID, dec.InboxAckToken, dec.RuntimeQueueAckToken, dec.StopBlockToken, dec.StopBlockCount); err != nil {
+			return fmt.Errorf("acknowledge Stop-hook inbox/budget: %w", err)
+		}
+		deliveryCommitted = true
+		return nil
+	}
+	if dec.InboxReason == "" {
+		return nil
+	}
+	fallback := session.StopHookDecision{Decision: dec.Decision, Reason: dec.InboxReason}
+	out, err = marshalStopHookDecision(fallback)
+	if err != nil {
+		return fmt.Errorf("marshal inbox-only Stop-hook response: %w", err)
+	}
+	if !responseWritten {
+		if err := writeStopHookResponse(writer, append(out, '\n')); err != nil {
+			return err
+		}
+		if err := session.MarkStopHookResponseWritten(instanceID, dec.StopBlockToken); err != nil {
+			return fmt.Errorf("record inbox-only Stop-hook response write: %w", err)
+		}
+		responseWritten = true
+	}
+	if err := session.AcknowledgeStopHookDelivery(instanceID, dec.InboxAckToken, dec.RuntimeQueueAckToken, dec.StopBlockToken, dec.StopBlockCount); err != nil {
+		return fmt.Errorf("acknowledge Stop-hook inbox/budget: %w", err)
+	}
+	deliveryCommitted = true
+	return nil
+}
+
+var stopHookWriteTimeout = 2 * time.Second
+
+func writeStopHookResponse(writer io.Writer, out []byte) error {
+	writeAll := func() error {
+		n, err := writer.Write(out)
+		if err != nil {
+			return fmt.Errorf("write Stop-hook response: %w", err)
+		}
+		if n != len(out) {
+			return fmt.Errorf("write Stop-hook response: %w", io.ErrShortWrite)
+		}
+		return nil
+	}
+	type deadlineWriter interface{ SetWriteDeadline(time.Time) error }
+	if dw, ok := writer.(deadlineWriter); ok {
+		if err := dw.SetWriteDeadline(time.Now().Add(stopHookWriteTimeout)); err == nil {
+			defer func() { _ = dw.SetWriteDeadline(time.Time{}) }()
+			return writeAll()
+		}
+	}
+	// In-memory/test writers complete synchronously and do not
+	// need a cancellation goroutine. Keeping them synchronous also makes it
+	// impossible for bytes to appear after this function returns.
+	type synchronousStopHookWriter interface{ StopHookSynchronousWriter() }
+	switch writer.(type) {
+	case *bytes.Buffer, synchronousStopHookWriter:
+		return writeAll()
+	}
+	// Arbitrary io.Writer implementations have no cancellation contract. Do not
+	// launch an unkillable goroutine: rejecting before Write guarantees neither
+	// a leak nor late bytes. Production stdout is *os.File and uses the OS write
+	// deadline above (including full pipes).
+	return errors.New("write Stop-hook response: writer is not deadline-capable")
+}
+
+func hookSourceArg(args []string) string {
+	for i, arg := range args {
+		if arg == "--source" && i+1 < len(args) {
+			return args[i+1]
+		}
+		if value, ok := strings.CutPrefix(arg, "--source="); ok {
+			return value
+		}
+	}
+	return ""
+}
+
+// resolveHookProtocol uses the explicit CLI source first, then the managed
+// session's configured tool, then the payload hint. The tool compatibility
+// checks also recognize user-defined wrappers around Claude and Codex.
+func resolveHookProtocol(explicitSource, tool, payloadSource string) hookProtocol {
+	for _, source := range []string{explicitSource, tool, payloadSource} {
+		source = strings.TrimSpace(source)
+		if source == "" {
+			continue
+		}
+		if session.IsCodexCompatible(source) {
+			return hookProtocolCodex
+		}
+		if session.IsClaudeCompatible(source) {
+			return hookProtocolClaude
+		}
+		return hookProtocolGeneric
+	}
+
+	return hookProtocolClaude
 }
 
 // parentIsDSP reports whether the parent process (typically the claude binary)

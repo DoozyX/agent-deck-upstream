@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,8 @@ import (
 //
 // Both tests build the binary once via the eval harness's buildOnce machinery
 // and exec it with `--help` / `--version`. The timed window covers everything
-// from process spawn through the package init() block (initColorProfile,
-// initUpdateSettings), the pre-dispatch tmux probes
+// from process spawn through the package init() block (initColorProfile), the
+// pre-dispatch setup in main() (initUpdateSettings), the pre-dispatch tmux probes
 // (tmux.SetDefaultSocketName, tmux.WarnIfVulnerableTmux), and the
 // subcommand-routing path that prints help/version and exits.
 //
@@ -38,14 +39,27 @@ import (
 const (
 	coldStartHelpBase    = 8 * time.Millisecond // → ColdBudget = 40ms locally, 80ms in CI
 	coldStartVersionBase = 8 * time.Millisecond // → ColdBudget = 40ms locally, 80ms in CI
+	coldStartDarwinBase  = 20 * time.Millisecond
 )
 
+func coldStartBase(base time.Duration) time.Duration {
+	// macOS process launch includes dyld and code-signature validation costs
+	// that are absent from the Linux baseline above. Under a package-wide test
+	// run the stable trimmed mean is 45–90ms even when main does no setup, so a
+	// Linux-calibrated 40ms ceiling produces false regressions on supported Macs.
+	if runtime.GOOS == "darwin" {
+		return coldStartDarwinBase
+	}
+	return base
+}
+
 // TestPerf_ColdStart_Help measures `agent-deck --help` end-to-end walltime.
-// Catches regressions in package init (initColorProfile, initUpdateSettings)
+// Catches regressions in package init (initColorProfile), main()'s
+// pre-dispatch setup (initUpdateSettings),
 // and the pre-dispatch tmux probes (SetDefaultSocketName, WarnIfVulnerableTmux).
 func TestPerf_ColdStart_Help(t *testing.T) {
 	testutil.SkipIfShort(t)
-	budget := testutil.ColdBudget(t, coldStartHelpBase)
+	budget := testutil.ColdBudget(t, coldStartBase(coldStartHelpBase))
 	sb := harness.NewSandbox(t)
 	env := perfEnv(sb)
 
@@ -64,7 +78,7 @@ func TestPerf_ColdStart_Help(t *testing.T) {
 // same init path.
 func TestPerf_ColdStart_Version(t *testing.T) {
 	testutil.SkipIfShort(t)
-	budget := testutil.ColdBudget(t, coldStartVersionBase)
+	budget := testutil.ColdBudget(t, coldStartBase(coldStartVersionBase))
 	sb := harness.NewSandbox(t)
 	env := perfEnv(sb)
 

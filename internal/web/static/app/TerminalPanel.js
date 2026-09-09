@@ -2,7 +2,7 @@
 // Ports createTerminalUI, connectWS, installTerminalTouchScroll from app.js
 import { html } from 'htm/preact'
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks'
-import { selectedIdSignal, authTokenSignal, wsStateSignal, readOnlySignal } from './state.js'
+import { selectedIdSignal, selectedRemoteSignal, authTokenSignal, wsStateSignal, readOnlySignal, remoteAttachFailedSignal, remoteTerminalKey } from './state.js'
 import { apiFetch } from './api.js'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
@@ -23,6 +23,17 @@ function wsURLForSession(sessionId, token) {
   const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
   const url = new URL(
     wsProto + '://' + window.location.host + '/ws/session/' + encodeURIComponent(sessionId)
+  )
+  if (token) url.searchParams.set('token', token)
+  return url.toString()
+}
+
+// Same, for a remote (SSH-attached) session: /ws/remote/<remote>/session/<id>
+function wsURLForRemoteSession(remote, sessionId, token) {
+  const wsProto = window.location.protocol === 'https:' ? 'wss' : 'ws'
+  const url = new URL(
+    wsProto + '://' + window.location.host + '/ws/remote/' + encodeURIComponent(remote) +
+    '/session/' + encodeURIComponent(sessionId)
   )
   if (token) url.searchParams.set('token', token)
   return url.toString()
@@ -73,7 +84,28 @@ function installTouchScroll(container, xtermEl, controller) {
 export function TerminalPanel() {
   const containerRef = useRef(null)
   const ctxRef = useRef(null)  // { terminal, fitAddon, ws, resizeObserver, controller, decoder, reconnectTimer, reconnectAttempt, wsReconnectEnabled, terminalAttached }
-  const sessionId = selectedIdSignal.value
+  const remoteSel = selectedRemoteSignal.value
+  const sessionId = remoteSel ? remoteSel.session.id : selectedIdSignal.value
+  const remoteName = remoteSel ? remoteSel.remote : null
+  // Composite key so switching local <-> remote (or between two remotes) tears
+  // down and rebuilds the terminal exactly as a local session switch does —
+  // two remotes can share a session id, and a remote id can collide with a
+  // local one.
+  //
+  // The `#<attempt>` suffix carries state.js's per-selection counter, which
+  // only advances when the user re-selects a tile whose CURRENT attempt has
+  // failed. That is what makes clicking the same Fleet tile a retry: remote
+  // attach has no Restart action (it must not touch the local mutation
+  // endpoints), so after a fatal REMOTE_ATTACH_FAILED disables reconnect,
+  // re-clicking the tile is the only retry gesture the UI offers, and without
+  // this the key was unchanged, the effect never re-ran, and the double-init
+  // guard below would have short-circuited anyway (round 7 #1). Re-clicking a
+  // HEALTHY tile leaves the counter — and this key — alone, so the live
+  // terminal is never torn down (round 8 #2); the failed state that gates the
+  // bump is published from the fatal branch below.
+  const terminalKey = remoteName
+    ? remoteTerminalKey(remoteName, sessionId, remoteSel.attempt)
+    : sessionId
   // #782: terminal-fatal errors (e.g. TMUX_SESSION_NOT_FOUND) render as a
   // banner overlay rather than a `[error:CODE]` line on every WS reconnect.
   // null when there's no fatal error; an object { code, message, hint }
@@ -120,12 +152,16 @@ export function TerminalPanel() {
     // sessionId is unchanged.
     if (
       ctxRef.current &&
-      ctxRef.current.sessionId === sessionId &&
+      ctxRef.current.terminalKey === terminalKey &&
       ctxRef.current.reconnectKey === reconnectKey
     ) return
     cleanup()
     // #782: a fresh session connection clears any prior fatal banner.
     setFatalError(null)
+    // Round 8 (#2): this attach is starting over, so no attempt is in the
+    // failed state any more. Only one terminal is mounted at a time, so
+    // clearing outright cannot drop another attachment's marker.
+    remoteAttachFailedSignal.value = null
 
     const container = containerRef.current
     const token = authTokenSignal.value
@@ -213,6 +249,8 @@ export function TerminalPanel() {
     // Context object for this session
     const ctx = {
       sessionId,
+      remoteName,
+      terminalKey,
       reconnectKey, // #782: stamp the key so the double-init guard can detect a forced reconnect
       terminal,
       fitAddon,
@@ -322,7 +360,9 @@ export function TerminalPanel() {
       ctx.wsReconnectEnabled = true
       wsStateSignal.value = 'connecting'
 
-      const ws = new WebSocket(wsURLForSession(sessionId, token))
+      const ws = new WebSocket(
+        remoteName ? wsURLForRemoteSession(remoteName, sessionId, token) : wsURLForSession(sessionId, token)
+      )
       ws.binaryType = 'arraybuffer'
       ctx.ws = ws
 
@@ -354,21 +394,26 @@ export function TerminalPanel() {
                 ctx.terminalAttached = false
               }
             } else if (payload.type === 'error') {
-              if (payload.code === 'TERMINAL_ATTACH_FAILED' || payload.code === 'TMUX_SESSION_NOT_FOUND') {
+              if (payload.code === 'TERMINAL_ATTACH_FAILED' || payload.code === 'TMUX_SESSION_NOT_FOUND' || payload.code === 'REMOTE_ATTACH_FAILED') {
                 ctx.terminalAttached = false
               }
               // #782: TMUX_SESSION_NOT_FOUND is terminal-fatal — the
               // session is gone, so reconnecting will just emit the same
               // error in a tight loop and spam the terminal. Stop the
               // reconnect cycle and surface a banner with the actionable
-              // hint from the server.
-              if (payload.code === 'TMUX_SESSION_NOT_FOUND') {
+              // hint from the server. REMOTE_ATTACH_FAILED (bad host, ssh
+              // auth rejected) is the same shape for remote sessions.
+              if (payload.code === 'TMUX_SESSION_NOT_FOUND' || payload.code === 'REMOTE_ATTACH_FAILED') {
                 ctx.wsReconnectEnabled = false
                 setFatalError({
                   code: payload.code,
                   message: payload.message || 'tmux session is not available',
                   hint: payload.hint || '',
                 })
+                // Round 8 (#2): publish the failed state for THIS attempt, so
+                // re-clicking the tile in Fleet is a retry. Nothing else marks
+                // it, so a healthy attachment's re-click stays a no-op.
+                if (remoteName) remoteAttachFailedSignal.value = terminalKey
                 wsStateSignal.value = 'disconnected'
                 return
               }
@@ -412,18 +457,28 @@ export function TerminalPanel() {
       clearTimeout(resizeTimer)
       cleanup()
     }
-  }, [sessionId, reconnectKey, cleanup])
+  }, [terminalKey, reconnectKey, cleanup])
 
   if (!sessionId) {
     return html`<${EmptyStateDashboard} />`
   }
 
-  // #782: actionable banner for terminal-fatal errors (currently only
-  // TMUX_SESSION_NOT_FOUND). The xterm canvas stays mounted underneath so
-  // the banner can be dismissed without losing terminal state, and the
-  // user gets a one-click Restart action that calls the same endpoint as
-  // the sidebar Restart icon.
+  // #782: actionable banner for terminal-fatal errors — TMUX_SESSION_NOT_FOUND
+  // for local sessions, REMOTE_ATTACH_FAILED for remote ones. The xterm canvas
+  // stays mounted underneath so the banner can be dismissed without losing
+  // terminal state.
+  //
+  // The Restart action is LOCAL-ONLY. Remote sessions are attach-only by design
+  // (design.md, first decision: "No restart/send/archive/create/fork for remote
+  // sessions"), and /api/sessions/{id}/restart addresses the LOCAL session
+  // store: with a remote selected, sessionId above is remoteSel.session.id,
+  // which — per the terminalKey comment — can collide with a local id. Offering
+  // Restart there would either restart an unrelated local session (and then
+  // bump reconnectKey, making the remote look recovered) or silently 404/403
+  // into the empty catch below. So the button is not rendered for a remote, and
+  // this handler hard-stops as well in case it ever is.
   async function handleFatalRestart() {
+    if (remoteName) return
     try {
       await apiFetch('POST', '/api/sessions/' + sessionId + '/restart')
       setFatalError(null)
@@ -453,7 +508,7 @@ export function TerminalPanel() {
         <div ref=${containerRef} style="height: 100%; width: 100%; overflow: hidden;"/>
       </div>
       ${fatalError && html`
-        <div role="alert"
+        <div role="alert" data-testid="terminal-fatal-banner"
              style=${{
                position: 'absolute', inset: '12px 12px auto 12px',
                border: '1px solid rgba(247,118,142,0.4)',
@@ -461,6 +516,11 @@ export function TerminalPanel() {
                borderRadius: 'var(--radius-lg)',
                boxShadow: '0 30px 60px -20px rgba(0,0,0,0.55)',
                padding: '14px 16px',
+               // xterm paints its own absolutely-positioned canvas layers over
+               // the frame; without an explicit stacking order the link layer
+               // swallows pointer events for the banner's buttons, leaving a
+               // remote banner (whose sole action is Dismiss) unusable.
+               zIndex: 5,
              }}>
           <div style="display: flex; align-items: flex-start; gap: 12px;">
             <span style="color: var(--tn-red); font-size: 18px; line-height: 1;">⚠</span>
@@ -469,8 +529,8 @@ export function TerminalPanel() {
               <div style="font-size: 12.5px; color: var(--text); margin-top: 4px;">${fatalError.message}</div>
               ${fatalError.hint && html`<div style="font-size: 11.5px; color: var(--muted); margin-top: 6px;">${fatalError.hint}</div>`}
               <div style="display: flex; gap: 8px; margin-top: 10px;">
-                <button type="button" class="btn primary" onClick=${handleFatalRestart}>Restart session</button>
-                <button type="button" class="btn ghost" onClick=${() => setFatalError(null)}>Dismiss</button>
+                ${!remoteName && html`<button type="button" class="btn primary" data-testid="terminal-fatal-restart" onClick=${handleFatalRestart}>Restart session</button>`}
+                <button type="button" class="btn ghost" data-testid="terminal-fatal-dismiss" onClick=${() => setFatalError(null)}>Dismiss</button>
               </div>
             </div>
           </div>

@@ -106,8 +106,12 @@ func TestNormalizeArgs(t *testing.T) {
 				fs.Bool("json", false, "")
 				return fs
 			},
+			// "--" is preserved, not dropped: the user wrote it so that
+			// "--json" is a positional (a session title) rather than the flag.
+			// Dropping it re-promoted "--json" to a flag at fs.Parse time,
+			// which is exactly what "--" exists to prevent.
 			args:     []string{"--", "--json", "title"},
-			expected: []string{"--json", "title"},
+			expected: []string{"--", "--json", "title"},
 		},
 		{
 			name: "session show with title containing special chars",
@@ -255,7 +259,13 @@ func TestReorderArgsForFlagParsing_CmdAndGroup(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := reorderArgsForFlagParsing(tt.args)
+			fs := flag.NewFlagSet("add", flag.ContinueOnError)
+			fs.String("c", "", "")
+			fs.String("g", "", "")
+			fs.String("model", "", "")
+			fs.Bool("no-parent", false, "")
+
+			result := reorderArgsForFlagParsing(fs, tt.args)
 			if !reflect.DeepEqual(result, tt.expected) {
 				t.Errorf("reorderArgsForFlagParsing(%v) = %v, want %v", tt.args, result, tt.expected)
 			}
@@ -654,6 +664,34 @@ func TestShouldInheritParentGroup(t *testing.T) {
 			}
 			if probed != tt.wantProbe {
 				t.Fatalf("git worktree probe called = %v, want %v (lazy thunk must not run when steps 1-2 decide)", probed, tt.wantProbe)
+			}
+		})
+	}
+}
+
+// TestParseInstanceIDFromTmuxEnv covers the `tmux show-environment` parse used
+// by GetCurrentSessionID to recover the authoritative instance id. The tmux
+// session NAME's trailing token is a random short id (generateShortID), so this
+// env-based path is the only fallback that can resolve the current session.
+func TestParseInstanceIDFromTmuxEnv(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   string
+	}{
+		{"set", "AGENTDECK_INSTANCE_ID=8ba55599-1784819563\n", "8ba55599-1784819563"},
+		{"set no trailing newline", "AGENTDECK_INSTANCE_ID=abc123-1", "abc123-1"},
+		{"unset removed form", "-AGENTDECK_INSTANCE_ID\n", ""},
+		{"empty value", "AGENTDECK_INSTANCE_ID=\n", ""},
+		{"empty output", "", ""},
+		{"unrelated var only", "SOME_OTHER=x\n", ""},
+		{"surrounded by other lines", "FOO=1\nAGENTDECK_INSTANCE_ID=deadbeef-9\nBAR=2\n", "deadbeef-9"},
+		{"whitespace padding", "  AGENTDECK_INSTANCE_ID=zz-7  \n", "zz-7"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseInstanceIDFromTmuxEnv(tt.output); got != tt.want {
+				t.Errorf("parseInstanceIDFromTmuxEnv(%q) = %q, want %q", tt.output, got, tt.want)
 			}
 		})
 	}

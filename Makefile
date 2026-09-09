@@ -2,7 +2,17 @@
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
-VERSION=$(shell git describe --tags --always --dirty 2>/dev/null | sed 's/^v//' || echo "dev")
+# Base the injected version on the authoritative `var Version` in main.go
+# (kept in lockstep with release tags by the check-version target), NOT on
+# `git describe --tags` — the latter matches ANY reachable tag (incl. backup
+# tags like backup/…-2026-07-13), yielding a non-semver string the updater
+# parses as 0.0.0 and flags "update available" forever. Append the short
+# commit (+g<hash>[-dirty]) as semver build-metadata so dev builds stay
+# identifiable while still parsing as a real version.
+CODE_VERSION=$(shell sed -n 's/^var Version = "\([^"]*\)".*/\1/p' cmd/agent-deck/main.go)
+GIT_REV=$(shell git rev-parse --short HEAD 2>/dev/null)
+GIT_DIRTY=$(shell git diff --quiet 2>/dev/null || echo '-dirty')
+VERSION=$(CODE_VERSION)$(if $(GIT_REV),+g$(GIT_REV)$(GIT_DIRTY),)
 LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
 
 # Tailwind v4 standalone CLI (PERF-01)
@@ -138,7 +148,8 @@ dev:
 
 # Run tests (with race detector)
 test:
-	go test -race -v ./...
+	bash hooks/test-session-start.sh
+	scripts/run-tests.sh go test -race -v ./...
 
 # Run hard-gated walltime regression tests (Track B). Honors PERF_BUDGET_MULTIPLIER
 # (default 1.0 locally; CI sets 2.0). See docs/perf-budget-suite.md.
@@ -148,13 +159,13 @@ test:
 # the perf-smoke.yml CI gate which already runs the whole module.
 test-perf:
 	PERF_BUDGET_MULTIPLIER=$${PERF_BUDGET_MULTIPLIER:-1.0} \
-		go test -run '^TestPerf_' -race -v -count=1 -timeout 120s \
+		scripts/run-tests.sh go test -run '^TestPerf_' -race -v -count=1 -timeout 120s \
 		./...
 
 # Run advisory benchmarks (Track A). No -race — race overhead distorts ns/op.
 # Output is for trending; not a CI gate.
 bench:
-	go test -run '^$$' -bench '^Benchmark' -benchmem -benchtime=1x -count=3 -timeout 5m \
+	scripts/run-tests.sh go test -run '^$$' -bench '^Benchmark' -benchmem -benchtime=1x -count=3 -timeout 5m \
 		./cmd/agent-deck/... ./internal/tmux/...
 
 # Format code
@@ -183,7 +194,7 @@ release-local:
 	@which goreleaser > /dev/null || (echo "ERROR: goreleaser not found. Run: brew install goreleaser" && exit 1)
 	@test -n "$$GITHUB_TOKEN" || (echo "ERROR: GITHUB_TOKEN not set" && exit 1)
 	@TAG=$$(git describe --tags --exact-match 2>/dev/null) || (echo "ERROR: HEAD is not tagged. Run: git tag vX.Y.Z" && exit 1); \
-	CODE_VERSION=$$(grep 'var Version' cmd/agent-deck/main.go | sed 's/.*"\(.*\)".*/\1/'); \
+	CODE_VERSION=$$(sed -n 's/^var Version = "\([^"]*\)".*/\1/p' cmd/agent-deck/main.go); \
 	TAG_VERSION=$${TAG#v}; \
 	if [ "$$TAG_VERSION" != "$$CODE_VERSION" ]; then \
 		echo "ERROR: Tag $$TAG ($$TAG_VERSION) != code Version $$CODE_VERSION"; \
@@ -205,7 +216,7 @@ release-local:
 # Web UI test targets
 # Vitest (unit) + Playwright (e2e + screenshot regression). Both run against
 # the in-memory web fixture binary at tests/web/fixtures/cmd/web-fixture/.
-# See documentation/webui-overhaul-plan.md for the parity strategy.
+# The parity strategy is enforced by internal/web/parity_test.go.
 
 # One-shot install for fresh clones / CI. Installs npm deps + chromium browser.
 test-web-install:

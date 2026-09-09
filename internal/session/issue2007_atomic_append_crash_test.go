@@ -11,7 +11,7 @@ import (
 )
 
 func TestIssue2007_CheckedAppendCapacityRejectsOverflow(t *testing.T) {
-	if _, err := checkedInboxAppendCapacity(maxInt(), 1); err == nil {
+	if _, err := checkedInboxAppendCapacity(platformMaxInt(), 1); err == nil {
 		t.Fatal("overflowing inbox append capacity must be rejected")
 	}
 	if got, err := checkedInboxAppendCapacity(10, 20); err != nil || got != 31 {

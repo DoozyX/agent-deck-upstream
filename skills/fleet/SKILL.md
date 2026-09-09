@@ -24,6 +24,10 @@ This differs from the single sub-agent pattern in the `agent-deck` skill (one
 child + fire-&-forget / on-demand / blocking retrieval). Fleet is **many
 children + a non-blocking peek** across all of them.
 
+Want each task taken all the way to a merge-ready PR — implement → verify →
+review loop → PR → CI green — rather than just fan-out and supervision? Use
+the `orchestrate` skill instead; it builds on this one.
+
 **Run from inside an agent-deck session.** Launching auto-parents each child to
 the launching session, which is what makes them show up nested in the TUI and
 routes their completion back to you. (If you are not in a session, the children
@@ -69,11 +73,32 @@ agent-deck launch <path> -c claude --inherit-group -m "<task for this child>"
   worktree auto-inherits the parent's group, so a worktree fleet stays
   co-located with you with no extra flags. For a non-worktree path that doesn't
   inherit, add `--inherit-group` to force it.
+- **Auto-parenting must actually fire, or the group silently strays.** Both the
+  worktree auto-inherit and `--inherit-group` only work when a parent is
+  attached; with **no parent**, a worktree child falls back to its **branch-leaf
+  cwd-derived group** (a stray `feature-x` group next to — not under — yours).
+  Auto-parenting finds the conductor via `$AGENTDECK_INSTANCE_ID` in the
+  launching shell, so it silently no-ops when `launch` runs somewhere that env
+  isn't set — most often a **launch delegated to a subagent shell** instead of
+  issued from the conductor's own session. Two defenses: **(a)** run every
+  `launch` from the conductor's own session (never hand it to a subagent), and
+  when robustness matters pass the parent explicitly with
+  `--parent "$AGENTDECK_INSTANCE_ID"` rather than trusting auto-detect; **(b)**
+  verify the group right after launch (below) — the CLI also now prints a
+  `Warning: worktree child has no parent session…` line when this happens.
 - **Do NOT pass a custom `-g/--group` for fleet children.** An explicit group
-  overrides inheritance and drops the child into its own detached group
-  (e.g. a stray `fleet-issues` sitting next to — not under — your group). Leave
-  the group off and let it inherit; only set `-g` when you deliberately want a
-  child somewhere other than with the parent.
+  overrides inheritance — including the worktree auto-inherit above — and a name
+  matching no existing group creates one (e.g. a stray `fleet-issues` sitting
+  next to — not under — your group). Leave the group off and let it inherit;
+  only set `-g` when you deliberately want a child somewhere other than with the
+  parent.
+- **Never guess a group name from the repo or folder name.** Groups are nested
+  paths and the repo name is often only the leaf: guessing `-g baba` for a group
+  actually stored as `doozyx/baba` is what detaches a child from its siblings.
+  A bare leaf name resolves to an existing group when exactly one matches, but
+  when two do (`work/api`, `personal/api`) the launch errors out. If you must
+  name a group, use the full path from `$AGENTDECK_RESOLVED_GROUP` or
+  `agent-deck group list` — never a guess.
 - **`--assert-done` is on by default for `-c claude`**: the child's message gets
   a final-step instruction to print the completion sentinel
   (`===AGENTDECK_DONE=== status=ok summary=…`) so "done" is trustworthy.
@@ -102,13 +127,29 @@ agent-deck session children --json
 ```
 
 Lists your sub-sessions with, per child: `id`, `title`, live `status`
-(running / waiting / idle / error), and the last asserted completion
-(`done_status` = ok|fail, `done_summary`, `done_at`). Defaults to the current
+(running / waiting / idle / error), the last asserted completion
+(`done_status` = ok|fail, `done_summary`, `done_at`), and `context_tokens` —
+the child's current context size from its Claude transcript (absent for
+non-Claude tools). Watch `context_tokens` on long-running children: past
+~200k tell the child to wrap up and write a handoff; past ~250k rotate it —
+`agent-deck session remove <id> --force`, then relaunch fresh in the same
+working dir with the handoff — rather than letting it degrade into
+auto-compaction. Defaults to the current
 session; pass an id/title to inspect another parent. **Read-only** — it never
 clears the inbox, so you can poll it as often as you like from any chat without
 disturbing the conductor or other readers.
 
 A child with a `done_status` has finished and asserted its result.
+
+**A completion answers the work the child had at the time.** If you send a child
+follow-up work after it reported done, its old ledger entry would otherwise read
+as the answer to the new request — the child appearing to replay an old
+completion instead of doing the work. Rows carry `done_stale: true` (plus
+`last_sent_at`) when the completion predates the last message delivered to that
+child. Stale completions are not terminal: `--until-done` keeps waiting, no
+`done` event is emitted for them, and they are counted under `done_stale`
+instead of `done_ok`/`done_fail`. So after nudging a child, wait for its NEXT
+completion — the tooling no longer lets the previous one pass for it.
 
 **Prefer push over polling when your harness supports it.** Instead of
 re-running the check yourself, let the fleet notify you:
@@ -142,6 +183,30 @@ until agent-deck session children --json | jq -e 'all(.children[]; .done_status 
 
 (Cloud-side schedulers — e.g. Claude Code routines — run on remote infra and
 cannot reach your local tmux/state.db; fleet supervision stays local.)
+
+**If `done_status` is null for a child you watched print the sentinel**, check
+the transition-notifier daemon — it writes the completion ledger, and while it
+is down completions used to go unrecorded, so a `done_status != null` loop
+waited forever:
+
+```bash
+launchctl print gui/$UID/com.agentdeck.transition-notifier | grep -E 'state|last exit'   # macOS
+systemctl --user status agentdeck-transition-notifier                                    # Linux
+```
+
+A macOS agent stuck at `last exit code = 78: EX_CONFIG` with `needs LWCR update`
+has a stale Background Task Management code requirement (the binary was
+reinstalled). Re-register it — `kickstart` alone will not clear this:
+
+```bash
+launchctl bootout gui/$UID/com.agentdeck.transition-notifier
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.agentdeck.transition-notifier.plist
+```
+
+`session children` now also reads the sentinel straight from the child's
+transcript when the ledger has no entry, so a dead daemon no longer hides a
+completion — but it does still mute the pushed transition/completion events, so
+fix it rather than living without it.
 
 ### 4. Unblock a child that's waiting on you
 
@@ -177,6 +242,38 @@ agent-deck session output <child-id> --json
 Returns that child's latest full response. Use it once `session children` shows
 the child is done (or any time you want its current output).
 
+Reading it right after a `session send` can return the PREVIOUS turn's answer —
+the child has not replied yet. The payload says so: `"stale": true` with
+`"last_sent_at"`, and `--require-fresh` exits 3 instead of handing you the old
+response. Use it whenever you read output you expect to be a reply:
+
+```bash
+agent-deck session output <child-id> --json --require-fresh   # exit 3 = not answered yet
+```
+
+When the child has not produced a message at all — mid-turn, stuck on a
+permission prompt, sitting on a login screen, hung in a tool call — there is no
+response to read and `session output` will hand you an older one. Ask for the
+pane instead of reaching for `tmux capture-pane`:
+
+```bash
+agent-deck session output <child-id> --pane   # live pane render, full UI
+```
+
+Rule: `--pane` for what the child is **showing right now**, plain
+`session output` for what it **last said**.
+
+If a child's composer looks like it is holding an un-submitted message, do not
+send it a bare `Enter` through tmux. `session send` already retries and verifies
+submission, and reports `"delivery": "typed_not_submitted"` with a non-zero exit
+when it truly failed. For supervisor loops use `session nudge`, which refuses a
+stalled target (exit 1) and skips a busy one (exit 0, `"delivered": false`)
+instead of typing into it blind:
+
+```bash
+agent-deck session nudge <child-id> "<message>" --json
+```
+
 ## Worked example
 
 ```bash
@@ -210,7 +307,9 @@ there is no parent to inherit from, so a worktree session falls back to its
 group sitting *next to* your real group instead of with its siblings).
 
 So the rule **inverts** for independent sessions: *pass the group explicitly.*
-`$AGENTDECK_RESOLVED_GROUP` holds the launching session's group.
+`$AGENTDECK_RESOLVED_GROUP` holds the launching session's group — use it verbatim
+rather than typing a group name, so a nested group (`doozyx/baba`) can't be
+flattened into a stray namesake (`baba`).
 
 ```bash
 agent-deck launch <path> -w <branch> --no-parent -g "$AGENTDECK_RESOLVED_GROUP" -c claude -m "..."
@@ -223,12 +322,19 @@ agent-deck group move <child-id> "$AGENTDECK_RESOLVED_GROUP"
 agent-deck group delete <stray-group>        # once it's empty
 ```
 
-**Verify the group** after any `--no-parent` worktree launch (`ls --json` is
-large; filter to the one session):
+**Verify the group after every worktree launch** — not just `--no-parent` ones.
+Auto-parenting can silently miss (see the launch section), so confirm each
+worktree child actually landed in the group you expected instead of a
+branch-leaf stray (`ls --json` is large; filter to the one session):
 
 ```bash
-agent-deck ls --json | jq -r '.[] | select(.title|test("<name>")) | "\(.title)\t\(.group)"'
+agent-deck ls --json | jq -r '.[] | select(.title|test("<name>")) | "\(.title)\t\(.parent_id)\t\(.group)"'
 ```
+
+A `null` `parent_id` on a child you meant to parent, or a `group` matching the
+worktree's branch leaf, means auto-parenting missed — repair it with the
+`group move` + `group delete` pair above (and, if you still need parentage,
+`agent-deck session set-parent <id> <parent-id>`).
 
 ## Supervision tools the parent can use
 
@@ -243,8 +349,17 @@ All read-only / on-demand — none of them block your session:
   is terminal. Run it in the background for a completion wake-up, or attach a
   stream watcher for live events. Read-only like the plain form.
 - `agent-deck session output <id> --json` — a child's latest full response.
+  Add `--require-fresh` (exit 3) when you expect a reply to something you sent.
+- `agent-deck session output <id> --pane` — the child's live pane render, for
+  when it has produced no message yet: mid-turn, stuck on a prompt, hung tool
+  call. Use this rather than `tmux capture-pane`.
 - `agent-deck session send <id> "<msg>" [--wait|--stream|--no-wait|--draft]` —
-  send a follow-up / answer a `waiting` child.
+  send a follow-up / answer a `waiting` child. Submission is verified; a message
+  left in the composer is a non-zero exit with `"delivery": "typed_not_submitted"`,
+  so never chase it with a manual `tmux send-keys ... Enter`.
+- `agent-deck session nudge <id> "<msg>" [--json]` — a send with preconditions,
+  for supervisor loops: exit 1 when the target is stalled or unreachable, exit 0
+  with `"delivered": false` when it is merely busy.
 - `agent-deck session approve <id> [once|always|session|N]` — resolve one
   visibly active Codex approval menu. Do not use `session send <id> "1"`:
   Codex consumes the digit as a decision key, while `session send` adds a
@@ -255,7 +370,27 @@ All read-only / on-demand — none of them block your session:
   completion events from your durable inbox (last-wins per child, deduped).
   Optional: `session children` already surfaces the same `done_status` without
   consuming anything, so only drain if you specifically want to clear the queue.
-- `agent-deck session stop <id>` / `agent-deck session remove <id>` — teardown.
+- `agent-deck session remove <id> --force` — teardown. **Delete a finished
+  child, never archive it**: the pane dies, the row leaves the registry, and
+  the child's transcript and worktree both stay on disk. Archiving instead
+  leaves a dead row per child forever.
+
+### Native Claude peer messages
+
+Claude child rows include `peer_messaging_candidate` and `peer_name`. For a
+short status question, dependency handoff, review finding, or unblock answer:
+
+1. Call Claude Code's `ListAgents` and match the child's exact `peer_name`.
+2. When exactly one reachable peer matches, prefer `SendMessage`; it delivers
+   between tool calls and does not interfere with the child's terminal composer.
+3. Fall back to `agent-deck session send <id> "<msg>"` when the peer is absent
+   or ambiguous, delivery is held/refused, native tools are unavailable, or the
+   child is not Claude.
+
+Native messaging is a live coordination fast path, **not completion proof**.
+The durable agent-deck inbox, `session children` completion fields, and the
+`===AGENTDECK_DONE===` sentinel remain authoritative. Do not change Claude
+inbound or permission settings to make a message pass.
 
 There is no always-on background watcher started for you — "monitored by
 default" means transition/completion events **queue** in your inbox; you still
@@ -299,5 +434,8 @@ it with `AGENTDECK_NO_CHILDREN_CONTEXT=1` in its environment.
   To clean up phantom DBs from a past `-p` slip: the orphaned rows live under
   `profiles/<parent-id>/state.db`; back up and remove that dir (the child's
   worktree/branch stay on disk).
-- **Stopping / cleanup:** `agent-deck session stop <id>` and
-  `agent-deck session remove <id>` (add `--force` if needed) tear a child down.
+- **Stopping / cleanup:** `agent-deck session remove <id> --force` tears a
+  child down and drops it from the registry in one step (registry-only:
+  transcript and worktree survive). Use plain `session stop <id>` only when you
+  intend to restart that same session later; do not `session archive` finished
+  children.

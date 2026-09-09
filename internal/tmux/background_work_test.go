@@ -41,6 +41,40 @@ const paneAwaitingAgent = `⏺ Probe launched. Ending my turn.
    Model: Opus 4.8  Ctx: 136.9k  ⎇ feat/context-budget-handoff  (+0,-0)  𖠰 main
   ⏵⏵ bypass permissions on · 1 shell · ← for agents`
 
+// The footer's `← N agents` team counter is a ROSTER count, not a live-work
+// count: under agent teams it stays in the footer for the life of the session
+// once teammates exist. Treating it as pending background work pinned finished
+// sessions at "running" forever (Stop fired, bg-work override undid it), so it
+// must NOT be detected as pending on its own.
+const paneTeamAgentRoster = `⏺ Launching the implementation subagent now.
+
+⏺ Agent(Implement chart text size story 1)
+
+⏺ Step 3 of 5 running: implementation subagent is building story 1.
+                                                                            115708 tokens
+─────────────────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents
+
+  ⏺ main
+  ◯ impl-chart-text-size  Work exclusively in the git worktree /...  7m 14s · ↓ 144.9k tokens`
+
+// Captured live from an idle implementer session (Stop hook had fired 7 minutes
+// earlier, transcript not growing, no spinner, no interrupt hint) whose footer
+// still advertised two team agents. This is the exact pane that stayed green.
+const paneIdleWithAgentRoster = `  The round-1 record is appended to the design doc.
+
+  ===AGENTDECK_DONE=== status=ok summary=All 6 review findings fixed.
+
+✻ Worked for 7m 10s · done 2:40 PM
+                                                                 182963 tokens
+────────────────────────────────────────────────── impl-ha-connection-c2a2409a ─
+❯ push the branch
+────────────────────────────────────────────────────────────────────────────────
+   Model: Opus 5  Ctx: 181.6k  ⎇ feature/dooday-home-assistant-connecti...
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← 2 agents · /diff to hide …`
+
 const paneIdleNoBackground = `⏺ All done — your tests pass.
 
 ✻ Churned for 1m 2s
@@ -76,6 +110,8 @@ func TestClaudeBackgroundWorkPending(t *testing.T) {
 		{"shells still running (plural)", paneShellsStillRunning, true},
 		{"single shell footer", paneSingleShell, true},
 		{"awaiting background agent", paneAwaitingAgent, true},
+		{"team roster count in footer is not pending work", paneTeamAgentRoster, false},
+		{"idle session whose footer still lists team agents", paneIdleWithAgentRoster, false},
 		{"idle, nothing pending", paneIdleNoBackground, false},
 		{"completed agent row, no background", paneCompletedAgentRowNoBackground, false},
 		{"empty", "", false},

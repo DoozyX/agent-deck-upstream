@@ -18,6 +18,8 @@ func handleSessionHandoff(profile string, args []string) {
 	maxChars := fs.Int("max-chars", session.DefaultHandoffMaxChars, "Maximum transcript characters to include (tail-truncated)")
 	outPath := fs.String("out", "", "Write the prompt to a file instead of stdout")
 	jsonOutput := fs.Bool("json", false, "Output prompt + info as JSON")
+	targetTool := fs.String("target-tool", "codex", "Tool the continuation will run (bare name, e.g. \"codex\"); same tool as the source produces continuation framing instead of cross-tool handoff framing")
+	ignoreAgentPrompt := fs.Bool("ignore-agent-prompt", false, "Ignore any curated PROMPT.md left by a wrap-up and always rebuild from the transcript")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck session handoff <id|title> [options]")
@@ -50,17 +52,19 @@ func handleSessionHandoff(profile string, args []string) {
 		os.Exit(1)
 	}
 
-	prompt, info, err := session.BuildClaudeToCodexHandoffPrompt(inst, *maxChars)
+	resolved, err := resolveSessionHandoff(inst, *targetTool, *ignoreAgentPrompt, *maxChars)
 	if err != nil {
-		out.Error(fmt.Sprintf("build handoff prompt: %v", err), ErrCodeInvalidOperation)
+		out.Error(err.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
+	prompt, info := resolved.Text, resolved.Info
 
 	if *jsonOutput {
 		payload := struct {
 			Prompt string              `json:"prompt"`
+			Source string              `json:"source"`
 			Info   session.HandoffInfo `json:"info"`
-		}{Prompt: prompt, Info: info}
+		}{Prompt: prompt, Source: resolved.Source, Info: info}
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetEscapeHTML(false)
 		if err := enc.Encode(payload); err != nil {
@@ -82,8 +86,36 @@ func handleSessionHandoff(profile string, args []string) {
 	} else {
 		fmt.Println(prompt)
 	}
-	fmt.Fprintf(os.Stderr, "handoff: %d/%d messages included (truncated=%v, max %d chars) from %s\n",
-		info.IncludedCount, info.MessageCount, info.Truncated, info.MaxChars, info.TranscriptPath)
+	if resolved.Source == session.ContinuationSourceAgent {
+		fmt.Fprintf(os.Stderr, "handoff: using the agent's curated prompt from %s (pass --ignore-agent-prompt to rebuild from the transcript)\n", session.HandoffPromptPath(inst))
+	} else {
+		fmt.Fprintf(os.Stderr, "handoff: %d/%d messages included (truncated=%v, max %d chars) from %s\n",
+			info.IncludedCount, info.MessageCount, info.Truncated, info.MaxChars, info.TranscriptPath)
+	}
+}
+
+// resolveSessionHandoff validates the requested target tool and resolves the
+// continuation prompt for a session, honoring --ignore-agent-prompt by
+// suppressing the curated PROMPT.md lookup. It shares
+// session.ResolveContinuationPrompt with the autonomous budget handoff so a
+// curated PROMPT.md left by a wrap-up is honored here too instead of being
+// silently ignored in favour of the raw transcript. Split out of
+// handleSessionHandoff so the flag routing (target-tool validation, the
+// --ignore-agent-prompt path suppression, and computing the curated path from
+// inst.ID) is unit-testable without os.Exit or a loaded profile.
+func resolveSessionHandoff(inst *session.Instance, targetTool string, ignoreAgentPrompt bool, maxChars int) (session.ContinuationPrompt, error) {
+	if err := session.ValidateHandoffTargetTool(targetTool); err != nil {
+		return session.ContinuationPrompt{}, err
+	}
+	var promptPath string
+	if inst != nil && !ignoreAgentPrompt {
+		promptPath = session.HandoffPromptPath(inst)
+	}
+	resolved, err := session.ResolveContinuationPrompt(inst, targetTool, promptPath, maxChars)
+	if err != nil {
+		return session.ContinuationPrompt{}, fmt.Errorf("build handoff prompt: %v", err)
+	}
+	return resolved, nil
 }
 
 // samePath reports whether two paths refer to the same file, following

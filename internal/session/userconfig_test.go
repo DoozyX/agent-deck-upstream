@@ -11,6 +11,17 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
+func TestUserConfigParsesAlternateQuickCreateTool(t *testing.T) {
+	var cfg UserConfig
+	if _, err := toml.Decode("[quick_create]\nalternate_tool = \"codex\"\n", &cfg); err != nil {
+		t.Fatalf("decode quick_create config: %v", err)
+	}
+
+	if cfg.QuickCreate.AlternateTool != "codex" {
+		t.Fatalf("quick_create alternate tool = %q, want codex", cfg.QuickCreate.AlternateTool)
+	}
+}
+
 // isolateConfigHomeXDG redirects XDG_CONFIG_HOME at the test's already-set HOME
 // so XDG-aware config writes stay inside the same temp tree as HOME. Package
 // TestMain clears XDG by default so ordinary HOME-only tests track HOME; this
@@ -427,10 +438,37 @@ func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
 	for _, want := range []string{
 		`compatible_with - Built-in compatibility to mirror ("claude" or "codex")`,
 		`compatible_with = "codex"`,
+		`quick_create_alternate = "ctrl+n"`,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf("example config missing %q", want)
 		}
+	}
+}
+
+func TestDesktopNotificationsConfigIsExplicitlyDisabledByDefault(t *testing.T) {
+	var config UserConfig
+	if config.DesktopNotifications.Enabled {
+		t.Fatal("desktop notifications must be disabled unless explicitly enabled")
+	}
+	_, err := toml.Decode(`[desktop_notifications]
+enabled = true
+`, &config)
+	if err != nil {
+		t.Fatalf("decode config: %v", err)
+	}
+	if !config.DesktopNotifications.Enabled {
+		t.Fatal("desktop_notifications.enabled was not decoded")
+	}
+}
+
+func TestDesktopNotificationSocketPathFitsMacOSUnixSocketLimit(t *testing.T) {
+	path, err := DesktopNotificationSocketPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(path) >= 104 {
+		t.Fatalf("socket path is %d bytes (%q), exceeding the macOS Unix-socket limit", len(path), path)
 	}
 }
 
@@ -954,6 +992,16 @@ show_analytics = false
 		t.Error("Expected Preview.ShowAnalytics to be set")
 	} else if *config.Preview.ShowAnalytics {
 		t.Error("Expected Preview.ShowAnalytics to be false")
+	}
+}
+
+func TestLegacyPreviewOrientationRemainsLoadable(t *testing.T) {
+	var config UserConfig
+	if _, err := toml.Decode("[ui]\npreview_orientation = \"below\"\npreview_pct = 60\n", &config); err != nil {
+		t.Fatalf("legacy preview_orientation must not break config loading: %v", err)
+	}
+	if got := config.UI.GetPreviewPct(); got != 60 {
+		t.Fatalf("GetPreviewPct() = %d, want 60; neighboring UI config was lost", got)
 	}
 }
 
@@ -2260,6 +2308,23 @@ func TestUserConfig_GroupDefaults_RoundTripZeroSurvives(t *testing.T) {
 	}
 	if *decoded.GroupDefaults.MaxConcurrent != 0 {
 		t.Errorf("round-trip changed max_concurrent: expected 0, got %d", *decoded.GroupDefaults.MaxConcurrent)
+	}
+}
+
+func TestUserConfig_GroupDefaults_ManualCreationOnlyRoundTrip(t *testing.T) {
+	const input = "[group_defaults]\nmanual_creation_only = true\n"
+
+	var cfg UserConfig
+	if _, err := toml.Decode(input, &cfg); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	var buf bytes.Buffer
+	if err := toml.NewEncoder(&buf).Encode(&cfg); err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	if !strings.Contains(buf.String(), "manual_creation_only = true") {
+		t.Fatalf("encoded TOML missing manual_creation_only = true:\n%s", buf.String())
 	}
 }
 

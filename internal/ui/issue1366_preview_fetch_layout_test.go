@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -30,18 +31,64 @@ func armHomeOneSessionForPreview(t *testing.T) *Home {
 	return h
 }
 
-// Issue #1366: navigating in a layout with no preview pane (single-column,
-// width < 50) must NOT schedule a `tmux capture-pane` for a preview nobody
-// renders. Today fetchSelectedPreview fires unconditionally — wasted subprocess.
+// Issue #1366: navigating in a layout with no preview pane must NOT schedule a
+// `tmux capture-pane` for a preview nobody renders. Mobile stacked layouts
+// (50-79 columns) are sessions-only just like single-column layouts.
 func TestIssue1366_NoPreviewFetchInSingleColumnLayout(t *testing.T) {
-	h := armHomeOneSessionForPreview(t)
-	h.width = 45 // < 50 => LayoutModeSingle (list only, no preview pane)
-	if got := h.getLayoutMode(); got != LayoutModeSingle {
-		t.Fatalf("setup: layout = %q, want %q", got, LayoutModeSingle)
+	for _, width := range []int{45, 65} {
+		t.Run(fmt.Sprintf("width-%d", width), func(t *testing.T) {
+			h := armHomeOneSessionForPreview(t)
+			h.width = width
+			if cmd := h.fetchSelectedPreview(); cmd != nil {
+				t.Fatalf("width=%d: hidden Preview scheduled a fetch", width)
+			}
+		})
 	}
-	if cmd := h.fetchSelectedPreview(); cmd != nil {
-		t.Fatal("fetchSelectedPreview must return nil in single-column layout (no preview pane) — issue #1366")
-	}
+}
+
+func TestIssue1366_HiddenPreviewFetchClearsInFlightMarker(t *testing.T) {
+	t.Run("local", func(t *testing.T) {
+		h := armHomeOneSessionForPreview(t)
+		h.width = 65
+		inst, key, _ := h.selectedPreviewTarget()
+		if inst == nil || key == "" {
+			t.Fatal("setup: expected a selected local preview target")
+		}
+
+		h.previewCacheMu.Lock()
+		h.previewFetchingID = key
+		h.previewCacheMu.Unlock()
+
+		if cmd := h.fetchPreview(inst, key, -1); cmd != nil {
+			t.Fatal("hidden Preview must not return a fetch command")
+		}
+
+		h.previewCacheMu.RLock()
+		defer h.previewCacheMu.RUnlock()
+		if h.previewFetchingID != "" {
+			t.Fatalf("hidden Preview left previewFetchingID = %q, want empty", h.previewFetchingID)
+		}
+	})
+
+	t.Run("remote", func(t *testing.T) {
+		h := NewHome()
+		h.width = 65
+		key := "remote:example:session"
+
+		h.previewCacheMu.Lock()
+		h.previewFetchingID = key
+		h.previewCacheMu.Unlock()
+
+		if cmd := h.fetchRemotePreview("example", "session", key); cmd != nil {
+			t.Fatal("hidden remote Preview must not return a fetch command")
+		}
+
+		h.previewCacheMu.RLock()
+		defer h.previewCacheMu.RUnlock()
+		if h.previewFetchingID != "" {
+			t.Fatalf("hidden remote Preview left previewFetchingID = %q, want empty", h.previewFetchingID)
+		}
+	})
 }
 
 // Regression guard: when the preview pane IS visible (dual layout), navigation

@@ -19,7 +19,9 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,6 +40,16 @@ func main() {
 	confirmLinkOpen := flag.Bool("confirm-link-open", true, "Value of `[web].confirm_link_open` served by GET /api/settings (issue #1682)")
 	authToken := flag.String("auth-token", "", "Bearer token for API/WS access. When set the fixture behaves like `agent-deck web --token`, so specs can exercise the authenticated browser path.")
 	flag.Parse()
+
+	// Remote-attach e2e coverage (GET /ws/remote/{remote}/session/{id}) needs
+	// session.LoadUserConfig() to resolve a deterministic [remotes.build]
+	// entry matching fixtureStore.Snapshot()'s "build" remote below, without
+	// depending on whatever the host machine's real config happens to have.
+	// LoadUserConfig() has no injection seam (unlike MenuData/RemoteFleet),
+	// so this redirects XDG_CONFIG_HOME to an isolated temp dir rather than
+	// HOME, to avoid perturbing GetHooksDir()/other paths keyed off
+	// XDG_DATA_HOME that the rest of this fixture's specs rely on.
+	isolateFixtureRemoteConfig()
 
 	store := newFixtureStore()
 	store.seed()
@@ -72,6 +84,21 @@ func main() {
 		ConfirmLinkOpen: confirmLinkOpen,
 		MenuData:        store,
 		RemoteFleet:     store,
+		// Test seam mirroring SSHRunner.openStreamFn: e2e specs never touch a
+		// real SSH host. A real terminal reads its own echoed writeln banner
+		// as a spurious prompt on some shells; \r\n keeps xterm.js happy.
+		RemoteAttachCommand: func(string, session.RemoteConfig, string) *exec.Cmd {
+			// `POST /__fixture/remotes?attach=fail` makes the attach command
+			// die immediately, which is how the real ssh path reports an
+			// unreachable host / rejected auth: the bridge's quick-exit branch
+			// turns that into a fatal REMOTE_ATTACH_FAILED frame and
+			// TerminalPanel renders its #782 banner. Nothing else can produce
+			// that banner in e2e without a real broken SSH host.
+			if store.remoteAttachFails() {
+				return exec.Command("sh", "-c", "exit 1")
+			}
+			return exec.Command("sh", "-c", `printf "remote-shell\r\n"; cat`)
+		},
 		// Empty by default, so the existing suite keeps running
 		// unauthenticated. mcp-auth.spec.js boots a second fixture WITH a
 		// token: without that, no browser test ever exercises the
@@ -132,6 +159,31 @@ func main() {
 	_ = server.Shutdown(ctx)
 }
 
+// isolateFixtureRemoteConfig points session.LoadUserConfig() at a fresh,
+// isolated config.toml declaring the "build" remote that fixtureStore.Snapshot
+// reports sessions for, so GET /ws/remote/build/session/remote-1 resolves
+// deterministically regardless of the host machine's real ~/.agent-deck or
+// ~/.config/agent-deck/config.toml.
+func isolateFixtureRemoteConfig() {
+	dir, err := os.MkdirTemp("", "agent-deck-web-fixture-config-*")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "web-fixture: isolate remote config: %v\n", err)
+		os.Exit(1)
+	}
+	configDir := filepath.Join(dir, "agent-deck")
+	if err := os.MkdirAll(configDir, 0o700); err != nil {
+		fmt.Fprintf(os.Stderr, "web-fixture: isolate remote config: %v\n", err)
+		os.Exit(1)
+	}
+	body := "[remotes.build]\nhost = \"fixture-remote-host\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(body), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "web-fixture: isolate remote config: %v\n", err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_CONFIG_HOME", dir)
+	session.ClearUserConfigCache()
+}
+
 func (s *fixtureStore) Start(context.Context) {}
 
 func (s *fixtureStore) Snapshot() session.RemoteFleetSnapshot {
@@ -171,6 +223,9 @@ type fixtureStore struct {
 	attached       map[string][]session.ProjectSkillAttachment // by projectPath
 	mcpMgr         *fixtureMCPManager                          // reset alongside the store on /__fixture/reset
 	remotesEnabled bool
+	// attachFails makes RemoteAttachCommand hand back a command that exits
+	// immediately, standing in for an unreachable remote host.
+	attachFails bool
 
 	// undoStack tracks recently-deleted sessions for ctrl+z undo. Capped
 	// at 10 entries (FIFO eviction) to match the TUI Home.undoStack.
@@ -181,6 +236,14 @@ type fixtureStore struct {
 type fixtureDeletedEntry struct {
 	session   *web.MenuSession
 	deletedAt time.Time
+}
+
+// remoteAttachFails is read from the web server's RemoteAttachCommand hook,
+// which runs on a request goroutine, so it takes the store lock.
+func (s *fixtureStore) remoteAttachFails() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.attachFails
 }
 
 func newFixtureStore() *fixtureStore {
@@ -200,6 +263,7 @@ func (s *fixtureStore) seed() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.remotesEnabled = false
+	s.attachFails = false
 	s.groups = map[string]*web.MenuGroup{
 		"work":           {Name: "work", Path: "work", Expanded: true, Order: 0, SessionCount: 2},
 		"work/innotrade": {Name: "innotrade", Path: "work/innotrade", Expanded: true, Order: 1, SessionCount: 1},
@@ -654,6 +718,7 @@ func (s *fixtureStore) adminHandler() http.Handler {
 		}
 		s.mu.Lock()
 		s.remotesEnabled = true
+		s.attachFails = r.URL.Query().Get("attach") == "fail"
 		s.mu.Unlock()
 		w.WriteHeader(http.StatusNoContent)
 	})

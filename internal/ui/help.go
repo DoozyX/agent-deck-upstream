@@ -177,6 +177,7 @@ func (h *HelpOverlay) View() string {
 
 	// Define help sections
 	newKeys := h.keyPair(hotkeyNewSession, hotkeyQuickCreate, "n/N")
+	newKeys = joinHotkeyLabels(newKeys, h.key(hotkeyQuickCreateAlt, ""))
 	forkKeys := h.keyPair(hotkeyQuickFork, hotkeyForkWithOptions, "f/F")
 	reorderUpKeys := "+ / K / Shift+↑"
 	reorderDownKeys := "- / J / Shift+↓"
@@ -289,8 +290,7 @@ func (h *HelpOverlay) View() string {
 				{skillsKey, "Skills Manager"},
 				{CostDashboardKey, "Cost Dashboard"},
 				{previewKey, "Toggle preview mode (output/stats/both)"},
-				{"O", "Toggle preview orientation (right / below — portrait monitors)"},
-				{"< / >", "Shrink / grow preview pane by 5% (drag divider with mouse; vertical in below-orientation)"},
+				{"< / >", "Shrink / grow preview pane by 5% (drag divider with mouse)"},
 				{unreadKey, "Mark unread"},
 				{quickApproveKey, "Quick approve (send '1' to Claude)"},
 				{promptSessionKey, "Prompt session (send a one-line prompt without attaching)"},

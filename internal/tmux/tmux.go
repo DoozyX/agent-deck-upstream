@@ -523,6 +523,15 @@ func isEmptyTmuxServerResult(err error) bool {
 // single background refresh for that socket (at most one in flight per socket)
 // and answers from whatever it currently knows: false when cold.
 func sessionExistsOnSocketCached(socketName, name string) bool {
+	exists, _ := socketSessionsCachedLiveness(socketName, name)
+	return exists
+}
+
+// socketSessionsCachedLiveness is sessionExistsOnSocketCached with the cache's
+// confidence exposed: known reports whether a probe for this socket has ever
+// completed. A cold entry answers (false, false) — "no evidence", NOT "dead" —
+// so callers that act on absence can tell the two apart.
+func socketSessionsCachedLiveness(socketName, name string) (alive, known bool) {
 	socket := strings.TrimSpace(socketName)
 
 	socketSessionCacheMu.Lock()
@@ -543,7 +552,32 @@ func sessionExistsOnSocketCached(socketName, name string) bool {
 	}
 
 	_, exists := entry.names[name]
-	return exists
+	return exists, entry.warm
+}
+
+// SessionLivenessCached answers "is <name> live on <socketName>?" from the
+// non-blocking caches only. Like ExistsCached() it NEVER spawns a subprocess
+// and never blocks, so it is safe in loops that walk every session on every
+// tick — the property that keeps the reconciler off the has-session storm path.
+//
+// The second return separates "known dead" from "no evidence yet": known=false
+// means no warm cache has answered for that socket. Callers MUST NOT read that
+// as death — the same indeterminate rule ListSessionNamesOnSocket documents.
+//
+// A known=true negative is still only as good as the cache behind it. For the
+// default socket that cache can transiently miss a live session when agent-deck
+// sessions span multiple sockets (see the note on Session.Exists), so callers
+// should use "known dead" to throttle work, not to abandon a session forever.
+func SessionLivenessCached(socketName, name string) (alive, known bool) {
+	// A live control pipe is proof, whatever the caches say.
+	if pm := GetPipeManager(); pm != nil && pm.IsConnected(name) {
+		return true, true
+	}
+	if strings.TrimSpace(socketName) == DefaultSocketName() {
+		exists, cacheValid := sessionExistsFromCache(name)
+		return exists, cacheValid
+	}
+	return socketSessionsCachedLiveness(socketName, name)
 }
 
 // refreshSocketSessionCache re-lists one socket off the caller's goroutine and
@@ -1824,6 +1858,21 @@ func (s *Session) resetPromptNoBusyHoldLocked() {
 // MUST be called with s.mu held.
 func (s *Session) inStartupWindowLocked() bool {
 	return !s.startupAt.IsZero() && time.Since(s.startupAt) < startupStateWindow
+}
+
+// MarkStartupAt seeds the startup window from a spawn that happened in ANOTHER
+// process. Start() and RespawnPane() set startupAt for the process that did the
+// spawning, but ReconnectSession/ReconnectSessionLazy — every CLI invocation
+// that attaches to an already-running session — explicitly zero it. Without a
+// seed, a booting agent that shows neither spinner nor prompt is classified
+// "waiting" instead of "starting", and callers waiting for readiness accept a
+// half-mounted TUI as ready.
+//
+// A zero t clears the window (same shape as the internal resets).
+func (s *Session) MarkStartupAt(t time.Time) {
+	s.mu.Lock()
+	s.startupAt = t
+	s.mu.Unlock()
 }
 
 // SetCustomPatterns sets custom patterns for generic tool support
@@ -3859,6 +3908,7 @@ func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 
 	// Capture process tree BEFORE killing so we can verify they die
 	_, oldPIDs := s.getPaneProcessTreeFor(target)
+	oldProcesses := CaptureProcessIdentities(oldPIDs)
 	if len(oldPIDs) > 0 {
 		respawnLog.Info("pre_kill_process_tree", slog.String("session", logging.SanitizeValue(s.Name)), slog.Any("pids", oldPIDs))
 	}
@@ -3871,11 +3921,11 @@ func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 
 	// Verify old processes are dead; escalate to SIGKILL if needed. No new
 	// process exists on this path — the session is gone — so nothing is spared.
-	if len(oldPIDs) > 0 {
+	if len(oldProcesses) > 0 {
 		if synchronous {
-			EnsurePIDsDead(oldPIDs, 3*time.Second)
+			EnsureProcessIdentitiesDead(oldProcesses, 3*time.Second)
 		} else {
-			go s.ensureProcessesDead(oldPIDs, nil)
+			go EnsureProcessIdentitiesDead(oldProcesses, 3*time.Second)
 		}
 	}
 
@@ -3885,13 +3935,15 @@ func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 	// fail to persist the archive when re-archiving a session whose tmux was
 	// already gone (the post-Unarchive path — Unarchive clears the flag without
 	// restarting tmux). Only surface the error if the session is genuinely
-	// still alive after the kill attempt.
+	// still alive after the kill attempt. This verification must bypass
+	// Session.Exists(): its positive cache can briefly outlive the killed
+	// session and turn a successful first archive into an error.
 	if err != nil {
 		if owned {
 			if s.probeSessionIdentity(target).state == sessionIdentityMissing {
 				return nil
 			}
-		} else if !s.Exists() {
+		} else if !tmuxSessionExistsOnSocket(s.SocketName, s.Name) {
 			return nil
 		}
 	}

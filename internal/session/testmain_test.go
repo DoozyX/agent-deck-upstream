@@ -217,7 +217,12 @@ func runTestMain(m *testing.M) int {
 	// profiles/<p>/state.db, worker-scratch, logs) lands in a temp dir, never
 	// the real ~/.agent-deck (2026-06-04 data-loss incident, S5).
 	// See internal/testutil/homeenv.go for the postmortem.
-	cleanupHome := testutil.IsolateHome()
+	//
+	// ONE call, not IsolateHome() plus a local isolatePackageHome(): the old
+	// pair created two temp HOMEs per run and only cleaned up the one the
+	// package never used, stranding the live one in $TMPDIR forever
+	// (2026-08-10 temp-leak incident).
+	cleanupHome := testutil.IsolatePackageHome("agent-deck-session-tests-home-*")
 	defer cleanupHome()
 
 	// Git hooks export GIT_DIR/GIT_WORK_TREE; clear them so test subprocess git

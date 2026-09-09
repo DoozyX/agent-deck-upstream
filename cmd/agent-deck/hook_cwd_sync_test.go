@@ -64,7 +64,7 @@ func TestApplyClaudeCwdSync_RefusesUndeclaredPathAndPreservesWorktreeFields(t *t
 		WorktreeBranch:   "feature-x",
 	})
 
-	applyClaudeCwdSync("inst-1", newPath)
+	applyHookCwdSync("inst-1", newPath)
 
 	got := loadCwdSyncInstance(t, storage, "inst-1")
 	if got.ProjectPath != oldPath {
@@ -81,7 +81,7 @@ func TestApplyClaudeCwdSync_RefusesUndeclaredPathAndPreservesWorktreeFields(t *t
 	}
 }
 
-// applyClaudeCwdSync fires from the LOCAL hook handler when Claude Code emits
+// applyHookCwdSync fires from the local hook handler when an agent emits
 // a hook. Remote sessions run Claude on the remote host, so their hooks fire
 // on the remote agent-deck binary (not this local one) and never reach this
 // code path — nothing to cover here.
@@ -108,7 +108,7 @@ func TestApplyClaudeCwdSync_NoopWhenSame(t *testing.T) {
 		Command:         "claude",
 	})
 
-	applyClaudeCwdSync("inst-2", sameDir)
+	applyHookCwdSync("inst-2", sameDir)
 
 	got := loadCwdSyncInstance(t, storage, "inst-2")
 	if got.ProjectPath != sameDir {
@@ -142,7 +142,7 @@ func TestApplyClaudeCwdSync_SwapsMultiRepo(t *testing.T) {
 		Command:         "claude",
 	})
 
-	applyClaudeCwdSync("inst-3", extraB)
+	applyHookCwdSync("inst-3", extraB)
 
 	got := loadCwdSyncInstance(t, storage, "inst-3")
 	if got.ProjectPath != extraB {
@@ -177,7 +177,7 @@ func TestApplyClaudeCwdSync_NoopWhenCwdEmpty(t *testing.T) {
 		Command:     "claude",
 	})
 
-	applyClaudeCwdSync("inst-4", "")
+	applyHookCwdSync("inst-4", "")
 
 	got := loadCwdSyncInstance(t, storage, "inst-4")
 	if got.ProjectPath != dir {

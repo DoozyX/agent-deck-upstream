@@ -1,13 +1,40 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/session"
 )
+
+func TestBuildChildRowsIncludesClaudePeerMetadata(t *testing.T) {
+	rows := buildChildRows([]*session.Instance{
+		{ID: "a1b2c3d4-1111-2222-3333-444455556666", Title: "Claude Child", Tool: "claude"},
+		{ID: "ffeeddcc-1111-2222-3333-444455556666", Title: "Codex Child", Tool: "codex"},
+	}, nil)
+	raw, err := json.Marshal(rows)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded []map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if got := decoded[0]["peer_name"]; got != "claude-child-a1b2c3d4" {
+		t.Fatalf("Claude child peer name = %#v", got)
+	}
+	if got := decoded[0]["peer_messaging_candidate"]; got != true {
+		t.Fatalf("Claude child candidate = %#v", got)
+	}
+	if _, ok := decoded[1]["peer_name"]; ok {
+		t.Fatalf("Codex child unexpectedly has Claude peer metadata: %s", raw)
+	}
+}
 
 func TestDiffChildEvents(t *testing.T) {
 	running := func(id, title string) childRow {
@@ -180,7 +207,7 @@ func TestRunChildrenFollowStopsOnDeadStream(t *testing.T) {
 			w := &errWriter{}
 			done := make(chan int, 1)
 			go func() {
-				done <- runChildrenFollow("p", "parent", time.Millisecond, 0, false, w)
+				done <- runChildrenFollow("p", "parent", "", time.Millisecond, 0, false, w)
 			}()
 
 			select {
@@ -198,6 +225,103 @@ func TestRunChildrenFollowStopsOnDeadStream(t *testing.T) {
 				t.Fatal("runChildrenFollow kept polling after the stream closed")
 			}
 		})
+	}
+}
+
+// Codex keeps the stdout pipe for old tool calls open after a turn completes.
+// The follower must therefore use the owning Agent Deck session lifecycle,
+// rather than waiting forever for a write failure that will never arrive.
+func TestRunChildrenFollowStopsWhenAgentOwnerStopsRunning(t *testing.T) {
+	restoreRows := pollChildRows
+	restoreOwner := pollFollowOwnerRunning
+	t.Cleanup(func() {
+		pollChildRows = restoreRows
+		pollFollowOwnerRunning = restoreOwner
+	})
+
+	polls := 0
+	pollChildRows = func(string, string) ([]childRow, error) {
+		polls++
+		return []childRow{{ID: "child", Status: "running"}}, nil
+	}
+	ownerPolls := 0
+	pollFollowOwnerRunning = func(profile, ownerID string) (bool, error) {
+		ownerPolls++
+		if profile != "p" || ownerID != "owner" {
+			t.Fatalf("owner poll = (%q, %q), want (p, owner)", profile, ownerID)
+		}
+		return false, nil
+	}
+
+	done := make(chan int, 1)
+	go func() {
+		done <- runChildrenFollow("p", "parent", "owner", time.Millisecond, 0, false, io.Discard)
+	}()
+
+	select {
+	case code := <-done:
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0", code)
+		}
+		if ownerPolls != 2 {
+			t.Fatalf("owner polls = %d, want two-observation shutdown", ownerPolls)
+		}
+		if polls != 2 {
+			t.Fatalf("child polls = %d, want 2", polls)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follower did not exit after owner stopped running")
+	}
+}
+
+func TestRunChildrenFollowArchivedChildEmitsOneRemovalThenStaysGone(t *testing.T) {
+	restoreRows := pollChildRows
+	restoreOwner := pollFollowOwnerRunning
+	t.Cleanup(func() {
+		pollChildRows = restoreRows
+		pollFollowOwnerRunning = restoreOwner
+	})
+
+	polls := 0
+	pollChildRows = func(string, string) ([]childRow, error) {
+		polls++
+		switch polls {
+		case 1:
+			return []childRow{{ID: "child", Title: "archived-later", Status: "running", ContextTokens: 120000}}, nil
+		case 2:
+			return []childRow{{ID: "child", Title: "archived-later", Status: "error", Archived: true, ContextTokens: 900000}}, nil
+		default:
+			return []childRow{{ID: "child", Title: "archived-later", Status: "stopped", Archived: true, ContextTokens: 950000}}, nil
+		}
+	}
+	ownerPolls := 0
+	pollFollowOwnerRunning = func(string, string) (bool, error) {
+		ownerPolls++
+		return ownerPolls == 1, nil
+	}
+
+	var stream bytes.Buffer
+	if code := runChildrenFollow("p", "parent", "owner", time.Millisecond, 0, false, &stream); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	var events []followEvent
+	for _, line := range bytes.Split(bytes.TrimSpace(stream.Bytes()), []byte{'\n'}) {
+		var event followEvent
+		if err := json.Unmarshal(line, &event); err != nil {
+			t.Fatalf("decode %q: %v", line, err)
+		}
+		events = append(events, event)
+	}
+	if len(events) != 2 || events[0].Event != "snapshot" || events[1].Event != "removed" {
+		t.Fatalf("events = %+v, want one snapshot then one removal", events)
+	}
+	if events[1].ID != "child" || events[1].Title != "archived-later" {
+		t.Fatalf("removal = %+v, want archived child identity", events[1])
+	}
+	for _, event := range events[1:] {
+		if event.Event == "status" || event.ContextTokens != 0 {
+			t.Fatalf("archived child leaked status/context after removal: %+v", event)
+		}
 	}
 }
 

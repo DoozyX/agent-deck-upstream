@@ -56,6 +56,9 @@ type UserConfig struct {
 	// If empty or invalid, defaults to "shell" (no pre-selection)
 	DefaultTool string `toml:"default_tool,omitempty"`
 
+	// QuickCreate configures the optional alternate quick-create tool.
+	QuickCreate QuickCreateSettings `toml:"quick_create,omitempty"`
+
 	// DefaultPath is the global fallback project directory for `agent-deck add`
 	// when no explicit path or group default_path is provided.
 	DefaultPath string `toml:"default_path,omitempty"`
@@ -125,8 +128,7 @@ type UserConfig struct {
 	// config_dir = "~/.claude-my-group"
 	Groups map[string]GroupSettings `toml:"groups,omitempty"`
 
-	// GroupDefaults holds defaults applied to NEWLY-created groups only.
-	// Existing groups (loaded from state.db) are never affected.
+	// GroupDefaults holds new-group defaults and group-creation policy.
 	GroupDefaults GroupDefaultsSettings `toml:"group_defaults,omitempty"`
 
 	// Conductors defines optional per-conductor overrides.
@@ -187,6 +189,13 @@ type UserConfig struct {
 	// Notifications defines waiting session notification bar settings
 	Notifications NotificationsConfig `toml:"notifications,omitempty"`
 
+	// DesktopNotifications enables macOS actionable desktop alerts. It is
+	// deliberately opt-in: absence of this section must never send banners.
+	DesktopNotifications DesktopNotificationsSettings `toml:"desktop_notifications,omitempty"`
+
+	// ContextBudget defines context-token usage budget and autonomous fork handling
+	ContextBudget ContextBudgetSettings `toml:"context_budget,omitempty"`
+
 	// Instances defines multiple instance behavior settings
 	Instances InstanceSettings `toml:"instances,omitempty"`
 
@@ -201,6 +210,9 @@ type UserConfig struct {
 
 	// Conductor defines conductor (meta-agent orchestration) settings
 	Conductor ConductorSettings `toml:"conductor,omitempty"`
+
+	// Orchestrate defines tool-selection policy for the orchestrate workflow.
+	Orchestrate OrchestrateSettings `toml:"orchestrate,omitempty"`
 
 	// Tmux defines tmux option overrides applied to every session
 	Tmux TmuxSettings `toml:"tmux,omitempty"`
@@ -264,6 +276,12 @@ type UserConfig struct {
 	Performance PerformanceSettings `toml:"performance,omitempty"`
 }
 
+// OrchestrateSettings controls how the orchestrate workflow chooses tools for
+// child sessions. An empty strategy preserves the workflow's legacy defaults.
+type OrchestrateSettings struct {
+	ToolStrategy string `toml:"tool_strategy,omitempty"`
+}
+
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
 // §3.7, §6). The shipped default is fully observe-only: it detects truly-stuck
 // sessions, exercises the safety state-machine, and LOGS what it would do —
@@ -276,10 +294,16 @@ type SelfHealSettings struct {
 	// run the observe-only Stage 1.
 	Enabled bool `toml:"enabled,omitempty"`
 
-	// Mode is the authority level: "observe" (default, the only acting mode in
-	// v1.9.67 — logs would_have, takes no action), "single_action" / "full"
-	// (Stages 2-3, DEFINED but GUARDED, refuse to act). An unknown/empty value
-	// is normalized to "observe".
+	// Mode is the authority level:
+	//   "observe"       (DEFAULT) — logs would_have, takes no action.
+	//   "resume"                  — authorises exactly one path: deliver a single
+	//                               continuation prompt to a session whose model is
+	//                               at capacity (model-unavailable), is wedged by a
+	//                               transport error (api-error), or has an exhausted
+	//                               usage window (usage-limit). Every other action
+	//                               still refuses.
+	//   "single_action" / "full"  — Stages 2-3, DEFINED but GUARDED, refuse to act.
+	// An unknown/empty value is normalized to "observe".
 	Mode string `toml:"mode,omitempty"`
 
 	// AuditPath overrides where the durable NDJSON audit log lands. Empty uses
@@ -287,6 +311,14 @@ type SelfHealSettings struct {
 	// SelfHealAuditPath). The audit is the dataset reviewed over the ≥1-week
 	// observe window before any Stage-2 re-approval.
 	AuditPath string `toml:"audit_path,omitempty"`
+
+	// AuditFullRecords writes one audit record per EVALUATION instead of one per
+	// session state change (plus a 15-minute heartbeat). The collapsed default
+	// exists because the per-evaluation stream measured 480 MB/day on a normal
+	// single-user machine, nearly all of it a healthy session re-recorded every
+	// poll. Turn this on only to debug the pass itself, and turn it back off:
+	// it restores the growth rate rotation then has to absorb.
+	AuditFullRecords bool `toml:"audit_full_records,omitempty"`
 
 	// PerSessionPerWindow overrides the per-session recovery cap (default 2 / 6h;
 	// auth_401 is always 1). 0 uses the default. Starting dial; tuned from
@@ -309,9 +341,15 @@ type SelfHealSettings struct {
 // SelfHealMode normalizes the configured mode to a known value. Empty / unknown
 // → "observe" (the safe default). Used by the daemon when constructing the
 // engine. The string return matches selfheal.Mode values.
+//
+// "resume" is the ONE acting mode: it authorises exactly (resume mode × resume
+// action) — deliver a single continuation prompt to a session whose model is
+// at capacity, is wedged by a transport error, or has an exhausted usage window
+// — and nothing else.
+// "single_action" / "full" remain DEFINED but GUARDED.
 func (s SelfHealSettings) SelfHealMode() string {
 	switch s.Mode {
-	case "single_action", "full":
+	case "single_action", "full", "resume":
 		return s.Mode
 	default:
 		return "observe"
@@ -354,6 +392,13 @@ type PerformanceSettings struct {
 	ClaimPolling *bool `toml:"claim_polling,omitempty"`
 }
 
+// QuickCreateSettings retains deprecated quick-create configuration so older
+// files remain parseable. Alternate selection is inferred from installed tools.
+type QuickCreateSettings struct {
+	// Deprecated: alternate quick-create ignores this value and infers a tool.
+	AlternateTool string `toml:"alternate_tool,omitempty"`
+}
+
 // ClaimPollingEnabled reports whether claim-based polling is enabled.
 func (c *UserConfig) ClaimPollingEnabled() bool {
 	if c == nil || c.Performance.ClaimPolling == nil {
@@ -371,11 +416,8 @@ type UISettings struct {
 	// Adjustable at runtime via < and > keybindings (5% step).
 	PreviewPct int `toml:"preview_pct,omitzero"`
 
-	// PreviewOrientation controls where the PREVIEW pane sits relative to
-	// the SESSIONS list on wide terminals (>= 80 cols). "right" (default)
-	// keeps the historical side-by-side split; "below" stacks PREVIEW under
-	// SESSIONS (useful on tall/portrait monitors). Narrow terminals always
-	// stack regardless. Toggle at runtime with the `O` keybinding.
+	// PreviewOrientation is retained only so legacy preview_orientation keys
+	// remain loadable. Preview placement is now derived solely from width.
 	PreviewOrientation string `toml:"preview_orientation,omitempty"`
 
 	// ITermOpenAs controls whether Shift+Enter pops the focused session
@@ -521,15 +563,6 @@ const (
 	ShellSplitWindow = "window"
 )
 
-// Preview-pane orientation modes for wide terminals (>= 80 cols).
-// "right" is the historical side-by-side split; "below" stacks the
-// PREVIEW pane under the SESSIONS list (portrait-monitor friendly).
-const (
-	PreviewOrientationRight   = "right"
-	PreviewOrientationBelow   = "below"
-	DefaultPreviewOrientation = PreviewOrientationRight
-)
-
 // Footer hint-bar styles. See UISettings.Footer.
 const (
 	FooterCurated = "curated"
@@ -601,20 +634,6 @@ func (u UISettings) GetShellSplit() string {
 		return ShellSplitWindow
 	}
 	return ""
-}
-
-// GetPreviewOrientation returns the configured preview-pane orientation
-// for wide terminals. Unknown or empty values fall through to the default
-// ("right"). Matching is case-insensitive so users can write "Below" or
-// "RIGHT" in TOML.
-func (u UISettings) GetPreviewOrientation() string {
-	switch strings.ToLower(strings.TrimSpace(u.PreviewOrientation)) {
-	case PreviewOrientationBelow:
-		return PreviewOrientationBelow
-	case PreviewOrientationRight:
-		return PreviewOrientationRight
-	}
-	return DefaultPreviewOrientation
 }
 
 // Remote session-list poll cadence bounds (issue #1170). The default is
@@ -828,15 +847,20 @@ type GroupSettings struct {
 	DefaultPath string `toml:"default_path,omitempty"`
 	// Claude defines Claude Code overrides for a specific group.
 	Claude GroupClaudeSettings `toml:"claude,omitempty"`
+	// Codex defines Codex CLI overrides for a specific group.
+	Codex GroupCodexSettings `toml:"codex,omitempty"`
 	// Hermes defines Hermes overrides for a specific group.
 	Hermes GroupHermesSettings `toml:"hermes,omitempty"`
 	// DeepSeek defines DeepSeek Harness overrides for a specific group.
 	DeepSeek GroupDeepSeekSettings `toml:"deepseek,omitempty"`
 }
 
-// GroupDefaultsSettings carries [group_defaults] — defaults stamped onto new
-// groups at creation time. Distinct from per-group [groups."<path>"] overrides.
+// GroupDefaultsSettings carries [group_defaults] creation defaults and policy.
+// Distinct from per-group [groups."<path>"] overrides.
 type GroupDefaultsSettings struct {
+	// ManualCreationOnly prevents commands run inside managed Agent Deck
+	// sessions from creating groups, explicitly or as a side effect.
+	ManualCreationOnly bool `toml:"manual_creation_only,omitempty"`
 	// MaxConcurrent is the max_concurrent value assigned to new groups created
 	// via `group create`, the TUI dialog, the web API, and the launch/session
 	// auto-create paths. Pointer to distinguish:
@@ -889,6 +913,45 @@ type GroupClaudeSettings struct {
 	// MCPs lists [mcps.X] catalog names appended to the local .mcp.json
 	// of sessions in this group. Same floor semantics as Skills.
 	MCPs []string `toml:"mcps,omitempty"`
+}
+
+// GroupCodexSettings defines group-specific Codex overrides. Its native
+// plugins are pre-provisioned in ConfigDir; Agent Deck never installs or
+// updates them at session startup.
+type GroupCodexSettings struct {
+	// ConfigDir overrides [codex].config_dir for sessions in this group.
+	ConfigDir string `toml:"config_dir,omitempty"`
+
+	// EnvFile overrides [codex].env_file for sessions in this group.
+	EnvFile string `toml:"env_file,omitempty"`
+
+	// Command overrides [codex].command for sessions in this group.
+	Command string `toml:"command,omitempty"`
+
+	// Model overrides [codex].default_model for sessions in this group.
+	// An explicit per-session model still takes precedence.
+	Model string `toml:"model,omitempty"`
+
+	// ReasoningEffort overrides [codex].default_reasoning_effort for sessions
+	// in this group. An explicit per-session value still takes precedence.
+	ReasoningEffort string `toml:"reasoning_effort,omitempty"`
+
+	// Skills lists declarative skill-loadout entries attached to Codex
+	// sessions in this group at create and before every start.
+	Skills []string `toml:"skills,omitempty"`
+
+	// MCPs lists [mcps.X] catalog names added to the resolved group
+	// CODEX_HOME/config.toml. Entries are an attach-only floor.
+	MCPs []string `toml:"mcps,omitempty"`
+
+	// Marketplaces lists Codex marketplace sources to register when an explicit
+	// group sync command is run. Sources are inherited from parent groups before
+	// plugins are installed into this group's resolved CODEX_HOME.
+	Marketplaces []string `toml:"marketplaces,omitempty"`
+
+	// Plugins lists Codex plugin selectors (plugin@marketplace) to install
+	// when an explicit group sync command is run.
+	Plugins []string `toml:"plugins,omitempty"`
 }
 
 // GroupHermesSettings defines group-specific Hermes overrides.
@@ -1244,6 +1307,13 @@ func (n NotificationsConfig) GetDesktopEnabled() bool {
 	return n.Desktop
 }
 
+// DesktopNotificationsSettings configures the macOS GUI-helper integration.
+// Additional provider/platform switches are intentionally absent: the first
+// release has one native macOS implementation and one explicit kill switch.
+type DesktopNotificationsSettings struct {
+	Enabled bool `toml:"enabled,omitempty"`
+}
+
 // GetTransitionEventsEnabled returns whether transition event dispatch is enabled.
 // Defaults to true when unset (nil).
 func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
@@ -1251,6 +1321,94 @@ func (n NotificationsConfig) GetTransitionEventsEnabled() bool {
 		return true
 	}
 	return *n.TransitionEvents
+}
+
+// ContextBudgetSettings configures absolute-token context warnings and the
+// autonomous fork-on-budget handoff. Thresholds measure CurrentContextTokens
+// (last-turn input + cache-read), i.e. real context-window occupancy.
+type ContextBudgetSettings struct {
+	// Enabled turns the whole feature on (default: true). Pointer so an unset
+	// section still defaults to enabled.
+	Enabled *bool `toml:"enabled,omitempty"`
+	// WarnTokens is the soft-warning threshold (default: 150000).
+	WarnTokens int `toml:"warn_tokens,omitzero"`
+	// HighTokens is the loud-warning + autonomous wrap-up trigger (default: 200000).
+	HighTokens int `toml:"high_tokens,omitzero"`
+	// CeilingTokens is the hard ceiling that must not be crossed (default: 250000).
+	CeilingTokens int `toml:"ceiling_tokens,omitzero"`
+	// AutonomousHandoff enables the fork-new-session handoff on autonomous
+	// sessions (default: true). Pointer for the same unset-defaults-true reason.
+	AutonomousHandoff *bool `toml:"autonomous_handoff,omitempty"`
+	// HandoffTimeoutSeconds is the failsafe window for the wrap-up to produce
+	// its PROMPT.md (default: 300).
+	HandoffTimeoutSeconds int `toml:"handoff_timeout_seconds,omitzero"`
+	// HandoffTargetTool is the tool the continuation session runs. Empty (the
+	// default) continues with the source's own tool. Must be a bare tool name
+	// ("codex"), never a command line: an unrecognized name silently maps to
+	// "shell" at spawn, so it is validated by ValidateHandoffTargetTool.
+	HandoffTargetTool string `toml:"handoff_target_tool,omitempty"`
+	// MaxHandoffChain bounds how many successors one human-started session may
+	// produce (default: 3). Beyond it the failsafe hard-stops instead of
+	// forking, so a session looping into its own ceiling cannot spawn an
+	// endless chain.
+	MaxHandoffChain int `toml:"max_handoff_chain,omitzero"`
+}
+
+// ValidateHandoffTargetTool reports whether a configured handoff target tool
+// will actually spawn that tool. An empty name is valid and means "same tool as
+// the source".
+//
+// This exists because the spawn path matches tool names EXACTLY and silently
+// falls back to "shell" for anything it does not recognize — so a typo or a
+// name carrying flags would turn a handoff into a dead shell pane with the
+// continuation prompt typed into it. Fail at config load instead.
+func ValidateHandoffTargetTool(name string) error {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return nil
+	}
+	if currentRegistry().IsBuiltin(trimmed) || GetToolDef(trimmed) != nil {
+		return nil
+	}
+	return fmt.Errorf("context_budget.handoff_target_tool %q is not a known tool: use a bare tool name (e.g. \"codex\"), not a command line", name)
+}
+
+// GetEnabled returns Enabled, defaulting to true when unset.
+func (c ContextBudgetSettings) GetEnabled() bool {
+	if c.Enabled == nil {
+		return true
+	}
+	return *c.Enabled
+}
+
+// GetAutonomousHandoff returns AutonomousHandoff, defaulting to true when unset.
+func (c ContextBudgetSettings) GetAutonomousHandoff() bool {
+	if c.AutonomousHandoff == nil {
+		return true
+	}
+	return *c.AutonomousHandoff
+}
+
+// GetContextBudget returns the context-budget settings with zero/nil fields
+// filled in with documented defaults. Mirrors the GetConductor accessor.
+func (c *UserConfig) GetContextBudget() ContextBudgetSettings {
+	cfg := c.ContextBudget
+	if cfg.WarnTokens == 0 {
+		cfg.WarnTokens = 150000
+	}
+	if cfg.HighTokens == 0 {
+		cfg.HighTokens = 200000
+	}
+	if cfg.CeilingTokens == 0 {
+		cfg.CeilingTokens = 250000
+	}
+	if cfg.HandoffTimeoutSeconds == 0 {
+		cfg.HandoffTimeoutSeconds = 300
+	}
+	if cfg.MaxHandoffChain == 0 {
+		cfg.MaxHandoffChain = 3
+	}
+	return cfg
 }
 
 // InstanceSettings configures multiple agent-deck instance behavior
@@ -1551,6 +1709,25 @@ type ClaudeSettings struct {
 	// (issue #1264). Off by default — only enable for sessions running Claude
 	// Code with vim editor mode. Other tools and non-vim Claude are unaffected.
 	VimMode bool `toml:"vim_mode,omitempty"`
+
+	// Skills, Plugins and MCPs declare a GLOBAL Claude loadout floor applied
+	// to every Claude session regardless of group, including ungrouped ones.
+	// The global list resolves as the outermost ancestor, so the effective
+	// loadout is (global ∪ root group ∪ … ∪ leaf group), root-first and
+	// deduplicated. Mirrors CodexSettings' loadout floor; see GroupLoadout.
+	Skills  []string `toml:"skills,omitempty"`
+	Plugins []string `toml:"plugins,omitempty"`
+	MCPs    []string `toml:"mcps,omitempty"`
+}
+
+// GroupLoadout projects the global [claude] loadout lists onto the group shape
+// so the group union helpers can treat it as one more ancestor.
+func (s ClaudeSettings) GroupLoadout() GroupClaudeSettings {
+	return GroupClaudeSettings{
+		Skills:  s.Skills,
+		Plugins: s.Plugins,
+		MCPs:    s.MCPs,
+	}
 }
 
 // GetVimMode reports whether vim-mode insert-guard sends are enabled. Off by
@@ -1605,6 +1782,21 @@ func (c *UserConfig) GetGroupClaudeEnvFile(groupPath string) string {
 		}
 	}
 	return ""
+}
+
+// hasGroupBlock reports whether groupPath or any ancestor has a [groups.X]
+// block in config.toml. Walks the same chain as findGroupClaudeSetting so
+// "declared" means exactly "some level of this chain can contribute settings".
+func (c *UserConfig) hasGroupBlock(groupPath string) bool {
+	if c == nil || groupPath == "" || c.Groups == nil {
+		return false
+	}
+	for p := groupPath; p != ""; p = getParentPath(p) {
+		if _, ok := c.Groups[p]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 // findGroupClaudeSetting walks the group ancestor chain (exact path first,
@@ -1694,16 +1886,24 @@ func (c *UserConfig) GetGroupClaudeMCPs(groupPath string) []string {
 }
 
 func (c *UserConfig) unionGroupClaudeList(groupPath string, get func(GroupClaudeSettings) []string) []string {
-	if c == nil || groupPath == "" || c.Groups == nil {
+	if c == nil {
 		return nil
 	}
 	var chain [][]string
-	for p := groupPath; p != ""; p = getParentPath(p) {
-		if groupCfg, ok := c.Groups[p]; ok {
-			if list := get(groupCfg.Claude); len(list) > 0 {
-				chain = append(chain, list)
+	if c.Groups != nil {
+		for p := groupPath; p != ""; p = getParentPath(p) {
+			if groupCfg, ok := c.Groups[p]; ok {
+				if list := get(groupCfg.Claude); len(list) > 0 {
+					chain = append(chain, list)
+				}
 			}
 		}
+	}
+	// Global [claude] loadout floor: outermost ancestor, so the root-first
+	// walk below emits it ahead of every group entry and an ungrouped session
+	// still receives it.
+	if list := get(c.Claude.GroupLoadout()); len(list) > 0 {
+		chain = append(chain, list)
 	}
 	if len(chain) == 0 {
 		return nil
@@ -1944,6 +2144,15 @@ type CodexSettings struct {
 	// Default: "codex"
 	Command string `toml:"command,omitempty"`
 
+	// DefaultModel is used when a Codex session does not have an explicit
+	// per-session model. Empty leaves the Codex CLI's own default in effect.
+	DefaultModel string `toml:"default_model,omitempty"`
+
+	// DefaultReasoningEffort is used when a Codex session does not have an
+	// explicit per-session reasoning effort. Empty leaves the CLI default in
+	// effect.
+	DefaultReasoningEffort string `toml:"default_reasoning_effort,omitempty"`
+
 	// ConfigDir is the path to Codex home directory.
 	// Default: ~/.codex (or CODEX_HOME env var)
 	ConfigDir string `toml:"config_dir,omitempty"`
@@ -1956,6 +2165,53 @@ type CodexSettings struct {
 	// Sourced AFTER global [shell].env_files
 	// Path can be absolute, ~ for home, $HOME/${VAR} for env vars, or relative to session working directory
 	EnvFile string `toml:"env_file,omitempty"`
+
+	// TUI defines Agent Deck-managed defaults merged into every resolved
+	// CODEX_HOME/config.toml. Nil leaves the home's TUI settings unmanaged.
+	TUI *CodexTUISettings `toml:"tui,omitempty"`
+
+	// Skills, MCPs, Marketplaces and Plugins declare a GLOBAL Codex loadout
+	// floor. They carry the same attach-only semantics as their
+	// [groups.X.codex] counterparts, but apply to every Codex session
+	// regardless of group — including sessions with no group at all.
+	//
+	// Resolution treats the global list as the outermost ancestor, so the
+	// effective loadout is (global ∪ root group ∪ … ∪ leaf group), root-first
+	// and deduplicated. A group cannot subtract from the global floor; that is
+	// deliberate and matches the existing "removing an entry does not detach"
+	// rule in ApplyConfiguredLoadout.
+	//
+	// Use these for entries that belong everywhere (a house skill, a shared
+	// marketplace) instead of repeating them in every group stanza.
+	Skills       []string `toml:"skills,omitempty"`
+	MCPs         []string `toml:"mcps,omitempty"`
+	Marketplaces []string `toml:"marketplaces,omitempty"`
+	Plugins      []string `toml:"plugins,omitempty"`
+}
+
+// GroupLoadout projects the global [codex] loadout lists onto the group shape
+// so the group union helpers can treat it as one more ancestor. Keeping the
+// projection here means a new loadout field is added in exactly one place.
+func (s CodexSettings) GroupLoadout() GroupCodexSettings {
+	return GroupCodexSettings{
+		Skills:       s.Skills,
+		MCPs:         s.MCPs,
+		Marketplaces: s.Marketplaces,
+		Plugins:      s.Plugins,
+	}
+}
+
+// CodexTUISettings is the subset of Codex [tui] configuration that Agent Deck
+// can keep consistent across isolated group homes.
+type CodexTUISettings struct {
+	// StatusLine is the ordered Codex footer item list. A pointer to an empty
+	// slice intentionally hides the footer; nil leaves the existing value
+	// untouched and keeps config save round-trips from inventing the setting.
+	StatusLine *[]string `toml:"status_line,omitempty"`
+
+	// StatusLineUseColors controls footer colors. Pointer semantics preserve an
+	// explicit false while nil leaves the existing value untouched.
+	StatusLineUseColors *bool `toml:"status_line_use_colors,omitempty"`
 }
 
 // GetProfileCodexConfigDir returns the profile-specific Codex config directory, if configured.
@@ -3313,6 +3569,19 @@ func LoadUserConfig() (*UserConfig, error) {
 		userConfigCacheErr = fmt.Errorf("config.toml parse error: %w", err)
 		return userConfigCache, userConfigCacheErr
 	}
+	if strategy := strings.TrimSpace(config.Orchestrate.ToolStrategy); strategy != "" && strategy != "default" && strategy != "auto" {
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
+		userConfigCacheMtime = currentMtime
+		SetGroupSortMode(fresh.GetGroupSort())
+		userConfigCacheErr = fmt.Errorf("invalid [orchestrate].tool_strategy %q: must be \"default\" or \"auto\"", strategy)
+		return userConfigCache, userConfigCacheErr
+	}
+	if alternate := strings.TrimSpace(config.QuickCreate.AlternateTool); alternate != "" {
+		registryLog.Warn("ignored deprecated quick-create alternate_tool",
+			"configured_tool", alternate,
+			"hint", "alternate quick-create now infers the first visible installed tool")
+	}
 
 	if config.Tools == nil {
 		config.Tools = make(map[string]ToolDef)
@@ -3652,6 +3921,18 @@ func GetCodexCommand() string {
 		return strings.TrimSpace(userConfig.Codex.Command)
 	}
 	return "codex"
+}
+
+// GetCodexCommandForInstance resolves the group command before the global
+// Codex command. An explicit per-session command remains stronger because the
+// caller only uses this function for blank or bare "codex" commands.
+func GetCodexCommandForInstance(inst *Instance) string {
+	if userConfig, _ := LoadUserConfig(); userConfig != nil && inst != nil {
+		if command := userConfig.GetGroupCodexCommand(inst.GroupPath); strings.TrimSpace(command) != "" {
+			return strings.TrimSpace(command)
+		}
+	}
+	return GetCodexCommand()
 }
 
 func isClaudeCommand(command string) bool {
@@ -4241,6 +4522,16 @@ func GetNotificationsSettings() NotificationsConfig {
 	return settings
 }
 
+// GetDesktopNotificationsSettings returns the explicit desktop alert setting.
+// A missing or unreadable config stays safely disabled.
+func GetDesktopNotificationsSettings() DesktopNotificationsSettings {
+	config, err := LoadUserConfig()
+	if err != nil || config == nil {
+		return DesktopNotificationsSettings{}
+	}
+	return config.DesktopNotifications
+}
+
 // GetSelfHealSettings returns self-heal settings from config. The zero value
 // (Enabled=false) is the safe default: self-heal does nothing unless explicitly
 // enabled. Mode is normalized to a known value by SelfHealMode().
@@ -4446,6 +4737,9 @@ func CreateExampleConfig() error {
 # Leave commented out or empty to default to shell (no pre-selection)
 # default_tool = "claude"
 
+# Dynamic alternate quick-create is inferred from the first visible, installed,
+# non-shell picker tool that differs from default_tool (Claude when unset).
+
 # Hotkey overrides (optional)
 # Action names are defined by agent-deck. Value is the key string.
 # Set value to "" to unbind an action.
@@ -4453,6 +4747,7 @@ func CreateExampleConfig() error {
 # delete = "d"
 # close_session = "D"
 # restart = "R"
+# quick_create_alternate = "ctrl+n" # Opt-in; replaces Ctrl+N move-down in the overview.
 # detach = "ctrl+d"   # PTY-attach detach key, default ctrl+q (issue #434).
                       # Alias [tmux].detach_key exists; [hotkeys].detach wins.
 # Session switcher (cycle sessions without first detaching to the list).
@@ -4543,6 +4838,10 @@ func CreateExampleConfig() error {
 # config_dir = "~/.codex-work"
 # Enable --yolo (bypass approvals and sandbox) by default (default: false)
 # yolo_mode = true
+# Default model and reasoning effort for Codex sessions. These are reconciled
+# into Agent Deck-managed group CODEX_HOME/config.toml files.
+# default_model = "gpt-5.6"
+# default_reasoning_effort = "high"
 
 # DeepSeek Harness settings — the dsh binary from npm @deepseek-ai/dsh
 # (github.com/deepseek-ai/deepseek-harness). Install: npm install -g @deepseek-ai/dsh

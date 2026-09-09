@@ -36,6 +36,7 @@ type remoteSessionsCache struct {
 	// authoritative freshness signal is per-remote FetchedAt.
 	SavedAt  time.Time                              `json:"saved_at"`
 	Sessions map[string][]session.RemoteSessionInfo `json:"sessions"`
+	Groups   map[string][]session.GroupData         `json:"groups,omitempty"`
 	// FetchedAt records when each remote's sessions last came from a LIVE
 	// fetch. Without it, every save cycle re-stamped the whole snapshot, so a
 	// continuously-failing remote's stale sessions never hit the age cutoff.
@@ -107,20 +108,10 @@ func (h *Home) flushRemoteSessionsCache(force bool) {
 		uiLog.Warn("save_remote_cache_marshal_failed", slog.String("error", err.Error()))
 		return
 	}
-	hash := fnv.New64a()
-	_, _ = hash.Write(sessions)
-	sum := hash.Sum64()
-	h.remoteCacheDirty = false
-	unchanged := sum == h.remoteCacheLastHash && now.Sub(h.remoteCacheLastSave) < remoteSessionsCacheRefreshAge
-	if unchanged {
-		h.remoteSessionsMu.Unlock()
-		return
-	}
-	h.remoteCacheLastSave = now
-	h.remoteCacheLastHash = sum
-	doc := remoteSessionsCacheDoc{
-		SavedAt:   now,
-		Sessions:  sessions,
+	snap := remoteSessionsCache{
+		SavedAt:   time.Now(),
+		Sessions:  h.remoteSessions,
+		Groups:    h.remoteGroups,
 		FetchedAt: h.remoteFetchedAt,
 	}
 	data, err := json.Marshal(doc)
@@ -153,7 +144,7 @@ func (h *Home) loadRemoteSessionsCache() {
 		uiLog.Warn("load_remote_cache_unmarshal_failed", slog.String("error", err.Error()))
 		return
 	}
-	if len(snap.Sessions) == 0 {
+	if len(snap.Sessions) == 0 && len(snap.Groups) == 0 {
 		return
 	}
 	h.applyRemoteSessionsSnapshot(snap)
@@ -166,14 +157,27 @@ func (h *Home) applyRemoteSessionsSnapshot(snap remoteSessionsCache) {
 	if h.remoteSessions == nil {
 		h.remoteSessions = make(map[string][]session.RemoteSessionInfo)
 	}
+	if h.remoteGroups == nil {
+		h.remoteGroups = make(map[string][]session.GroupData)
+	}
 	if h.remoteFromCache == nil {
 		h.remoteFromCache = make(map[string]bool)
 	}
 	if h.remoteFetchedAt == nil {
 		h.remoteFetchedAt = make(map[string]time.Time)
 	}
-	for name, sessions := range snap.Sessions {
+	remoteNames := make(map[string]bool, len(snap.Sessions)+len(snap.Groups))
+	for name := range snap.Sessions {
+		remoteNames[name] = true
+	}
+	for name := range snap.Groups {
+		remoteNames[name] = true
+	}
+	for name := range remoteNames {
 		if _, live := h.remoteSessions[name]; live {
+			continue
+		}
+		if _, live := h.remoteGroups[name]; live {
 			continue
 		}
 		// Per-remote freshness: fall back to the snapshot stamp for early
@@ -192,10 +196,12 @@ func (h *Home) applyRemoteSessionsSnapshot(snap remoteSessionsCache) {
 		// live fetch path does. Without this, every cached session renders
 		// and routes with an empty remote name until live data lands, which
 		// is exactly the startup window this cache exists to cover.
+		sessions := snap.Sessions[name]
 		for i := range sessions {
 			sessions[i].RemoteName = name
 		}
 		h.remoteSessions[name] = sessions
+		h.remoteGroups[name] = snap.Groups[name]
 		h.remoteFromCache[name] = true
 		h.remoteFetchedAt[name] = fetched
 	}

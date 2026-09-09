@@ -306,9 +306,9 @@ func (r *SSHRunner) Attach(sessionID string) error {
 	if err := ValidateSSHHost(r.Host); err != nil {
 		return err
 	}
-	_ = os.MkdirAll(sshControlDir, 0700)
 
-	sshArgs := r.buildAttachArgs(sessionID)
+	// AttachArgs creates sshControlDir itself.
+	sshArgs := r.AttachArgs(sessionID)
 
 	cmd := exec.Command("ssh", sshArgs...)
 
@@ -545,21 +545,47 @@ func (r *SSHRunner) FetchSessions(ctx context.Context) ([]RemoteSessionInfo, err
 	if err != nil {
 		return nil, err
 	}
-	return parseRemoteSessions(output)
+	snapshot, err := parseRemoteSnapshot(output)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Sessions, nil
 }
 
-// parseRemoteSessions decodes `list --json` output; empty or non-JSON output
-// (an older remote, or "No sessions found") is an empty list, not an error.
-func parseRemoteSessions(output []byte) ([]RemoteSessionInfo, error) {
+// FetchSnapshot retrieves sessions and saved groups from a remote instance.
+func (r *SSHRunner) FetchSnapshot(ctx context.Context) (RemoteSnapshot, error) {
+	output, err := r.Run(ctx, "list", "--json", "--include-groups")
+	if err != nil {
+		sessions, fallbackErr := r.FetchSessions(ctx)
+		if fallbackErr != nil {
+			return RemoteSnapshot{}, err
+		}
+		return RemoteSnapshot{Sessions: sessions}, nil
+	}
+	return parseRemoteSnapshot(output)
+}
+
+func parseRemoteSnapshot(output []byte) (RemoteSnapshot, error) {
+	// Handle empty/non-JSON output (e.g., "No sessions found" message)
 	trimmed := bytes.TrimSpace(output)
-	if len(trimmed) == 0 || trimmed[0] != '[' {
-		return nil, nil
+	if len(trimmed) == 0 {
+		return RemoteSnapshot{}, nil
 	}
-	var sessions []RemoteSessionInfo
-	if err := json.Unmarshal(trimmed, &sessions); err != nil {
-		return nil, fmt.Errorf("failed to parse remote sessions: %w", err)
+
+	var snapshot RemoteSnapshot
+	switch trimmed[0] {
+	case '[':
+		if err := json.Unmarshal(trimmed, &snapshot.Sessions); err != nil {
+			return RemoteSnapshot{}, fmt.Errorf("failed to parse remote sessions: %w", err)
+		}
+	case '{':
+		if err := json.Unmarshal(trimmed, &snapshot); err != nil {
+			return RemoteSnapshot{}, fmt.Errorf("failed to parse remote snapshot: %w", err)
+		}
+	default:
+		return RemoteSnapshot{}, nil
 	}
-	return sessions, nil
+	return snapshot, nil
 }
 
 // FetchAccounts lists the named Claude account slots configured on the remote
@@ -1190,51 +1216,16 @@ func (r *SSHRunner) sshBaseArgs(remoteCmd string) []string {
 	return append(r.sshConnOpts(), r.Host, remoteCmd)
 }
 
-// sshChannelArgs is sshBaseArgs for the persistent channel (#2174). It adds
-// ServerAlive probes so a link that died under the session (laptop sleep,
-// VPN flap, NAT expiry) is torn down by ssh within about 45 s instead of
-// the OS keepalive's hours (#5). One-shot execs do not need them: their
-// command timeout already bounds them.
-func (r *SSHRunner) sshChannelArgs(remoteCmd string) []string {
-	args := append(r.sshConnOpts(), "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")
-	return append(args, r.Host, remoteCmd)
-}
-
-// remoteVerbReadOnly reports whether args is a verb that only reads remote
-// state, so running it twice is harmless. Anything not listed here counts
-// as mutating.
-func remoteVerbReadOnly(args []string) bool {
-	if len(args) == 0 {
-		return false
-	}
-	second := ""
-	if len(args) > 1 {
-		second = args[1]
-	}
-	switch args[0] {
-	case "list", "ls", "accounts", "version", "status":
-		return true
-	case "group":
-		return second == "list"
-	case "costs":
-		return second == "summary"
-	case "mcp", "skill":
-		return second == "list"
-	case "inbox":
-		return second == "export" || second == "writer-status"
-	case "session":
-		return second == "show" || second == "output" || second == "pane"
-	}
-	return false
-}
-
-// buildAttachArgs builds the ssh argv for an interactive attach. It shares
+// AttachArgs builds the ssh argv for an interactive attach. It shares
 // sshConnOpts() with every other path so the host-key/BatchMode stance is
 // identical (#1206 regression: Attach() previously omitted BatchMode and
 // ConnectTimeout, so an unknown host key could hang on a prompt instead of
-// failing fast). "-tt" forces a remote PTY.
-func (r *SSHRunner) buildAttachArgs(sessionID string) []string {
-	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand("session", "attach", sessionID)
+// failing fast). "-tt" forces a remote PTY. Exported so the web terminal
+// bridge (internal/web) can build the same ssh command Attach() runs, in a
+// local PTY instead of the TUI's os.Stdin one.
+func (r *SSHRunner) AttachArgs(sessionID string) []string {
+	_ = os.MkdirAll(sshControlDir, 0700)
+	remoteCmd := r.buildRemoteCommand("session", "attach", sessionID)
 	args := append([]string{"-tt"}, r.sshConnOpts()...)
 	return append(args, r.Host, remoteCmd)
 }
@@ -1547,20 +1538,10 @@ type RemoteSessionInfo struct {
 	RemoteName string `json:"-"`
 }
 
-// LastActivity parses LastActivityAt. ok is false when the field is empty or
-// unparseable — a remote agent-deck build too old to send it, or a malformed
-// value — and callers should treat that as "unknown" (matches any recency
-// filter) rather than "very old", so an old remote's sessions don't just
-// vanish under a time filter.
-func (r RemoteSessionInfo) LastActivity() (t time.Time, ok bool) {
-	if r.LastActivityAt == "" {
-		return time.Time{}, false
-	}
-	parsed, err := time.Parse(time.RFC3339Nano, r.LastActivityAt)
-	if err != nil {
-		return time.Time{}, false
-	}
-	return parsed, true
+// RemoteSnapshot is the remote list response used by the TUI.
+type RemoteSnapshot struct {
+	Sessions []RemoteSessionInfo `json:"sessions"`
+	Groups   []GroupData         `json:"groups"`
 }
 
 // RemoteLatency is a live round-trip-time sample for a configured remote.

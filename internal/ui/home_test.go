@@ -3,6 +3,7 @@ package ui
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -28,6 +29,99 @@ func TestNewHome(t *testing.T) {
 	}
 	if home.newDialog == nil {
 		t.Error("NewDialog component should be initialized")
+	}
+}
+
+func TestAlternateQuickCreateHotkeyDispatchesWithoutDialog(t *testing.T) {
+	home := NewHome()
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		"quick_create_alternate": "ctrl+n",
+	}))
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	updated := model.(*Home)
+	if cmd == nil {
+		t.Fatal("configured alternate quick-create hotkey returned no create command")
+	}
+	if updated.newDialog.IsVisible() {
+		t.Fatal("alternate quick-create opened the new-session dialog")
+	}
+}
+
+func TestAlternateQuickCreateInfersInstalledCustomTool(t *testing.T) {
+	tmuxPath, err := exec.LookPath("tmux")
+	if err != nil {
+		t.Fatalf("find tmux: %v", err)
+	}
+	binDir := t.TempDir()
+	if err := os.Symlink(tmuxPath, filepath.Join(binDir, "tmux")); err != nil {
+		t.Fatalf("link tmux: %v", err)
+	}
+	if err := os.Symlink("/bin/sleep", filepath.Join(binDir, "sleep")); err != nil {
+		t.Fatalf("link sleep: %v", err)
+	}
+	t.Setenv("PATH", binDir)
+	homeDir := setXDGTestHome(t)
+	writeXDGTestConfig(t, homeDir, `
+default_tool = "primary-test"
+
+[quick_create]
+alternate_tool = "shell"
+
+[tools.primary-test]
+command = "sleep 30"
+
+[tools.secondary-test]
+command = "sleep 30"
+`)
+
+	home := NewHome()
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		"quick_create_alternate": "ctrl+n",
+	}))
+	source := session.NewInstanceWithGroupAndTool("source", t.TempDir(), "primary-test", "primary-test")
+	home.instances = []*session.Instance{source}
+	home.flatItems = []session.Item{{Type: session.ItemTypeSession, Session: source}}
+	home.cursor = 0
+
+	_, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	if cmd == nil {
+		t.Fatal("configured alternate quick-create hotkey returned no create command")
+	}
+	msg := cmd().(sessionCreatedMsg)
+	if msg.err != nil {
+		t.Fatalf("alternate quick-create: %v", msg.err)
+	}
+	t.Cleanup(func() {
+		if err := msg.instance.KillAndWait(); err != nil {
+			t.Errorf("cleanup alternate quick-created session: %v", err)
+		}
+	})
+	if got := msg.instance.Tool; got != "secondary-test" {
+		t.Fatalf("alternate quick-create tool = %q, want inferred secondary-test", got)
+	}
+}
+
+func TestSelectAlternateQuickCreateTool(t *testing.T) {
+	tests := []struct {
+		name       string
+		contextual string
+		primary    string
+		alternate  string
+		want       string
+	}{
+		{name: "primary context selects alternate", contextual: "claude", primary: "claude", alternate: "codex", want: "codex"},
+		{name: "alternate context flips to primary", contextual: "codex", primary: "claude", alternate: "codex", want: "claude"},
+		{name: "unrelated context selects alternate", contextual: "gemini", primary: "claude", alternate: "codex", want: "codex"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := selectAlternateQuickCreateTool(tt.contextual, tt.primary, tt.alternate)
+			if got != tt.want {
+				t.Fatalf("resolved tool = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -992,16 +1086,17 @@ func TestHomeGlobalSearchEscape(t *testing.T) {
 
 func TestGetLayoutMode(t *testing.T) {
 	tests := []struct {
-		name     string
-		width    int
-		expected string
+		name           string
+		width          int
+		expected       string
+		previewVisible bool
 	}{
-		{"narrow phone", 45, "single"},
-		{"phone landscape", 65, "stacked"},
-		{"tablet", 85, "dual"},
-		{"desktop", 120, "dual"},
-		{"exact boundary 50", 50, "stacked"},
-		{"exact boundary 80", 80, "dual"},
+		{"narrow phone", 45, "single", false},
+		{"phone landscape", 65, "stacked", false},
+		{"tablet", 85, "dual", true},
+		{"desktop", 120, "dual", true},
+		{"exact boundary 50", 50, "stacked", false},
+		{"exact boundary 80", 80, "dual", true},
 	}
 
 	for _, tt := range tests {
@@ -1011,6 +1106,9 @@ func TestGetLayoutMode(t *testing.T) {
 			got := home.getLayoutMode()
 			if got != tt.expected {
 				t.Errorf("getLayoutMode() at width %d = %q, want %q", tt.width, got, tt.expected)
+			}
+			if got := home.hasPreviewPane(); got != tt.previewVisible {
+				t.Errorf("hasPreviewPane() at width %d = %v, want %v", tt.width, got, tt.previewVisible)
 			}
 		})
 	}
@@ -1740,6 +1838,28 @@ func TestRemoteSelectionQuickCreateStillRunsRemoteCommand(t *testing.T) {
 	}
 }
 
+func TestRemoteSelectionAlternateQuickCreateIsRejected(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+	home.height = 30
+	home.setHotkeys(resolveHotkeys(map[string]string{
+		"quick_create_alternate": "ctrl+n",
+	}))
+
+	remote := session.RemoteSessionInfo{ID: "remote-123", Title: "remote-session", RemoteName: "myserver"}
+	home.flatItems = []session.Item{{Type: session.ItemTypeRemoteSession, RemoteSession: &remote, RemoteName: "myserver"}}
+	home.cursor = 0
+
+	model, cmd := home.handleMainKey(tea.KeyMsg{Type: tea.KeyCtrlN})
+	updated := model.(*Home)
+	if cmd != nil {
+		t.Fatal("alternate quick-create on a remote selection must not create a local session")
+	}
+	if updated.err == nil || !strings.Contains(updated.err.Error(), "not supported for remote") {
+		t.Fatalf("remote alternate quick-create error = %v, want unsupported explanation", updated.err)
+	}
+}
+
 func TestRenderRemotePreviewIncludesCachedResponse(t *testing.T) {
 	home := NewHome()
 	home.width = 100
@@ -2126,6 +2246,19 @@ func TestHomeViewStackedLayout(t *testing.T) {
 	if strings.Contains(view, "Terminal too small") {
 		t.Error("65-col terminal should not show 'too small' error")
 	}
+	if strings.Contains(view, "PREVIEW") {
+		t.Fatalf("65-col mobile stacked layout rendered Preview:\n%s", view)
+	}
+
+}
+
+func TestWideTerminalUsesSideBySidePreview(t *testing.T) {
+	home := NewHome()
+	home.width = 100
+
+	if got := home.getLayoutMode(); got != LayoutModeDual {
+		t.Fatalf("getLayoutMode() = %q, want %q; preview must only render beside sessions", got, LayoutModeDual)
+	}
 }
 
 func TestHomeViewUsesCachedPreviewDuringNavigationBursts(t *testing.T) {
@@ -2135,7 +2268,7 @@ func TestHomeViewUsesCachedPreviewDuringNavigationBursts(t *testing.T) {
 		height int
 	}{
 		{name: "dual layout", width: 100, height: 30},
-		{name: "stacked layout", width: 65, height: 50},
+		{name: "tall dual layout", width: 100, height: 50},
 	}
 
 	for _, tt := range tests {
@@ -3008,7 +3141,7 @@ func TestMouseIgnoredWhenDialogVisible(t *testing.T) {
 	}
 }
 
-func TestMouseClickInStackedPreviewAreaIgnored(t *testing.T) {
+func TestMouseClickInMobileStackedSessionAreaSelectsItem(t *testing.T) {
 	// Generate enough items to fill the list area
 	items := make([]session.Item, 30)
 	for i := range items {
@@ -3019,11 +3152,8 @@ func TestMouseClickInStackedPreviewAreaIgnored(t *testing.T) {
 		}
 	}
 
-	// Stacked layout: width 65, height 40
-	// contentHeight = 40 - 1(header) - 2(help) - 1(filter) = 36
-	// listHeight = (36 * 60) / 100 = 21, list content = 21 - 2(title) = 19 lines
-	// List content starts at y=4, ends around y=22
-	// y=25 should be in the preview section
+	// Mobile stacked layout: width 65, height 40. It has no Preview pane, so
+	// the session list uses the full content height and y=25 targets item 21.
 	home := newTestHomeWithItems(65, 40, items)
 	home.cursor = 0
 
@@ -3031,8 +3161,8 @@ func TestMouseClickInStackedPreviewAreaIgnored(t *testing.T) {
 	model, _ := home.Update(msg)
 	h := model.(*Home)
 
-	if h.cursor != 0 {
-		t.Errorf("cursor = %d after click in stacked preview area, want 0 (unchanged)", h.cursor)
+	if h.cursor != 21 {
+		t.Errorf("cursor = %d after click in mobile stacked session area, want 21", h.cursor)
 	}
 }
 
