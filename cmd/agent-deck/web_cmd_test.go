@@ -20,6 +20,7 @@ func (noopMutator) CreateSession(string, string, string, string, string, string)
 func (noopMutator) StartSession(string) error          { return nil }
 func (noopMutator) StopSession(string) error           { return nil }
 func (noopMutator) RestartSession(string) error        { return nil }
+func (noopMutator) SendToSession(string, string) error { return nil }
 func (noopMutator) DeleteSession(string) error         { return nil }
 func (noopMutator) CloseSession(string) error          { return nil }
 func (noopMutator) ArchiveSession(string) error        { return nil }

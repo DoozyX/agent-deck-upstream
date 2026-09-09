@@ -125,6 +125,10 @@ type SessionMutator interface {
 	StartSession(sessionID string) error
 	StopSession(sessionID string) error
 	RestartSession(sessionID string) error
+	// SendToSession delivers a user message to an existing session (MCP /
+	// remote control). Implementations must not accept shell commands or
+	// arbitrary HTTP targets — only sessionID + message text.
+	SendToSession(sessionID, message string) error
 	DeleteSession(sessionID string) error
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).

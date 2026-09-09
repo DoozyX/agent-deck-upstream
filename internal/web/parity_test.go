@@ -503,7 +503,18 @@ func (s *parityStore) CreateSession(title, tool, projectPath, groupPath, modelID
 func (s *parityStore) StartSession(id string) error   { return s.transition(id, session.StatusRunning) }
 func (s *parityStore) StopSession(id string) error    { return s.transition(id, session.StatusStopped) }
 func (s *parityStore) RestartSession(id string) error { return s.transition(id, session.StatusRunning) }
-func (s *parityStore) CloseSession(id string) error   { return s.transition(id, session.StatusStopped) }
+func (s *parityStore) SendToSession(id, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[id]; !ok {
+		return errNotFound(id)
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("message is required")
+	}
+	return nil
+}
+func (s *parityStore) CloseSession(id string) error { return s.transition(id, session.StatusStopped) }
 
 func (s *parityStore) ArchiveSession(id string) error {
 	s.mu.Lock()
