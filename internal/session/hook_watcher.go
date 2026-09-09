@@ -282,8 +282,18 @@ func (w *StatusFileWatcher) Start() {
 		w.addExistingScopedWatches()
 	}
 
-	// Load any existing status files on startup (flat + scoped)
+	// Load any existing status files on startup (flat + scoped). Startup can
+	// encounter thousands of historical hook files; per-file INFO logging here
+	// contends with the TUI's renderer and turns initialization into log I/O.
+	// Live file events still retain their per-file audit record.
+	startupLoad := time.Now()
 	w.loadExisting()
+	w.mu.RLock()
+	startupStatuses := len(w.statuses)
+	w.mu.RUnlock()
+	hookLog.Debug("hook_watcher_initial_load",
+		slog.Duration("duration", time.Since(startupLoad)),
+		slog.Int("statuses", startupStatuses))
 
 	// Debounce timer: coalesce rapid file events
 	var debounceTimer *time.Timer
@@ -568,12 +578,16 @@ func (w *StatusFileWatcher) ClearHookStatus(instanceID string) {
 // top-level files (non-sandbox sessions) and the per-instance scoped subdir
 // files (sandbox sessions under …/hooks/sandbox/<id>/).
 func (w *StatusFileWatcher) loadExisting() {
-	w.loadDir(w.hooksDir)
-	w.loadScopedDirs()
+	w.loadDirWithLogging(w.hooksDir, false)
+	w.loadScopedDirsWithLogging(false)
 }
 
 // loadDir processes every .json status file directly inside dir (non-recursive).
 func (w *StatusFileWatcher) loadDir(dir string) {
+	w.loadDirWithLogging(dir, true)
+}
+
+func (w *StatusFileWatcher) loadDirWithLogging(dir string, logUpdates bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
@@ -582,13 +596,11 @@ func (w *StatusFileWatcher) loadDir(dir string) {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		w.processFile(filepath.Join(dir, entry.Name()))
+		w.processFileWithLogging(filepath.Join(dir, entry.Name()), logUpdates)
 	}
 }
 
-// loadScopedDirs processes the status file inside each per-instance sandbox
-// subdir under sandboxDir.
-func (w *StatusFileWatcher) loadScopedDirs() {
+func (w *StatusFileWatcher) loadScopedDirsWithLogging(logUpdates bool) {
 	entries, err := os.ReadDir(w.sandboxDir)
 	if err != nil {
 		return
@@ -597,7 +609,7 @@ func (w *StatusFileWatcher) loadScopedDirs() {
 		if !entry.IsDir() {
 			continue
 		}
-		w.loadDir(filepath.Join(w.sandboxDir, entry.Name()))
+		w.loadDirWithLogging(filepath.Join(w.sandboxDir, entry.Name()), logUpdates)
 	}
 }
 
@@ -624,6 +636,10 @@ func (w *StatusFileWatcher) addExistingScopedWatches() {
 // fail-open silently; success-path logs at INFO with file path so a hook
 // audit can be done without opening SQLite.
 func (w *StatusFileWatcher) processFile(filePath string) {
+	w.processFileWithLogging(filePath, true)
+}
+
+func (w *StatusFileWatcher) processFileWithLogging(filePath string, logUpdates bool) {
 	// Bind identity to the file's LOCATION before reading it. A scoped sandbox
 	// file is authoritative ONLY for the instance that owns its subdir; a
 	// foreign-named file planted inside another instance's writable subdir is
@@ -708,12 +724,14 @@ func (w *StatusFileWatcher) processFile(filePath string) {
 	w.statuses[instanceID] = hookStatus
 	w.mu.Unlock()
 
-	hookLog.Info("hook_status_updated",
-		slog.String("instance", instanceID),
-		slog.String("status", status.Status),
-		slog.String("event", status.Event),
-		slog.String("path", filePath),
-	)
+	if logUpdates {
+		hookLog.Info("hook_status_updated",
+			slog.String("instance", instanceID),
+			slog.String("status", status.Status),
+			slog.String("event", status.Event),
+			slog.String("path", filePath),
+		)
+	}
 
 	if w.onChange != nil {
 		w.onChange()

@@ -4,6 +4,7 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/stretchr/testify/require"
 	"testing"
+	"time"
 )
 
 func requireWatcherSignal(t *testing.T, w *StorageWatcher) {
@@ -48,13 +49,13 @@ func TestStorageWatcherMaterialChangesIgnoreTimestamp(t *testing.T) {
 			requireWatcherAppliedRow(t, w, db, "a", "one")
 			w.checkAndNotify()
 			requireNoWatcherSignal(t, w)
-			require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "a", Title: "one", Status: "running"}))
+			require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "a", Title: "two", Status: "running"}))
 			w.checkAndNotify()
 			requireWatcherSignal(t, w)
 			row, err := db.LoadInstanceByID("a")
 			require.NoError(t, err)
 			require.Equal(t, "running", row.Status)
-			requireWatcherAppliedRow(t, w, db, "a", "one")
+			requireWatcherAppliedRow(t, w, db, "a", "two")
 		})
 	}
 }
@@ -69,6 +70,70 @@ func TestStorageWatcherMetadataOnlyDoesNotReload(t *testing.T) {
 	require.NoError(t, db.Touch())
 	w.checkAndNotify()
 	requireNoWatcherSignal(t, w)
+}
+
+func TestStorageWatcherStatusOnlyChangesDoNotReload(t *testing.T) {
+	db := newTestDB(t)
+	w, err := NewStorageWatcher(db)
+	require.NoError(t, err)
+	defer w.Close()
+	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "status-only", Title: "session", Tool: "shell", Status: "idle"}))
+	settleWatcherInitialLoad(t, w, db)
+
+	// Status coordination is a volatile field in the registry row. It must not
+	// make the TUI rebuild every hydrated Instance when another deck writes it.
+	require.NoError(t, db.WriteStatus("status-only", "running", "shell"))
+	w.checkAndNotify()
+	requireNoWatcherSignal(t, w)
+}
+
+func TestStorageWatcherStatusChurnDuringLoadDoesNotKeepReloadPending(t *testing.T) {
+	db := newTestDB(t)
+	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "status-race", Title: "session", Tool: "shell", Status: "idle"}))
+	w, err := NewStorageWatcher(db)
+	require.NoError(t, err)
+	defer w.Close()
+	settleWatcherInitialLoad(t, w, db)
+
+	ticket, err := w.beginLoad()
+	require.NoError(t, err)
+	require.NoError(t, db.WriteStatus("status-race", "running", "shell"))
+	snapshot, err := db.LoadRegistrySnapshot()
+	require.NoError(t, err)
+	ticket, err = w.endLoad(ticket)
+	require.NoError(t, err)
+	w.acknowledge(ticket, snapshot, true)
+	w.checkAndNotify()
+	requireNoWatcherSignal(t, w)
+}
+
+func TestStorageWatcherArchiveViewTracksArchivePartition(t *testing.T) {
+	db := newTestDB(t)
+	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "active", Title: "active", Status: "idle"}))
+	require.NoError(t, db.SaveInstance(&statedb.InstanceRow{ID: "archived", Title: "archived", Status: "stopped", ArchivedAt: time.Unix(123, 0)}))
+	w, err := NewStorageWatcher(db)
+	require.NoError(t, err)
+	defer w.Close()
+	settleWatcherInitialLoad(t, w, db)
+
+	w.SetArchiveView(true)
+	ticket, err := w.beginLoad()
+	require.NoError(t, err)
+	snapshot, err := db.LoadRegistrySnapshotByArchive(true)
+	require.NoError(t, err)
+	ticket, err = w.endLoad(ticket)
+	require.NoError(t, err)
+	w.acknowledge(ticket, snapshot, true)
+	w.checkAndNotify()
+	requireNoWatcherSignal(t, w)
+
+	require.NoError(t, db.WriteStatus("active", "running", "shell"))
+	w.checkAndNotify()
+	requireNoWatcherSignal(t, w)
+	_, err = db.DB().Exec("UPDATE instances SET title = ? WHERE id = ?", "archive-edited", "archived")
+	require.NoError(t, err)
+	w.checkAndNotify()
+	requireWatcherSignal(t, w)
 }
 func TestStorageWatcherFailedAndStaleLoadCannotAcknowledge(t *testing.T) {
 	db := newTestDB(t)

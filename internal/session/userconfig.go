@@ -3862,6 +3862,13 @@ func IsClaudeCompatible(toolName string) bool {
 	if toolName == "claude" {
 		return true
 	}
+	if isStaticBuiltinToolName(toolName) {
+		// Built-in tools cannot be shadowed by custom entries. Keep this path
+		// constant-time: capability checks run once per visible row per frame,
+		// and consulting the custom-tool registry would stat config.toml for
+		// every scroll render.
+		return false
+	}
 	if def := GetToolDef(toolName); def != nil {
 		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "claude") || isClaudeCommand(def.Command)
 	}
@@ -3888,10 +3895,27 @@ func IsCodexCompatible(toolName string) bool {
 	if toolName == "codex" {
 		return true
 	}
+	if isStaticBuiltinToolName(toolName) {
+		// See IsClaudeCompatible: built-in capability checks must not enter
+		// the config-backed custom registry on the render hot path.
+		return false
+	}
 	if def := GetToolDef(toolName); def != nil {
 		return strings.EqualFold(strings.TrimSpace(def.CompatibleWith), "codex") || isCodexCommand(def.Command)
 	}
 	return false
+}
+
+// isStaticBuiltinToolName answers the common built-in-name question without
+// loading the config-backed registry. A custom tool cannot use one of these
+// names: Registry.InitFiltered rejects entries that shadow a built-in.
+func isStaticBuiltinToolName(toolName string) bool {
+	switch toolName {
+	case "claude", "opencode", "gemini", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "aider", "shell":
+		return true
+	default:
+		return false
+	}
 }
 
 // isShellBinary returns true if cmd is a known interactive shell process name.
@@ -4082,7 +4106,14 @@ func GetToolCommand(toolName string) string {
 }
 
 func isBuiltinToolName(toolName string) bool {
-	return currentRegistry().IsBuiltin(toolName)
+	return isStaticBuiltinToolName(toolName)
+}
+
+// IsBuiltinToolName reports whether toolName is one of Agent Deck's canonical
+// built-ins without consulting config.toml. This is used by render paths that
+// need to distinguish custom tools before calling the config-backed registry.
+func IsBuiltinToolName(toolName string) bool {
+	return isStaticBuiltinToolName(toolName)
 }
 
 // GetToolIcon returns the icon for a tool (custom or built-in)

@@ -1520,6 +1520,17 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 // watcher compares that raw snapshot against the next one to decide whether a
 // reload is even needed, so it must be the exact rows this load observed.
 func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
+	return s.loadWithGroupsSnapshot(false, false)
+}
+
+// LoadWithGroupsSnapshotForArchive reads exactly one archive partition. The
+// TUI keeps the active partition in memory for its normal path and requests
+// archived rows only when the archive filter is opened.
+func (s *Storage) LoadWithGroupsSnapshotForArchive(archived bool) ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
+	return s.loadWithGroupsSnapshot(true, archived)
+}
+
+func (s *Storage) loadWithGroupsSnapshot(filterArchive, archived bool) ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1528,7 +1539,13 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		return []*Instance{}, nil, nil, nil
 	}
 
-	snapshot, err := s.db.LoadRegistrySnapshot()
+	var snapshot *statedb.RegistrySnapshotResult
+	var err error
+	if filterArchive {
+		snapshot, err = s.db.LoadRegistrySnapshotByArchive(archived)
+	} else {
+		snapshot, err = s.db.LoadRegistrySnapshot()
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
