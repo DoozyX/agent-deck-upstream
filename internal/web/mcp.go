@@ -3,10 +3,12 @@ package web
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -14,6 +16,8 @@ import (
 // mcpSessionTimeout bounds idle stateful sessions on the long-lived M1 web
 // process. Tests shorten it to verify cleanup without waiting five minutes.
 var mcpSessionTimeout = 5 * time.Minute
+
+var mcpLog = logging.ForComponent(logging.CompWeb)
 
 // NewMCPHandler returns the dedicated Streamable HTTP MCP handler with the six
 // approved tools registered against Loader/Mutator seams.
@@ -54,55 +58,74 @@ func registerMCPTools(server *mcpsdk.Server, deps MCPDependencies) {
 		case "fleet_status":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, MCPFleetStatusResult, error) {
 				out, err := mcpFleetStatus(deps)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "session_details":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPSessionDetailsResult, error) {
 				out, err := mcpSessionDetails(deps, in.SessionID)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "send_to_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSendToSessionInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpSendToSession(deps, in)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "start_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.StartSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "stop_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.StopSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "restart_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.RestartSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "create_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPCreateSessionInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpCreateSession(deps, in)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err,
+					slog.String("sessionTool", strings.TrimSpace(in.Tool)),
+					slog.String("projectPath", strings.TrimSpace(in.ProjectPath)),
+				)
 			})
 		case "delete_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.DeleteSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		default:
 			panic(fmt.Sprintf("unexpected MCP tool %q", spec.Name))
 		}
 	}
+}
+
+func mcpLogToolFailure(tool string, err error, attrs ...slog.Attr) error {
+	if err == nil {
+		return nil
+	}
+	fields := []any{
+		slog.String("tool", tool),
+		slog.String("errorKind", string(ClassifyMCPError(err))),
+		slog.String("error", err.Error()),
+	}
+	for _, attr := range attrs {
+		fields = append(fields, attr)
+	}
+	mcpLog.Warn("mcp_tool_failed", fields...)
+	return err
 }
 
 func mcpCreateSession(deps MCPDependencies, in MCPCreateSessionInput) (MCPMutationResult, error) {
