@@ -137,8 +137,9 @@ const MCPAdditionalPropertyPrefix = "mcp: additional property:"
 // isMCPMalformedValidationMessage matches only pinned jsonschema-go forms and
 // the explicit MCP singular wrapper prefix — not bare substrings like
 // "missing properties" or "additional property" that can appear in backend text.
-// jsonschema-go may wrap as "validating <path>: <form>"; peel ": "-segments
-// until a recognized form is a prefix of the remainder.
+// jsonschema-go may wrap as "validating <path>: <form>"; peel only those
+// "validating …: " wrappers until a recognized form is a prefix of the remainder.
+// Do not peel arbitrary "prefix: " segments (e.g. "storage: required: …").
 func isMCPMalformedValidationMessage(msg string) bool {
 	for {
 		msg = strings.TrimSpace(msg)
@@ -148,6 +149,10 @@ func isMCPMalformedValidationMessage(msg string) bool {
 			strings.HasPrefix(msg, "required: missing properties:"),
 			strings.HasPrefix(msg, "unexpected additional properties"):
 			return true
+		}
+		// Only peel jsonschema-go "validating <path>: …" wrappers.
+		if !strings.HasPrefix(msg, "validating ") {
+			return false
 		}
 		_, rest, ok := strings.Cut(msg, ": ")
 		if !ok || rest == "" || rest == msg {
