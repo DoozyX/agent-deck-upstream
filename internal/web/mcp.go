@@ -3,11 +3,21 @@ package web
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/logging"
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// mcpSessionTimeout bounds idle stateful sessions on the long-lived M1 web
+// process. Tests shorten it to verify cleanup without waiting five minutes.
+var mcpSessionTimeout = 5 * time.Minute
+
+var mcpLog = logging.ForComponent(logging.CompWeb)
 
 // NewMCPHandler returns the dedicated Streamable HTTP MCP handler with the six
 // approved tools registered against Loader/Mutator seams.
@@ -21,8 +31,9 @@ func NewMCPHandler(deps MCPDependencies) http.Handler {
 	inner := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server {
 		return server
 	}, &mcpsdk.StreamableHTTPOptions{
-		JSONResponse:                true,
+		JSONResponse:               true,
 		DisableLocalhostProtection: true,
+		SessionTimeout:             mcpSessionTimeout,
 	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,43 +58,125 @@ func registerMCPTools(server *mcpsdk.Server, deps MCPDependencies) {
 		case "fleet_status":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, _ struct{}) (*mcpsdk.CallToolResult, MCPFleetStatusResult, error) {
 				out, err := mcpFleetStatus(deps)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "session_details":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPSessionDetailsResult, error) {
 				out, err := mcpSessionDetails(deps, in.SessionID)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "send_to_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSendToSessionInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpSendToSession(deps, in)
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "start_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.StartSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "stop_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.StopSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		case "restart_session":
 			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
 				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
 					return m.RestartSession(id)
 				})
-				return nil, out, err
+				return nil, out, mcpLogToolFailure(spec.Name, err)
+			})
+		case "create_session":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPCreateSessionInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
+				out, err := mcpCreateSession(deps, in)
+				return nil, out, mcpLogToolFailure(spec.Name, err,
+					slog.String("sessionTool", strings.TrimSpace(in.Tool)),
+					slog.String("projectPath", strings.TrimSpace(in.ProjectPath)),
+				)
+			})
+		case "delete_session":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
+				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
+					return m.DeleteSession(id)
+				})
+				return nil, out, mcpLogToolFailure(spec.Name, err)
+			})
+		case "session_output":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPSessionOutputResult, error) {
+				out, err := mcpSessionOutput(deps, in.SessionID)
+				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
 		default:
 			panic(fmt.Sprintf("unexpected MCP tool %q", spec.Name))
 		}
 	}
+}
+
+func mcpSessionOutput(deps MCPDependencies, sessionID string) (MCPSessionOutputResult, error) {
+	id, err := mcpRequireSessionID(sessionID)
+	if err != nil {
+		return MCPSessionOutputResult{}, err
+	}
+	if deps.OutputReader == nil {
+		return MCPSessionOutputResult{}, fmt.Errorf("%w: session output reader unavailable", ErrMCPBackend)
+	}
+	content, err := deps.OutputReader.SessionOutput(id)
+	if err != nil {
+		if ClassifyMCPError(err) == MCPErrorNotFound {
+			return MCPSessionOutputResult{}, fmt.Errorf("%w: %v", ErrMCPNotFound, err)
+		}
+		return MCPSessionOutputResult{}, fmt.Errorf("%w: %v", ErrMCPBackend, err)
+	}
+	return MCPSessionOutputResult{SessionID: id, Content: content}, nil
+}
+
+func mcpLogToolFailure(tool string, err error, attrs ...slog.Attr) error {
+	if err == nil {
+		return nil
+	}
+	fields := []any{
+		slog.String("tool", tool),
+		slog.String("errorKind", string(ClassifyMCPError(err))),
+		slog.String("error", err.Error()),
+	}
+	for _, attr := range attrs {
+		fields = append(fields, attr)
+	}
+	mcpLog.Warn("mcp_tool_failed", fields...)
+	return err
+}
+
+func mcpCreateSession(deps MCPDependencies, in MCPCreateSessionInput) (MCPMutationResult, error) {
+	if err := mcpGuardMutation(deps); err != nil {
+		return MCPMutationResult{}, err
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: title is required", ErrMCPMalformed)
+	}
+	projectPath := strings.TrimSpace(in.ProjectPath)
+	if projectPath == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: projectPath is required", ErrMCPMalformed)
+	}
+	if err := session.ValidateLaunchReasoningEffort(in.Tool, in.ReasoningEffort); err != nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: %v", ErrMCPMalformed, err)
+	}
+	if deps.Mutator == nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: session mutator unavailable", ErrMCPBackend)
+	}
+	id, err := deps.Mutator.CreateSession(title, strings.TrimSpace(in.Tool), projectPath, strings.TrimSpace(in.GroupPath), strings.TrimSpace(in.ModelID), strings.TrimSpace(in.ReasoningEffort))
+	if err != nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: %v", ErrMCPBackend, err)
+	}
+	if strings.TrimSpace(id) == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: create returned empty session ID", ErrMCPBackend)
+	}
+	return MCPMutationResult{SessionID: id, OK: true}, nil
 }
 
 func mcpGuardMutation(deps MCPDependencies) error {
@@ -122,6 +215,12 @@ func mcpFleetStatus(deps MCPDependencies) (MCPFleetStatusResult, error) {
 		TotalSessions: snap.TotalSessions,
 		Sessions:      make([]MCPSessionSummary, 0, mcpNonNegCap(snap.TotalSessions)),
 		Groups:        make([]MCPGroupSummary, 0, mcpNonNegCap(snap.TotalGroups)),
+		Remotes:       make([]session.RemoteFleetRemote, 0),
+	}
+	if deps.RemoteFleet != nil {
+		remote := deps.RemoteFleet.Snapshot()
+		out.Remotes = remote.Remotes
+		out.RemoteCounts = remote.Counts
 	}
 	for _, item := range snap.Items {
 		if item.Group != nil {
