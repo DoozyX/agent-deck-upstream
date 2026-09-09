@@ -412,6 +412,20 @@ func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
 	}
 }
 
+func TestIsBuiltinToolNameCoversCanonicalTools(t *testing.T) {
+	for _, name := range []string{
+		"claude", "opencode", "gemini", "codex", "pi", "copilot",
+		"crush", "cursor", "hermes", "deepseek", "aider", "shell",
+	} {
+		if !IsBuiltinToolName(name) {
+			t.Errorf("IsBuiltinToolName(%q) = false, want true", name)
+		}
+	}
+	if IsBuiltinToolName("custom-tool") {
+		t.Error("IsBuiltinToolName(custom-tool) = true, want false")
+	}
+}
+
 func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")

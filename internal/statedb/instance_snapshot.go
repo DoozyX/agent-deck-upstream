@@ -71,6 +71,34 @@ func (s *StateDB) LoadRegistrySnapshot() (*RegistrySnapshotResult, error) {
 	return &RegistrySnapshotResult{Instances: instances, Groups: groups}, nil
 }
 
+// LoadRegistrySnapshotByArchive reads one instance archive partition and all
+// groups from one SQLite snapshot. The TUI uses this to keep the normal active
+// view and its storage watcher independent of a large archived backlog.
+func (s *StateDB) LoadRegistrySnapshotByArchive(archived bool) (*RegistrySnapshotResult, error) {
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	where := "WHERE archived_at = 0"
+	if archived {
+		where = "WHERE archived_at > 0"
+	}
+	instances, err := loadInstancesWhere(tx.Query, where)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load instances: %w", err)
+	}
+	groups, err := loadGroups(tx.Query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load groups: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &RegistrySnapshotResult{Instances: instances, Groups: groups}, nil
+}
+
 // MergeRegistrySnapshots commits instance and group snapshots together. Both
 // returned slices preserve input order and are available only after COMMIT.
 func (s *StateDB) MergeRegistrySnapshots(updates []InstanceSnapshot, groups []GroupSnapshot) (*RegistrySnapshotResult, error) {

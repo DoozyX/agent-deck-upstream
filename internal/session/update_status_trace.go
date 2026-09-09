@@ -30,6 +30,7 @@ type updateStatusTrace struct {
 	terminated time.Duration // applyTerminatedPaneStatus + auth-hold death probe
 	bgWork     time.Duration // BackgroundWorkPending — captures the pane
 	getStatus  time.Duration // tmuxSession.GetStatus() — capture + classify
+	codex      time.Duration // Codex process/session discovery
 	gateway    time.Duration // Hermes gateway reachability check
 	hookFile   time.Duration // readHookStatusFile — cold-load disk read
 	persist    time.Duration // persistLastActivity — SQLite write
@@ -68,10 +69,11 @@ func (t *updateStatusTrace) finish(id, title string) {
 		slog.Duration("terminated", t.terminated),
 		slog.Duration("bg_work", t.bgWork),
 		slog.Duration("get_status", t.getStatus),
+		slog.Duration("codex", t.codex),
 		slog.Duration("gateway", t.gateway),
 		slog.Duration("hook_file", t.hookFile),
 		slog.Duration("persist", t.persist),
-		slog.Duration("other", total-t.lockWait-t.exists-t.terminated-t.bgWork-t.getStatus-t.gateway-t.hookFile-t.persist),
+		slog.Duration("other", total-t.lockWait-t.exists-t.terminated-t.bgWork-t.getStatus-t.codex-t.gateway-t.hookFile-t.persist),
 	)
 }
 

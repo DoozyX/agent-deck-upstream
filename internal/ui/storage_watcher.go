@@ -23,6 +23,7 @@ type StorageWatcher struct {
 	closeOnce      sync.Once
 	mu             sync.Mutex
 	acknowledged   *statedb.RegistrySnapshotResult
+	archived       bool
 	scannedVersion int64
 	scannedEpoch   uint64
 	pending        bool
@@ -32,6 +33,7 @@ type StorageWatcher struct {
 
 type storageLoadTicket struct {
 	sequence                uint64
+	archived                bool
 	before, after           int64
 	beforeEpoch, afterEpoch uint64
 }
@@ -44,7 +46,7 @@ func NewStorageWatcher(db *statedb.StateDB) (*StorageWatcher, error) {
 	if err != nil {
 		return nil, err
 	}
-	snapshot, _, after, err := observer.Snapshot()
+	snapshot, _, after, err := observer.SnapshotByArchive(false)
 	if err != nil {
 		_ = observer.Close()
 		return nil, err
@@ -90,10 +92,19 @@ func (sw *StorageWatcher) checkAndNotify() {
 	if unchanged || closed {
 		return
 	}
-	snapshot, before, after, err := sw.observer.Snapshot()
+	sw.mu.Lock()
+	archived := sw.archived
+	sw.mu.Unlock()
+	snapshot, _, after, err := sw.observer.SnapshotByArchive(archived)
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	if sw.closed {
+		return
+	}
+	// A view switch can race this poll. Its load command owns the new
+	// acknowledged snapshot, so discard the old-scope scan rather than
+	// comparing two different archive partitions.
+	if archived != sw.archived {
 		return
 	}
 	if err != nil {
@@ -103,18 +114,44 @@ func (sw *StorageWatcher) checkAndNotify() {
 	}
 	sw.scannedVersion = after
 	sw.scannedEpoch = epoch
-	if before != after || !reflect.DeepEqual(snapshot, sw.acknowledged) {
+	if !registrySnapshotsMateriallyEqual(snapshot, sw.acknowledged) {
+		// The notification means the next UI load is expected to apply this
+		// snapshot. Make it the comparison baseline now so acknowledgment only
+		// reports edits that happen while that load is in flight.
+		sw.acknowledged = filterWatcherSnapshot(snapshot, archived)
 		sw.pending = true
 	}
 	if sw.pending {
 		sw.signalLocked()
 	}
 }
+
 func (sw *StorageWatcher) ReloadChannel() <-chan struct{} { return sw.reloadCh }
 
 // NotifySave remains compatible with callers. Intent is not commit provenance;
 // it never suppresses unrelated writes.
 func (sw *StorageWatcher) NotifySave() {}
+
+// NotifyStatusWrite advances the observer's acknowledged volatile status for a
+// write made by this process. Status writes happen on every live sweep and are
+// already reflected in memory; acknowledging them here prevents those writes
+// from masquerading as full registry edits. A concurrent material edit still
+// differs from the snapshot and causes a reload.
+func (sw *StorageWatcher) NotifyStatusWrite(id, status, tool string) {
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	if sw.closed || sw.acknowledged == nil {
+		return
+	}
+	for _, row := range sw.acknowledged.Instances {
+		if row != nil && row.ID == id {
+			row.Status = status
+			row.Tool = tool
+			return
+		}
+	}
+}
+
 func (sw *StorageWatcher) TriggerReload() {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
@@ -125,7 +162,7 @@ func (sw *StorageWatcher) issueLoad() storageLoadTicket {
 	sw.mu.Lock()
 	defer sw.mu.Unlock()
 	sw.sequence++
-	return storageLoadTicket{sequence: sw.sequence}
+	return storageLoadTicket{sequence: sw.sequence, archived: sw.archived}
 }
 
 func (sw *StorageWatcher) beginLoad() (storageLoadTicket, error) {
@@ -157,17 +194,102 @@ func (sw *StorageWatcher) acknowledge(ticket storageLoadTicket, snapshot *stated
 	}
 	if !success || snapshot == nil {
 		sw.pending = true
+		sw.signalLocked()
 		return
 	}
-	sw.acknowledged = snapshot
-	// Never acknowledge a version observed after the load's own boundary.
-	sw.pending = ticket.before != ticket.after || ticket.beforeEpoch != ticket.afterEpoch || sw.scannedEpoch != ticket.beforeEpoch || sw.scannedVersion != ticket.before
+	if ticket.archived != sw.archived {
+		// The user switched views while this load was in flight. Do not let an
+		// obsolete partition replace the watcher baseline.
+		sw.pending = true
+		sw.signalLocked()
+		return
+	}
+	filtered := filterWatcherSnapshot(snapshot, ticket.archived)
+	materialChanged := sw.acknowledged != nil && !registrySnapshotsMateriallyEqual(filtered, sw.acknowledged)
+	sw.acknowledged = filtered
+	// Keep the scan cursor at the load's boundary so the next poll performs one
+	// material comparison. This catches edits made during the load while
+	// avoiding a follow-up reload for volatile status-only writes.
+	boundaryChanged := ticket.beforeEpoch != ticket.afterEpoch ||
+		sw.scannedEpoch != ticket.beforeEpoch
+	sw.pending = materialChanged || boundaryChanged
 	sw.scannedVersion = ticket.before
 	sw.scannedEpoch = ticket.beforeEpoch
 	if sw.pending {
 		sw.signalLocked()
 	}
 }
+
+// SetArchiveView changes the partition observed by future loads and polls.
+// The following load establishes the new baseline; no synthetic notification
+// is emitted because the filter change already schedules that load directly.
+func (sw *StorageWatcher) SetArchiveView(archived bool) {
+	sw.mu.Lock()
+	if sw.archived != archived {
+		// The two partitions are independent baselines. The view's next load
+		// establishes the new one; comparing it with the previous partition
+		// would manufacture a reload after every view switch.
+		sw.acknowledged = nil
+	}
+	sw.archived = archived
+	sw.mu.Unlock()
+}
+
+func filterWatcherSnapshot(snapshot *statedb.RegistrySnapshotResult, archived bool) *statedb.RegistrySnapshotResult {
+	if snapshot == nil {
+		return nil
+	}
+	filtered := &statedb.RegistrySnapshotResult{Groups: snapshot.Groups}
+	var instances []*statedb.InstanceRow
+	for _, row := range snapshot.Instances {
+		if row == nil {
+			continue
+		}
+		if row.ArchivedAt.IsZero() != archived {
+			if instances == nil {
+				instances = make([]*statedb.InstanceRow, 0, len(snapshot.Instances))
+			}
+			instances = append(instances, statedb.CloneInstanceRow(row))
+		}
+	}
+	filtered.Instances = instances
+	return filtered
+}
+
+// registrySnapshotsMateriallyEqual compares the fields that require
+// rehydrating the TUI. WriteStatus intentionally updates only the volatile
+// status/tool pair (plus the separate acknowledgment column), and those
+// values are refreshed by the background status path. Treating them as a
+// registry edit makes concurrent agent-deck processes turn every status tick
+// into a full session reload, which starves scroll input on a busy profile.
+func registrySnapshotsMateriallyEqual(a, b *statedb.RegistrySnapshotResult) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if !reflect.DeepEqual(a.Groups, b.Groups) || len(a.Instances) != len(b.Instances) {
+		return false
+	}
+	for i, left := range a.Instances {
+		right := b.Instances[i]
+		if left == nil || right == nil {
+			if left != right {
+				return false
+			}
+			continue
+		}
+		leftCopy := *left
+		rightCopy := *right
+		leftCopy.Status = ""
+		rightCopy.Status = ""
+		leftCopy.Tool = ""
+		rightCopy.Tool = ""
+		if !reflect.DeepEqual(leftCopy, rightCopy) {
+			return false
+		}
+	}
+	return true
+}
+
 func (sw *StorageWatcher) Warning() string { return "" }
 func (sw *StorageWatcher) Close() error {
 	var err error

@@ -2,6 +2,7 @@ package session
 
 import (
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -80,6 +81,62 @@ type Reviver struct {
 	// because its agent cannot authenticate (see auth_hold.go). nil disables the
 	// check — legacy behavior for unit tests that construct Reviver{} directly.
 	AuthHeld func(*Instance) (bool, string)
+	// suppressDeadClassifications keeps large fleet sweeps from writing one
+	// diagnostic record for every intentionally stopped session. Direct callers
+	// and tests retain detailed Classify evidence by default.
+	suppressDeadClassifications bool
+}
+
+const reviverRepeatedEvidenceInterval = 5 * time.Minute
+
+type reviverClassificationLogState struct {
+	tmuxAlive    bool
+	pipeAlive    bool
+	storedStatus Status
+	class        RevivalClass
+	lastSeen     time.Time
+	lastInfo     time.Time
+}
+
+// Reviver instances are intentionally short-lived in the TUI (one per coarse
+// recovery tick). Keep repeated-evidence suppression outside the instance so a
+// session that stays errored does not write one INFO record on every sweep.
+// The first errored verdict and every evidence change remain INFO; an unchanged
+// verdict is emitted again periodically so a long-lived incident still has a
+// heartbeat in the log.
+var reviverClassificationLog = struct {
+	sync.Mutex
+	states map[string]reviverClassificationLogState
+}{states: make(map[string]reviverClassificationLogState)}
+
+func shouldLogReviverInfo(inst *Instance, name string, tmuxAlive, pipeAlive bool, class RevivalClass, now time.Time) bool {
+	key := inst.ID
+	if key == "" {
+		key = name
+	}
+
+	current := reviverClassificationLogState{
+		tmuxAlive:    tmuxAlive,
+		pipeAlive:    pipeAlive,
+		storedStatus: inst.Status,
+		class:        class,
+		lastSeen:     now,
+	}
+
+	reviverClassificationLog.Lock()
+	defer reviverClassificationLog.Unlock()
+	previous, exists := reviverClassificationLog.states[key]
+	current.lastInfo = previous.lastInfo
+	changed := !exists || previous.tmuxAlive != current.tmuxAlive ||
+		previous.pipeAlive != current.pipeAlive ||
+		previous.storedStatus != current.storedStatus || previous.class != current.class
+	if class != ClassAlive && (changed || previous.lastInfo.IsZero() || now.Sub(previous.lastInfo) >= reviverRepeatedEvidenceInterval) {
+		current.lastInfo = now
+		reviverClassificationLog.states[key] = current
+		return true
+	}
+	reviverClassificationLog.states[key] = current
+	return false
 }
 
 // NewReviver returns a Reviver wired to real tmux + PipeManager primitives.
@@ -97,8 +154,9 @@ func NewReviver() *Reviver {
 		// accumulate. The breaker must outlive the Reviver to detect a
 		// storm across sweeps. CLI one-shots run in a short-lived process,
 		// so their global breaker starts empty and always probes.
-		Breaker:  globalReviveBreaker,
-		AuthHeld: defaultBootAuthHeld,
+		Breaker:                     globalReviveBreaker,
+		AuthHeld:                    defaultBootAuthHeld,
+		suppressDeadClassifications: true,
 	}
 }
 
@@ -144,10 +202,10 @@ func (r *Reviver) Classify(inst *Instance) RevivalClass {
 // Issue #1705 was a live conductor restarted as if it were dead, and the
 // investigation stalled because only the OUTCOME was recoverable afterwards — the
 // readings that produced it were never written down anywhere an operator could
-// retrieve. So every non-alive verdict states its evidence: tmux liveness, the
-// control-pipe reading, the stored status it was judged against, and when. Alive
-// verdicts stay at debug level; they are the overwhelming majority and carry no
-// diagnostic value.
+// retrieve. Errored verdicts therefore keep their evidence at INFO. Dead
+// verdicts carry the same evidence at DEBUG: a large deck can contain many
+// intentionally stopped sessions, and writing one INFO record for each on every
+// reviver sweep blocks the shared logger and makes TUI input visibly lag.
 func (r *Reviver) logClassify(inst *Instance, name string, tmuxAlive, pipeAlive bool, class RevivalClass) {
 	if r.Log == nil {
 		return
@@ -163,7 +221,23 @@ func (r *Reviver) logClassify(inst *Instance, name string, tmuxAlive, pipeAlive 
 		slog.Time("sampled_at", time.Now()),
 	}
 	if class == ClassAlive {
+		// Track the healthy state so a later non-alive verdict is recognized as
+		// a transition and is promoted back to INFO.
+		_ = shouldLogReviverInfo(inst, name, tmuxAlive, pipeAlive, class, time.Now())
 		r.Log.Debug("reviver_classify", attrs...)
+		return
+	}
+	if class == ClassDead {
+		if r.suppressDeadClassifications {
+			return
+		}
+		if !shouldLogReviverInfo(inst, name, tmuxAlive, pipeAlive, class, time.Now()) {
+			return
+		}
+		r.Log.Debug("reviver_classify", attrs...)
+		return
+	}
+	if !shouldLogReviverInfo(inst, name, tmuxAlive, pipeAlive, class, time.Now()) {
 		return
 	}
 	r.Log.Info("reviver_classify", attrs...)
@@ -186,16 +260,40 @@ func (r *Reviver) logClassify(inst *Instance, name string, tmuxAlive, pipeAlive 
 // runReviveAll / PersistRevivedInstances — MUST be revisited so those mutations
 // are not silently dropped.
 func (r *Reviver) ReviveAll(instances []*Instance) []ReviveOutcome {
+	started := time.Now()
 	if r.Breaker != nil {
 		r.Breaker.Prune()
 	}
 	outcomes := make([]ReviveOutcome, 0, len(instances))
 	firstRevive := true
+	var alive, errored, dead, revived int
 	for _, inst := range instances {
 		if inst == nil {
 			continue
 		}
-		outcomes = append(outcomes, r.reviveOneInternal(inst, &firstRevive))
+		outcome := r.reviveOneInternal(inst, &firstRevive)
+		outcomes = append(outcomes, outcome)
+		switch outcome.Class {
+		case ClassAlive:
+			alive++
+		case ClassErrored:
+			errored++
+		case ClassDead:
+			dead++
+		}
+		if outcome.Revived {
+			revived++
+		}
+	}
+	if r.Log != nil {
+		r.Log.Debug("reviver_sweep",
+			slog.Duration("duration", time.Since(started)),
+			slog.Int("instances", len(outcomes)),
+			slog.Int("alive", alive),
+			slog.Int("errored", errored),
+			slog.Int("dead", dead),
+			slog.Int("revived", revived),
+		)
 	}
 	return outcomes
 }
