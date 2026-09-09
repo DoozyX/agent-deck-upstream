@@ -3909,13 +3909,17 @@ func IsCodexCompatible(toolName string) bool {
 // isStaticBuiltinToolName answers the common built-in-name question without
 // loading the config-backed registry. A custom tool cannot use one of these
 // names: Registry.InitFiltered rejects entries that shadow a built-in.
-func isStaticBuiltinToolName(toolName string) bool {
-	switch toolName {
-	case "claude", "opencode", "gemini", "codex", "pi", "copilot", "crush", "cursor", "hermes", "deepseek", "aider", "shell":
-		return true
-	default:
-		return false
+var staticBuiltinToolNames = func() map[string]struct{} {
+	names := make(map[string]struct{}, len(builtinTools()))
+	for _, tool := range builtinTools() {
+		names[tool.Name] = struct{}{}
 	}
+	return names
+}()
+
+func isStaticBuiltinToolName(toolName string) bool {
+	_, ok := staticBuiltinToolNames[toolName]
+	return ok
 }
 
 // isShellBinary returns true if cmd is a known interactive shell process name.

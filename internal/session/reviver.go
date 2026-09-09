@@ -87,7 +87,11 @@ type Reviver struct {
 	suppressDeadClassifications bool
 }
 
-const reviverRepeatedEvidenceInterval = 5 * time.Minute
+const (
+	reviverRepeatedEvidenceInterval    = 5 * time.Minute
+	reviverClassificationLogStateTTL   = 15 * time.Minute
+	reviverClassificationPruneInterval = time.Minute
+)
 
 type reviverClassificationLogState struct {
 	tmuxAlive    bool
@@ -106,7 +110,8 @@ type reviverClassificationLogState struct {
 // heartbeat in the log.
 var reviverClassificationLog = struct {
 	sync.Mutex
-	states map[string]reviverClassificationLogState
+	states     map[string]reviverClassificationLogState
+	lastPruned time.Time
 }{states: make(map[string]reviverClassificationLogState)}
 
 func shouldLogReviverInfo(inst *Instance, name string, tmuxAlive, pipeAlive bool, class RevivalClass, now time.Time) bool {
@@ -125,6 +130,14 @@ func shouldLogReviverInfo(inst *Instance, name string, tmuxAlive, pipeAlive bool
 
 	reviverClassificationLog.Lock()
 	defer reviverClassificationLog.Unlock()
+	if reviverClassificationLog.lastPruned.IsZero() || now.Sub(reviverClassificationLog.lastPruned) >= reviverClassificationPruneInterval {
+		for stateKey, state := range reviverClassificationLog.states {
+			if now.Sub(state.lastSeen) > reviverClassificationLogStateTTL {
+				delete(reviverClassificationLog.states, stateKey)
+			}
+		}
+		reviverClassificationLog.lastPruned = now
+	}
 	previous, exists := reviverClassificationLog.states[key]
 	current.lastInfo = previous.lastInfo
 	changed := !exists || previous.tmuxAlive != current.tmuxAlive ||
