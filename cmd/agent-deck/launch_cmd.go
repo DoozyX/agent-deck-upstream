@@ -550,7 +550,13 @@ func handleLaunch(profile string, args []string) {
 		}
 
 		worktreeRepoRoot = repoRoot
-		path = worktreePath
+		// [worktree].session_cwd: "repo-root" starts the session in the base
+		// repository so its conversation joins the root project's
+		// `claude --resume` history (Claude buckets transcripts by startup
+		// cwd). The worktree still holds the work — see the --add-dir and
+		// system-prompt directive in buildClaudeExtraFlagsWithName.
+		path = session.ResolveWorktreeSessionCwd(
+			session.GetWorktreeSessionCwd(), worktreePath, worktreeRepoRoot)
 	}
 
 	// Load sessions
