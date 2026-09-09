@@ -5,9 +5,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+// mcpSessionTimeout bounds idle stateful sessions on the long-lived M1 web
+// process. Tests shorten it to verify cleanup without waiting five minutes.
+var mcpSessionTimeout = 5 * time.Minute
 
 // NewMCPHandler returns the dedicated Streamable HTTP MCP handler with the six
 // approved tools registered against Loader/Mutator seams.
@@ -21,8 +26,9 @@ func NewMCPHandler(deps MCPDependencies) http.Handler {
 	inner := mcpsdk.NewStreamableHTTPHandler(func(*http.Request) *mcpsdk.Server {
 		return server
 	}, &mcpsdk.StreamableHTTPOptions{
-		JSONResponse:                true,
+		JSONResponse:               true,
 		DisableLocalhostProtection: true,
+		SessionTimeout:             mcpSessionTimeout,
 	})
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
