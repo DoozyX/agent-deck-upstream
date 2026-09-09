@@ -1072,12 +1072,18 @@ func DeepSeekProfileBundles(profileDir string) []string {
 //   - tmux `remain-on-exit` is set, so the pane (and the answer in it) survives
 //     the process that printed it.
 //
-// Today the only such surface is DeepSeek's headless profile, whose whole
-// contract is "answer one task, print the final assistant message, and exit"
-// (0 when the turn completed, else 1). It is a method rather than a package
-// function so a second one-shot surface has an obvious home.
+// DeepSeek's headless profile and bounded Codex exec share the contract
+// "answer one task, print the final assistant message, and exit" (0 when the
+// turn completed, else 1). It is a method rather than a package function so
+// every start path consumes the same one-shot decision.
 func (i *Instance) expectsFastExit() bool {
-	if i == nil || i.Tool != "deepseek" {
+	if i == nil {
+		return false
+	}
+	if i.isBoundedCodexExec() {
+		return true
+	}
+	if i.Tool != "deepseek" {
 		return false
 	}
 	return DeepSeekProfileMode(i.resolveDeepSeekProfile()) == deepSeekModeHeadless
