@@ -281,7 +281,12 @@ func TestMCP_FleetStatus_ReadOnlySnapshot(t *testing.T) {
 			return nil
 		},
 	}
-	cs, _ := connectMCP(t, mcpTestDeps(t, mut))
+	deps := mcpTestDeps(t, mut)
+	deps.RemoteFleet = &fakeRemoteFleetLoader{snapshot: session.RemoteFleetSnapshot{
+		Remotes: []session.RemoteFleetRemote{{Name: "m2", Online: true, Sessions: []session.RemoteSessionInfo{{ID: "remote-1", Title: "Remote", Tool: "cursor", Status: "running", Path: "/srv/app", Group: "work"}}}},
+		Counts:  session.RemoteFleetCounts{RemotesOnline: 1, Sessions: 1, Running: 1},
+	}}
+	cs, _ := connectMCP(t, deps)
 	raw, isErr, err := callToolJSON(t, cs, "fleet_status", map[string]any{})
 	if err != nil || isErr {
 		t.Fatalf("fleet_status error: isErr=%v err=%v", isErr, err)
@@ -295,6 +300,12 @@ func TestMCP_FleetStatus_ReadOnlySnapshot(t *testing.T) {
 	}
 	if len(got.Sessions) != 2 || len(got.Groups) != 1 {
 		t.Fatalf("sessions=%d groups=%d", len(got.Sessions), len(got.Groups))
+	}
+	if len(got.Remotes) != 1 || got.Remotes[0].Name != "m2" || got.Remotes[0].Sessions[0].ID != "remote-1" {
+		t.Fatalf("remotes=%+v", got.Remotes)
+	}
+	if got.RemoteCounts.RemotesOnline != 1 || got.RemoteCounts.Sessions != 1 {
+		t.Fatalf("remote counts=%+v", got.RemoteCounts)
 	}
 	if got.Sessions[0].ID != "sess-1" || !got.Sessions[0].IsConductor {
 		t.Fatalf("session[0]=%+v", got.Sessions[0])

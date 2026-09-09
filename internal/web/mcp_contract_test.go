@@ -163,6 +163,7 @@ func TestMCPStableJSONFieldNames(t *testing.T) {
 		`"profile"`, `"totalGroups"`, `"totalSessions"`, `"sessions"`, `"groups"`,
 		`"id"`, `"title"`, `"tool"`, `"status"`, `"groupPath"`, `"projectPath"`, `"isConductor"`,
 		`"name"`, `"path"`, `"sessionCount"`,
+		`"remotes"`, `"remoteCounts"`,
 	} {
 		if !bytes.Contains(raw, []byte(key)) {
 			t.Fatalf("fleet status JSON missing %s: %s", key, raw)
