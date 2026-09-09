@@ -74,6 +74,32 @@ func TestLaunchAckScriptPublishesDrainedOutputAndPreservesExit(t *testing.T) {
 	}
 }
 
+func TestLaunchAckScriptJoinsDelayedDiagnosticWriterBeforeMarker(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	bin := t.TempDir()
+	tailPath := filepath.Join(bin, "tail")
+	realTail, err := exec.LookPath("tail")
+	if err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\nsleep 0.25\nexec %s \"$@\"\n", realTail)
+	if err := os.WriteFile(tailPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd := exec.Command("bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", "printf DIAGNOSTIC_ONCE; exit 7")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("wrapper unexpectedly succeeded for exit 7")
+	}
+	marker, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(marker), "DIAGNOSTIC_ONCE") {
+		t.Fatalf("completion marker published before delayed diagnostic drain: %q", marker)
+	}
+}
+
 func TestSessionIdentityMismatchIsNotOwned(t *testing.T) {
 	if sessionIdentityMatches("$1", "$2") {
 		t.Fatal("different tmux session identities must not be treated as owned")
@@ -519,6 +545,33 @@ func TestLaunchAckScriptDoesNotWaitForOutlivingDescendant(t *testing.T) {
 	time.Sleep(2500 * time.Millisecond)
 	if _, err := os.Stat(latePath); !os.IsNotExist(err) {
 		t.Fatalf("outliving descendant survived wrapper cleanup, stat error %v", err)
+	}
+}
+
+func TestLaunchAckScriptKillsDescendantThatIgnoresSIGTERM(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	pidPath := filepath.Join(t.TempDir(), "descendant.pid")
+	command := fmt.Sprintf("(trap '' TERM; sleep 30) & descendant=$!; printf '%%s' $descendant > %s; printf DIRECT; exit 7", shellQuote(pidPath))
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", command)
+	err := cmd.Run()
+	if err == nil {
+		t.Fatal("wrapper returned nil for child exit 7")
+	}
+	if ctx.Err() != nil {
+		t.Fatal("wrapper did not complete its bounded group cleanup")
+	}
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		t.Fatalf("read descendant pid: %v", err)
+	}
+	var pid int
+	if _, err := fmt.Sscanf(string(raw), "%d", &pid); err != nil || pid <= 0 {
+		t.Fatalf("descendant pid %q: %v", raw, err)
+	}
+	if err := syscall.Kill(pid, syscall.Signal(0)); err == nil {
+		t.Fatalf("SIGTERM-resistant descendant %d survived wrapper completion", pid)
 	}
 }
 

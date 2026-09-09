@@ -4557,15 +4557,39 @@ func (i *Instance) isBoundedCodexExec() bool {
 		return false
 	}
 	if shellwords.ExecutableBase(fields) == "codex" {
-		for _, field := range fields[1:] {
-			if field == "exec" {
-				return true
-			}
-		}
+		return isCodexExecArgs(fields)
 	}
 	if filepath.Base(fields[0]) == "bash" && len(fields) >= 3 && (fields[1] == "-c" || fields[1] == "-lc") {
 		inner, ok := shellwords.Split(fields[2])
-		return ok && shellwords.ExecutableBase(inner) == "codex" && len(inner) > 1 && inner[1] == "exec"
+		return ok && len(inner) > 0 && shellwords.ExecutableBase(inner) == "codex" && isCodexExecArgs(inner)
+	}
+	return false
+}
+
+// isCodexExecArgs parses the global options that Codex accepts before its
+// subcommand. Values are consumed positionally so a value named "exec" is not
+// mistaken for the subcommand. The short "e" alias is equivalent to exec.
+func isCodexExecArgs(fields []string) bool {
+	for idx := 1; idx < len(fields); idx++ {
+		field := fields[idx]
+		if field == "exec" || field == "e" {
+			return true
+		}
+		if field == "--" {
+			return false
+		}
+		if !strings.HasPrefix(field, "-") {
+			return false
+		}
+		if strings.Contains(field, "=") {
+			continue
+		}
+		switch field {
+		case "--add-dir", "-C", "--model", "--profile", "--config", "--color":
+			if idx+1 < len(fields) {
+				idx++
+			}
+		}
 	}
 	return false
 }
