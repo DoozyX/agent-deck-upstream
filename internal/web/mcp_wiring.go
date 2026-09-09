@@ -22,10 +22,12 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		authorize = func(*http.Request) bool { return true }
 	}
 
+	live := &mcpLiveMutator{s: s}
 	mcpHandler := NewMCPHandler(MCPDependencies{
-		Loader:    s.menuData,
-		Mutator:   &mcpLiveMutator{s: s},
-		Authorize: authorize,
+		Loader:       s.menuData,
+		Mutator:      live,
+		OutputReader: live,
+		Authorize:    authorize,
 		MutationsAllowed: func() bool {
 			// ReadOnly and WebMutations are independent Config inputs; both must
 			// allow writes (web_cmd clears WebMutations when --read-only is set,
@@ -37,6 +39,13 @@ func (s *Server) registerMCPRoute(mux *http.ServeMux) {
 		},
 	})
 	mux.Handle(MCPRoute, withMCPCORS(mcpHandler))
+}
+
+func (m *mcpLiveMutator) SessionOutput(sessionID string) (string, error) {
+	if reader, ok := m.mutator().(SessionOutputReader); ok {
+		return reader.SessionOutput(sessionID)
+	}
+	return "", errMCPMutatorUnavailable
 }
 
 // withMCPCORS handles browser clients that preflight MCP requests and need to

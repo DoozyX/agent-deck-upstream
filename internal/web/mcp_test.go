@@ -122,14 +122,14 @@ func callToolJSON(t *testing.T, cs *mcpsdk.ClientSession, name string, args any)
 	return nil, false, fmt.Errorf("empty tool result")
 }
 
-func TestMCP_ToolsListExactlyEightWithReadOnlyHints(t *testing.T) {
+func TestMCP_ToolsListExactlyNineWithReadOnlyHints(t *testing.T) {
 	cs, _ := connectMCP(t, mcpTestDeps(t, nil))
 	listed, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(listed.Tools) != 8 {
-		t.Fatalf("tools len = %d, want 8", len(listed.Tools))
+	if len(listed.Tools) != 9 {
+		t.Fatalf("tools len = %d, want 9", len(listed.Tools))
 	}
 	want := map[string]bool{
 		"fleet_status":    true,
@@ -140,6 +140,7 @@ func TestMCP_ToolsListExactlyEightWithReadOnlyHints(t *testing.T) {
 		"restart_session": false,
 		"create_session":  false,
 		"delete_session":  false,
+		"session_output":  true,
 	}
 	got := make(map[string]bool, len(listed.Tools))
 	for _, tool := range listed.Tools {
