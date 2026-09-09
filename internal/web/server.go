@@ -25,6 +25,11 @@ type Config struct {
 	ReadOnly     bool
 	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
 	Token        string
+	// MCPNoAuth explicitly disables bearer authentication for the dedicated
+	// /mcp endpoint. It does not affect the web/API routes, which continue to
+	// use Token. This is intended only for short-lived local testing because
+	// the MCP tools include session-mutating operations.
+	MCPNoAuth bool
 	// InsecureBind explicitly acknowledges binding a non-loopback address
 	// with no auth token (an unauthenticated RCE surface). Without it the
 	// server refuses to start in that configuration. See bind.go / report #1.
