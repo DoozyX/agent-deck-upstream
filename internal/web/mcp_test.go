@@ -120,14 +120,14 @@ func callToolJSON(t *testing.T, cs *mcpsdk.ClientSession, name string, args any)
 	return nil, false, fmt.Errorf("empty tool result")
 }
 
-func TestMCP_ToolsListExactlySixWithReadOnlyHints(t *testing.T) {
+func TestMCP_ToolsListExactlyEightWithReadOnlyHints(t *testing.T) {
 	cs, _ := connectMCP(t, mcpTestDeps(t, nil))
 	listed, err := cs.ListTools(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("ListTools: %v", err)
 	}
-	if len(listed.Tools) != 6 {
-		t.Fatalf("tools len = %d, want 6", len(listed.Tools))
+	if len(listed.Tools) != 8 {
+		t.Fatalf("tools len = %d, want 8", len(listed.Tools))
 	}
 	want := map[string]bool{
 		"fleet_status":    true,
@@ -136,6 +136,8 @@ func TestMCP_ToolsListExactlySixWithReadOnlyHints(t *testing.T) {
 		"start_session":   false,
 		"stop_session":    false,
 		"restart_session": false,
+		"create_session":  false,
+		"delete_session":  false,
 	}
 	got := make(map[string]bool, len(listed.Tools))
 	for _, tool := range listed.Tools {
@@ -155,6 +157,87 @@ func TestMCP_ToolsListExactlySixWithReadOnlyHints(t *testing.T) {
 		if !got[name] {
 			t.Fatalf("missing tool %q", name)
 		}
+	}
+}
+
+func TestMCP_CreateAndDeleteSession_DelegateAndReturnResults(t *testing.T) {
+	var createArgs []string
+	var deletedID string
+	mut := &fakeMutator{
+		createSessionFn: func(title, tool, projectPath, groupPath, modelID, reasoningEffort string) (string, error) {
+			createArgs = []string{title, tool, projectPath, groupPath, modelID, reasoningEffort}
+			return "new-session", nil
+		},
+		deleteSessionFn: func(id string) error { deletedID = id; return nil },
+	}
+	cs, _ := connectMCP(t, mcpTestDeps(t, mut))
+	raw, isErr, err := callToolJSON(t, cs, "create_session", map[string]any{
+		"title": "Mobile work", "tool": "codex", "projectPath": "/tmp/project",
+		"groupPath": "mobile", "modelId": "gpt-5.6", "reasoningEffort": "high",
+	})
+	if err != nil || isErr {
+		t.Fatalf("create_session: isErr=%v err=%v", isErr, err)
+	}
+	if got, want := strings.Join(createArgs, "|"), "Mobile work|codex|/tmp/project|mobile|gpt-5.6|high"; got != want {
+		t.Fatalf("create args = %q, want %q", got, want)
+	}
+	var result MCPMutationResult
+	if err := json.Unmarshal(raw, &result); err != nil || !result.OK || result.SessionID != "new-session" {
+		t.Fatalf("create result=%s err=%v", raw, err)
+	}
+
+	raw, isErr, err = callToolJSON(t, cs, "delete_session", map[string]any{"sessionId": "new-session"})
+	if err != nil || isErr {
+		t.Fatalf("delete_session: isErr=%v err=%v", isErr, err)
+	}
+	if deletedID != "new-session" {
+		t.Fatalf("deleted id = %q", deletedID)
+	}
+	if err := json.Unmarshal(raw, &result); err != nil || !result.OK || result.SessionID != "new-session" {
+		t.Fatalf("delete result=%s err=%v", raw, err)
+	}
+}
+
+func TestMCP_CreateAndDeleteSession_ValidationAndGuards(t *testing.T) {
+	var delegated atomic.Int64
+	mut := &fakeMutator{
+		createSessionFn: func(string, string, string, string, string, string) (string, error) {
+			delegated.Add(1)
+			return "x", nil
+		},
+		deleteSessionFn: func(string) error { delegated.Add(1); return nil },
+	}
+	cs, _ := connectMCP(t, mcpTestDeps(t, mut))
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"create_session", map[string]any{"title": "", "projectPath": "/tmp/p"}},
+		{"create_session", map[string]any{"title": "x", "projectPath": " "}},
+		{"delete_session", map[string]any{"sessionId": " "}},
+	} {
+		_, isErr, err := callToolJSON(t, cs, tc.name, tc.args)
+		if !isErr || ClassifyMCPError(err) != MCPErrorMalformed {
+			t.Fatalf("%s validation: isErr=%v kind=%s err=%v", tc.name, isErr, ClassifyMCPError(err), err)
+		}
+	}
+	deps := mcpTestDeps(t, mut)
+	deps.MutationsAllowed = func() bool { return false }
+	cs2, _ := connectMCP(t, deps)
+	for _, tc := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"create_session", map[string]any{"title": "x", "projectPath": "/tmp/p"}},
+		{"delete_session", map[string]any{"sessionId": "x"}},
+	} {
+		_, isErr, err := callToolJSON(t, cs2, tc.name, tc.args)
+		if !isErr || ClassifyMCPError(err) != MCPErrorMutationDisabled {
+			t.Fatalf("%s guard: isErr=%v kind=%s err=%v", tc.name, isErr, ClassifyMCPError(err), err)
+		}
+	}
+	if delegated.Load() != 0 {
+		t.Fatalf("invalid/guarded calls delegated=%d", delegated.Load())
 	}
 }
 
