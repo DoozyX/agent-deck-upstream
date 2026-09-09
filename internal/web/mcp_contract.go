@@ -17,9 +17,14 @@ const MCPRoute = "/mcp"
 type MCPDependencies struct {
 	Loader           MenuDataLoader
 	Mutator          SessionMutator
+	OutputReader     SessionOutputReader
 	Authorize        func(*http.Request) bool
 	MutationsAllowed func() bool
 	AllowMutation    func() bool
+}
+
+type SessionOutputReader interface {
+	SessionOutput(sessionID string) (string, error)
 }
 
 // MCP tool / result contracts (stable JSON field names for Tasks 02–03).
@@ -80,6 +85,11 @@ type MCPSessionDetailsResult struct {
 type MCPMutationResult struct {
 	SessionID string `json:"sessionId"`
 	OK        bool   `json:"ok"`
+}
+
+type MCPSessionOutputResult struct {
+	SessionID string `json:"sessionId"`
+	Content   string `json:"content"`
 }
 
 // MCPErrorKind distinguishes protocol/API failure classes for Task 02 mapping.
@@ -180,7 +190,7 @@ type MCPToolSpec struct {
 	InputSchema map[string]any
 }
 
-// MCPToolCatalog returns the eight fixed remote-MCP tools and their input schemas.
+// MCPToolCatalog returns the nine fixed remote-MCP tools and their input schemas.
 // Task 02 registers these on the Streamable HTTP server; this catalog is the
 // authoritative contract for names, required fields, and read-only hints.
 func MCPToolCatalog() []MCPToolSpec {
@@ -299,8 +309,19 @@ func MCPToolCatalog() []MCPToolSpec {
 				"additionalProperties": false,
 			},
 		},
+		{
+			Name:        "session_output",
+			Description: "Return the latest assistant response from one local Agent Deck session. Read-only.",
+			Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: true},
+			InputSchema: map[string]any{
+				"type":                 "object",
+				"properties":           sessionIDProps,
+				"required":             []string{"sessionId"},
+				"additionalProperties": false,
+			},
+		},
 	}
 }
 
 // NewMCPHandler is implemented in mcp.go (Task 02): Streamable HTTP transport,
-// auth gate, and the eight tool registrations against MCPDependencies.
+// auth gate, and the nine tool registrations against MCPDependencies.

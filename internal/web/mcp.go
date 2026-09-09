@@ -106,10 +106,33 @@ func registerMCPTools(server *mcpsdk.Server, deps MCPDependencies) {
 				})
 				return nil, out, mcpLogToolFailure(spec.Name, err)
 			})
+		case "session_output":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPSessionOutputResult, error) {
+				out, err := mcpSessionOutput(deps, in.SessionID)
+				return nil, out, mcpLogToolFailure(spec.Name, err)
+			})
 		default:
 			panic(fmt.Sprintf("unexpected MCP tool %q", spec.Name))
 		}
 	}
+}
+
+func mcpSessionOutput(deps MCPDependencies, sessionID string) (MCPSessionOutputResult, error) {
+	id, err := mcpRequireSessionID(sessionID)
+	if err != nil {
+		return MCPSessionOutputResult{}, err
+	}
+	if deps.OutputReader == nil {
+		return MCPSessionOutputResult{}, fmt.Errorf("%w: session output reader unavailable", ErrMCPBackend)
+	}
+	content, err := deps.OutputReader.SessionOutput(id)
+	if err != nil {
+		if ClassifyMCPError(err) == MCPErrorNotFound {
+			return MCPSessionOutputResult{}, fmt.Errorf("%w: %v", ErrMCPNotFound, err)
+		}
+		return MCPSessionOutputResult{}, fmt.Errorf("%w: %v", ErrMCPBackend, err)
+	}
+	return MCPSessionOutputResult{SessionID: id, Content: content}, nil
 }
 
 func mcpLogToolFailure(tool string, err error, attrs ...slog.Attr) error {

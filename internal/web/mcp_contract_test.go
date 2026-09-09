@@ -19,10 +19,10 @@ func TestMCPRouteConstant(t *testing.T) {
 	}
 }
 
-func TestMCPToolCatalog_ExactEightWithReadOnlyAnnotations(t *testing.T) {
+func TestMCPToolCatalog_ExactNineWithReadOnlyAnnotations(t *testing.T) {
 	catalog := MCPToolCatalog()
-	if len(catalog) != 8 {
-		t.Fatalf("catalog len = %d, want 8", len(catalog))
+	if len(catalog) != 9 {
+		t.Fatalf("catalog len = %d, want 9", len(catalog))
 	}
 	wantNames := []string{
 		"fleet_status",
@@ -33,6 +33,7 @@ func TestMCPToolCatalog_ExactEightWithReadOnlyAnnotations(t *testing.T) {
 		"restart_session",
 		"create_session",
 		"delete_session",
+		"session_output",
 	}
 	for i, name := range wantNames {
 		if catalog[i].Name != name {
@@ -45,7 +46,7 @@ func TestMCPToolCatalog_ExactEightWithReadOnlyAnnotations(t *testing.T) {
 			t.Fatalf("tool %q missing annotations", name)
 		}
 		readOnly := catalog[i].Annotations.ReadOnlyHint
-		wantRO := name == "fleet_status" || name == "session_details"
+		wantRO := name == "fleet_status" || name == "session_details" || name == "session_output"
 		if readOnly != wantRO {
 			t.Fatalf("tool %q ReadOnlyHint = %v, want %v", name, readOnly, wantRO)
 		}
@@ -68,6 +69,7 @@ func TestMCPToolInputSchemas_RequiredFieldsNoCommandOrURL(t *testing.T) {
 		"restart_session": {"sessionId"},
 		"create_session":  {"title", "projectPath"},
 		"delete_session":  {"sessionId"},
+		"session_output":  {"sessionId"},
 	}
 	for _, tool := range MCPToolCatalog() {
 		required, ok := cases[tool.Name]
