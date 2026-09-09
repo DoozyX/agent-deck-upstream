@@ -25,6 +25,7 @@ const updateStatusSlowThreshold = 50 * time.Millisecond
 type updateStatusTrace struct {
 	start time.Time
 
+	lockWait   time.Duration // i.mu acquisition — a hook-path holder blocks here
 	exists     time.Duration // tmuxSession.Exists() — has-session probe
 	terminated time.Duration // applyTerminatedPaneStatus + auth-hold death probe
 	bgWork     time.Duration // BackgroundWorkPending — captures the pane
@@ -62,6 +63,7 @@ func (t *updateStatusTrace) finish(id, title string) {
 		slog.String("id", id),
 		slog.String("title", title),
 		slog.Duration("total", total),
+		slog.Duration("lock_wait", t.lockWait),
 		slog.Duration("exists", t.exists),
 		slog.Duration("terminated", t.terminated),
 		slog.Duration("bg_work", t.bgWork),
@@ -69,8 +71,20 @@ func (t *updateStatusTrace) finish(id, title string) {
 		slog.Duration("gateway", t.gateway),
 		slog.Duration("hook_file", t.hookFile),
 		slog.Duration("persist", t.persist),
-		slog.Duration("other", total-t.exists-t.terminated-t.bgWork-t.getStatus-t.gateway-t.hookFile-t.persist),
+		slog.Duration("other", total-t.lockWait-t.exists-t.terminated-t.bgWork-t.getStatus-t.gateway-t.hookFile-t.persist),
 	)
+}
+
+// traceLock acquires i.mu with the wait attributed. UpdateHookStatus holds the
+// same lock across the Codex subagent gate, whose rollout lookup can walk the
+// whole codexHome/sessions tree, so a sweep's UpdateStatus can spend most of its
+// wall time here having done no work of its own. Before this the wait landed in
+// the trace's unattributed "other" bucket, which is how it stayed invisible
+// through two rounds of status-sweep profiling.
+func (i *Instance) traceLock(t *updateStatusTrace) {
+	done := t.phase(&t.lockWait)
+	i.mu.Lock()
+	done()
 }
 
 // traceExists is tmuxSession.Exists() with its cost attributed. Exists is the
