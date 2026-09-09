@@ -8,15 +8,25 @@ import (
 	"time"
 )
 
-func TestClaudeCommandInjectsPeerName(t *testing.T) {
+func TestClaudeCommandCarriesTheDeckTitleAsItsName(t *testing.T) {
+	// #2075: the deck title is the single startup name, and it is the address
+	// ClaudeAddressName hands out. The derived peer slug is no longer launched
+	// with, so it must not appear on the command line.
+	startupNameConfig(t, "")
 	inst := &Instance{
 		ID:    "a1b2c3d4-1111-2222-3333-444455556666",
 		Title: "Payments Review!",
 		Tool:  "claude",
 	}
 	cmd := inst.buildClaudeCommand("claude")
-	if !strings.Contains(cmd, "--name payments-review-a1b2c3d4") {
-		t.Fatalf("Claude command does not carry deterministic peer name: %s", cmd)
+	if !strings.Contains(cmd, "--name 'Payments Review!'") {
+		t.Fatalf("Claude command does not carry the deck title as its name: %s", cmd)
+	}
+	if strings.Contains(cmd, "payments-review-a1b2c3d4") {
+		t.Fatalf("Claude command still carries the retired peer address: %s", cmd)
+	}
+	if got := inst.ClaudeAddressName(); got != "Payments Review!" {
+		t.Fatalf("ClaudeAddressName() = %q, want the name the command registers", got)
 	}
 }
 
@@ -100,7 +110,8 @@ func TestPeerMessagingCandidateIsClaudeOnly(t *testing.T) {
 	}
 }
 
-func TestClaudeForkCommandUsesTargetPeerName(t *testing.T) {
+func TestClaudeForkCommandUsesTargetName(t *testing.T) {
+	startupNameConfig(t, "")
 	parent := &Instance{
 		ID:               "aaaaaaaa-1111-2222-3333-444455556666",
 		Title:            "Parent",
@@ -119,15 +130,16 @@ func TestClaudeForkCommandUsesTargetPeerName(t *testing.T) {
 	if err != nil {
 		t.Fatalf("build fork command: %v", err)
 	}
-	if !strings.Contains(cmd, "--name review-child-bbbbbbbb") {
-		t.Fatalf("fork command lacks target peer name: %s", cmd)
+	if !strings.Contains(cmd, "--name 'Review Child'") {
+		t.Fatalf("fork command lacks the target's name: %s", cmd)
 	}
-	if strings.Contains(cmd, "--name parent-aaaaaaaa") {
-		t.Fatalf("fork command incorrectly uses parent peer name: %s", cmd)
+	if strings.Contains(cmd, "--name Parent") {
+		t.Fatalf("fork command incorrectly uses the parent's name: %s", cmd)
 	}
 }
 
-func TestClaudeForkDoesNotInheritParentsExplicitPeerName(t *testing.T) {
+func TestClaudeForkDoesNotInheritParentsExplicitName(t *testing.T) {
+	startupNameConfig(t, "")
 	parent := &Instance{
 		ID:               "aaaaaaaa-1111-2222-3333-444455556666",
 		Title:            "Parent",
@@ -142,10 +154,10 @@ func TestClaudeForkDoesNotInheritParentsExplicitPeerName(t *testing.T) {
 		t.Fatalf("create fork: %v", err)
 	}
 	if strings.Contains(cmd, "operator-parent") {
-		t.Fatalf("fork inherited parent's explicit peer name: %s", cmd)
+		t.Fatalf("fork inherited the parent's explicit name: %s", cmd)
 	}
-	if !strings.Contains(cmd, "--name review-child-") {
-		t.Fatalf("fork lacks its own generated peer name: %s", cmd)
+	if !strings.Contains(cmd, "--name 'Review Child'") {
+		t.Fatalf("fork lacks its own name: %s", cmd)
 	}
 	if strings.Join(forked.ExtraArgs, " ") != "--agent reviewer" {
 		t.Fatalf("fork extra args = %v, want non-name args preserved", forked.ExtraArgs)

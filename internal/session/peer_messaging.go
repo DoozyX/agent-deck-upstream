@@ -6,8 +6,25 @@ import (
 
 const maxClaudePeerNameBytes = 64
 
-// ClaudePeerName returns the stable name used to address this managed session
-// through Claude Code's ListAgents and SendMessage tools.
+// ClaudeAddressName returns the name this session is actually registered under
+// with Claude Code — the one string buildClaudeExtraFlagsWithName emits as
+// --name, which since #2075 is the exact deck title. Empty means this startup
+// carries no deck-assigned name (a custom command, an operator's own --name,
+// an unbound continue/resume), so there is no address to hand out. Report this,
+// not ClaudePeerName: a conductor that addresses a child by a name the child
+// never registered gets nothing back.
+func (i *Instance) ClaudeAddressName() string {
+	if i == nil {
+		return ""
+	}
+	return i.ClaudeLaunchName()
+}
+
+// ClaudePeerName returns the address the deck used to launch Claude sessions
+// with before #2075 replaced it with the exact title. Nothing launches with it
+// any more; it survives so IsClaudePeerNameEcho can still recognise — and
+// refuse to adopt as a title — the address baked into panes that are still
+// running from before that change.
 func (i *Instance) ClaudePeerName() string {
 	var b strings.Builder
 	lastDash := false

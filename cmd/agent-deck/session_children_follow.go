@@ -193,7 +193,7 @@ func buildChildRows(kids []*session.Instance, db *statedb.StateDB) []childRow {
 		_ = k.UpdateStatus()
 		row := childRow{ID: k.ID, Title: k.Title, Status: StatusString(k.Status), Archived: k.IsArchived()}
 		if k.PeerMessagingCandidate() {
-			row.PeerName = k.ClaudePeerName()
+			row.PeerName = k.ClaudeAddressName()
 			row.PeerMessagingCandidate = true
 		}
 		lastSent := lastSentClock(db, k.ID)
