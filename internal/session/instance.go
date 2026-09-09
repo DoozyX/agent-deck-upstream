@@ -4635,7 +4635,7 @@ var codexExecTopLevelCommands = map[string]struct{}{
 	"agents": {}, "review": {}, "login": {}, "logout": {}, "mcp": {},
 	"plugin": {}, "mcp-server": {}, "app-server": {}, "remote-control": {},
 	"app": {}, "completion": {}, "update": {}, "doctor": {}, "sandbox": {},
-	"debug": {}, "apply": {}, "resume": {}, "queue": {}, "archive": {},
+	"debug": {}, "apply": {}, "a": {}, "resume": {}, "queue": {}, "archive": {},
 	"delete": {}, "migrate-rollouts": {}, "unarchive": {}, "fork": {},
 	"cloud": {}, "exec-server": {}, "features": {}, "execpolicy": {}, "help": {},
 }
