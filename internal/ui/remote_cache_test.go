@@ -94,9 +94,9 @@ func TestRemoteSessionsCache_SaveLoadRoundTrip(t *testing.T) {
 	}
 	writer.remoteSessionsMu.Lock()
 	writer.remoteSessions = live
-	writer.remoteGroups = map[string][]session.GroupData{
-		"g14":         {{Name: "empty", Path: "empty"}},
-		"groups-only": {{Name: "vacant", Path: "vacant"}},
+	writer.remoteGroups = map[string][]string{
+		"g14":         {"empty"},
+		"groups-only": {"vacant"},
 	}
 	writer.remoteSessions["groups-only"] = []session.RemoteSessionInfo{}
 	writer.remoteSessionsMu.Unlock()
@@ -119,10 +119,10 @@ func TestRemoteSessionsCache_SaveLoadRoundTrip(t *testing.T) {
 	if got[0].RemoteName != "g14" {
 		t.Errorf("RemoteName = %q, want \"g14\" — it is json:\"-\" and must be restored on load", got[0].RemoteName)
 	}
-	if groups := reader.remoteGroups["g14"]; len(groups) != 1 || groups[0].Path != "empty" {
+	if groups := reader.remoteGroups["g14"]; len(groups) != 1 || groups[0] != "empty" {
 		t.Errorf("saved remote groups = %+v, want empty", groups)
 	}
-	if groups := reader.remoteGroups["groups-only"]; len(groups) != 1 || groups[0].Path != "vacant" {
+	if groups := reader.remoteGroups["groups-only"]; len(groups) != 1 || groups[0] != "vacant" {
 		t.Errorf("zero-session remote groups = %+v, want vacant", groups)
 	}
 }
