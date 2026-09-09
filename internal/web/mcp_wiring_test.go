@@ -243,7 +243,7 @@ func TestServer_MCPRoute_ToolsListOmitsUnsupportedCacheFields(t *testing.T) {
 
 func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
 	previousTimeout := mcpSessionTimeout
-	mcpSessionTimeout = 50 * time.Millisecond
+	mcpSessionTimeout = 500 * time.Millisecond
 	t.Cleanup(func() { mcpSessionTimeout = previousTimeout })
 
 	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
@@ -266,11 +266,17 @@ func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
 
 	idle := newClientSession()
 	active := newClientSession()
+	keepAliveStarted := make(chan struct{})
 	keepAliveDone := make(chan struct{})
 	keepAliveErr := make(chan error, 1)
 	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(25 * time.Millisecond)
 		defer ticker.Stop()
+		if _, err := active.ListTools(context.Background(), nil); err != nil {
+			keepAliveErr <- err
+			return
+		}
+		close(keepAliveStarted)
 		for {
 			select {
 			case <-ticker.C:
@@ -284,10 +290,15 @@ func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
 			}
 		}
 	}()
+	select {
+	case <-keepAliveStarted:
+	case err := <-keepAliveErr:
+		t.Fatalf("initial active session keepalive failed: %v", err)
+	}
 
-	// Ten timeout periods gives the SDK cleanup timer ample scheduling room;
-	// the active session is refreshed independently throughout that window.
-	time.Sleep(10 * mcpSessionTimeout)
+	// Three timeout periods gives the SDK cleanup timer scheduling room. The
+	// active session is refreshed with 20x margin throughout that window.
+	time.Sleep(3 * mcpSessionTimeout)
 	if _, err := idle.ListTools(context.Background(), nil); err == nil {
 		t.Fatal("idle session should expire")
 	}
