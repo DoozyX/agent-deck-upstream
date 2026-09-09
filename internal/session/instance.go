@@ -6447,7 +6447,7 @@ func (i *Instance) UpdateStatus() error {
 	// Cheap no-op unless the cold-load fold below (or an earlier
 	// UpdateHookStatus within the throttle window) left something behind.
 	defer func() { done := trace.phase(&trace.persist); i.persistLastActivity(false); done() }()
-	i.mu.Lock()
+	i.traceLock(trace)
 	defer i.mu.Unlock()
 
 	// Short grace period for tmux initialization (not Claude startup)
