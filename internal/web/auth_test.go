@@ -39,6 +39,8 @@ func TestBearerTokenSchemeCaseInsensitive(t *testing.T) {
 		{"lowercase scheme", "bearer secret", "secret"},
 		{"mixed case scheme", "BeArEr secret", "secret"},
 		{"malformed scheme", "Bear secret", ""},
+		{"tab delimiter rejected", "Bearer\tsecret", ""},
+		{"missing delimiter rejected", "Bearersecret", ""},
 		{"empty value", "Bearer ", ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
