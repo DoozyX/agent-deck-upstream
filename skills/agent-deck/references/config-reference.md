@@ -532,6 +532,7 @@ branch_prefix = "feature/"                           # Prefix for branch names (
 auto_cleanup = true                                  # Remove worktree when session is deleted
 setup_timeout_seconds = 60                           # Timeout for .agent-deck/worktree-setup.sh
 sparse_checkout = "off"                              # "inherit" to copy the source worktree's sparse checkout
+session_cwd = "worktree"                             # "repo-root" to share the repo's resume history
 ```
 
 | Key | Type | Default | Description |
@@ -542,6 +543,7 @@ sparse_checkout = "off"                              # "inherit" to copy the sou
 | `branch_prefix` | string | `"feature/"` | Prefix prepended to branch names. Supports environment variable expansion (e.g., `"$USER/"`). Set to `""` to disable. Won't double-prepend if the branch already starts with the prefix. |
 | `auto_cleanup` | bool | `false` | Remove worktree directory when the session is deleted. |
 | `setup_timeout_seconds` | int | `60` | Max seconds for `.agent-deck/worktree-setup.sh` to run. Set to `0` for unlimited. |
+| `session_cwd` | string | `"worktree"` | Working directory a NEW worktree session starts in. Claude Code buckets conversation history by startup cwd (`~/.claude/projects/<slug-of-cwd>/`), so a session started inside the worktree gets a private `claude --resume` history that is invisible from the repo root — one throwaway bucket per worktree. `"repo-root"` starts the session in the base repository instead, so every session in the repo shares one resume history; the worktree is still created and is handed to the agent via `--add-dir` plus an appended system-prompt directive telling it to work there and never commit in the main checkout. Applied at creation and baked into the session's project path, so changing it never moves an existing session's transcripts. |
 | `sparse_checkout` | string | `"off"` | Sparse-checkout inheritance (#1708). `"inherit"` captures the mode (cone / non-cone, sparse index) and patterns of the worktree you create the session from, creates the new worktree with `git worktree add --no-checkout`, and materializes it with those patterns, so a sparse monorepo never checks out the full tree first. `"off"` / unset / any other value keeps git's normal checkout. A non-sparse source is also left unchanged. `.worktreeinclude` and the setup script still run afterwards. Requires git 2.32+ (`sparse-checkout set --[no-]sparse-index`). |
 
 ### Path template examples
