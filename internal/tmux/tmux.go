@@ -602,6 +602,12 @@ func registerSessionInCache(name string) {
 	sessionCacheData[name] = time.Now().Unix()
 }
 
+func removeSessionFromCache(name string) {
+	sessionCacheMu.Lock()
+	defer sessionCacheMu.Unlock()
+	delete(sessionCacheData, name)
+}
+
 // sessionActivityFromCache gets session activity timestamp from cache
 // Returns (activity, cacheValid) - if cache is stale/empty, cacheValid is false
 func sessionActivityFromCache(name string) (int64, bool) {
@@ -1480,8 +1486,12 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			// Keep the acknowledgement protocol out of the command string: both
 			// the marker path and user command are positional arguments, so an
 			// unusual project path or command cannot alter the wrapper script.
+			launchMode := "interactive"
+			if s.AllowInitialProcessExit {
+				launchMode = "isolated"
+			}
 			tmuxArgs = append(tmuxArgs, bashBinary, "-c", launchAckScript,
-				"agent-deck-launch-ack", s.launchAckPath, command)
+				"agent-deck-launch-ack", s.launchAckPath, launchMode, command)
 		} else {
 			tmuxArgs = append(tmuxArgs, bashBinary, "-c", command)
 		}
@@ -1535,8 +1545,11 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	}
 }
 
+const launchAckDiagnosticLimit = 64 * 1024
+
 const launchAckScript = `ack_path="$1"
-command="$2"
+launch_mode="$2"
+command="$3"
 output_path="${ack_path}.output"
 fifo_path="${ack_path}.fifo"
 marker_tmp="${ack_path}.tmp"
@@ -1545,6 +1558,20 @@ cleanup() {
 }
 trap cleanup EXIT
 rm -f "$output_path" "$fifo_path" "$marker_tmp"
+
+# Interactive TUIs must remain in the pane's controlling terminal. The wrapper
+# writes the launch marker and then runs the command in the same foreground
+# shell session, so there is no detached session, background process group, or
+# output FIFO between the TUI and its PTY. Only one-shot commands use the
+# isolated diagnostic path below.
+if [ "$launch_mode" = "interactive" ]; then
+  printf 'pid:%s\n' "$$" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
+  bash -c "$command"
+  exit_code=$?
+  printf 'exit:%s\n' "$exit_code" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
+  exit "$exit_code"
+fi
+
 # A process-group owner is required before starting the direct command. The
 # wrapper cannot safely reap descendants when neither setsid nor the Perl POSIX
 # fallback exists: its own process group also contains tee and this shell, so a
@@ -1557,7 +1584,7 @@ fi
 if ! mkfifo "$fifo_path"; then
   exit 125
 fi
-tee "$output_path" < "$fifo_path" &
+tee >(tail -c 65536 > "$output_path") < "$fifo_path" &
 tee_pid=$!
 # Run the direct command in its own process group when the host provides a
 # session launcher. A background descendant must not keep the FIFO open after
@@ -1587,6 +1614,7 @@ while kill -0 "$tee_pid" 2>/dev/null; do
   sleep 0.01
 done
 wait "$tee_pid" 2>/dev/null || true
+wait 2>/dev/null || true
 {
   printf 'exit:%s\n' "$exit_code"
   if [ -s "$output_path" ]; then
@@ -2769,9 +2797,19 @@ func (s *Session) Start(command string) error {
 
 	// Fallback: if RunCommandAsInitialProcess is false, send command via send-keys.
 	if command != "" && !s.RunCommandAsInitialProcess {
+		ownedName, ownedID := s.OwnershipSnapshot()
 		// Always wrap in bash -c so the command runs under bash regardless
 		// of the user's login shell. See #526 and bashCWrap for details.
 		if err := s.SendKeysAndEnter(bashCWrap(command)); err != nil {
+			if cleanupErr := s.KillIfOwnedSnapshot(ownedName, ownedID); cleanupErr != nil {
+				statusLog.Warn("pane_command_send_cleanup_failed",
+					slog.String("session", logging.SanitizeValue(ownedName)),
+					slog.String("identity", logging.SanitizeValue(ownedID)),
+					slog.String("error", cleanupErr.Error()),
+				)
+			} else {
+				removeSessionFromCache(ownedName)
+			}
 			return fmt.Errorf("failed to send command: %w", err)
 		}
 	}
@@ -2994,8 +3032,7 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 	}
 	go func() {
 		defer cleanupLaunchAckFiles(ackPath)
-		ticker := time.NewTicker(10 * time.Millisecond)
-		defer ticker.Stop()
+		pollAttempt := 0
 		for {
 			select {
 			case <-cancel:
@@ -3006,14 +3043,6 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 			switch probe.state {
 			case sessionIdentityMissing:
 				return
-			case sessionIdentityIndeterminate:
-				select {
-				case <-cancel:
-					return
-				case <-ticker.C:
-					continue
-				default:
-				}
 			case sessionIdentityOwned:
 				if !sessionIdentityMatches(sessionID, probe.identity) {
 					return
@@ -3026,13 +3055,34 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 					return
 				}
 			}
+			timer := time.NewTimer(launchAckWatchDelay(pollAttempt))
 			select {
 			case <-cancel:
+				if !timer.Stop() {
+					<-timer.C
+				}
 				return
-			case <-ticker.C:
+			case <-timer.C:
 			}
+			pollAttempt++
 		}
 	}()
+}
+
+const (
+	launchAckWatchInitialDelay = 100 * time.Millisecond
+	launchAckWatchMaxDelay     = time.Second
+)
+
+func launchAckWatchDelay(attempt int) time.Duration {
+	delay := launchAckWatchInitialDelay
+	for i := 0; i < attempt && delay < launchAckWatchMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > launchAckWatchMaxDelay {
+		return launchAckWatchMaxDelay
+	}
+	return delay
 }
 
 func cleanupLaunchAckFiles(ackPath string) {

@@ -44,7 +44,7 @@ func intPtr(value int) *int { return &value }
 func TestLaunchAckScriptPublishesDrainedOutputAndPreservesExit(t *testing.T) {
 	ackPath := filepath.Join(t.TempDir(), "ack")
 	command := `printf 'DIAGNOSTIC_ONCE\n'; exit 7`
-	cmd := exec.Command("bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	cmd := exec.Command("bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", command)
 	err := cmd.Run()
 	if err == nil {
 		t.Fatal("launch acknowledgement wrapper returned nil for child exit 7")
@@ -80,6 +80,66 @@ func TestSessionIdentityMismatchIsNotOwned(t *testing.T) {
 	}
 	if !sessionIdentityMatches("$1", "$1") {
 		t.Fatal("matching tmux session identity must be treated as owned")
+	}
+}
+
+func TestLaunchAckScriptBoundsDiagnosticTail(t *testing.T) {
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	command := `i=0; while [ "$i" -lt 100000 ]; do printf x; i=$((i + 1)); done; printf DIAGNOSTIC_TAIL; exit 7`
+	cmd := exec.Command("bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", command)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("launch acknowledgement wrapper unexpectedly succeeded for exit 7")
+	}
+	marker, err := os.ReadFile(ackPath)
+	if err != nil {
+		t.Fatalf("read bounded completion marker: %v", err)
+	}
+	if len(marker) > launchAckDiagnosticLimit+len("exit:7\n")+64 {
+		t.Fatalf("diagnostic marker grew beyond bounded tail: %d bytes", len(marker))
+	}
+	if !strings.Contains(string(marker), "DIAGNOSTIC_TAIL") {
+		t.Fatalf("bounded diagnostic lost the tail: %q", marker)
+	}
+}
+
+func TestWatchInitialProcessCompletionDoesNotPollInA10msStorm(t *testing.T) {
+	dir := t.TempDir()
+	countPath := filepath.Join(dir, "identity-calls")
+	if err := os.WriteFile(countPath, []byte("0"), 0o600); err != nil {
+		t.Fatalf("initialize identity probe count: %v", err)
+	}
+	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
+		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+"if [ \"$1\" = \"display-message\" ]; then\n"+"  n=0; [ -f "+shellQuote(countPath)+" ] && n=$(cat "+shellQuote(countPath)+")\n"+"  n=$((n + 1)); echo $n > "+shellQuote(countPath)+"\n"+
+		"  echo '$owned'; exit 0\nfi\nexit 1\n")
+	ackPath := filepath.Join(t.TempDir(), "ack")
+	if err := os.WriteFile(ackPath, []byte("pid:42\n"), 0o600); err != nil {
+		t.Fatalf("write acknowledgement: %v", err)
+	}
+	sess := &Session{Name: "slow-watcher", createdSessionID: "$owned", launchAckPath: ackPath}
+	cancel := make(chan struct{})
+	sess.WatchInitialProcessCompletion(cancel, func(int, string) {})
+	time.Sleep(75 * time.Millisecond)
+	close(cancel)
+	time.Sleep(25 * time.Millisecond)
+	raw, err := os.ReadFile(countPath)
+	if err != nil {
+		t.Fatalf("read identity probe count: %v", err)
+	}
+	var calls int
+	if _, err := fmt.Sscanf(string(raw), "%d", &calls); err != nil {
+		t.Fatalf("parse identity probe count %q: %v", raw, err)
+	}
+	if calls > 2 {
+		t.Fatalf("completion watcher still polls every 10ms: %d probes in 75ms", calls)
+	}
+}
+
+func TestLaunchAckWatchDelayUsesBoundedExponentialBackoff(t *testing.T) {
+	want := []time.Duration{100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond, 800 * time.Millisecond, time.Second}
+	for attempt, expected := range want {
+		if got := launchAckWatchDelay(attempt); got != expected {
+			t.Fatalf("launchAckWatchDelay(%d) = %s, want %s", attempt, got, expected)
+		}
 	}
 }
 
@@ -322,7 +382,7 @@ func TestLaunchAckScriptFailsClosedWithoutProcessGroupCapability(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bash, "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	cmd := exec.Command(bash, "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", command)
 	err = cmd.Run()
 	if err == nil {
 		t.Fatal("capability-minimal wrapper unexpectedly reported success")
@@ -441,7 +501,7 @@ func TestLaunchAckScriptDoesNotWaitForOutlivingDescendant(t *testing.T) {
 	command := fmt.Sprintf("(sleep 2; printf LATE > %s) & printf DIRECT; exit 7", shellQuote(latePath))
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, command)
+	cmd := exec.CommandContext(ctx, "bash", "-c", launchAckScript, "agent-deck-launch-ack", ackPath, "isolated", command)
 	err := cmd.Run()
 	if err == nil {
 		t.Fatal("wrapper returned nil for child exit 7")

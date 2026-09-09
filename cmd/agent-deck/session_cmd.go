@@ -3954,23 +3954,34 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					arrived = true
 				}
 				codex := session.IsCodexCompatible(opts.tool)
-				// Codex renders the timed Working line together with the submitted
-				// body. That is already submission evidence; sending a recovery
-				// Enter would deliver a second Enter to the accepted prompt. Keep
-				// attribution strict when another prompt/draft is visible.
-				if codex && arrived && !recoveryAttempted &&
-					codexWorkingIndicator(content, message) && codexTimedWorkingLine(content) &&
-					!codexBaselineWorking &&
-					!strings.Contains(strings.ToLower(content), "codex>") {
-					return deliverySubmitted, nil
-				}
 				if codex {
 					token := strings.ToLower(collapseWhitespace(messageDeliveryToken(message)))
 					if codexWorkingLine(content, token) && !arrived && !codexBaselineWorking {
 						codexWorkingSeenBeforeBody = true
 					}
+					// A normal or timed Working line that is attributable to this
+					// body is already submission evidence. Check the same foreign-
+					// draft guard used by recovery before accepting it; otherwise a
+					// pre-existing active turn can appear to submit a new message
+					// that is still sitting in the composer.
+					if arrived && !recoveryAttempted && !codexWorkingSeenBeforeBody &&
+						!codexBaselineWorking && codexWorkingIndicator(content, message) &&
+						!strings.Contains(strings.ToLower(content), "codex>") &&
+						!send.HasUnsentComposerPrompt(content, message) &&
+						!attrib.EnterWouldSubmitForeignDraft(paneNow, tmux.StripANSI) {
+						return deliverySubmitted, nil
+					}
 				}
 				if arrived && !recoveryAttempted && session.IsCodexCompatible(opts.tool) {
+					if codex && codexWorkingIndicator(content, message) &&
+						send.HasUnsentComposerPrompt(content, message) {
+						// Working plus a visible composer means this is still a
+						// draft while another turn is active. Consume the bounded
+						// recovery opportunity without pressing into foreign text.
+						recoveryAttempted = true
+						recoveryIteration = i
+						continue
+					}
 					// Consume the single recovery budget before sending. NudgeEnter
 					// reports both an attribution refusal and a transport failure as
 					// false; neither may re-arm another Enter into a pane whose draft
@@ -3985,7 +3996,8 @@ func verifyContentArrival(target sendRetryTarget, message string, opts sendRetry
 					i > recoveryIteration &&
 					!codexWorkingSeenBeforeBody &&
 					!codexBaselineWorking &&
-					codexWorkingIndicator(content, message) {
+					codexWorkingIndicator(content, message) &&
+					!send.HasUnsentComposerPrompt(content, message) {
 					return deliverySubmitted, nil
 				}
 			}
@@ -4075,16 +4087,6 @@ func codexWorkingLine(content, token string) bool {
 		if line == "working" || line == "working..." ||
 			strings.HasPrefix(line, "working(") ||
 			(strings.HasPrefix(line, "working") && strings.Contains(line, "esc to interrupt")) {
-			return true
-		}
-	}
-	return false
-}
-
-func codexTimedWorkingLine(content string) bool {
-	for _, line := range strings.Split(strings.ToLower(content), "\n") {
-		line = collapseWhitespace(strings.TrimLeft(line, "•·⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏*"))
-		if strings.HasPrefix(line, "working(") && strings.Contains(line, "esctointerrupt") {
 			return true
 		}
 	}

@@ -288,6 +288,34 @@ func TestIssue1793_CodexTimedWorkingPaneConfirmsSubmitted(t *testing.T) {
 	}
 }
 
+func TestIssue1793_CodexNormalWorkingPaneConfirmsSubmittedWithoutRecoveryEnter(t *testing.T) {
+	const msg = "ISSUE1793 NORMAL CODEX WORKING submitted prompt"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working\n" + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err != nil || delivery != deliverySubmitted {
+		t.Fatalf("normal Codex Working pane = delivery %q, err %v; want submitted", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("normal Working state must not receive recovery Enter, got %d", got)
+	}
+}
+
+func TestIssue1793_CodexTimedWorkingDoesNotSubmitForeignDraftFromExistingTurn(t *testing.T) {
+	const msg = "ISSUE1793 PREEXISTING TURN DRAFT"
+	mock := &mockSendRetryTarget{statuses: []string{"active"}, panes: []string{
+		"codex>\n", "• Working (4s • esc to interrupt)\nprior request\n❯ " + msg + "\n",
+	}}
+	delivery, err := sendWithRetryTarget(mock, msg, true, sendRetryOptions{maxRetries: 3, checkDelay: 0, tool: "codex"})
+	if err == nil || delivery == deliverySubmitted {
+		t.Fatalf("pre-existing Working turn with an unsent draft must not submit: delivery=%q err=%v", delivery, err)
+	}
+	if got := atomic.LoadInt32(&mock.sendEnterCalls); got != 0 {
+		t.Fatalf("foreign draft must not receive recovery Enter, got %d", got)
+	}
+}
+
 func TestIssue1793_CodexPayloadWorkingLineIsNotSubmissionEvidence(t *testing.T) {
 	const msg = "working on the deployment plan"
 	mock := &mockSendRetryTarget{
