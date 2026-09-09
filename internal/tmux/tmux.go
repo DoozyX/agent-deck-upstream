@@ -3866,28 +3866,34 @@ func (s *Session) captureCreatedSessionIdentity() (string, error) {
 		if err == nil {
 			for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 				parts := strings.SplitN(line, "\t", 3)
-				if len(parts) != 3 || parts[1] != s.Name || parts[2] != s.creationMarker {
+				if len(parts) != 3 || parts[1] != s.Name {
 					continue
 				}
 				identity := strings.TrimSpace(parts[0])
 				if identity == "" {
 					continue
 				}
+				if parts[2] != s.creationMarker {
+					return "", fmt.Errorf("session identity changed during capture: expected marker %s, found %s", s.creationMarker, parts[2])
+				}
 				if s.createdSessionID != "" && !sessionIdentityMatches(s.createdSessionID, identity) {
 					return "", fmt.Errorf("session identity changed during capture: expected %s, found %s", s.createdSessionID, identity)
 				}
 				return identity, nil
 			}
+		} else if identity := strings.TrimSpace(s.createdSessionID); identity != "" {
+			// The creating new-session command's -P/-F output is authoritative. A
+			// launcher may suppress the later marker listing (for example when a
+			// systemd service owns a separate tmux environment), but the immutable
+			// ID printed by the command that created this session remains a safe
+			// cleanup target when that follow-up probe is unavailable.
+			return identity, nil
 		}
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("identity probe remained indeterminate")
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func (s *Session) sessionIdentityIs(want string) bool {
-	return sessionIdentityMatches(want, s.sessionIdentity())
 }
 
 // getPaneProcessTree returns the pane's direct PID and all descendant PIDs.
