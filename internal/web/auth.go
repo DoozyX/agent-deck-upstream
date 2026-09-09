@@ -60,12 +60,14 @@ func bearerToken(authHeader string) string {
 		return ""
 	}
 
-	const bearerPrefix = "Bearer "
-	if len(authHeader) < len(bearerPrefix) || !strings.EqualFold(authHeader[:len(bearerPrefix)], bearerPrefix) {
+	const bearerScheme = "Bearer"
+	if len(authHeader) <= len(bearerScheme) ||
+		!strings.EqualFold(authHeader[:len(bearerScheme)], bearerScheme) ||
+		authHeader[len(bearerScheme)] != ' ' {
 		return ""
 	}
 
-	token := strings.TrimSpace(authHeader[len(bearerPrefix):])
+	token := strings.TrimSpace(authHeader[len(bearerScheme):])
 	if token == "" {
 		return ""
 	}

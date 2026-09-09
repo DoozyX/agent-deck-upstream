@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/time/rate"
@@ -162,6 +163,146 @@ func TestServer_MCPRoute_AllowsReverseProxyHostOnLoopback(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200 for an authenticated reverse-proxy Host", resp.StatusCode)
+	}
+}
+
+func TestServer_MCPRoute_SupportsCORSPreflight(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, MCPNoAuth: true, WebMutations: true})
+	req := httptest.NewRequest(http.MethodOptions, MCPRoute, nil)
+	req.Header.Set("Origin", "https://chatgpt.com")
+	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
+	req.Header.Set("Access-Control-Request-Headers", "authorization, content-type, mcp-session-id")
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("OPTIONS /mcp status=%d body=%s, want 204", rec.Code, rec.Body.String())
+	}
+	for header, want := range map[string]string{
+		"Access-Control-Allow-Origin":   "*",
+		"Access-Control-Allow-Methods":  "GET, POST, DELETE, OPTIONS",
+		"Access-Control-Allow-Headers":  "authorization, content-type, mcp-session-id, mcp-protocol-version",
+		"Access-Control-Expose-Headers": "mcp-session-id, mcp-protocol-version, www-authenticate",
+	} {
+		if got := rec.Header().Get(header); got != want {
+			t.Errorf("%s=%q, want %q", header, got, want)
+		}
+	}
+
+	initReq := httptest.NewRequest(http.MethodPost, MCPRoute, strings.NewReader(mcpInitializeBody()))
+	initReq.Header.Set("Origin", "https://chatgpt.com")
+	initReq.Header.Set("Content-Type", "application/json")
+	initReq.Header.Set("Accept", "application/json, text/event-stream")
+	initRec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(initRec, initReq)
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("CORS initialize status=%d body=%s, want 200", initRec.Code, initRec.Body.String())
+	}
+	if got := initRec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Errorf("initialize Access-Control-Allow-Origin=%q, want %q", got, "*")
+	}
+	if got := initRec.Header().Get("Access-Control-Expose-Headers"); got != "mcp-session-id, mcp-protocol-version, www-authenticate" {
+		t.Errorf("initialize Access-Control-Expose-Headers=%q", got)
+	}
+	if got := initRec.Header().Get("Mcp-Session-Id"); got == "" {
+		t.Error("initialize did not return Mcp-Session-Id")
+	}
+}
+
+func TestServer_MCPRoute_ToolsListOmitsUnsupportedCacheFields(t *testing.T) {
+	srv := wiringServer(t, Config{Token: wiringToken, MCPNoAuth: true, WebMutations: true})
+	initRec := postMCP(t, srv.Handler(), MCPRoute, "", mcpInitializeBody(), "")
+	if initRec.Code != http.StatusOK {
+		t.Fatalf("initialize status=%d body=%s, want 200", initRec.Code, initRec.Body.String())
+	}
+	sessionID := initRec.Header().Get("Mcp-Session-Id")
+	if sessionID == "" {
+		t.Fatal("initialize did not return Mcp-Session-Id")
+	}
+
+	req := httptest.NewRequest(http.MethodPost, MCPRoute, strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Mcp-Session-Id", sessionID)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tools/list status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	for _, unsupported := range []string{`"ttlMs"`, `"cacheScope"`} {
+		if strings.Contains(rec.Body.String(), unsupported) {
+			t.Errorf("tools/list contains unsupported field %s: %s", unsupported, rec.Body.String())
+		}
+	}
+}
+
+func TestServer_MCPRoute_ExpiresIdleSessions(t *testing.T) {
+	previousTimeout := mcpSessionTimeout
+	mcpSessionTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { mcpSessionTimeout = previousTimeout })
+
+	srv := wiringServer(t, Config{Token: wiringToken, WebMutations: true})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+
+	newClientSession := func() *mcpsdk.ClientSession {
+		t.Helper()
+		client := mcpsdk.NewClient(&mcpsdk.Implementation{Name: "timeout-test", Version: "0"}, nil)
+		session, err := client.Connect(context.Background(), &mcpsdk.StreamableClientTransport{
+			Endpoint:   ts.URL + MCPRoute,
+			HTTPClient: bearerHTTPClient(wiringToken),
+		}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = session.Close() })
+		return session
+	}
+
+	idle := newClientSession()
+	active := newClientSession()
+	keepAliveStarted := make(chan struct{})
+	keepAliveDone := make(chan struct{})
+	keepAliveErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		if _, err := active.ListTools(context.Background(), nil); err != nil {
+			keepAliveErr <- err
+			return
+		}
+		close(keepAliveStarted)
+		for {
+			select {
+			case <-ticker.C:
+				if _, err := active.ListTools(context.Background(), nil); err != nil {
+					keepAliveErr <- err
+					return
+				}
+			case <-keepAliveDone:
+				keepAliveErr <- nil
+				return
+			}
+		}
+	}()
+	select {
+	case <-keepAliveStarted:
+	case err := <-keepAliveErr:
+		t.Fatalf("initial active session keepalive failed: %v", err)
+	}
+
+	// Three timeout periods gives the SDK cleanup timer scheduling room. The
+	// active session is refreshed with 20x margin throughout that window.
+	time.Sleep(3 * mcpSessionTimeout)
+	if _, err := idle.ListTools(context.Background(), nil); err == nil {
+		t.Fatal("idle session should expire")
+	}
+	close(keepAliveDone)
+	if err := <-keepAliveErr; err != nil {
+		t.Fatalf("active session keepalive failed: %v", err)
+	}
+	if _, err := active.ListTools(context.Background(), nil); err != nil {
+		t.Fatalf("active session should remain usable after idle session expires: %v", err)
 	}
 }
 
