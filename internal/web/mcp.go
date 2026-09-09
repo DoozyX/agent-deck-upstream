@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -86,10 +87,50 @@ func registerMCPTools(server *mcpsdk.Server, deps MCPDependencies) {
 				})
 				return nil, out, err
 			})
+		case "create_session":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPCreateSessionInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
+				out, err := mcpCreateSession(deps, in)
+				return nil, out, err
+			})
+		case "delete_session":
+			mcpsdk.AddTool(server, tool, func(ctx context.Context, req *mcpsdk.CallToolRequest, in MCPSessionIDInput) (*mcpsdk.CallToolResult, MCPMutationResult, error) {
+				out, err := mcpMutateSession(deps, in.SessionID, func(m SessionMutator, id string) error {
+					return m.DeleteSession(id)
+				})
+				return nil, out, err
+			})
 		default:
 			panic(fmt.Sprintf("unexpected MCP tool %q", spec.Name))
 		}
 	}
+}
+
+func mcpCreateSession(deps MCPDependencies, in MCPCreateSessionInput) (MCPMutationResult, error) {
+	if err := mcpGuardMutation(deps); err != nil {
+		return MCPMutationResult{}, err
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: title is required", ErrMCPMalformed)
+	}
+	projectPath := strings.TrimSpace(in.ProjectPath)
+	if projectPath == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: projectPath is required", ErrMCPMalformed)
+	}
+	if err := session.ValidateLaunchReasoningEffort(in.Tool, in.ReasoningEffort); err != nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: %v", ErrMCPMalformed, err)
+	}
+	if deps.Mutator == nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: session mutator unavailable", ErrMCPBackend)
+	}
+	id, err := deps.Mutator.CreateSession(title, strings.TrimSpace(in.Tool), projectPath, strings.TrimSpace(in.GroupPath), strings.TrimSpace(in.ModelID), strings.TrimSpace(in.ReasoningEffort))
+	if err != nil {
+		return MCPMutationResult{}, fmt.Errorf("%w: %v", ErrMCPBackend, err)
+	}
+	if strings.TrimSpace(id) == "" {
+		return MCPMutationResult{}, fmt.Errorf("%w: create returned empty session ID", ErrMCPBackend)
+	}
+	return MCPMutationResult{SessionID: id, OK: true}, nil
 }
 
 func mcpGuardMutation(deps MCPDependencies) error {
