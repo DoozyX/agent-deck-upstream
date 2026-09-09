@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/asheshgoplani/agent-deck/internal/session"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -18,6 +19,7 @@ type MCPDependencies struct {
 	Loader           MenuDataLoader
 	Mutator          SessionMutator
 	OutputReader     SessionOutputReader
+	RemoteFleet      RemoteFleetLoader
 	Authorize        func(*http.Request) bool
 	MutationsAllowed func() bool
 	AllowMutation    func() bool
@@ -48,11 +50,13 @@ type MCPCreateSessionInput struct {
 }
 
 type MCPFleetStatusResult struct {
-	Profile       string              `json:"profile"`
-	TotalGroups   int                 `json:"totalGroups"`
-	TotalSessions int                 `json:"totalSessions"`
-	Sessions      []MCPSessionSummary `json:"sessions"`
-	Groups        []MCPGroupSummary   `json:"groups"`
+	Profile       string                      `json:"profile"`
+	TotalGroups   int                         `json:"totalGroups"`
+	TotalSessions int                         `json:"totalSessions"`
+	Sessions      []MCPSessionSummary         `json:"sessions"`
+	Groups        []MCPGroupSummary           `json:"groups"`
+	Remotes       []session.RemoteFleetRemote `json:"remotes"`
+	RemoteCounts  session.RemoteFleetCounts   `json:"remoteCounts"`
 }
 
 type MCPSessionSummary struct {
