@@ -1207,11 +1207,17 @@ func (s *Storage) SaveGroupsOnly(groupTree *GroupTree) error {
 		return nil
 	}
 
-	groupRows := groupTreeRows(groupTree)
-
-	if err := s.db.SaveGroups(groupRows); err != nil {
+	// Snapshot-aware, like SaveWithGroups: a group-only save must not push a
+	// field this tree never read over a newer value another writer committed.
+	batch, err := s.prepareGroupSave(groupTree)
+	if err != nil {
+		return err
+	}
+	result, err := s.db.MergeRegistrySnapshots(nil, batch.updates)
+	if err != nil {
 		return fmt.Errorf("failed to save groups: %w", err)
 	}
+	s.finishGroupSave(batch, result.Groups)
 
 	return nil
 }
@@ -1366,8 +1372,12 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 }
 
 // LoadWithGroups reads instances and groups from SQLite, reconnects tmux sessions.
+// Both tables come from ONE read snapshot: a concurrent committed rename between
+// two reads would otherwise hand callers instances and groups that describe
+// different databases.
 func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
-	return s.loadWithGroups(false, false)
+	instances, groups, _, err := s.LoadWithGroupsSnapshot()
+	return instances, groups, err
 }
 
 // LoadActiveWithGroups reads only non-archived sessions and reconnects their
