@@ -710,6 +710,11 @@ type Instance struct {
 	// Gateway health cache for Hermes sessions (volatile, not persisted).
 	hermesGatewayCheckedAt time.Time
 	hermesGatewayOK        bool
+
+	// storageSnapshot records the rows this instance was last loaded from or
+	// saved as, so a save can tell a real edit apart from a field the caller
+	// never read. Owned by Storage; see instanceStorageSnapshot.
+	storageSnapshot *instanceStorageSnapshot
 }
 
 // newSpawnGenWatch bumps the generation and hands back both the new generation
@@ -1866,6 +1871,25 @@ func ValidateExtraArgToken(token string) error {
 // persisted ExtraArgs on every lifecycle path.
 func SupportsExtraArgs(tool string) bool {
 	return IsClaudeCompatible(tool) || IsCodexCompatible(tool)
+}
+
+// ValidateClaudeExtraArgToken rejects an --extra-arg token that reads
+// like a flag mashed together with its value (issue #1431b). Each --extra-arg
+// is shell-quoted as ONE argument, so `--extra-arg "--model opus"` reaches
+// claude as the literal single arg '--model opus' (embedded space) — an
+// unknown flag that makes claude exit on startup and leaves a dead pane the
+// registry still reports as running. A token that starts with '-' AND contains
+// whitespace is almost always two tokens the user meant to pass separately;
+// surfacing it as an error at spawn time beats the silent tmux death. Clean
+// flags ("--model") and clean values ("opus", "be concise") pass.
+func ValidateClaudeExtraArgToken(token string) error {
+	if strings.HasPrefix(token, "-") && strings.ContainsAny(token, " \t\n\r") {
+		return fmt.Errorf(
+			"--extra-arg %q looks like a flag and its value combined; pass them as separate --extra-arg tokens (e.g. --extra-arg \"--model\" --extra-arg \"opus\"), or use the first-class --model flag",
+			token,
+		)
+	}
+	return nil
 }
 
 // extraArgsSupplyModel reports whether the persisted --extra-arg tokens already
@@ -5663,7 +5687,7 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	}
 	if err := i.tmuxSession.AcknowledgeInitialProcess(); err != nil {
 		i.recordTmuxStartFailure(command, err)
-		return fmt.Errorf("initial session command did not launch: %w", err)
+		return send.DeliverySendFailed, fmt.Errorf("initial session command did not launch: %w", err)
 	}
 
 	// #1580: fast-death watcher (sister path to Start()).

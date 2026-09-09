@@ -391,6 +391,7 @@ func (h *Home) spawnCrossToolContinuation(inst *session.Instance, targetTool, se
 		nil,   // toolOptionsJSON
 		nil,   // claudeExtraArgs
 		"",    // claudeStartQuery — the handoff prompt is sent after the pane is live
+		"",    // claudeAccount — inherit the deck default for the continuation
 		"",    // launchModelID
 		false, // multiRepoEnabled
 		nil,   // additionalPaths

@@ -399,7 +399,7 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 		return nil, fmt.Errorf("storage database not initialized")
 	}
 	if err := s.rejectNewGroups(instances, groupTree); err != nil {
-		return err
+		return nil, err
 	}
 
 	// Enforce one Claude conversation owner across persisted sessions.
@@ -1036,6 +1036,20 @@ func (s *Storage) PersistRecoveredInstances(instances []*Instance) error {
 	return errors.Join(errs...)
 }
 
+// consumeGenericSessionIDCleared clears the one-shot "operator cleared the
+// generic session id" intent after a write has landed.
+//
+// Must run only after the DB write succeeds: consuming before Upsert would
+// let a failed save + retry omit the key and sticky-merge resurrect the
+// pre-clear id when write-through (GetGlobal / Persist) was not used.
+func consumeGenericSessionIDCleared(insts ...*Instance) {
+	for _, inst := range insts {
+		if inst != nil {
+			inst.genericSessionIDCleared = false
+		}
+	}
+}
+
 // instanceToRow converts a session.Instance into the statedb row shape.
 // Shared by SaveWithGroups (bulk path) and InsertSessionAndVerify
 // (targeted single-row path) so the marshal/normalize logic stays in
@@ -1466,7 +1480,7 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 
 	if s.db == nil {
 		storageLog.Debug("load_db_not_initialized", slog.String("profile", s.profile))
-		return []*Instance{}, nil, nil, nil
+		return []*Instance{}, nil, nil
 	}
 
 	// Load from SQLite
@@ -1480,9 +1494,42 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 		dbRows, err = s.db.LoadInstances()
 	}
 	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+	}
+
+	dbGroups, err := s.db.LoadGroups()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
+	}
+
+	return s.hydrateRegistry(dbRows, dbGroups)
+}
+
+// LoadWithGroupsSnapshot reads instances and groups from one SQLite snapshot and
+// hands the raw result back alongside the hydrated model. The TUI's storage
+// watcher compares that raw snapshot against the next one to decide whether a
+// reload is even needed, so it must be the exact rows this load observed.
+func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		storageLog.Debug("load_db_not_initialized", slog.String("profile", s.profile))
+		return []*Instance{}, nil, nil, nil
+	}
+
+	snapshot, err := s.db.LoadRegistrySnapshot()
+	if err != nil {
 		return nil, nil, nil, err
 	}
-	dbRows, dbGroups := snapshot.Instances, snapshot.Groups
+	instances, groups, err := s.hydrateRegistry(snapshot.Instances, snapshot.Groups)
+	return instances, groups, snapshot, err
+}
+
+// hydrateRegistry converts loaded rows into live instances and groups and
+// records the per-row storage snapshots that saveWithGroups needs to tell an
+// edit apart from a field that simply went unread. Callers already hold s.mu.
+func (s *Storage) hydrateRegistry(dbRows []*statedb.InstanceRow, dbGroups []*statedb.GroupRow) ([]*Instance, []*GroupData, error) {
 
 	// Convert to InstanceData for the existing convertToInstances pipeline
 	data := &StorageData{
@@ -1599,7 +1646,7 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 		for _, inst := range instances {
 			original, convertErr := instanceToRow(inst)
 			if convertErr != nil {
-				return nil, nil, nil, convertErr
+				return nil, nil, convertErr
 			}
 			stored := byID[inst.ID]
 			if stored != nil && stored.GroupPath == DefaultGroupName {
@@ -1615,7 +1662,7 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 		}
 		if legacy := groupsByPath[DefaultGroupName]; legacy != nil {
 			if groupsByPath[DefaultGroupPath] != nil {
-				return nil, nil, nil, fmt.Errorf("legacy default group migration conflicts with existing %q group", DefaultGroupPath)
+				return nil, nil, fmt.Errorf("legacy default group migration conflicts with existing %q group", DefaultGroupPath)
 			}
 			groupsByPath[DefaultGroupPath] = legacy
 		}
@@ -1629,7 +1676,7 @@ func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*
 				original: original, stored: statedb.CloneGroupRow(stored)}
 		}
 	}
-	return instances, groups, snapshot, err
+	return instances, groups, err
 }
 
 // SaveRecentSession captures a deleted session's config for quick re-creation.

@@ -565,6 +565,17 @@ func (r *SSHRunner) FetchSnapshot(ctx context.Context) (RemoteSnapshot, error) {
 	return parseRemoteSnapshot(output)
 }
 
+// parseRemoteSessions decodes the sessions half of `list --json` output; empty
+// or non-JSON output (an older remote, or "No sessions found") is an empty
+// list, not an error. The persistent channel parses pushed listings with this.
+func parseRemoteSessions(output []byte) ([]RemoteSessionInfo, error) {
+	snapshot, err := parseRemoteSnapshot(output)
+	if err != nil {
+		return nil, err
+	}
+	return snapshot.Sessions, nil
+}
+
 func parseRemoteSnapshot(output []byte) (RemoteSnapshot, error) {
 	// Handle empty/non-JSON output (e.g., "No sessions found" message)
 	trimmed := bytes.TrimSpace(output)
@@ -1216,6 +1227,44 @@ func (r *SSHRunner) sshBaseArgs(remoteCmd string) []string {
 	return append(r.sshConnOpts(), r.Host, remoteCmd)
 }
 
+// sshChannelArgs is sshBaseArgs for the persistent channel (#2174). It adds
+// ServerAlive probes so a link that died under the session (laptop sleep,
+// VPN flap, NAT expiry) is torn down by ssh within about 45 s instead of
+// the OS keepalive's hours (#5). One-shot execs do not need them: their
+// command timeout already bounds them.
+func (r *SSHRunner) sshChannelArgs(remoteCmd string) []string {
+	args := append(r.sshConnOpts(), "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=3")
+	return append(args, r.Host, remoteCmd)
+}
+
+// remoteVerbReadOnly reports whether args is a verb that only reads remote
+// state, so running it twice is harmless. Anything not listed here counts
+// as mutating.
+func remoteVerbReadOnly(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	second := ""
+	if len(args) > 1 {
+		second = args[1]
+	}
+	switch args[0] {
+	case "list", "ls", "accounts", "version", "status":
+		return true
+	case "group":
+		return second == "list"
+	case "costs":
+		return second == "summary"
+	case "mcp", "skill":
+		return second == "list"
+	case "inbox":
+		return second == "export" || second == "writer-status"
+	case "session":
+		return second == "show" || second == "output" || second == "pane"
+	}
+	return false
+}
+
 // AttachArgs builds the ssh argv for an interactive attach. It shares
 // sshConnOpts() with every other path so the host-key/BatchMode stance is
 // identical (#1206 regression: Attach() previously omitted BatchMode and
@@ -1225,7 +1274,7 @@ func (r *SSHRunner) sshBaseArgs(remoteCmd string) []string {
 // local PTY instead of the TUI's os.Stdin one.
 func (r *SSHRunner) AttachArgs(sessionID string) []string {
 	_ = os.MkdirAll(sshControlDir, 0700)
-	remoteCmd := r.buildRemoteCommand("session", "attach", sessionID)
+	remoteCmd := "env TERM=" + shellQuote(remoteAttachTERM()) + " " + r.buildRemoteCommand("session", "attach", sessionID)
 	args := append([]string{"-tt"}, r.sshConnOpts()...)
 	return append(args, r.Host, remoteCmd)
 }
@@ -1536,6 +1585,22 @@ type RemoteSessionInfo struct {
 
 	// Set locally, not from JSON
 	RemoteName string `json:"-"`
+}
+
+// LastActivity parses LastActivityAt. ok is false when the field is empty or
+// unparseable — a remote agent-deck build too old to send it, or a malformed
+// value — and callers should treat that as "unknown" (matches any recency
+// filter) rather than "very old", so an old remote's sessions don't just
+// vanish under a time filter.
+func (r RemoteSessionInfo) LastActivity() (t time.Time, ok bool) {
+	if r.LastActivityAt == "" {
+		return time.Time{}, false
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, r.LastActivityAt)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return parsed, true
 }
 
 // RemoteSnapshot is the remote list response used by the TUI.

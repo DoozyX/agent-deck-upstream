@@ -164,8 +164,8 @@ func TestIssue1170_RemoteFetchMsg_FailedRemoteKeepsLastGood(t *testing.T) {
 		"dev":  {remoteInfo("dev", "r1", "a", "running")},
 		"prod": {remoteInfo("prod", "r9", "z", "waiting")},
 	}
-	home.remoteGroups = map[string][]session.GroupData{
-		"prod": {{Name: "empty", Path: "empty"}},
+	home.remoteGroups = map[string][]string{
+		"prod": {"empty"},
 	}
 	home.remoteSessionsMu.Unlock()
 
@@ -193,13 +193,13 @@ func TestRemoteFetchMsgStoresSavedEmptyGroups(t *testing.T) {
 	home := NewHome()
 	model, _ := home.Update(remoteSessionsFetchedMsg{
 		sessions: map[string][]session.RemoteSessionInfo{"dev": {}},
-		groups: map[string][]session.GroupData{
-			"dev": {{Name: "empty", Path: "empty"}},
+		groups: map[string][]string{
+			"dev": {"empty"},
 		},
 	})
 	home = model.(*Home)
 
-	if len(home.remoteGroups["dev"]) != 1 || home.remoteGroups["dev"][0].Path != "empty" {
+	if len(home.remoteGroups["dev"]) != 1 || home.remoteGroups["dev"][0] != "empty" {
 		t.Fatalf("stored remote groups = %+v, want empty", home.remoteGroups["dev"])
 	}
 	for _, item := range home.flatItems {

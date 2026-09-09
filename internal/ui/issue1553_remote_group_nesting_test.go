@@ -135,11 +135,7 @@ func TestIssue1553_DeepPathEmitsIntermediateHeaders(t *testing.T) {
 }
 
 func TestRemoteSnapshotEmitsSavedEmptyGroups(t *testing.T) {
-	snapshot := session.RemoteSnapshot{
-		Sessions: []session.RemoteSessionInfo{},
-		Groups:   []session.GroupData{{Name: "empty", Path: "work/empty"}},
-	}
-	items := buildRemoteSnapshotFlatItems("dev", snapshot, nil, nil)
+	items := buildRemoteFlatItemsWithEmptyGroups("dev", nil, nil, nil, []string{"work/empty"}, true)
 
 	var paths []string
 	for _, item := range items {

@@ -125,11 +125,8 @@ func TestPopulatedTopWiringSinksEmptyRemoteGroup(t *testing.T) {
 	home.remoteSessions = map[string][]session.RemoteSessionInfo{
 		"dev": {{ID: "remote-1", Title: "build", Group: "work", Status: "idle", RemoteName: "dev"}},
 	}
-	home.remoteGroups = map[string][]session.GroupData{
-		"dev": {
-			{Name: "work", Path: "work"},
-			{Name: "empty", Path: "empty"},
-		},
+	home.remoteGroups = map[string][]string{
+		"dev": {"work", "empty"},
 	}
 	home.groupViewMode = session.GroupViewPopulatedTop
 	home.rebuildFlatItems()
