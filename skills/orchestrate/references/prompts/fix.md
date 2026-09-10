@@ -4,10 +4,12 @@ Review round {{ROUND}} found issues on your branch — fix them:
 
 Fix every finding in the `patch` bucket. `decision-needed` items are not
 yours to resolve and `defer` items are out of scope — leave both alone and
-say so in your summary if any were listed. Rerun the full
-test suite (no new failures vs your baseline), the lint/format checks, and
-the e2e check; update screenshots if the UI changed again; commit.
-Do NOT push.
+say so in your summary if any were listed. Run the focused tests for
+the paths you touched — {{FOCUSED_TESTS}} — (no new failures vs your
+baseline) plus the lint/format/build checks; the next reviewer runs the full
+suite, so do not spend this round on it. Rerun the e2e check only if a
+finding was about end-to-end behaviour; update screenshots if the UI changed
+again; commit. Do NOT push.
 
 Your report must paste `git status --porcelain` and `git diff HEAD` verbatim,
 plus the commit sha and `git show --stat` for what you committed. Do not
