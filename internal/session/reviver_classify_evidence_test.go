@@ -1,8 +1,10 @@
 package session
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
+	"time"
 )
 
 // Issue #1705: a live conductor was restarted as if it were dead, and the
@@ -107,6 +109,26 @@ func TestReviver_Classify_DeadServerEvidence(t *testing.T) {
 	if attrs["tmux_alive"] != "false" || attrs["class"] != "dead" {
 		t.Errorf("dead-server evidence wrong: tmux_alive=%q class=%q", attrs["tmux_alive"], attrs["class"])
 	}
+	if attrs["__level"] != slog.LevelDebug.String() {
+		t.Errorf("dead-server evidence level = %s, want DEBUG", attrs["__level"])
+	}
+}
+
+func TestReviver_Classify_CanSuppressDeadEvidenceForFleetSweeps(t *testing.T) {
+	inst := newReviverTestInstance("evidence-dead-fleet", StatusRunning)
+	h := &recordingHandler{}
+	r := &Reviver{
+		TmuxExists:                  func(string, string) bool { return false },
+		Log:                         slog.New(h),
+		suppressDeadClassifications: true,
+	}
+
+	if got := r.Classify(inst); got != ClassDead {
+		t.Fatalf("expected ClassDead, got %v", got)
+	}
+	if got := h.count("reviver_classify"); got != 0 {
+		t.Fatalf("fleet sweep emitted %d dead classification records, want 0", got)
+	}
 }
 
 // An alive session is the overwhelming majority of every sweep: its verdict stays
@@ -126,6 +148,69 @@ func TestReviver_Classify_AliveVerdictStaysDebug(t *testing.T) {
 	}
 	if attrs := classifyAttrs(t, h); attrs["__level"] != slog.LevelDebug.String() {
 		t.Errorf("alive verdict level = %s, want DEBUG", attrs["__level"])
+	}
+}
+
+func TestReviver_Classify_RateLimitsUnchangedNonAliveEvidence(t *testing.T) {
+	inst := newReviverTestInstance("evidence-rate-limit", StatusError)
+	h := &recordingHandler{}
+	newReviver := func() *Reviver {
+		return &Reviver{
+			TmuxExists: func(string, string) bool { return true },
+			PipeAlive:  func(string) bool { return false },
+			Log:        slog.New(h),
+		}
+	}
+
+	if got := newReviver().Classify(inst); got != ClassErrored {
+		t.Fatalf("first classification = %v, want errored", got)
+	}
+	if got := newReviver().Classify(inst); got != ClassErrored {
+		t.Fatalf("repeated classification = %v, want errored", got)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	infoCount := 0
+	for _, rec := range h.recs {
+		if rec.Message == "reviver_classify" && rec.Level == slog.LevelInfo {
+			infoCount++
+		}
+	}
+	if infoCount != 1 {
+		t.Fatalf("unchanged non-alive evidence emitted at INFO %d times, want 1", infoCount)
+	}
+}
+
+func TestReviverClassificationLogPrunesExpiredSessionChurn(t *testing.T) {
+	reviverClassificationLog.Lock()
+	originalStates := reviverClassificationLog.states
+	originalLastPruned := reviverClassificationLog.lastPruned
+	reviverClassificationLog.states = make(map[string]reviverClassificationLogState)
+	reviverClassificationLog.lastPruned = time.Time{}
+	reviverClassificationLog.Unlock()
+	t.Cleanup(func() {
+		reviverClassificationLog.Lock()
+		reviverClassificationLog.states = originalStates
+		reviverClassificationLog.lastPruned = originalLastPruned
+		reviverClassificationLog.Unlock()
+	})
+
+	started := time.Unix(1_000_000, 0)
+	for i := 0; i < 1_000; i++ {
+		inst := newReviverTestInstance(fmt.Sprintf("expired-%d", i), StatusError)
+		shouldLogReviverInfo(inst, inst.Title, true, false, ClassErrored, started)
+	}
+	fresh := newReviverTestInstance("fresh", StatusError)
+	shouldLogReviverInfo(fresh, fresh.Title, true, false, ClassErrored, started.Add(reviverClassificationLogStateTTL+time.Second))
+
+	reviverClassificationLog.Lock()
+	defer reviverClassificationLog.Unlock()
+	if got := len(reviverClassificationLog.states); got != 1 {
+		t.Fatalf("classification state count after churn expiry = %d, want 1", got)
+	}
+	if _, ok := reviverClassificationLog.states[fresh.ID]; !ok {
+		t.Fatal("fresh classification state was pruned")
 	}
 }
 

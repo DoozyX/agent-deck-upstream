@@ -502,6 +502,18 @@ func NewNewDialog() *NewDialog {
 // ShowInGroup shows the dialog with a pre-selected parent group and optional default path.
 // conductors is the list of active conductor sessions available as parent options.
 func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conductors []*session.Instance, suggestedParentID string) {
+	d.showInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID, nil, false)
+}
+
+// ShowInGroupWithConfig is the render/event-loop-safe form of ShowInGroup.
+// Home already keeps a cached UserConfig, so opening a local new-session
+// dialog can pass it here instead of resolving config.toml and stat'ing the
+// filesystem synchronously on every `n` keypress.
+func (d *NewDialog) ShowInGroupWithConfig(groupPath, groupName, defaultPath string, conductors []*session.Instance, suggestedParentID string, userConfig *session.UserConfig) {
+	d.showInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID, userConfig, true)
+}
+
+func (d *NewDialog) showInGroup(groupPath, groupName, defaultPath string, conductors []*session.Instance, suggestedParentID string, userConfig *session.UserConfig, configProvided bool) {
 	if groupPath == "" {
 		groupPath = "default"
 		groupName = "default"
@@ -586,7 +598,10 @@ func (d *NewDialog) ShowInGroup(groupPath, groupName, defaultPath string, conduc
 	d.geminiOptions.SetDefaults(false)
 	d.codexOptions.SetDefaults(false)
 	d.hermesOptions.SetDefaults(false)
-	if userConfig, err := session.LoadUserConfig(); err == nil && userConfig != nil {
+	if !configProvided {
+		userConfig, _ = session.LoadUserConfig()
+	}
+	if userConfig != nil {
 		d.geminiOptions.SetDefaults(userConfig.Gemini.YoloMode)
 		d.codexOptions.SetDefaults(userConfig.Codex.YoloMode)
 		d.hermesOptions.SetDefaults(userConfig.Hermes.YoloMode)

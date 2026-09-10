@@ -91,6 +91,16 @@ func (o *RegistryObserver) reconnectLocked() error {
 
 // Snapshot returns persisted rows, never converted process-local runtime state.
 func (o *RegistryObserver) Snapshot() (*RegistrySnapshotResult, int64, int64, error) {
+	return o.snapshot(false, false)
+}
+
+// SnapshotByArchive returns one instance archive partition while preserving
+// the observer's single-transaction consistency with the groups table.
+func (o *RegistryObserver) SnapshotByArchive(archived bool) (*RegistrySnapshotResult, int64, int64, error) {
+	return o.snapshot(true, archived)
+}
+
+func (o *RegistryObserver) snapshot(filterArchive, archived bool) (*RegistrySnapshotResult, int64, int64, error) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	if o.conn == nil {
@@ -107,7 +117,14 @@ func (o *RegistryObserver) Snapshot() (*RegistrySnapshotResult, int64, int64, er
 		return nil, 0, 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := loadInstances(tx.Query)
+	where := ""
+	if filterArchive {
+		where = "WHERE archived_at = 0"
+		if archived {
+			where = "WHERE archived_at > 0"
+		}
+	}
+	rows, err := loadInstancesWhere(tx.Query, where)
 	if err != nil {
 		return nil, 0, 0, err
 	}

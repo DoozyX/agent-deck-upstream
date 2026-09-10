@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	runtimemetrics "runtime/metrics"
 	"sort"
 	"strconv"
 	"strings"
@@ -352,6 +353,12 @@ type Home struct {
 	previewCacheTime  map[string]time.Time // previewKey -> when cached (for expiration)
 	previewCacheMu    sync.RWMutex         // Protects previewCache for thread-safety
 	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
+	// MCP preview data is fetched lazily after selection. GetMCPInfo can resolve
+	// config homes and read several files, so View must only read this cache.
+	mcpPreviewCache      map[string]*session.MCPInfo
+	mcpPreviewFetching   map[string]bool
+	mcpPreviewGeneration map[string]uint64
+	mcpPreviewCacheMu    sync.RWMutex
 
 	// Preview debouncing (PERFORMANCE: prevents subprocess spawn on every keystroke)
 	// During rapid navigation, we delay preview fetch by 150ms to let navigation settle
@@ -386,11 +393,12 @@ type Home struct {
 
 	// Background status worker (Priority 1C optimization)
 	// Moves status updates to a separate goroutine, completely decoupling from UI
-	statusTrigger       chan statusUpdateRequest // Triggers background status update
-	statusWorkerDone    chan struct{}            // Signals worker has stopped
-	liveReconcilerDone  chan struct{}            // Signals live-pipe reconciler has stopped
-	lastFullStatusSweep atomic.Int64             // UnixNano timestamp of last full background status sweep
-	lastPersistedStatus map[string]string        // instanceID -> last status written to SQLite
+	statusTrigger         chan statusUpdateRequest // Triggers background status update
+	statusWorkerDone      chan struct{}            // Signals worker has stopped
+	liveReconcilerDone    chan struct{}            // Signals live-pipe reconciler has stopped
+	lastFullStatusSweep   atomic.Int64             // UnixNano timestamp of last full background status sweep
+	backgroundStatusIndex atomic.Int64             // Round-robin cursor for bounded background sweeps
+	lastPersistedStatus   map[string]string        // instanceID -> last status written to SQLite
 	// lastPersistedAutoNameDesc tracks the last auto-name description written to
 	// SQLite per instance, so the background loop only issues a targeted write
 	// when the live Claude task description actually changes (mirrors
@@ -463,7 +471,9 @@ type Home struct {
 
 	// File watcher for external changes (auto-reload)
 	storageWatcher      *StorageWatcher
-	sessionLoadSequence uint64 // issued only by the UI event loop
+	storageReloads      reloadCoalescer             // event-loop-owned single-flight reload state
+	sessionLoadSequence uint64                      // issued only by the UI event loop
+	recentSessionsCache []*statedb.RecentSessionRow // refreshed off the input path
 
 	// Optional in-memory web menu data sink for web mode.
 	webMenuData   *web.MemoryMenuData
@@ -474,6 +484,13 @@ type Home struct {
 
 	// Storage warning (shown if storage initialization failed)
 	storageWarning string
+
+	// cachedUserConfig is refreshed on the low-frequency UI tick and after
+	// in-app config saves. View must not call LoadUserConfig directly: resolving
+	// the config path and checking its mtime performs filesystem stats on every
+	// frame, which made scroll latency proportional to the user's filesystem.
+	cachedUserConfig       *session.UserConfig
+	cachedUserConfigLoaded bool
 
 	// Watcher warning (shown if fsnotify may not work, e.g., on 9p/NFS)
 	watcherWarning string
@@ -530,6 +547,10 @@ type Home struct {
 	navigationHotUntil atomic.Int64
 	// Snapshot of status/tool used by render path to avoid per-row lock contention.
 	sessionRenderSnapshot atomic.Value // map[string]sessionRenderState
+	// viewTrace is owned by the Bubble Tea event-loop render call. It is only
+	// populated when debug logging is enabled, and lets the total view timing
+	// attribute time spent in the list, preview, layout, and final clamp paths.
+	viewTrace *viewRenderTrace
 
 	// Jump mode (vimium-style hint navigation)
 	jumpMode   bool   // True when jump mode is active
@@ -595,8 +616,13 @@ type Home struct {
 	attachOnCreate bool
 
 	// Performance observability (debug mode only, zero cost when off)
-	debugMode          bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
-	lastRenderDuration atomic.Int64 // microseconds, for debug status bar
+	debugMode           bool         // true when AGENTDECK_DEBUG=1, enables perf overlay
+	lastRenderDuration  atomic.Int64 // microseconds, for debug status bar
+	debugHeapBytes      atomic.Uint64
+	debugGoroutines     atomic.Int64
+	lastViewPerfLog     atomic.Int64
+	lastInputPerfLog    atomic.Int64
+	lastKeypressPerfLog atomic.Int64
 
 	// Reusable string builder for View() to reduce allocations
 	viewBuilder strings.Builder
@@ -1250,6 +1276,33 @@ func (h *Home) normalizeMainKey(pressed string) string {
 	return pressed
 }
 
+func isNavigationKey(key string) bool {
+	switch key {
+	case "up", "down", "k", "j", "ctrl+p", "ctrl+n":
+		return true
+	default:
+		return false
+	}
+}
+
+// recordKeypressTrace retains a low-rate raw-key diagnostic for debug sessions.
+// Navigation input is already covered by recordInputLatency; logging every
+// keypress at INFO made the hot path synchronously serialize a JSON record to
+// disk, which could delay the next frame when the log writer was busy.
+func (h *Home) recordKeypressTrace(msg tea.KeyMsg, raw, key string) {
+	if !logging.IsDebugEnabled() || isNavigationKey(key) ||
+		!takePerfLogSample(&h.lastKeypressPerfLog, 250*time.Millisecond) {
+		return
+	}
+	fields := []any{
+		slog.String("raw", raw),
+		slog.String("normalized", key),
+		slog.String("type", msg.Type.String()),
+		slog.String("runes", string(msg.Runes)),
+	}
+	go uiLog.Debug("keypress", fields...)
+}
+
 func (h *Home) actionKey(action string) string {
 	return actionHotkey(h.hotkeys, action)
 }
@@ -1350,14 +1403,17 @@ type loadSessionsMsg struct {
 	loadSequence      uint64
 	loadWatcher       *StorageWatcher
 	watcherTicket     *storageLoadTicket
+	archiveView       bool
+	coalescedReload   bool
 	persistedSnapshot *statedb.RegistrySnapshotResult
 	instances         []*session.Instance
 	groups            []*session.GroupData
 	err               error
-	restoreState      *reloadState // Optional state to restore after reload
-	poolProxies       int          // Number of socket proxies started
-	poolError         error        // Pool initialization error
-	loadMtime         time.Time    // File mtime at load time (for external change detection)
+	restoreState      *reloadState  // Optional state to restore after reload
+	poolProxies       int           // Number of socket proxies started
+	poolError         error         // Pool initialization error
+	loadMtime         time.Time     // File mtime at load time (for external change detection)
+	loadDuration      time.Duration // End-to-end storage load time
 }
 
 type sessionCreatedMsg struct {
@@ -1377,6 +1433,12 @@ type sessionForkedMsg struct {
 
 type refreshMsg struct{}
 type importReloadMsg struct{}
+
+type recentSessionsLoadedMsg struct {
+	sessions []*statedb.RecentSessionRow
+	err      error
+	duration time.Duration
+}
 
 type statusUpdateMsg struct {
 	attachedSessionID string // Session that just returned from attach (if local attach)
@@ -1445,6 +1507,11 @@ type usageFetchedMsg struct {
 	accounts  []usage.Account
 }
 
+type debugStatsMsg struct {
+	heapBytes  uint64
+	goroutines int
+}
+
 func usageSnapshotKey(snapshot usage.Snapshot) string {
 	home := snapshot.Home
 	if home == "" {
@@ -1499,6 +1566,12 @@ type previewFetchedMsg struct {
 	previewKey string // cache key: sessionID or sessionID:windowIndex
 	content    string
 	err        error
+}
+
+type mcpInfoFetchedMsg struct {
+	sessionID  string
+	generation uint64
+	info       *session.MCPInfo
 }
 
 // remotePaneWatchTarget names the remote session whose pane the TUI asked
@@ -1824,6 +1897,9 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		flatItems:                 []session.Item{},
 		previewCache:              make(map[string]string),
 		previewCacheTime:          make(map[string]time.Time),
+		mcpPreviewCache:           make(map[string]*session.MCPInfo),
+		mcpPreviewFetching:        make(map[string]bool),
+		mcpPreviewGeneration:      make(map[string]uint64),
 		analyticsCache:            make(map[string]*session.SessionAnalytics),
 		geminiAnalyticsCache:      make(map[string]*session.GeminiSessionAnalytics),
 		analyticsCacheTime:        make(map[string]time.Time),
@@ -1869,7 +1945,10 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 	// Cache display settings (config.toml [display]) and resolve the
 	// status-bar cost-line template once. The template + hide flag are
 	// reused on every render; see (*Home).renderStats.
-	if cfg, _ := session.LoadUserConfig(); cfg != nil {
+	cfg, _ := session.LoadUserConfig()
+	h.cachedUserConfig = cfg
+	h.cachedUserConfigLoaded = true
+	if cfg != nil {
 		// [performance] claim_polling: snapshot once at startup. Defaults to
 		// false (today's behavior); stays false when config is unreadable.
 		h.claimPolling = cfg.ClaimPollingEnabled()
@@ -3806,6 +3885,9 @@ func (h *Home) Init() tea.Cmd {
 		// everyone who has not said yes.
 		telemetrySendCmd(Version),
 	}
+	if h.debugMode {
+		cmds = append(cmds, h.debugStatsRefreshCmd())
+	}
 
 	// Start listening for storage changes
 	if h.storageWatcher != nil {
@@ -4753,16 +4835,36 @@ func (h *Home) loadSessions() tea.Msg {
 // sessionLoadCmd issues ordering without database I/O. The returned command
 // probes and reads the captured storage asynchronously, including initial loads.
 func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd {
+	return h.sessionLoadCmdWithTracking(restore, initializePool, false)
+}
+
+// sessionLoadCmdWithTracking is the storage-load implementation. Tracked
+// loads participate in storageReloads so a burst of watcher events produces
+// one in-flight snapshot and at most one follow-up snapshot.
+func (h *Home) sessionLoadCmdWithTracking(restore *reloadState, initializePool, coalescedReload bool) tea.Cmd {
 	h.sessionLoadSequence++
 	sequence := h.sessionLoadSequence
 	storage, watcher := h.storage, h.storageWatcher
+	archiveView := h.statusFilter == FilterModeArchived
 	var issuedTicket storageLoadTicket
 	if watcher != nil {
+		watcher.SetArchiveView(archiveView)
 		issuedTicket = watcher.issueLoad()
 	}
-	return func() tea.Msg {
+	return func() (result tea.Msg) {
+		loadStarted := time.Now()
 		ticket := issuedTicket
-		msg := loadSessionsMsg{loadSequence: sequence, loadWatcher: watcher, restoreState: restore}
+		msg := loadSessionsMsg{
+			loadSequence:    sequence,
+			loadWatcher:     watcher,
+			archiveView:     archiveView,
+			restoreState:    restore,
+			coalescedReload: coalescedReload,
+		}
+		defer func() {
+			msg.loadDuration = time.Since(loadStarted)
+			result = msg
+		}()
 		if storage == nil {
 			msg.err = fmt.Errorf("storage not initialized")
 			return msg
@@ -4777,7 +4879,7 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 			}
 		}
 		msg.loadMtime, _ = storage.GetFileMtime()
-		msg.instances, msg.groups, msg.persistedSnapshot, msg.err = storage.LoadWithGroupsSnapshot()
+		msg.instances, msg.groups, msg.persistedSnapshot, msg.err = storage.LoadWithGroupsSnapshotForArchive(archiveView)
 		if msg.err == nil {
 			// Lifecycle intents recorded by a CLI process must be reconciled
 			// against the rows this load observed, before anything renders.
@@ -4805,6 +4907,35 @@ func (h *Home) sessionLoadCmd(restore *reloadState, initializePool bool) tea.Cmd
 			}
 		}
 		return msg
+	}
+}
+
+// completeStorageReload releases the current watcher reload and starts the
+// single coalesced follow-up, if a write arrived while the snapshot was being
+// loaded. It is called only from the Bubble Tea event loop.
+func (h *Home) completeStorageReload(msg loadSessionsMsg) tea.Cmd {
+	if !msg.coalescedReload || !h.storageReloads.complete() {
+		return nil
+	}
+
+	h.reloadMu.Lock()
+	h.isReloading = true
+	h.reloadVersion++
+	h.reloadMu.Unlock()
+	state := h.preserveState()
+	uiLog.Debug("storage_reload_followup", slog.String("profile", h.profile))
+	return h.sessionLoadCmdWithTracking(&state, false, true)
+}
+
+func (h *Home) loadRecentSessionsCmd() tea.Cmd {
+	storage := h.storage
+	return func() tea.Msg {
+		started := time.Now()
+		if storage == nil {
+			return recentSessionsLoadedMsg{err: fmt.Errorf("storage not initialized"), duration: time.Since(started)}
+		}
+		sessions, err := storage.LoadRecentSessions()
+		return recentSessionsLoadedMsg{sessions: sessions, err: err, duration: time.Since(started)}
 	}
 }
 
@@ -4885,6 +5016,35 @@ func (h *Home) tick() tea.Cmd {
 	})
 }
 
+func debugStatsSnapshot() tea.Msg {
+	samples := []runtimemetrics.Sample{{Name: "/memory/classes/heap/objects:bytes"}}
+	runtimemetrics.Read(samples)
+	var heapBytes uint64
+	if samples[0].Value.Kind() == runtimemetrics.KindUint64 {
+		heapBytes = samples[0].Value.Uint64()
+	}
+	return debugStatsMsg{
+		heapBytes:  heapBytes,
+		goroutines: runtime.NumGoroutine(),
+	}
+}
+
+// debugStatsRefreshCmd samples runtime memory outside the Bubble Tea event
+// loop. Runtime metrics avoid the stop-the-world pause of ReadMemStats, and
+// keeping the sample out of View prevents debug instrumentation from becoming
+// input latency.
+func (h *Home) debugStatsRefreshCmd() tea.Cmd {
+	return func() tea.Msg {
+		return debugStatsSnapshot()
+	}
+}
+
+func (h *Home) debugStatsTick() tea.Cmd {
+	return tea.Tick(time.Second, func(time.Time) tea.Msg {
+		return debugStatsSnapshot()
+	})
+}
+
 // reviverTick fires every 60s to sweep the session list for instances whose
 // tmux server survived an SSH scope cleanup but whose control pipe got
 // reaped. See .planning/v178-ssh-reviver/PLAN.md (REPORT-D).
@@ -4901,6 +5061,15 @@ func (h *Home) invalidatePreviewCache(sessionID string) {
 	delete(h.previewCache, sessionID)
 	delete(h.previewCacheTime, sessionID)
 	h.previewCacheMu.Unlock()
+
+	h.mcpPreviewCacheMu.Lock()
+	delete(h.mcpPreviewCache, sessionID)
+	if h.mcpPreviewGeneration == nil {
+		h.mcpPreviewGeneration = make(map[string]uint64)
+	}
+	h.mcpPreviewGeneration[sessionID]++
+	delete(h.mcpPreviewFetching, sessionID)
+	h.mcpPreviewCacheMu.Unlock()
 }
 
 // pruneAnalyticsCache removes stale entries from analytics and log activity caches.
@@ -5162,6 +5331,36 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 			content:    content,
 			err:        err,
 		}
+	}
+}
+
+func (h *Home) mcpInfoForRender(inst *session.Instance) *session.MCPInfo {
+	if inst == nil {
+		return nil
+	}
+	h.mcpPreviewCacheMu.RLock()
+	info := h.mcpPreviewCache[inst.ID]
+	h.mcpPreviewCacheMu.RUnlock()
+	return info
+}
+
+func (h *Home) fetchMCPInfo(inst *session.Instance) tea.Cmd {
+	if inst == nil || !h.getSessionRenderState(inst).toolSupportsMCP {
+		return nil
+	}
+
+	instanceID := inst.ID
+	h.mcpPreviewCacheMu.Lock()
+	if _, cached := h.mcpPreviewCache[instanceID]; cached || h.mcpPreviewFetching[instanceID] {
+		h.mcpPreviewCacheMu.Unlock()
+		return nil
+	}
+	h.mcpPreviewFetching[instanceID] = true
+	generation := h.mcpPreviewGeneration[instanceID]
+	h.mcpPreviewCacheMu.Unlock()
+
+	return func() tea.Msg {
+		return mcpInfoFetchedMsg{sessionID: instanceID, generation: generation, info: inst.GetMCPInfo()}
 	}
 }
 
@@ -5576,6 +5775,64 @@ type sessionRenderState struct {
 	title          string // Instance.Title at snapshot time
 	autoName       bool   // session displays a captured/live task description
 	autoNameDesc   string // last persisted auto-name description (fallback when paneTitle empty)
+	// These capabilities are evaluated while refreshing the render snapshot.
+	// Several checks inspect disk or the config-backed tool registry; keeping
+	// them here prevents View from doing that work on the scroll path.
+	canRestartFresh       bool
+	canFork               bool
+	toolSupportsMCP       bool
+	supportsProjectSkills bool
+	sandboxed             bool
+	multiRepo             bool
+	authHeld              bool
+	lastActivityAt        time.Time
+	confirmedActivityAt   time.Time
+	confirmedActivitySeen bool
+}
+
+type viewRenderTrace struct {
+	header  time.Duration
+	usage   time.Duration
+	list    time.Duration
+	preview time.Duration
+	layout  time.Duration
+	footer  time.Duration
+	help    time.Duration
+	debug   time.Duration
+	tail    time.Duration
+	clamp   time.Duration
+	pin     time.Duration
+}
+
+func (h *Home) viewPhase(name string, started time.Time) {
+	if h.viewTrace == nil {
+		return
+	}
+	elapsed := time.Since(started)
+	switch name {
+	case "header":
+		h.viewTrace.header += elapsed
+	case "usage":
+		h.viewTrace.usage += elapsed
+	case "list":
+		h.viewTrace.list += elapsed
+	case "preview":
+		h.viewTrace.preview += elapsed
+	case "layout":
+		h.viewTrace.layout += elapsed
+	case "footer":
+		h.viewTrace.footer += elapsed
+	case "help":
+		h.viewTrace.help += elapsed
+	case "debug":
+		h.viewTrace.debug += elapsed
+	case "tail":
+		h.viewTrace.tail += elapsed
+	case "clamp":
+		h.viewTrace.clamp += elapsed
+	case "pin":
+		h.viewTrace.pin += elapsed
+	}
 }
 
 // displaySessionTitle returns the label to render for a session row. For an
@@ -5713,6 +5970,23 @@ func (h *Home) getSessionRenderSnapshot() map[string]sessionRenderState {
 	return nil
 }
 
+// getCachedUserConfig is the render-path config accessor. The config loader
+// intentionally checks config.toml's mtime, but doing that from View means
+// every scroll frame performs filesystem path resolution and stat calls.
+// Refreshes happen on the 2-second tick and after an in-app config save.
+func (h *Home) getCachedUserConfig() *session.UserConfig {
+	if !h.cachedUserConfigLoaded {
+		h.cachedUserConfig, _ = session.LoadUserConfig()
+		h.cachedUserConfigLoaded = true
+	}
+	return h.cachedUserConfig
+}
+
+func (h *Home) refreshCachedUserConfig() {
+	h.cachedUserConfig, _ = session.LoadUserConfig()
+	h.cachedUserConfigLoaded = true
+}
+
 func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 	if instances == nil {
 		h.instancesMu.RLock()
@@ -5740,11 +6014,20 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 			// through GetTitleThreadSafe because SetField/ReconcileTitleFromClaude/
 			// pending-title reapply can mutate it concurrently from the Bubble
 			// Tea event-loop goroutine.
-			account:      inst.GetAccountThreadSafe(),
-			title:        inst.GetTitleThreadSafe(),
-			autoName:     inst.GetAutoName(),
-			autoNameDesc: inst.GetAutoNameDescription(),
+			account:               inst.GetAccountThreadSafe(),
+			title:                 inst.GetTitleThreadSafe(),
+			autoName:              inst.GetAutoName(),
+			autoNameDesc:          inst.GetAutoNameDescription(),
+			canRestartFresh:       inst.CanRestartFresh(),
+			canFork:               inst.CanFork(),
+			toolSupportsMCP:       session.ToolSupportsMCPManager(inst.GetToolThreadSafe()),
+			supportsProjectSkills: session.SupportsProjectSkills(inst.GetToolThreadSafe()),
+			sandboxed:             inst.IsSandboxed(),
+			multiRepo:             inst.IsMultiRepo(),
+			authHeld:              inst.AuthHeldCached(),
+			lastActivityAt:        inst.LastActivityAt(),
 		}
+		state.confirmedActivityAt, state.confirmedActivitySeen = inst.LastObservedActivity()
 		display, ok := accounts[state.account]
 		if !ok {
 			display = newAccountPresentation(state.account)
@@ -5791,15 +6074,25 @@ func (h *Home) getSessionRenderState(inst *session.Instance) sessionRenderState 
 	// take Instance.mu (briefly, as a reader); it is bounded to sessions that a
 	// snapshot refresh has not seen yet, never the steady-state whole list.
 	account := inst.GetAccountThreadSafe()
-	return sessionRenderState{
-		status:         inst.GetStatusThreadSafe(),
-		tool:           inst.GetToolThreadSafe(),
-		account:        account,
-		accountDisplay: newAccountPresentation(account),
-		title:          inst.GetTitleThreadSafe(),
-		autoName:       inst.GetAutoName(),
-		autoNameDesc:   inst.GetAutoNameDescription(),
+	state := sessionRenderState{
+		status:                inst.GetStatusThreadSafe(),
+		tool:                  inst.GetToolThreadSafe(),
+		account:               account,
+		accountDisplay:        newAccountPresentation(account),
+		title:                 inst.GetTitleThreadSafe(),
+		autoName:              inst.GetAutoName(),
+		autoNameDesc:          inst.GetAutoNameDescription(),
+		canRestartFresh:       inst.CanRestartFresh(),
+		canFork:               inst.CanFork(),
+		toolSupportsMCP:       session.ToolSupportsMCPManager(inst.GetToolThreadSafe()),
+		supportsProjectSkills: session.SupportsProjectSkills(inst.GetToolThreadSafe()),
+		sandboxed:             inst.IsSandboxed(),
+		multiRepo:             inst.IsMultiRepo(),
+		authHeld:              inst.AuthHeldCached(),
+		lastActivityAt:        inst.LastActivityAt(),
 	}
+	state.confirmedActivityAt, state.confirmedActivitySeen = inst.LastObservedActivity()
+	return state
 }
 
 // markNavigationActivity records a short "hot" window where background workers
@@ -5809,6 +6102,11 @@ func (h *Home) markNavigationActivity() {
 	h.lastNavigationTime = now
 	h.isNavigating = true
 	h.navigationHotUntil.Store(now.Add(900 * time.Millisecond).UnixNano())
+}
+
+func (h *Home) navigationIsHot() bool {
+	hotUntil := h.navigationHotUntil.Load()
+	return hotUntil > 0 && time.Now().UnixNano() < hotUntil
 }
 
 func (h *Home) beginAttachReturnGrace(now time.Time) {
@@ -5858,6 +6156,18 @@ func (h *Home) getDefaultPathForGroup(groupPath string) string {
 	return p
 }
 
+// getDefaultPathForDialog returns the stored group default without touching
+// the filesystem. Opening a dialog is on the Bubble Tea event loop, while the
+// submit path already validates the selected directory and shows the existing
+// create-directory confirmation for missing paths. A synchronous Stat here
+// made a dead/network-backed default path add tens of milliseconds to every n.
+func (h *Home) getDefaultPathForDialog(groupPath string) string {
+	if h.groupTree == nil {
+		return ""
+	}
+	return h.groupTree.DefaultPathForDialog(groupPath)
+}
+
 // Status-sweep cadence (issue #1366). The sweep normally runs every
 // baseStatusInterval. When a sweep overruns that interval — which happens at
 // large session counts when the tmux control-mode pipe is unavailable/degraded
@@ -5869,6 +6179,11 @@ func (h *Home) getDefaultPathForGroup(groupPath string) string {
 const (
 	baseStatusInterval = 2 * time.Second
 	maxStatusInterval  = 10 * time.Second
+	// A fleet-wide status pass must yield to the interactive preview and list.
+	// UpdateStatus can hold an Instance lock across tmux capture calls, and tmux
+	// serializes those calls internally. Eight probes bound the amount of work
+	// that can compete with a scroll while round-robin keeps all sessions fresh.
+	backgroundStatusBatchSize = 8
 )
 
 // nextStatusInterval returns how long to wait before the next status sweep,
@@ -5883,6 +6198,31 @@ func nextStatusInterval(lastSweep, base, ceiling time.Duration) time.Duration {
 		return ceiling
 	}
 	return next
+}
+
+// takeStatusSweepBatch returns at most limit eligible instances, starting at
+// start and wrapping once. The returned cursor advances past every examined
+// instance, including ineligible ones, so a permanently skipped row cannot
+// pin the round-robin cursor in place.
+func takeStatusSweepBatch(instances []*session.Instance, start, limit int, include func(*session.Instance) bool) ([]*session.Instance, int) {
+	if len(instances) == 0 || limit <= 0 {
+		return nil, 0
+	}
+	start %= len(instances)
+	if start < 0 {
+		start += len(instances)
+	}
+
+	batch := make([]*session.Instance, 0, min(limit, len(instances)))
+	examined := 0
+	for examined < len(instances) && len(batch) < limit {
+		inst := instances[(start+examined)%len(instances)]
+		if inst != nil && (include == nil || include(inst)) {
+			batch = append(batch, inst)
+		}
+		examined++
+	}
+	return batch, (start + examined) % len(instances)
 }
 
 // statusWorker runs in a background goroutine with its own timer
@@ -5982,7 +6322,7 @@ func (h *Home) backgroundStatusUpdate() {
 	}()
 
 	totalStart := time.Now()
-	if hotUntil := h.navigationHotUntil.Load(); hotUntil > 0 && time.Now().UnixNano() < hotUntil {
+	if h.navigationIsHot() {
 		return
 	}
 
@@ -6029,8 +6369,13 @@ func (h *Home) backgroundStatusUpdate() {
 	// panes, so walking them here only burns tmux subprocesses (Exists() /
 	// Capture()) without changing anything the UI shows — with a large archive
 	// backlog that was the dominant cost in this sweep. Loops that need the full
-	// set (status skip-counting, idle lastSeen cleanup) keep using `instances`.
+	// set (claim reconciliation, idle lastSeen cleanup, and archive-capable
+	// rendering) keep using `instances`.
 	activeInstances := session.FilterInstancesByArchive(instances, false)
+	// Everything after this point is either live-session status work or a
+	// derived live-session publication. Keep the full slice above only for
+	// claim/lifecycle operations and the archive-capable render snapshot.
+	statusInstances := activeInstances
 
 	// Issue #1143: rate-limit the idle-timeout watcher to one tick per minute.
 	// The background sweep runs every 2s; capture-pane on every session every
@@ -6073,7 +6418,7 @@ func (h *Home) backgroundStatusUpdate() {
 
 	// Feed hook statuses from watcher to instances (enables hook fast path in UpdateStatus)
 	if h.hookWatcher != nil {
-		for _, inst := range instances {
+		for _, inst := range statusInstances {
 			if session.IsClaudeCompatible(inst.Tool) || inst.Tool == "codex" || inst.Tool == "gemini" || inst.Tool == "hermes" || inst.Tool == "cursor" {
 				if hs := h.hookWatcher.GetHookStatus(inst.ID); hs != nil {
 					inst.UpdateHookStatus(hs)
@@ -6086,7 +6431,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// instances (enables the SSE fast path in UpdateStatus, issue #1614).
 	if h.sseWatcher != nil {
 		var targets []session.SSETarget
-		for _, inst := range instances {
+		for _, inst := range statusInstances {
 			if inst.Tool != "opencode" {
 				continue
 			}
@@ -6106,7 +6451,7 @@ func (h *Home) backgroundStatusUpdate() {
 
 	// Proactive context-% monitoring: send /clear before auto-compact triggers
 	// For conductor sessions with clear_on_compact enabled, check cached analytics
-	for _, inst := range instances {
+	for _, inst := range statusInstances {
 		if !session.IsClaudeCompatible(inst.Tool) || inst.GroupPath != "conductor" {
 			continue
 		}
@@ -6156,42 +6501,47 @@ func (h *Home) backgroundStatusUpdate() {
 	var statusChanged atomic.Bool
 	var slowMu sync.Mutex
 	var slowSessions []string
+	var skippedDuringNavigation atomic.Int64
 	pm := tmux.GetPipeManager()
-	var skipped int // sessions not polled this tick (archived + idle fast-path)
+	var skipped int // sessions not polled this tick (deferred + archived + idle fast-path)
+	statusBatch, nextStatusIndex := takeStatusSweepBatch(
+		statusInstances,
+		int(h.backgroundStatusIndex.Load()),
+		backgroundStatusBatchSize,
+		func(inst *session.Instance) bool {
+			if !h.shouldSweepInstance(inst) {
+				return false
+			}
+			if pm != nil {
+				if ts := inst.GetTmuxSession(); ts != nil && pm.IsConnected(ts.Name) {
+					lastOut := pm.LastOutputTime(ts.Name)
+					if !lastOut.IsZero() && time.Since(lastOut) > 5*time.Second {
+						return false
+					}
+				}
+			}
+			return true
+		},
+	)
+	h.backgroundStatusIndex.Store(int64(nextStatusIndex))
+	skipped = len(statusInstances) - len(statusBatch)
 
 	tracker := h.getTransitionTracker()
 
 	g := new(errgroup.Group)
 	g.SetLimit(10) // Pool of 10 workers (tmux server serializes, more doesn't help)
 
-	for _, inst := range instances {
+	for _, inst := range statusBatch {
 		inst := inst // capture loop variable
 
-		// Skip archived sessions: their tmux pane is torn down and their row
-		// status is display-frozen (rowStatusGlyph forces the stopped glyph
-		// regardless of Status), so UpdateStatus can only burn a serialized tmux
-		// subprocess without changing anything the UI shows. With a large archive
-		// backlog this dominated the loop (observed: 723 archived of 742 total
-		// pushed the sweep to multi-second spikes). Unarchiving runs its own
-		// refresh, so the periodic loop never needs to poll archived sessions.
-		if !h.shouldSweepInstance(inst) {
-			skipped++
-			continue
-		}
-
-		// Skip idle sessions when PipeManager knows they haven't produced output.
-		// Only skip if pipe is alive (otherwise we need UpdateStatus for Error detection).
-		if pm != nil {
-			if ts := inst.GetTmuxSession(); ts != nil && pm.IsConnected(ts.Name) {
-				lastOut := pm.LastOutputTime(ts.Name)
-				if !lastOut.IsZero() && time.Since(lastOut) > 5*time.Second {
-					skipped++
-					continue
-				}
-			}
-		}
-
 		g.Go(func() error {
+			// A full sweep can already be queued when the user starts scrolling.
+			// Do not start another tmux probe after navigation begins; the next
+			// adaptive sweep remains responsible for eventual freshness.
+			if h.navigationIsHot() {
+				skippedDuringNavigation.Add(1)
+				return nil
+			}
 			oldStatus := inst.GetStatusThreadSafe()
 			instStart := time.Now()
 			_ = inst.UpdateStatus()
@@ -6220,6 +6570,7 @@ func (h *Home) backgroundStatusUpdate() {
 		})
 	}
 	_ = g.Wait() // Errors are logged within each goroutine
+	skipped += int(skippedDuringNavigation.Load())
 
 	statusDur := time.Since(statusStart)
 	tracker.tickEnd(statusStart, time.Now())
@@ -6227,11 +6578,15 @@ func (h *Home) backgroundStatusUpdate() {
 		perfLog.Debug(
 			"idle_sessions_skipped",
 			slog.Int("skipped", skipped),
-			slog.Int("checked", len(instances)-skipped),
+			slog.Int("checked", len(statusInstances)-skipped),
 		)
 	}
 	if statusDur > 500*time.Millisecond {
-		perfLog.Info("slow_status_loop", slog.Duration("duration", statusDur), slog.Int("sessions", len(instances)))
+		perfLog.Info("slow_status_loop",
+			slog.Duration("duration", statusDur),
+			slog.Int("sessions", len(statusInstances)),
+			slog.Int("scheduled", len(statusBatch)),
+		)
 		slowMu.Lock()
 		if len(slowSessions) > 0 {
 			perfLog.Info("slow_sessions", slog.String("details", strings.Join(slowSessions, ", ")))
@@ -6251,7 +6606,7 @@ func (h *Home) backgroundStatusUpdate() {
 	if db := statedb.GetGlobal(); db != nil {
 		if statuses, err := db.ReadAllStatuses(); err == nil {
 			sharedStatuses = statuses
-			for _, inst := range instances {
+			for _, inst := range statusInstances {
 				s, ok := sharedStatuses[inst.ID]
 				if !ok {
 					continue
@@ -6281,7 +6636,7 @@ func (h *Home) backgroundStatusUpdate() {
 	// Invalidate cache if status changed
 	if statusChanged.Load() {
 		h.cachedStatusCounts.valid.Store(false)
-		h.publishWebSessionStates(instances)
+		h.publishWebSessionStates(statusInstances)
 	}
 	h.refreshSessionRenderSnapshot(instances)
 
@@ -6304,8 +6659,8 @@ func (h *Home) backgroundStatusUpdate() {
 		// the owning instance (or, for orphans, this primary's orphan sweep)
 		// is the source of truth for that session's status row. Orphans MUST
 		// be written here — that's the entire point of polling them above.
-		currentIDs := make(map[string]struct{}, len(instances))
-		for _, inst := range instances {
+		currentIDs := make(map[string]struct{}, len(statusInstances))
+		for _, inst := range statusInstances {
 			currentIDs[inst.ID] = struct{}{}
 			if !h.isPolledByMe(inst.ID) {
 				continue
@@ -6313,6 +6668,9 @@ func (h *Home) backgroundStatusUpdate() {
 			status := string(inst.GetStatusThreadSafe())
 			if prev, ok := h.lastPersistedStatus[inst.ID]; ok && prev == status {
 				continue
+			}
+			if h.storageWatcher != nil {
+				h.storageWatcher.NotifyStatusWrite(inst.ID, status, inst.Tool)
 			}
 			_ = db.WriteStatus(inst.ID, status, inst.Tool)
 			h.lastPersistedStatus[inst.ID] = status
@@ -6329,7 +6687,7 @@ func (h *Home) backgroundStatusUpdate() {
 		// so getSessionRenderState returns the freshly-cleaned pane title. Only
 		// write on change (mirrors the status loop) and only when non-empty — an
 		// empty/idle pane must not clobber a previously captured description.
-		for _, inst := range instances {
+		for _, inst := range statusInstances {
 			desc, write := shouldPersistAutoNameDesc(
 				inst.GetAutoName(),
 				h.getSessionRenderState(inst).paneTitle,
@@ -6356,7 +6714,7 @@ func (h *Home) backgroundStatusUpdate() {
 		// Read acknowledgments from SQLite (picks up acks from other instances).
 		// Reuses the sharedStatuses map read before the render snapshot.
 		if sharedStatuses != nil {
-			for _, inst := range instances {
+			for _, inst := range statusInstances {
 				if s, ok := sharedStatuses[inst.ID]; ok && s.Acknowledged {
 					inst.SetAcknowledgedFromShared(true)
 				}
@@ -6377,7 +6735,8 @@ func (h *Home) backgroundStatusUpdate() {
 			slog.Duration("status", time.Since(statusStart)),
 			slog.Duration("notif", notifDur),
 			slog.Duration("refresh", refreshDur),
-			slog.Int("sessions", len(instances)))
+			slog.Int("sessions", len(statusInstances)),
+			slog.Int("scheduled", len(statusBatch)))
 	}
 	h.lastFullStatusSweep.Store(time.Now().UnixNano())
 }
@@ -6436,6 +6795,7 @@ func (h *Home) syncNotificationsBackground() {
 		}
 	}
 	h.instancesMu.RUnlock()
+	instances = session.FilterInstancesByArchive(instances, false)
 
 	// Detect currently attached session (may be the user's session during tea.Exec)
 	currentSessionID := h.getAttachedSessionID()
@@ -6672,6 +7032,9 @@ func (h *Home) refreshAttachedSessionStatus(sessionID string) {
 		h.cachedStatusCounts.valid.Store(false)
 		h.publishCurrentSessionStates()
 		if db := statedb.GetGlobal(); db != nil {
+			if h.storageWatcher != nil {
+				h.storageWatcher.NotifyStatusWrite(inst.ID, string(newStatus), inst.GetToolThreadSafe())
+			}
 			_ = db.WriteStatus(inst.ID, string(newStatus), inst.GetToolThreadSafe())
 		}
 	}
@@ -6701,7 +7064,7 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 	// keeps a screenful fresh within a few passes while bounding the worst case
 	// (large group expanded => visible ≈ fleet) to a constant per pass.
 	const visibleStatusBatchSize = 4
-	if hotUntil := h.navigationHotUntil.Load(); hotUntil > 0 && time.Now().UnixNano() < hotUntil {
+	if h.navigationIsHot() {
 		return
 	}
 	if last := h.lastFullStatusSweep.Load(); last > 0 {
@@ -6858,6 +7221,9 @@ func (h *Home) processStatusUpdate(req statusUpdateRequest) {
 // clears (issue #607). Under the default (full_repaint = false) this wrapper
 // is a pass-through — no regression for users who never opt in.
 func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	inputStart := time.Now()
+	defer func() { h.recordInputLatency(msg, inputStart) }()
+
 	// Terminal reads may combine rapid printable keystrokes. Route them in
 	// order so a shortcut can open the text field that receives the tail.
 	// Bracketed paste and Alt input retain their original event semantics.
@@ -6889,6 +7255,77 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return model, cmd
 }
 
+// uiInputLabel gives the performance log stable labels for the interactions
+// being profiled. It intentionally covers only navigation and new-session
+// entry points; other messages are too frequent or unrelated to this trace.
+func uiInputLabel(msg tea.Msg) (kind, action string) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.Type {
+		case tea.KeyUp:
+			return "scroll", "up"
+		case tea.KeyDown:
+			return "scroll", "down"
+		case tea.KeyRunes:
+			if len(msg.Runes) == 1 && msg.Runes[0] == 'n' {
+				return "key", "new_session"
+			}
+			if len(msg.Runes) == 1 {
+				switch msg.Runes[0] {
+				case 'j':
+					return "scroll", "down"
+				case 'k':
+					return "scroll", "up"
+				}
+			}
+		}
+	case tea.MouseMsg:
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			return "scroll", "up"
+		case tea.MouseButtonWheelDown:
+			return "scroll", "down"
+		}
+	}
+	return "", ""
+}
+
+func (h *Home) recordInputLatency(msg tea.Msg, started time.Time) {
+	if !logging.IsDebugEnabled() {
+		return
+	}
+	kind, action := uiInputLabel(msg)
+	if kind == "" {
+		return
+	}
+	elapsed := time.Since(started)
+	slow := (kind == "scroll" && elapsed >= 16*time.Millisecond) || elapsed >= 50*time.Millisecond
+	// Normal scroll events are sampled. A synchronous JSONL write for every
+	// keystroke can itself stall the Bubble Tea loop when the log is busy.
+	// Slow events and new-session entry are always retained, but are written
+	// asynchronously for the same reason.
+	if !slow && !(kind == "key" && action == "new_session") && !takePerfLogSample(&h.lastInputPerfLog, 250*time.Millisecond) {
+		return
+	}
+	fields := []any{slog.String("kind", kind), slog.String("action", action),
+		slog.Duration("duration", elapsed), slog.Int("cursor", h.cursor),
+		slog.Int("flat_items", len(h.flatItems)), slog.Bool("modal", h.hasModalVisible())}
+	if slow {
+		go perfLog.Warn("ui_input", fields...)
+	} else {
+		go perfLog.Debug("ui_input", fields...)
+	}
+}
+
+func takePerfLogSample(last *atomic.Int64, interval time.Duration) bool {
+	now := time.Now().UnixNano()
+	previous := last.Load()
+	if previous != 0 && now-previous < int64(interval) {
+		return false
+	}
+	return last.CompareAndSwap(previous, now)
+}
+
 // appendClearScreen batches tea.ClearScreen onto cmd, preserving nil-safety.
 func appendClearScreen(cmd tea.Cmd) tea.Cmd {
 	if cmd == nil {
@@ -6909,6 +7346,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		h.usageSnapshots = mergeUsageSnapshots(h.usageSnapshots, msg.snapshots, msg.accounts)
 		h.lastUsageFetch = time.Now()
 		h.usageFetchInFlight = false
+		return h, nil
+
+	case debugStatsMsg:
+		h.debugHeapBytes.Store(msg.heapBytes)
+		h.debugGoroutines.Store(int64(msg.goroutines))
+		if h.debugMode {
+			return h, h.debugStatsTick()
+		}
 		return h, nil
 
 	case quitMsg:
@@ -7079,12 +7524,28 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return h, h.fetchPreview(inst, key, winIdx)
 
-	case loadSessionsMsg:
-		if msg.loadSequence != 0 && (msg.loadSequence != h.sessionLoadSequence || msg.loadWatcher != h.storageWatcher) {
+	case recentSessionsLoadedMsg:
+		if msg.err != nil {
+			perfLog.Debug("new_session_recent_sessions_load_failed",
+				slog.Duration("duration", msg.duration), slog.String("error", msg.err.Error()))
 			return h, nil
 		}
+		h.recentSessionsCache = msg.sessions
+		perfLog.Debug("new_session_recent_sessions_loaded",
+			slog.Duration("duration", msg.duration), slog.Int("count", len(msg.sessions)))
+		// A result from a local dialog may arrive after it opened. Do not inject
+		// local recent sessions into a remote create flow.
+		if h.newDialog.IsVisible() && h.pendingRemoteName == "" {
+			h.newDialog.SetRecentSessions(msg.sessions)
+		}
+		return h, nil
+
+	case loadSessionsMsg:
+		if msg.loadSequence != 0 && (msg.loadSequence != h.sessionLoadSequence || msg.loadWatcher != h.storageWatcher) {
+			return h, h.completeStorageReload(msg)
+		}
 		if msg.watcherTicket != nil && h.storageWatcher != nil && !h.storageWatcher.current(*msg.watcherTicket) {
-			return h, nil
+			return h, h.completeStorageReload(msg)
 		}
 		if msg.watcherTicket != nil && h.storageWatcher != nil {
 			h.storageWatcher.acknowledge(*msg.watcherTicket, msg.persistedSnapshot, msg.err == nil)
@@ -7180,7 +7641,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			oldCount := len(h.instances)
 			h.instances = msg.instances
 			newCount := len(msg.instances)
-			uiLog.Debug("reload_load_sessions", slog.Int("old_count", oldCount), slog.Int("new_count", newCount), slog.String("profile", h.profile))
+			uiLog.Debug("reload_load_sessions", slog.Int("old_count", oldCount), slog.Int("new_count", newCount),
+				slog.Duration("load_duration", msg.loadDuration), slog.Bool("coalesced", msg.coalescedReload),
+				slog.String("profile", h.profile))
 			// Rebuild instanceByID map for O(1) lookup
 			h.instanceByID = make(map[string]*session.Instance, len(h.instances))
 			for _, inst := range h.instances {
@@ -7346,14 +7809,19 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				h.previewCacheMu.Unlock()
 				// Batch preview fetch with any OpenCode detection commands
 				allCmds := append(detectionCmds, h.fetchPreview(selected, selected.ID, -1))
+				if cmd := h.fetchMCPInfo(selected); cmd != nil {
+					allCmds = append(allCmds, cmd)
+				}
+				allCmds = append(allCmds, h.completeStorageReload(msg))
 				return h, tea.Batch(allCmds...)
 			}
 			// No selection, but still run detection commands if any
 			if len(detectionCmds) > 0 {
+				detectionCmds = append(detectionCmds, h.completeStorageReload(msg))
 				return h, tea.Batch(detectionCmds...)
 			}
 		}
-		return h, nil
+		return h, h.completeStorageReload(msg)
 
 	case sessionCreatedMsg:
 		uiLog.Info("session_created_msg",
@@ -8442,8 +8910,14 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		// Preserve UI state before reload
 		state := h.preserveState()
+		if !h.storageReloads.request() {
+			uiLog.Debug("storage_reload_coalesced", slog.String("profile", h.profile))
+			// Continue listening for the eventual completion; it will launch one
+			// follow-up load using the newest in-memory UI state.
+			return h, listenForReloads(h.storageWatcher)
+		}
 
-		cmd := h.sessionLoadCmd(&state, false)
+		cmd := h.sessionLoadCmdWithTracking(&state, false, true)
 
 		// Continue listening for next change
 		return h, tea.Batch(cmd, listenForReloads(h.storageWatcher))
@@ -8678,6 +9152,9 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if needsPreviewFetch {
 				cmds = append(cmds, h.fetchPreview(inst, msg.previewKey, msg.windowIndex))
 			}
+			if cmd := h.fetchMCPInfo(inst); cmd != nil {
+				cmds = append(cmds, cmd)
+			}
 
 			// Analytics fetch (for Claude/Gemini sessions with analytics enabled)
 			// Use TTL cache - only fetch if cache miss/expired and not already fetching
@@ -8774,6 +9251,20 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			h.previewCache[msg.previewKey] = expandTabs(msg.content)
 		}
 		h.previewCacheMu.Unlock()
+		return h, nil
+
+	case mcpInfoFetchedMsg:
+		// A nil info is a valid result (the session has no configured MCPs), so
+		// retain the map entry and use its presence to prevent refetching on
+		// every preview debounce.
+		h.mcpPreviewCacheMu.Lock()
+		if msg.generation != h.mcpPreviewGeneration[msg.sessionID] {
+			h.mcpPreviewCacheMu.Unlock()
+			return h, nil
+		}
+		h.mcpPreviewCache[msg.sessionID] = msg.info
+		delete(h.mcpPreviewFetching, msg.sessionID)
+		h.mcpPreviewCacheMu.Unlock()
 		return h, nil
 
 	case analyticsFetchedMsg:
@@ -9014,6 +9505,10 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case tickMsg:
+		// Refresh the render-path config at tick cadence so external edits are
+		// still observed without putting config path/stat work on every frame.
+		h.refreshCachedUserConfig()
+
 		// Honor a pending `agent-deck session focus <id>` request from the CLI.
 		// A non-nil cmd means the request asked to --attach the session: open it
 		// now (same as Enter) and skip the rest of this tick's background work,
@@ -9306,7 +9801,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				h.setupWizard.Hide()
 				// Reload config cache
-				_, _ = session.ReloadUserConfig()
+				h.refreshCachedUserConfig()
 				h.reloadHotkeysFromConfig()
 				// Apply default tool to new dialog
 				if defaultTool := session.GetDefaultTool(); defaultTool != "" {
@@ -9337,7 +9832,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					h.err = err
 					h.errTime = time.Now()
 				} else {
-					_, _ = session.ReloadUserConfig()
+					h.refreshCachedUserConfig()
 					if h.newDialog != nil {
 						h.newDialog.RefreshPresetCommands()
 					}
@@ -9372,7 +9867,7 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 					h.err = err
 					h.errTime = time.Now()
 				}
-				_, _ = session.ReloadUserConfig()
+				h.refreshCachedUserConfig()
 				h.reloadHotkeysFromConfig()
 				h.showSessionTimestamps = config.Display.ShowSessionTimestamps
 				h.showPaneTitles = config.Display.ShowPaneTitles
@@ -10056,7 +10551,7 @@ func (h *Home) showRemoteNewSessionDialog(item session.Item) tea.Cmd {
 		defaultPath = paths[0]
 	}
 
-	h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, nil, "")
+	h.newDialog.ShowInGroupWithConfig(groupPath, groupName, defaultPath, nil, "", h.getCachedUserConfig())
 	if defaultPath == "" {
 		h.newDialog.pathInput.SetValue(".")
 		h.newDialog.pathSoftSelected = true
@@ -10629,7 +11124,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	raw := msg.String()
 	key := h.normalizeMainKey(raw)
-	uiLog.Info("keypress", "raw", raw, "normalized", key, "type", msg.Type, "runes", string(msg.Runes))
+	h.recordKeypressTrace(msg, raw, key)
 	if key == "" {
 		return h, nil
 	}
@@ -11509,6 +12004,7 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return h, nil
 
 	case "n":
+		newSessionStart := time.Now()
 		// Reset any stale remote target from a previously abandoned flow.
 		h.pendingRemoteName = ""
 		// If the cursor is on a remote group/session, open the same
@@ -11525,12 +12021,18 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 		// Collect unique project paths sorted by most recently accessed
+		pathCollectionStart := time.Now()
 		type pathInfo struct {
 			path           string
 			lastAccessedAt time.Time
 		}
 		pathMap := make(map[string]*pathInfo)
+		activeSessionCount := 0
 		for _, inst := range h.instances {
+			if inst.IsArchived() {
+				continue
+			}
+			activeSessionCount++
 			if inst.ProjectPath == "" {
 				continue
 			}
@@ -11577,18 +12079,21 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		for i, info := range pathInfos {
 			paths[i] = info.path
 		}
+		pathCollectionDuration := time.Since(pathCollectionStart)
+		pathSuggestionStart := time.Now()
 		h.newDialog.SetPathSuggestions(paths)
-
-		// Load recent sessions for the picker
-		if recents, err := h.storage.LoadRecentSessions(); err == nil {
-			h.newDialog.SetRecentSessions(recents)
-		}
+		pathSuggestionDuration := time.Since(pathSuggestionStart)
+		// Use the last loaded picker data immediately. The fresh query runs off
+		// the event loop and updates the open dialog when it returns.
+		h.newDialog.SetRecentSessions(h.recentSessionsCache)
 
 		// Apply the preselected tool: explicit [default_tool] config wins,
 		// otherwise fall back to the last successfully-submitted tool remembered
 		// in the profile StateDB (UX top-3 #2). First run (neither set) leaves
 		// shell selected, unchanged.
+		defaultsStart := time.Now()
 		h.newDialog.SetDefaultTool(resolveInitialTool(session.GetDefaultTool(), rememberedTool(h.stateDB())))
+		defaultsDuration := time.Since(defaultsStart)
 
 		// Auto-select parent group from current cursor position
 		groupPath := session.DefaultGroupPath
@@ -11614,11 +12119,34 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
-		defaultPath := h.getDefaultPathForGroup(groupPath)
+		groupContextStart := time.Now()
+		defaultPathStart := time.Now()
+		defaultPath := h.getDefaultPathForDialog(groupPath)
+		defaultPathDuration := time.Since(defaultPathStart)
+		conductorStart := time.Now()
 		conductors := h.activeConductorSessions()
+		conductorDuration := time.Since(conductorStart)
+		parentStart := time.Now()
 		suggestedParentID := h.suggestConductorParent()
-		h.newDialog.ShowInGroup(groupPath, groupName, defaultPath, conductors, suggestedParentID)
-		return h, nil
+		parentDuration := time.Since(parentStart)
+		groupContextDuration := time.Since(groupContextStart)
+		dialogShowStart := time.Now()
+		h.newDialog.ShowInGroupWithConfig(groupPath, groupName, defaultPath, conductors, suggestedParentID, h.getCachedUserConfig())
+		dialogShowDuration := time.Since(dialogShowStart)
+		perfLog.Debug("new_session_dialog_open",
+			slog.Duration("duration", time.Since(newSessionStart)),
+			slog.Int("active_sessions", activeSessionCount),
+			slog.Int("path_suggestions", len(paths)),
+			slog.Int("recent_cached", len(h.recentSessionsCache)),
+			slog.Duration("path_collection", pathCollectionDuration),
+			slog.Duration("path_suggestions_setup", pathSuggestionDuration),
+			slog.Duration("defaults", defaultsDuration),
+			slog.Duration("group_context", groupContextDuration),
+			slog.Duration("default_path", defaultPathDuration),
+			slog.Duration("conductors", conductorDuration),
+			slog.Duration("parent", parentDuration),
+			slog.Duration("dialog_show", dialogShowDuration))
+		return h, h.loadRecentSessionsCmd()
 
 	case "N":
 		// Check if cursor is on a remote group/session — create on remote instead
@@ -12155,36 +12683,56 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "0":
 		// Clear status filter (show all)
+		wasArchived := h.statusFilter == FilterModeArchived
 		h.statusFilter = ""
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
+		}
 		h.rebuildFlatItems()
 		return h, nil
 
 	case "!", "shift+1":
 		// Filter to running sessions only
+		wasArchived := h.statusFilter == FilterModeArchived
 		if h.statusFilter == session.StatusRunning {
 			h.statusFilter = "" // Toggle off
 		} else {
 			h.statusFilter = session.StatusRunning
+		}
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
 		}
 		h.rebuildFlatItems()
 		return h, nil
 
 	case "@", "shift+2":
 		// Filter to waiting sessions only
+		wasArchived := h.statusFilter == FilterModeArchived
 		if h.statusFilter == session.StatusWaiting {
 			h.statusFilter = "" // Toggle off
 		} else {
 			h.statusFilter = session.StatusWaiting
+		}
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
 		}
 		h.rebuildFlatItems()
 		return h, nil
 
 	case "#", "shift+3":
 		// Filter to idle sessions only
+		wasArchived := h.statusFilter == FilterModeArchived
 		if h.statusFilter == session.StatusIdle {
 			h.statusFilter = "" // Toggle off
 		} else {
 			h.statusFilter = session.StatusIdle
+		}
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
 		}
 		h.rebuildFlatItems()
 		return h, nil
@@ -12201,20 +12749,30 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case FilterKeyError, "shift+7":
 		// Filter to error sessions only.
+		wasArchived := h.statusFilter == FilterModeArchived
 		if h.statusFilter == session.StatusError {
 			h.statusFilter = "" // Toggle off
 		} else {
 			h.statusFilter = session.StatusError
+		}
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
 		}
 		h.rebuildFlatItems()
 		return h, nil
 
 	case FilterKeyActive, "shift+5":
 		// Filter to open sessions (excludes error/stopped)
+		wasArchived := h.statusFilter == FilterModeArchived
 		if h.statusFilter == FilterModeActive {
 			h.statusFilter = "" // Toggle off
 		} else {
 			h.statusFilter = FilterModeActive
+		}
+		if wasArchived {
+			state := h.preserveState()
+			return h, h.sessionLoadCmd(&state, false)
 		}
 		h.rebuildFlatItems()
 		return h, nil
@@ -12225,8 +12783,8 @@ func (h *Home) handleMainKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			h.statusFilter = FilterModeArchived
 		}
-		h.rebuildFlatItems()
-		return h, nil
+		state := h.preserveState()
+		return h, h.sessionLoadCmd(&state, false)
 	}
 
 	return h, nil
@@ -14992,7 +15550,7 @@ func (h *Home) activeConductorSessions() []*session.Instance {
 
 	var out []*session.Instance
 	for _, inst := range h.instances {
-		if inst.IsConductor &&
+		if !inst.IsArchived() && inst.IsConductor &&
 			inst.Status != session.StatusError &&
 			inst.Status != session.StatusStopped {
 			out = append(out, inst)
@@ -17305,7 +17863,16 @@ func (h *Home) updateSizes() {
 }
 
 // View renders the UI
-func (h *Home) View() string {
+func (h *Home) View() (rendered string) {
+	viewStart := time.Now()
+	if logging.IsDebugEnabled() {
+		h.viewTrace = &viewRenderTrace{}
+		// Keep the trace available to recordViewDuration, which runs after this
+		// defer because defers execute in last-in-first-out order.
+		defer func() { h.viewTrace = nil }()
+	}
+	defer func() { h.recordViewDuration(viewStart) }()
+
 	// CRITICAL: Do not render fresh output during attach (Bubble Tea Issue #431
 	// - View gets printed to stdout during tea.Exec). Historically this
 	// returned "", which had two failure modes (#1753 black-screen family):
@@ -17333,7 +17900,45 @@ func (h *Home) View() string {
 	// paths that return before clampViewToViewport. A row the terminal measures
 	// wider than we did is then clipped instead of wrapping into the row below
 	// and shifting the rest of the screen. See internal/ui/autowrap.go.
-	return pinAutowrapOff(frame)
+	pinStart := time.Now()
+	frame = pinAutowrapOff(frame)
+	h.viewPhase("pin", pinStart)
+	return frame
+}
+
+func (h *Home) recordViewDuration(started time.Time) {
+	if !logging.IsDebugEnabled() {
+		return
+	}
+	elapsed := time.Since(started)
+	h.lastRenderDuration.Store(elapsed.Microseconds())
+	fields := []any{
+		slog.Duration("elapsed", elapsed),
+		slog.Int("width", h.width),
+		slog.Int("height", h.height),
+		slog.Int("sessions", len(h.flatItems)),
+		slog.Bool("modal", h.hasModalVisible()),
+	}
+	if trace := h.viewTrace; trace != nil {
+		fields = append(fields,
+			slog.Duration("header", trace.header),
+			slog.Duration("usage", trace.usage),
+			slog.Duration("list", trace.list),
+			slog.Duration("preview", trace.preview),
+			slog.Duration("layout", trace.layout),
+			slog.Duration("footer", trace.footer),
+			slog.Duration("help", trace.help),
+			slog.Duration("debug", trace.debug),
+			slog.Duration("tail", trace.tail),
+			slog.Duration("clamp", trace.clamp),
+			slog.Duration("pin", trace.pin),
+		)
+	}
+	if elapsed >= 50*time.Millisecond {
+		go perfLog.Warn("slow_view_render", fields...)
+	} else if takePerfLogSample(&h.lastViewPerfLog, 250*time.Millisecond) {
+		go perfLog.Debug("view_render", fields...)
+	}
 }
 
 // renderFrame is the real frame builder behind View. Split out so View can
@@ -17343,11 +17948,6 @@ func (h *Home) View() string {
 func (h *Home) renderFrame() string {
 	if h.width == 0 {
 		return "Loading..."
-	}
-
-	var renderStart time.Time
-	if logging.IsDebugEnabled() {
-		renderStart = time.Now()
 	}
 
 	// Check minimum terminal size for usability
@@ -17469,6 +18069,7 @@ func (h *Home) renderFrame() string {
 	h.viewBuilder.Reset()
 	h.viewBuilder.Grow(32768) // Pre-allocate 32KB for typical view size
 	b := &h.viewBuilder
+	headerStart := time.Now()
 
 	// ═══════════════════════════════════════════════════════════════════
 	// HEADER BAR
@@ -17635,11 +18236,14 @@ func (h *Home) renderFrame() string {
 		b.WriteString(maintStyle.Render(" " + h.maintenanceMsg + " "))
 		b.WriteString("\n")
 	}
+	h.viewPhase("header", headerStart)
 
 	// ═══════════════════════════════════════════════════════════════════
 	// MAIN CONTENT AREA - Responsive layout based on terminal width
 	// ═══════════════════════════════════════════════════════════════════
+	usageStart := time.Now()
 	usageBar := renderUsageBar(h.usageSnapshots, h.width)
+	h.viewPhase("usage", usageStart)
 	// Height breakdown: -1 header, -filterBarHeight filter, -updateBannerHeight banner, -maintenanceBannerHeight maintenance, -helpBarHeight help, -debugBarHeight debug
 	contentHeight := h.mainContentHeightForUsageBar(lipgloss.Height(usageBar))
 
@@ -17647,6 +18251,7 @@ func (h *Home) renderFrame() string {
 	layoutMode := h.getLayoutMode()
 
 	var mainContent string
+	layoutStart := time.Now()
 	switch layoutMode {
 	case LayoutModeSingle:
 		mainContent = h.renderSingleColumnLayout(contentHeight)
@@ -17655,6 +18260,7 @@ func (h *Home) renderFrame() string {
 	default: // LayoutModeDual
 		mainContent = h.renderDualColumnLayout(contentHeight)
 	}
+	h.viewPhase("layout", layoutStart)
 
 	// Ensure mainContent has exact height
 	mainContent = ensureExactHeight(mainContent, contentHeight)
@@ -17664,6 +18270,8 @@ func (h *Home) renderFrame() string {
 		b.WriteString(usageBar)
 		b.WriteString("\n")
 	}
+
+	footerStart := time.Now()
 
 	// ═══════════════════════════════════════════════════════════════════
 	// HELP BAR (context-aware shortcuts) — replaced by the insert-mode
@@ -17676,12 +18284,16 @@ func (h *Home) renderFrame() string {
 		helpBar = h.renderHelpBar()
 	}
 	b.WriteString(helpBar)
+	h.viewPhase("help", footerStart)
 
 	// Debug performance overlay (AGENTDECK_DEBUG=1 only)
 	if h.debugMode {
+		debugStart := time.Now()
 		b.WriteString("\n")
 		b.WriteString(h.renderDebugBar())
+		h.viewPhase("debug", debugStart)
 	}
+	tailStart := time.Now()
 
 	// Error and warning messages are displayed but may be truncated by final height constraint
 	if h.err != nil {
@@ -17707,24 +18319,15 @@ func (h *Home) renderFrame() string {
 		b.WriteString("\n")
 		b.WriteString(warnStyle.Render("⚠ " + h.watcherWarning))
 	}
-
-	// Performance: log render duration when debug mode is active
-	if logging.IsDebugEnabled() {
-		elapsed := time.Since(renderStart)
-		if elapsed > 50*time.Millisecond {
-			perfLog.Warn("slow_view_render", slog.Duration("elapsed", elapsed),
-				slog.Int("width", h.width), slog.Int("height", h.height),
-				slog.Int("sessions", len(h.flatItems)))
-		} else {
-			perfLog.Debug("view_render", slog.Duration("elapsed", elapsed))
-		}
-		h.lastRenderDuration.Store(elapsed.Microseconds())
-	}
+	h.viewPhase("tail", tailStart)
+	h.viewPhase("footer", footerStart)
 
 	// CRITICAL: Use ensureExactHeight for robust, consistent output across all platforms
 	// This is the single source of truth for output height - guarantees exactly h.height lines
 	// regardless of component content, ANSI codes, or terminal differences
+	clampStart := time.Now()
 	rendered := clampViewToViewport(b.String(), h.width, h.height)
+	h.viewPhase("clamp", clampStart)
 
 	// #1410: when the inline prompt input is open, overlay it at the bottom of
 	// the (already viewport-clamped) list so the operator types without
@@ -18629,7 +19232,7 @@ func (h *Home) renderHelpBarMinimal() string {
 	mcpKey := h.actionKey(hotkeyMCPManager)
 	skillsKey := h.actionKey(hotkeySkillsManager)
 	notesKey := h.actionKey(hotkeyEditNotes)
-	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
+	if cfg := h.getCachedUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
 	if h.jumpMode {
@@ -18645,26 +19248,27 @@ func (h *Home) renderHelpBarMinimal() string {
 		if item.Type == session.ItemTypeGroup {
 			contextKeys = renderKeys("⏎", newKey, quickKey, alternateQuickKey, groupKey)
 		} else {
+			itemState := h.getSessionRenderState(item.Session)
 			contextKeys = renderKeys("⏎", newKey, quickKey, alternateQuickKey, restartKey)
-			if item.Session != nil && item.Session.CanRestartFresh() {
+			if itemState.canRestartFresh {
 				freshRendered := renderKeys(restartFreshKey)
 				if freshRendered != "" {
 					contextKeys += " " + freshRendered
 				}
 			}
-			if item.Session != nil && item.Session.CanFork() {
+			if itemState.canFork {
 				forkRendered := renderKeys(forkKey)
 				if forkRendered != "" {
 					contextKeys += " " + forkRendered
 				}
 			}
-			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
+			if itemState.toolSupportsMCP {
 				mcpRendered := renderKeys(mcpKey)
 				if mcpRendered != "" {
 					contextKeys += " " + mcpRendered
 				}
 			}
-			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
+			if itemState.supportsProjectSkills {
 				skillsRendered := renderKeys(skillsKey)
 				if skillsRendered != "" {
 					contextKeys += " " + skillsRendered
@@ -18743,6 +19347,7 @@ func (h *Home) renderHelpBarCompact() string {
 				contextHints = append(contextHints, h.helpKeyShort(newQuickKey, "New"))
 			}
 		} else {
+			itemState := h.getSessionRenderState(item.Session)
 			contextHints = append(contextHints, h.helpKeyShort("⏎", "Attach"))
 			if newQuickKey != "" {
 				contextHints = append(contextHints, h.helpKeyShort(newQuickKey, "New"))
@@ -18752,20 +19357,20 @@ func (h *Home) renderHelpBarCompact() string {
 			}
 			// Skills is a primary selected-session action. Keep it ahead of the
 			// rarer optional actions so the width fitter retains it at 100 cols.
-			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
+			if itemState.supportsProjectSkills {
 				if key := h.actionKey(hotkeySkillsManager); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Skills"))
 				}
 			}
-			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
+			if itemState.canRestartFresh && restartFreshKey != "" {
 				contextHints = append(contextHints, h.helpKeyShort(restartFreshKey, "Fresh"))
 			}
-			if item.Session != nil && item.Session.CanFork() {
+			if itemState.canFork {
 				if key := h.actionKey(hotkeyQuickFork); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "Fork"))
 				}
 			}
-			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
+			if itemState.toolSupportsMCP {
 				if key := h.actionKey(hotkeyMCPManager); key != "" {
 					contextHints = append(contextHints, h.helpKeyShort(key, "MCP"))
 				}
@@ -18885,7 +19490,7 @@ func (h *Home) renderHelpBarFull() string {
 	execShellKey := h.actionKey(hotkeyExecShell)
 	openShellHereKey := h.actionKey(hotkeyOpenShellHere)
 	notesKey := h.actionKey(hotkeyEditNotes)
-	if cfg, _ := session.LoadUserConfig(); cfg != nil && !cfg.GetShowNotes() {
+	if cfg := h.getCachedUserConfig(); cfg != nil && !cfg.GetShowNotes() {
 		notesKey = ""
 	}
 	undoKey := h.actionKey(hotkeyUndoDelete)
@@ -18925,6 +19530,7 @@ func (h *Home) renderHelpBarFull() string {
 			}
 		} else {
 			contextTitle = "Session"
+			itemState := h.getSessionRenderState(item.Session)
 			primaryHints = append(primaryHints, h.helpKey("Enter", "Attach"))
 			if newQuickKey != "" {
 				primaryHints = append(primaryHints, h.helpKey(newQuickKey, "New/Quick"))
@@ -18935,17 +19541,17 @@ func (h *Home) renderHelpBarFull() string {
 			if restartKey != "" {
 				primaryHints = append(primaryHints, h.helpKey(restartKey, "Restart"))
 			}
-			if item.Session != nil && item.Session.CanRestartFresh() && restartFreshKey != "" {
+			if itemState.canRestartFresh && restartFreshKey != "" {
 				primaryHints = append(primaryHints, h.helpKey(restartFreshKey, "Restart Fresh"))
 			}
 			// Only show fork hints when the selected tool supports Agent Deck forking.
-			if item.Session != nil && item.Session.CanFork() {
+			if itemState.canFork {
 				if forkKeys != "" {
 					primaryHints = append(primaryHints, h.helpKey(forkKeys, "Fork"))
 				}
 			}
 			// Show MCP Manager and preview mode toggle for Claude and Gemini sessions
-			if item.Session != nil && session.ToolSupportsMCPManager(item.Session.Tool) {
+			if itemState.toolSupportsMCP {
 				if mcpKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(mcpKey, "MCP"))
 				}
@@ -18953,12 +19559,12 @@ func (h *Home) renderHelpBarFull() string {
 					primaryHints = append(primaryHints, h.helpKey(previewKey, h.previewModeShort()))
 				}
 			}
-			if item.Session != nil && session.SupportsProjectSkills(item.Session.Tool) {
+			if itemState.supportsProjectSkills {
 				if skillsKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(skillsKey, "Skills"))
 				}
 			}
-			if item.Session != nil && item.Session.IsSandboxed() {
+			if itemState.sandboxed {
 				if execShellKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(execShellKey, "Exec"))
 				}
@@ -18966,7 +19572,7 @@ func (h *Home) renderHelpBarFull() string {
 			if openShellHereKey != "" && item.Session != nil && item.Type == session.ItemTypeSession {
 				primaryHints = append(primaryHints, h.helpKey(openShellHereKey, "Shell"))
 			}
-			if item.Session != nil && item.Session.IsMultiRepo() {
+			if itemState.multiRepo {
 				if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
 					primaryHints = append(primaryHints, h.helpKey(editPathsKey, "Paths"))
 				}
@@ -19196,7 +19802,8 @@ func (h *Home) curatedContextHints(item session.Item) []footerHint {
 		if s == nil {
 			return hints
 		}
-		if sessionIsQueued(s) {
+		state := h.getSessionRenderState(s)
+		if state.status == session.StatusQueued {
 			// Queued: waiting for a group slot, no tmux yet — so it is neither
 			// attachable (no pane to enter) nor restartable (nothing running to
 			// restart). The only meaningful actions are dropping it from the
@@ -19205,12 +19812,12 @@ func (h *Home) curatedContextHints(item session.Item) []footerHint {
 			// tmux (PR #1289 review nit 2b).
 			add(h.actionKey(hotkeyDelete), "delete")
 			add(newQuick, "new")
-		} else if sessionIsDead(s) {
+		} else if state.status == session.StatusStopped || state.status == session.StatusError {
 			// Dead (stopped or error): restart, then restart-fresh when the
 			// tool tracks a session id, then delete — the actions for a session
 			// that broke or was parked, in order of likely intent.
 			add(h.actionKey(hotkeyRestart), "restart")
-			if s.CanRestartFresh() {
+			if state.canRestartFresh {
 				add(h.actionKey(hotkeyRestartFresh), "restart fresh")
 			}
 			add(h.actionKey(hotkeyDelete), "delete")
@@ -19219,7 +19826,7 @@ func (h *Home) curatedContextHints(item session.Item) []footerHint {
 			// most relevant follow-up (fork while forkable, else new).
 			add("⏎", "attach")
 			add(h.actionKey(hotkeyRestart), "restart")
-			if s.CanFork() {
+			if state.canFork {
 				add(h.actionKey(hotkeyQuickFork), "fork")
 			} else {
 				add(newQuick, "new")
@@ -19238,22 +19845,6 @@ func (h *Home) curatedContextHints(item session.Item) []footerHint {
 	}
 
 	return hints
-}
-
-// sessionIsDead reports whether a session is stopped or errored — the states
-// for which restart, rather than attach, is the relevant footer action. Reads
-// the status via the thread-safe getter since the render goroutine runs
-// concurrently with backgroundStatusUpdate (PR #1289 review nit 2).
-func sessionIsDead(s *session.Instance) bool {
-	status := s.GetStatusThreadSafe()
-	return status == session.StatusStopped || status == session.StatusError
-}
-
-// sessionIsQueued reports whether a session is waiting for a group slot and has
-// no tmux yet — so it is neither attachable nor restartable. Reads the status
-// via the thread-safe getter for the same concurrency reason as sessionIsDead.
-func sessionIsQueued(s *session.Instance) bool {
-	return s.GetStatusThreadSafe() == session.StatusQueued
 }
 
 // renderHelpBarCurated renders the lighter, context-aware footer (the default
@@ -19319,12 +19910,9 @@ func (h *Home) renderHelpBarCurated() string {
 // renderDebugBar renders a compact performance overlay for debug mode.
 // Shows: render time, goroutine count, heap usage, session count.
 func (h *Home) renderDebugBar() string {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
 	renderUs := h.lastRenderDuration.Load()
-	goroutines := runtime.NumGoroutine()
-	heapMB := float64(memStats.HeapAlloc) / (1024 * 1024)
+	goroutines := h.debugGoroutines.Load()
+	heapMB := float64(h.debugHeapBytes.Load()) / (1024 * 1024)
 	sessionCount := len(h.flatItems)
 
 	debugText := fmt.Sprintf(
@@ -19342,7 +19930,9 @@ func (h *Home) renderDebugBar() string {
 }
 
 // renderSessionList renders the left panel with hierarchical session list
-func (h *Home) renderSessionList(width, height int) string {
+func (h *Home) renderSessionList(width, height int) (rendered string) {
+	started := time.Now()
+	defer func() { h.viewPhase("list", started) }()
 	var b strings.Builder
 
 	if len(h.flatItems) == 0 {
@@ -19943,7 +20533,7 @@ func (h *Home) renderSessionItem(
 		// global config but no per-session override.
 		if opts := inst.GetHermesOptions(); opts != nil && opts.YoloMode != nil {
 			showYolo = *opts.YoloMode
-		} else if cfg, _ := session.LoadUserConfig(); cfg != nil && cfg.Hermes.YoloMode {
+		} else if cfg := h.getCachedUserConfig(); cfg != nil && cfg.Hermes.YoloMode {
 			showYolo = true
 		}
 	}
@@ -20033,8 +20623,7 @@ func (h *Home) renderSessionItem(
 		if h.hookWatcher != nil {
 			hookStatus = h.hookWatcher.GetHookStatus(inst.ID)
 		}
-		confirmedTs, confirmedObserved := inst.LastObservedActivity()
-		ts := sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, inst.LastActivityAt(), inst.LastAccessedAt, confirmedTs, confirmedObserved, hookStatus)
+		ts := sessionActivityTime(inst.CreatedAt, inst.LastStartedAt, instState.lastActivityAt, inst.LastAccessedAt, instState.confirmedActivityAt, instState.confirmedActivitySeen, hookStatus)
 		timestampBadge = tsStyle.Render(" " + formatRelativeTime(ts))
 	}
 
@@ -20258,7 +20847,7 @@ func (h *Home) renderRemotePreview(item session.Item, width, height int) string 
 		count := len(h.remoteSessionsInView(item.RemoteName))
 		h.remoteSessionsMu.RUnlock()
 
-		config, _ := session.LoadUserConfig()
+		config := h.getCachedUserConfig()
 		host := item.RemoteName
 		if config != nil && config.Remotes != nil {
 			if rc, ok := config.Remotes[item.RemoteName]; ok {
@@ -20905,7 +21494,9 @@ func (h *Home) renderSessionInfoCard(inst *session.Instance, width, height int) 
 }
 
 // renderPreviewPane renders the right panel with live preview
-func (h *Home) renderPreviewPane(width, height int) string {
+func (h *Home) renderPreviewPane(width, height int) (rendered string) {
+	started := time.Now()
+	defer func() { h.viewPhase("preview", started) }()
 	var b strings.Builder
 
 	if len(h.flatItems) == 0 || h.cursor >= len(h.flatItems) {
@@ -21014,8 +21605,11 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Session info header box
-	// Cache status once to avoid races with background status updates
-	selectedStatus := selected.GetStatusThreadSafe()
+	// Use the background render snapshot for all values whose getters can wait
+	// behind UpdateStatus. View runs on Bubble Tea's input loop; a status probe
+	// must never turn a scroll frame into a lock wait.
+	selectedState := h.getSessionRenderState(selected)
+	selectedStatus := selectedState.status
 	statusIcon := "○"
 	statusColor := ColorTextDim
 	switch selectedStatus {
@@ -21047,7 +21641,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	// 2026-07-26 incident). Say what happened and what to do, right under the
 	// status, before anything else in the preview. Reads the in-memory mirror so
 	// the render path never touches the filesystem.
-	if selected.AuthHeldCached() {
+	if selectedState.authHeld {
 		b.WriteString(authHoldBannerLines(width))
 	}
 
@@ -21066,8 +21660,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	if h.hookWatcher != nil {
 		previewHookStatus = h.hookWatcher.GetHookStatus(selected.ID)
 	}
-	confirmedTs, confirmedObserved := selected.LastObservedActivity()
-	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selected.LastActivityAt(), selected.LastAccessedAt, confirmedTs, confirmedObserved, previewHookStatus)
+	activityTime := sessionActivityTime(selected.CreatedAt, selected.LastStartedAt, selectedState.lastActivityAt, selected.LastAccessedAt, selectedState.confirmedActivityAt, selectedState.confirmedActivitySeen, previewHookStatus)
 	activityStr := formatRelativeTime(activityTime)
 	if selectedStatus == session.StatusRunning {
 		activityStr = "active now"
@@ -21172,7 +21765,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Multi-repo info section
-	if selected.IsMultiRepo() {
+	if selectedState.multiRepo {
 		mrHeader := renderSectionDivider("Multi-Repo", width-4)
 		b.WriteString(mrHeader)
 		b.WriteString("\n")
@@ -21226,7 +21819,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		renderLaunchModelInfoLines(&b, selected)
 
 		// MCP servers - compact format with source indicators and sync status
-		mcpInfo := selected.GetMCPInfo()
+		mcpInfo := h.mcpInfoForRender(selected)
 		hasLoadedMCPs := len(selected.LoadedMCPNames) > 0
 		hasMCPs := mcpInfo != nil && mcpInfo.HasAny()
 
@@ -21370,7 +21963,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		}
 
 		// Fork hint when session can be forked
-		if selected.CanFork() {
+		if selectedState.canFork {
 			quickForkKey := h.actionKey(hotkeyQuickFork)
 			forkWithOptionsKey := h.actionKey(hotkeyForkWithOptions)
 			if quickForkKey != "" || forkWithOptionsKey != "" {
@@ -21414,7 +22007,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			renderLaunchModelInfoLines(&b, selected)
 
 			// MCPs for Gemini (global only)
-			mcpInfo := selected.GetMCPInfo()
+			mcpInfo := h.mcpInfoForRender(selected)
 			renderSimpleMCPLine(&b, mcpInfo, width)
 		} else {
 			statusStyle := lipgloss.NewStyle().Foreground(ColorText)
@@ -21438,7 +22031,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n")
 		renderLaunchModelInfoLines(&b, selected)
 
-		mcpInfo := selected.GetMCPInfo()
+		mcpInfo := h.mcpInfoForRender(selected)
 		renderSimpleMCPLine(&b, mcpInfo, width)
 	}
 
@@ -21479,7 +22072,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			}
 
 			// Fork hint for OpenCode
-			if selected.CanFork() {
+			if selectedState.canFork {
 				h.renderForkHintLine(&b)
 			}
 		} else {
@@ -21508,7 +22101,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(codexHeader)
 		b.WriteString("\n")
 
-		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true, selected.IsArchived(), selected.Status)
+		renderToolStatusLine(&b, selected.CodexSessionID, selected.CodexDetectedAt, true, selected.IsArchived(), selectedStatus)
 		renderLaunchModelInfoLines(&b, selected)
 		if selected.CodexSessionID != "" {
 			renderDetectedAtLine(&b, selected.CodexDetectedAt)
@@ -21516,7 +22109,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	}
 
 	// Custom tool info (tools defined in config.toml that aren't built-in)
-	if !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
+	if !session.IsBuiltinToolName(selected.Tool) && !session.IsClaudeCompatible(selected.Tool) && selected.Tool != "gemini" && selected.Tool != "opencode" &&
 		selected.Tool != "codex" {
 		if toolDef := session.GetToolDef(selected.Tool); toolDef != nil {
 			toolName := selected.Tool
@@ -21558,7 +22151,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 					b.WriteString("\n")
 				}
 			}
-			if selected.CanRestartFresh() {
+			if selectedState.canRestartFresh {
 				if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
 					hintStyle := lipgloss.NewStyle().Foreground(ColorText).Italic(true)
 					keyStyle := lipgloss.NewStyle().Foreground(ColorAccent).Bold(true)
@@ -21574,7 +22167,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 	b.WriteString("\n")
 
 	// Check preview settings for what to show
-	config, _ := session.LoadUserConfig()
+	config := h.getCachedUserConfig()
 	showAnalytics := config != nil && config.GetShowAnalytics() &&
 		(session.IsClaudeCompatible(selected.Tool) || selected.Tool == "gemini")
 	showOutput := config == nil || config.GetShowOutput() // Default to true if config fails
@@ -21619,7 +22212,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 			b.WriteString(dimStyle.Render(" Resume  - restart with session resume"))
 			b.WriteString("\n")
 		}
-		if selected.CanRestartFresh() {
+		if selectedState.canRestartFresh {
 			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
 				b.WriteString("  ")
 				b.WriteString(keyStyle.Render(restartFreshKey))
@@ -21637,7 +22230,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(keyStyle.Render("Enter"))
 		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
 		b.WriteString("\n")
-		if selected.IsMultiRepo() {
+		if selectedState.multiRepo {
 			if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
 				b.WriteString("  ")
 				b.WriteString(keyStyle.Render(editPathsKey))
@@ -21691,7 +22284,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString("\n\n")
 		b.WriteString(dimStyle.Render("Actions:"))
 		b.WriteString("\n")
-		if selected.CanRestartFresh() {
+		if selectedState.canRestartFresh {
 			if restartFreshKey := h.actionKey(hotkeyRestartFresh); restartFreshKey != "" {
 				b.WriteString("  ")
 				b.WriteString(keyStyle.Render(restartFreshKey))
@@ -21709,7 +22302,7 @@ func (h *Home) renderPreviewPane(width, height int) string {
 		b.WriteString(keyStyle.Render("Enter"))
 		b.WriteString(dimStyle.Render(" - attach (will auto-start)"))
 		b.WriteString("\n")
-		if selected.IsMultiRepo() {
+		if selectedState.multiRepo {
 			if editPathsKey := h.actionKey(hotkeyEditPaths); editPathsKey != "" {
 				b.WriteString("  ")
 				b.WriteString(keyStyle.Render(editPathsKey))
