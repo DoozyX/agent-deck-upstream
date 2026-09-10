@@ -2,6 +2,11 @@ Review round {{ROUND}} found issues on your branch — fix them:
 
 {{FINDINGS}}
 
+This message carries only what changed since your last round: the findings.
+Your task file, the approved design and the branch are unchanged and already
+in your context — do not re-read them wholesale; re-read the one section a
+finding points at.
+
 Fix every finding in the `patch` bucket. `decision-needed` items are not
 yours to resolve and `defer` items are out of scope — leave both alone and
 say so in your summary if any were listed. Run the focused tests for

@@ -197,7 +197,9 @@ Every checkout path is exactly
 `$RUN_DIR/worktrees.tsv` by `references/create-worktree.sh`. Never create a
 run artifact or retrospective outside `$RUN_DIR`. Never create a source
 checkout outside `$WORKTREES_DIR`. Never create a design, plan, task file,
-prompt, review, report, or retrospective outside `$RUN_ROOT`.
+prompt, review, report, or retrospective outside `$RUN_ROOT`. The one
+run-independent artifact is the cross-run diary at
+`$ROOT_WT/.agent-deck/diary.md`, written only by the retrospective child.
 
 **No child of this run works in a primary checkout — including the ones that
 are not tasks.** Implementers get a worktree because the recipe hands them
@@ -598,7 +600,7 @@ so a half-rendered prompt never reaches a child.
 | `fix` | `ROUND` `FINDINGS` `FOCUSED_TESTS` |
 | `cleanup-execute` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` |
 | `cleanup-verify` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` `VERDICT_FILE` |
-| `retrospective` | `RUN_DIR` `RETRO_PATH` |
+| `retrospective` | `RUN_DIR` `RETRO_PATH` `DIARY_PATH` |
 | `ab-judge` | `PAIRS_DIR` `VERDICT_FILE` |
 
 Use `inspect` for every bounded audit, fetch, repository-policy read, overlap
@@ -1181,6 +1183,19 @@ agent-deck session send "impl-<task-slug>" \
   signal in the manifest next to the round. A send you never confirmed is an
   open question, not a completed stage.
 
+  **Two strikes on an evidence-free response.** A fix report without the
+  diff, sha and `git show --stat` the prompt demands, a done sentinel with no
+  commit on the branch, or a "fixed" with no hunk to show for it is an
+  evidence-free response, not a completed round. On the first, `session
+  send` one focused retry that names exactly the missing evidence and
+  nothing else. On the second, stop sending: rotate the worker (a fresh
+  session in the same worktree, fix prompt prefixed by the rotation
+  instruction, `deviation: implementer replaced after two evidence-free
+  responses` in the manifest) or, if the counted budget is spent, mark the
+  task needs-attention. Never take over its production or verification work
+  yourself — a conductor that fixes one finding by hand has stopped
+  supervising, and the branch now has a change no reviewer session saw.
+
   A nonzero send result is not permission to send the same fix twice. If the
   child subsequently emits a response attributable to that message, or its
   state transitions from idle/waiting to running after the send, record the
@@ -1624,7 +1639,8 @@ reloading the workflow and its durable state.
    Preserve the absolute skill path and run directory in the handoff.
 2. Recover the approved design constraints from the manifest's
    `## Design constraints` summary: absolute source path, scope, non-goals,
-   acceptance criteria, and approved deviations. Keep this bounded summary
+   acceptance criteria, testing decisions (seam and prior-art tests), and
+   approved deviations. Keep this bounded summary
    current when a design decision changes. Do not read the full design into
    conductor context or reopen approved design decisions.
 3. Run the heartbeat to reconcile surviving children. If the design summary
@@ -1906,9 +1922,11 @@ run. The retrospective stays with every other artifact:
 
 ```bash
 RETRO_PATH="$RUN_DIR/retro.md"
+DIARY_PATH="$ROOT_WT/.agent-deck/diary.md"
 ```
 
-The child writes the file but does **not** commit, push, or copy it elsewhere.
+The child writes the retrospective, consolidates what changes future work
+into the diary, and does **not** commit, push, or copy either elsewhere.
 
 Keep it short and only record what actually happened — an empty section is
 better than a padded one:
@@ -1928,13 +1946,30 @@ quote the rule that misled you. "none">
 <per task: tiers used, rounds needed, escalations and their trigger —
 the data that validates or refutes the tier table. "n/a">
 
+## Automated checks
+<a lint, test or CI check that would have caught a fix-round finding
+before a reviewer did — the cheapest review round is the one a check
+replaces. "none">
+
+## Tool economy
+<which children spent context on what — an implementer that read half the
+repo, a reviewer that re-ran a suite it was handed — and what they could
+have been handed instead; feeds "Context budget". "none">
+
 ## Suggested changes
 <concrete edits to SKILL.md / fleet / agent-deck worth making, one line
 each. "none">
 ```
 
-The retrospective child skims prior `$ROOT_WT/.agent-deck/*/retro.md` files for
-a repeat issue before writing. If a prior retro already reports it, it
-references that file and adds only what is new (a recurring issue is a
-stronger signal than a new one). Mention the completed retro path as the last
-line of the final report.
+The retrospective child reads `$DIARY_PATH` and skims prior
+`$ROOT_WT/.agent-deck/*/retro.md` files for a repeat issue before writing. If
+a prior retro already reports it, it references that file and adds only what
+is new (a recurring issue is a stronger signal than a new one).
+
+**The diary is the run's only cross-run memory.** Retros are per-run and
+nobody re-reads them; `brainstorming` reads the diary before its first
+question, so a decision, a discarded approach, a mistake or a lesson about
+this repository that would change the next design belongs there — rewritten
+into its one canonical entry, never appended as chronology. Everything else
+stays in the retro. Mention the completed retro path and the diary verdict
+(`updated` or `unchanged`) as the last line of the final report.
