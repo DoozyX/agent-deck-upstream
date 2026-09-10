@@ -5064,6 +5064,9 @@ func (h *Home) invalidatePreviewCache(sessionID string) {
 
 	h.mcpPreviewCacheMu.Lock()
 	delete(h.mcpPreviewCache, sessionID)
+	if h.mcpPreviewGeneration == nil {
+		h.mcpPreviewGeneration = make(map[string]uint64)
+	}
 	h.mcpPreviewGeneration[sessionID]++
 	delete(h.mcpPreviewFetching, sessionID)
 	h.mcpPreviewCacheMu.Unlock()
