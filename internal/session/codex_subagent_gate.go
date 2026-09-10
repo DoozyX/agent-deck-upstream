@@ -160,6 +160,51 @@ var (
 	codexRolloutNow = time.Now
 )
 
+type codexRolloutIndexEntry struct {
+	loadedAt   time.Time
+	sessionIDs map[string]struct{}
+}
+
+var (
+	codexRolloutIndexMu sync.Mutex
+	codexRolloutIndexes = map[string]codexRolloutIndexEntry{}
+)
+
+// codexRolloutExistsForFork answers the render-path forkability check from one
+// short-lived index per Codex home. A TUI snapshot asks this once per Codex row;
+// globbing the dated rollout tree separately for every row made a 78-session,
+// 6.9k-rollout deck pause for 2-3 seconds on every refresh.
+func codexRolloutExistsForFork(sessionID, codexHome string) bool {
+	now := codexRolloutNow()
+	codexRolloutIndexMu.Lock()
+	defer codexRolloutIndexMu.Unlock()
+
+	entry, ok := codexRolloutIndexes[codexHome]
+	if !ok || now.Sub(entry.loadedAt) >= codexRolloutMissTTL {
+		entry = codexRolloutIndexEntry{
+			loadedAt:   now,
+			sessionIDs: make(map[string]struct{}),
+		}
+		pattern := filepath.Join(codexHome, "sessions", "*", "*", "*", "rollout-*.jsonl")
+		matches, _ := filepath.Glob(pattern)
+		for _, path := range matches {
+			name := strings.TrimSuffix(filepath.Base(path), ".jsonl")
+			if len(name) < 36 {
+				continue
+			}
+			entry.sessionIDs[name[len(name)-36:]] = struct{}{}
+		}
+		codexRolloutIndexes[codexHome] = entry
+		for home, cached := range codexRolloutIndexes {
+			if now.Sub(cached.loadedAt) >= codexRolloutMissTTL {
+				delete(codexRolloutIndexes, home)
+			}
+		}
+	}
+	_, ok = entry.sessionIDs[sessionID]
+	return ok
+}
+
 // codexRolloutMissKey scopes a miss to the home it was looked up in: the same
 // id genuinely resolves differently across codex homes (issue #1929).
 func codexRolloutMissKey(sessionID, codexHome string) string {
