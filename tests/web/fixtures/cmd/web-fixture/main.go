@@ -443,6 +443,18 @@ func (s *fixtureStore) RestartSession(id string) error {
 	return s.transition(id, session.StatusRunning)
 }
 
+func (s *fixtureStore) SendToSession(id, message string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.sessions[id]; !ok {
+		return fmt.Errorf("session %q not found", id)
+	}
+	if strings.TrimSpace(message) == "" {
+		return fmt.Errorf("message is required")
+	}
+	return nil
+}
+
 func (s *fixtureStore) DeleteSession(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

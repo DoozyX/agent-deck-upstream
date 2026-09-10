@@ -23,6 +23,14 @@ import (
 func (s *Server) csrfProtect(next http.Handler) http.Handler {
 	failClosed := s.cfg.Token != ""
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Bearer-authenticated MCP clients are non-browser and do not send
+		// Origin/Referer. CSRF is for cookie-style browser mutations; /mcp
+		// relies on Authorization: Bearer instead.
+		if r.URL.Path == MCPRoute {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		if !isMutationMethod(r.Method) {
 			next.ServeHTTP(w, r)
 			return

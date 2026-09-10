@@ -18581,7 +18581,11 @@ func renderEmptyStateResponsive(config EmptyStateConfig, width, height int) stri
 		subtitle := config.Subtitle
 		maxSubtitleWidth := width - hPad*2 - 4 // Account for padding and margins
 		if maxSubtitleWidth > 0 && len(subtitle) > maxSubtitleWidth {
-			subtitle = subtitle[:maxSubtitleWidth-3] + "..."
+			if maxSubtitleWidth <= 3 {
+				subtitle = strings.Repeat(".", maxSubtitleWidth)
+			} else {
+				subtitle = subtitle[:maxSubtitleWidth-3] + "..."
+			}
 		}
 		content.WriteString(subtitleStyle.Render(subtitle))
 	}
@@ -18615,7 +18619,11 @@ func renderEmptyStateResponsive(config EmptyStateConfig, width, height int) stri
 			displayHint := hint
 			maxHintWidth := width - hPad*2 - 6 // Account for "• " prefix and margins
 			if maxHintWidth > 0 && len(displayHint) > maxHintWidth {
-				displayHint = displayHint[:maxHintWidth-3] + "..."
+				if maxHintWidth <= 3 {
+					displayHint = strings.Repeat(".", maxHintWidth)
+				} else {
+					displayHint = displayHint[:maxHintWidth-3] + "..."
+				}
 			}
 			content.WriteString(hintStyle.Render("• " + displayHint))
 			if i < len(hintsToShow)-1 {
