@@ -283,8 +283,10 @@ func BenchmarkHomeRenderPreviewLargeHistory(b *testing.B) {
 			break
 		}
 	}
-	h.previewCache[inst.ID] = strings.Repeat("preview history line\n", 100000)
+	preview := strings.Repeat("preview history line\n", 100000)
+	h.previewCache[inst.ID] = preview
 	h.previewCacheTime[inst.ID] = time.Now()
+	h.previewLineCounts[inst.ID] = previewLineCount(preview)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {

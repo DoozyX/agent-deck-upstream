@@ -351,6 +351,7 @@ type Home struct {
 	// Preview cache (async fetching - View() must be pure, no blocking I/O)
 	previewCache      map[string]string    // previewKey -> cached preview content
 	previewCacheTime  map[string]time.Time // previewKey -> when cached (for expiration)
+	previewLineCounts map[string]int       // previewKey -> non-blank logical line count
 	previewCacheMu    sync.RWMutex         // Protects previewCache for thread-safety
 	previewFetchingID string               // ID currently being fetched (prevents duplicate fetches)
 	// MCP preview data is fetched lazily after selection. GetMCPInfo can resolve
@@ -1571,6 +1572,7 @@ type (
 type previewFetchedMsg struct {
 	previewKey string // cache key: sessionID or sessionID:windowIndex
 	content    string
+	lineCount  int // precomputed off the event loop; 0 means empty/unknown
 	err        error
 }
 
@@ -1903,6 +1905,7 @@ func NewHomeWithProfileAndMode(profile string) *Home {
 		flatItems:                 []session.Item{},
 		previewCache:              make(map[string]string),
 		previewCacheTime:          make(map[string]time.Time),
+		previewLineCounts:         make(map[string]int),
 		mcpPreviewCache:           make(map[string]*session.MCPInfo),
 		mcpPreviewFetching:        make(map[string]bool),
 		mcpPreviewGeneration:      make(map[string]uint64),
@@ -5083,6 +5086,7 @@ func (h *Home) invalidatePreviewCache(sessionID string) {
 	h.previewCacheMu.Lock()
 	delete(h.previewCache, sessionID)
 	delete(h.previewCacheTime, sessionID)
+	delete(h.previewLineCounts, sessionID)
 	h.previewCacheMu.Unlock()
 
 	h.mcpPreviewCacheMu.Lock()
@@ -5352,6 +5356,7 @@ func (h *Home) fetchPreview(inst *session.Instance, key string, windowIndex int)
 		return previewFetchedMsg{
 			previewKey: key,
 			content:    content,
+			lineCount:  previewLineCount(content),
 			err:        err,
 		}
 	}
@@ -5464,7 +5469,7 @@ func (h *Home) fetchRemotePreview(remoteName, sessionID, key string) tea.Cmd {
 			}
 		}
 		content = truncateRemotePreviewContent(content)
-		return previewFetchedMsg{previewKey: key, content: content, err: fetchErr}
+		return previewFetchedMsg{previewKey: key, content: content, lineCount: previewLineCount(content), err: fetchErr}
 	}
 }
 
@@ -5579,6 +5584,10 @@ func (h *Home) applyRemotePane(remoteName string, pane *session.RemotePaneEvent)
 	h.previewCacheTime[key] = time.Now()
 	if content := expandTabs(truncateRemotePreviewContent(pane.Content)); pane.Err == "" && strings.TrimSpace(content) != "" {
 		h.previewCache[key] = content
+		if h.previewLineCounts == nil {
+			h.previewLineCounts = make(map[string]int)
+		}
+		h.previewLineCounts[key] = previewLineCount(content)
 	}
 	return strings.TrimSpace(h.previewCache[key]) == ""
 }
@@ -9274,7 +9283,16 @@ func (h *Home) updateInner(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// passes every width gate and still overflows the pane. Expand at
 			// ingest — one chokepoint for local and remote previews alike — so
 			// the cached content is already what the terminal will render.
-			h.previewCache[msg.previewKey] = expandTabs(msg.content)
+			content := expandTabs(msg.content)
+			h.previewCache[msg.previewKey] = content
+			if content == "" {
+				delete(h.previewLineCounts, msg.previewKey)
+			} else {
+				if h.previewLineCounts == nil {
+					h.previewLineCounts = make(map[string]int)
+				}
+				h.previewLineCounts[msg.previewKey] = msg.lineCount
+			}
 		}
 		h.previewCacheMu.Unlock()
 		return h, nil
@@ -20112,15 +20130,10 @@ type previewLinesWindow struct {
 	offset           int
 }
 
-// previewLineWindow finds only the lines the preview can display. Terminal
-// captures can be large; splitting the entire capture on every scroll event
-// allocates one string entry per historical line even though only a screenful
-// is rendered.
-func previewLineWindow(content string, maxLines, offset int) previewLinesWindow {
-	if maxLines < 1 {
-		maxLines = 1
-	}
-
+// previewTrimmedEnd returns the byte end of the last non-blank line. It
+// matches renderPreviewPane's trailing TrimSpace behavior without allocating
+// one string per history line.
+func previewTrimmedEnd(content string) int {
 	end := len(content)
 	for end > 0 {
 		start := strings.LastIndexByte(content[:end], '\n') + 1
@@ -20128,16 +20141,42 @@ func previewLineWindow(content string, maxLines, offset int) previewLinesWindow 
 			break
 		}
 		if start == 0 {
-			end = 0
-			break
+			return 0
 		}
 		end = start - 1
 	}
+	return end
+}
+
+func previewLineCount(content string) int {
+	end := previewTrimmedEnd(content)
+	if end == 0 {
+		return 0
+	}
+	return strings.Count(content[:end], "\n") + 1
+}
+
+// previewLineWindow finds only the lines the preview can display. Terminal
+// captures can be large; splitting the entire capture on every scroll event
+// allocates one string entry per historical line even though only a screenful
+// is rendered. totalLines is supplied by the fetch worker when available, so
+// the event-loop render path does not rescan the full capture just to count it.
+func previewLineWindow(content string, maxLines, offset int, totalLinesHint ...int) previewLinesWindow {
+	if maxLines < 1 {
+		maxLines = 1
+	}
+
+	end := previewTrimmedEnd(content)
 	if end == 0 {
 		return previewLinesWindow{}
 	}
 
-	totalLines := strings.Count(content[:end], "\n") + 1
+	totalLines := 0
+	if len(totalLinesHint) > 0 && totalLinesHint[0] > 0 {
+		totalLines = totalLinesHint[0]
+	} else {
+		totalLines = strings.Count(content[:end], "\n") + 1
+	}
 	maxOffset := totalLines - maxLines
 	if maxOffset < 0 {
 		maxOffset = 0
@@ -22626,6 +22665,7 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 	// Terminal preview - use cached content (async fetching keeps View() pure)
 	h.previewCacheMu.RLock()
 	preview, hasCached := h.previewCache[pvKey]
+	previewLineCountHint := h.previewLineCounts[pvKey]
 	h.previewCacheMu.RUnlock()
 
 	// Show worktree setup animation when setup script is running
@@ -22666,7 +22706,7 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 			maxLines = 1
 		}
 
-		window := previewLineWindow(preview, maxLines, h.previewScrollOffset)
+		window := previewLineWindow(preview, maxLines, h.previewScrollOffset, previewLineCountHint)
 		if len(window.lines) == 0 {
 			emptyTerm := lipgloss.NewStyle().
 				Foreground(ColorText).
@@ -22681,7 +22721,7 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 			if maxLines < 1 {
 				maxLines = 1
 			}
-			window = previewLineWindow(preview, maxLines, h.previewScrollOffset)
+			window = previewLineWindow(preview, maxLines, h.previewScrollOffset, previewLineCountHint)
 		}
 		h.previewScrollOffset = window.offset
 		lines := window.lines
