@@ -36,6 +36,7 @@ type remoteSessionsCache struct {
 	// authoritative freshness signal is per-remote FetchedAt.
 	SavedAt  time.Time                              `json:"saved_at"`
 	Sessions map[string][]session.RemoteSessionInfo `json:"sessions"`
+	Groups   map[string][]string                    `json:"groups,omitempty"`
 	// FetchedAt records when each remote's sessions last came from a LIVE
 	// fetch. Without it, every save cycle re-stamped the whole snapshot, so a
 	// continuously-failing remote's stale sessions never hit the age cutoff.
@@ -58,6 +59,7 @@ const remoteSessionsCacheRefreshAge = time.Hour
 type remoteSessionsCacheDoc struct {
 	SavedAt   time.Time            `json:"saved_at"`
 	Sessions  json.RawMessage      `json:"sessions"`
+	Groups    map[string][]string  `json:"groups,omitempty"`
 	FetchedAt map[string]time.Time `json:"fetched_at,omitempty"`
 }
 
@@ -121,6 +123,7 @@ func (h *Home) flushRemoteSessionsCache(force bool) {
 	doc := remoteSessionsCacheDoc{
 		SavedAt:   now,
 		Sessions:  sessions,
+		Groups:    cloneRemoteGroupLists(h.remoteGroups),
 		FetchedAt: h.remoteFetchedAt,
 	}
 	data, err := json.Marshal(doc)
@@ -199,5 +202,32 @@ func (h *Home) applyRemoteSessionsSnapshot(snap remoteSessionsCache) {
 		h.remoteFromCache[name] = true
 		h.remoteFetchedAt[name] = fetched
 	}
+	for name, groups := range snap.Groups {
+		if _, live := h.remoteSessions[name]; live && !h.remoteFromCache[name] {
+			continue
+		}
+		fetched := snap.FetchedAt[name]
+		if fetched.IsZero() {
+			fetched = snap.SavedAt
+		}
+		if fetched.IsZero() || time.Since(fetched) > remoteSessionsCacheMaxAge {
+			continue
+		}
+		if h.remoteGroups == nil {
+			h.remoteGroups = make(map[string][]string)
+		}
+		h.remoteGroups[name] = append([]string(nil), groups...)
+	}
 	h.remoteSessionsMu.Unlock()
+}
+
+func cloneRemoteGroupLists(groups map[string][]string) map[string][]string {
+	if len(groups) == 0 {
+		return nil
+	}
+	clone := make(map[string][]string, len(groups))
+	for name, paths := range groups {
+		clone[name] = append([]string(nil), paths...)
+	}
+	return clone
 }

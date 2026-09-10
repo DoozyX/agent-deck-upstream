@@ -72,3 +72,33 @@ func TestBuildGroupRenderStats_SnapshotRowsRespectThePartition(t *testing.T) {
 		t.Errorf("(running, sessionCount) = (%d, %d), want (1, 1) — a snapshot must not resurrect an archived row into the header (#1987)", got.running, got.sessionCount)
 	}
 }
+
+func TestBuildGroupRenderStats_ReusesSnapshotAndInvalidatesAfterRefresh(t *testing.T) {
+	inst := &session.Instance{ID: "a1", Title: "active", GroupPath: "demo", Status: session.StatusRunning}
+	h := &Home{groupTree: session.NewGroupTree([]*session.Instance{inst})}
+
+	h.refreshSessionRenderSnapshot([]*session.Instance{inst})
+	first := h.buildGroupRenderStats(h.getSessionRenderSnapshot())
+	firstCache := h.groupRenderStatsCache
+	if firstCache == nil {
+		t.Fatal("buildGroupRenderStats did not populate its cache")
+	}
+
+	second := h.buildGroupRenderStats(h.getSessionRenderSnapshot())
+	if h.groupRenderStatsCache != firstCache {
+		t.Fatal("buildGroupRenderStats rebuilt stats for the same render snapshot")
+	}
+	if second["demo"] != first["demo"] {
+		t.Fatalf("cached stats = %#v, first stats = %#v", second["demo"], first["demo"])
+	}
+
+	inst.Status = session.StatusWaiting
+	h.refreshSessionRenderSnapshot([]*session.Instance{inst})
+	third := h.buildGroupRenderStats(h.getSessionRenderSnapshot())
+	if h.groupRenderStatsCache == firstCache {
+		t.Fatal("buildGroupRenderStats reused stale stats after a snapshot refresh")
+	}
+	if got := third["demo"]; got.running != 0 || got.waiting != 1 {
+		t.Fatalf("refreshed stats = %#v, want running=0 waiting=1", got)
+	}
+}
