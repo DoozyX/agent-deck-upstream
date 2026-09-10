@@ -11,6 +11,7 @@ func TestPreviewLineWindowKeepsOnlyVisibleLines(t *testing.T) {
 		content       string
 		maxLines      int
 		offset        int
+		totalLines    int
 		wantLines     []string
 		wantTruncated bool
 		wantAbove     int
@@ -21,6 +22,7 @@ func TestPreviewLineWindowKeepsOnlyVisibleLines(t *testing.T) {
 			name:          "tail",
 			content:       "a\nb\nc\nd\n",
 			maxLines:      3,
+			totalLines:    4,
 			wantLines:     []string{"b", "c", "d"},
 			wantTruncated: true,
 			wantAbove:     1,
@@ -30,6 +32,7 @@ func TestPreviewLineWindowKeepsOnlyVisibleLines(t *testing.T) {
 			content:       "a\nb\nc\nd\n",
 			maxLines:      3,
 			offset:        1,
+			totalLines:    4,
 			wantLines:     []string{"a", "b", "c"},
 			wantTruncated: true,
 			wantAbove:     0,
@@ -52,7 +55,7 @@ func TestPreviewLineWindowKeepsOnlyVisibleLines(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := previewLineWindow(tt.content, tt.maxLines, tt.offset)
+			got := previewLineWindow(tt.content, tt.maxLines, tt.offset, tt.totalLines)
 			if !reflect.DeepEqual(got.lines, tt.wantLines) {
 				t.Fatalf("lines = %#v, want %#v", got.lines, tt.wantLines)
 			}
