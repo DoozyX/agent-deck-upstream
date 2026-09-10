@@ -251,7 +251,11 @@ cp -R <agent-deck-repo>/skills/orchestrate/references/prompts "$RUN_DIR/"
 # exactly once per run — see "The conductor" under Context budget for why a
 # run without it can sit finished and unnoticed for hours.
 agent-deck session show --json | jq -r '(.data // .).id' > "$RUN_DIR/.conductor-id"
-nohup bash "$RUN_DIR/heartbeat.sh" >> "$RUN_DIR/heartbeat.log" 2>&1 &
+# macOS: a sleeping laptop stalls every child mid-turn (one run lost ~3 h to
+# two naps). `caffeinate -i` holds an idle-sleep assertion for as long as the
+# heartbeat lives; `.heartbeat-stop` releases it with the heartbeat.
+command -v caffeinate >/dev/null 2>&1 && KEEPAWAKE=(caffeinate -i) || KEEPAWAKE=()
+nohup "${KEEPAWAKE[@]}" bash "$RUN_DIR/heartbeat.sh" >> "$RUN_DIR/heartbeat.log" 2>&1 &
 
 # Lean child launch flags — see "Child startup baseline" under Context budget.
 # Drop them for a child that must drive a browser.
@@ -335,7 +339,7 @@ Maintain a run manifest at `$RUN_DIR/manifest.md` and update it after every
 stage transition. Start it with one shared `## Verification contract` block:
 the exact baseline, full-suite, lint/format, build/vet and E2E commands, plus
 the focused-test command shape (how to test only the packages or paths a
-diff touches — incremental review rounds render it as `FOCUSED_TESTS=`); each
+diff touches — fix rounds and review rounds 2+ render it as `FOCUSED_TESTS=`); each
 command's required services, credentials and fixtures; who owns that
 infrastructure; the known environment-dependent failures; and the **known
 test-generated drift files** — tracked files the suite itself rewrites
@@ -379,6 +383,12 @@ notifications and the turn-start snapshot route to the new conductor.
   finish it": hand off the design and stop there. The user does not need to
   write a plan; when the gate justifies one, a planner child writes a concise
   coordination plan against the codebase in the worktree.
+  A design path arriving in a session titled `conductor-<run-id>` is the
+  **hand-off entrance**: the brainstorm session launched you detached
+  (`--no-parent`) so it stays free for the next feature. You are the root of
+  your own session tree; behaviour is otherwise identical to the in-session
+  entrance, and your questions reach the user through the watchdog banner
+  and your own `waiting` state, never through the session that launched you.
 - An argument that is already an **implementation plan** (ordered tasks with
   file paths and verification steps) → plan-fed: skip the planner child, then
   apply the fan-out gate in "Reviewing the plan" exactly as if a planner had
@@ -496,7 +506,12 @@ planner. At least one of these must be concrete and true:
   product design was approved.
 
 If none applies, skip planning and render one `impl` prompt whose spec block
-points at the approved design. If that design states a qualitative acceptance
+points at the approved design. A design written by `brainstorming` for
+feature work carries a `## Decomposition sketch`: one unit means one
+implementer and no planner regardless of file count; two or more units with
+their interfaces settled in `## Interfaces` is the first trigger above
+already recorded for you — the planner elaborates the sketch into task files
+and never re-decomposes it. If that design states a qualitative acceptance
 criterion (visual polish, UX, "feels fast" — anything a test cannot assert),
 have the `inspect` child first append a `## Quality bar` block to
 `spec-block.md` in the planner prompt's format — a 0–10 scale per criterion
@@ -579,8 +594,8 @@ so a half-rendered prompt never reaches a child.
 | `plan` | `SPEC_PATH` `TASK_DIR` |
 | `impl` | `TASK_TITLE` `SPEC_BLOCK` `RUN_DIR` `TASK_SLUG` |
 | `review-full` | `VERDICT_FILE` `SPEC_BLOCK` `BASE_BRANCH` `AGENT_DECK_REPO` `BASELINE` |
-| `review-incremental` | `VERDICT_FILE` `SPEC_BLOCK` `REVIEWED_SHA` `PREVIOUS_FINDINGS` `BASELINE` `AGENT_DECK_REPO` |
-| `fix` | `ROUND` `FINDINGS` |
+| `review-round` | `VERDICT_FILE` `SPEC_BLOCK` `BASE_REF` `REVIEWED_SHA` `PREVIOUS_FINDINGS` `BASELINE` `FOCUSED_TESTS` `AGENT_DECK_REPO` |
+| `fix` | `ROUND` `FINDINGS` `FOCUSED_TESTS` |
 | `cleanup-execute` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` |
 | `cleanup-verify` | `REPO_ROOT` `BASE_REF` `CANDIDATE_FILE` `RESULT_FILE` `VERDICT_FILE` |
 | `retrospective` | `RUN_DIR` `RETRO_PATH` |
@@ -805,12 +820,12 @@ The reviewer default is mid regardless of the implementer's tier:
 review is verification work (diff vs. spec, run the suite) and the
 Checked/VERDICT format keeps it honest. Freeform or design-heavy tasks get
 a strong reviewer because spec compliance there is a judgment call, not a
-checklist. Run the **last** gate strong when the budget is nearly spent,
-for a reason distinct from difficulty: a mid-tier gate re-raises items
-already dispositioned in earlier rounds, and the final gate cannot afford
-that noise. One run's strong gate-2 matched 9 of 11 findings back to prior
-dispositions and dropped them, leaving 2 genuinely new items; its mid-tier
-predecessors had re-litigated deferred work every round.
+checklist. Run the round that spends the **last** counted fix round strong,
+for a reason distinct from difficulty: a mid-tier reviewer re-raises items
+already dispositioned in earlier rounds, and the final round cannot afford
+that noise. One run's strong final round matched 9 of 11 findings back to
+prior dispositions and dropped them, leaving 2 genuinely new items; its
+mid-tier predecessors had re-litigated deferred work every round.
 
 Cheap keeps one home: work you would otherwise do yourself. Three properties
 make a job safe to hand down — bounded input, extraction rather than
@@ -988,7 +1003,7 @@ agent-deck launch <worktree-path> -c "$REVIEWER_TOOL" -t "review-<task-slug>-r1"
 ```
 
 Record the worktree's current HEAD sha in the manifest when you launch each
-reviewer — incremental rounds and the full-branch gate need it.
+reviewer — every later round is scoped against it as `REVIEWED_SHA`.
 
 **Never grant a reviewer write authority without sole occupancy, in the same
 sentence.** If a proof you want genuinely needs a mutation — flipping a guard,
@@ -1083,7 +1098,7 @@ replaces the old
 `session output ... > $RUN_DIR/<slug>/review-r<n>.txt` capture: the raw layer
 output lands there without ever passing through your context, and you read
 only the merged findings, the `Checked:` lines and the `VERDICT:` line from
-the child's response. Keep the file — a later round's incremental reviewer is
+the child's response. Keep the file — the next round's reviewer is
 handed the previous round's findings from it, and it is the evidence trail for
 a needs-attention task. **Check the file before you build a fix round from
 it:** if it is absent, or `grep -q '^## Merged findings'` fails, the reviewer
@@ -1176,14 +1191,16 @@ agent-deck session send "impl-<task-slug>" \
 
 - When the implementer is done, launch the next fresh reviewer
   (`review-<task-slug>-r2`, then `-r3`) with the same `--disallowedTools`
-  flags. **Rounds 2+ are incremental** — the round-1 full review already
-  happened, so re-reviewing the whole branch each round is wasted cost. It
-  reuses the same findings file the fix round was built from:
+  flags. **Rounds 2+ are full-branch rounds with the prior findings
+  attached** — there is no separate end gate, so every round after the first
+  must be able to certify the whole branch. It reuses the same findings file
+  the fix round was built from:
 
 ```bash
-bash "$RUN_DIR/prompts/render.sh" review-incremental "$RUN_DIR/<slug>/review-r<n+1>-prompt.md" \
+bash "$RUN_DIR/prompts/render.sh" review-round "$RUN_DIR/<slug>/review-r<n+1>-prompt.md" \
   VERDICT_FILE="$RUN_DIR/<slug>/review-r<n+1>.md" \
   SPEC_BLOCK@="$RUN_DIR/<slug>/spec-block.md" \
+  BASE_REF=<base-branch, or the subtask start sha in relay mode> \
   REVIEWED_SHA=<reviewed-sha> PREVIOUS_FINDINGS@="$RUN_DIR/<slug>/findings-r<n>.md" \
   BASELINE="<shared manifest baseline plus task-specific delta, or none>" \
   FOCUSED_TESTS="<the contract's focused-test command for the paths in git diff <reviewed-sha>...HEAD>" \
@@ -1191,35 +1208,45 @@ bash "$RUN_DIR/prompts/render.sh" review-incremental "$RUN_DIR/<slug>/review-r<n
 ```
 
   It carries the same read-only contract and verdict format as the full
-  review, but scopes the layers to `git diff <reviewed-sha>...HEAD`, runs only
-  the focused tests (the full suite belongs to the fix round and to the
-  full-branch gate) and makes every unfixed prior finding a new finding.
+  review: the full suite starts detached first, the layers take `git diff
+  <reviewed-sha>...HEAD` as their focus and `git diff <base-ref>...HEAD` as
+  their scope, the focused tests run in the foreground, every unfixed prior
+  finding is a new finding, and already-dispositioned items are not
+  re-raised. That last clause is what replaced the old incremental-then-gate
+  pair: incremental rounds passed code a later full gate flagged, and the
+  gate then re-litigated deferred work, so tasks burned two extra sessions
+  to end where one round could have ended them.
 
   Once you have read the previous round's findings, **delete the
   superseded reviewer** (see "Deleting finished sessions").
-- **Full-branch end gate: the loop only ends on a clean full-branch
-  verdict.** A round-1 clean qualifies directly. A clean from an
-  *incremental* round does not — launch one more fresh reviewer with the
-  full-branch (round-1) prompt to confirm the branch as a whole. Gate
-  `VERDICT: clean` → proceed to the PR. Gate findings do **not** automatically
-  start another implementation round. First, the conductor writes a one-line
-  disposition beside every finding in the gate artifact and manifest:
-  `fix` (a defect or required scope), `defer` (valid but non-blocking follow-up),
-  or `separate issue` (independent scope, with an issue URL/identifier before
-  proceeding). Only `fix` findings enter the fix-round prompt. Any
-  `decision-needed` disposition goes to the user. A repeated in-scope defect
-  is reviewer oscillation and escalates the reviewer tier; preventive or
-  adjacent scope is never smuggled into the branch merely because a final gate
-  mentioned it.
-- **A blind A/B regression consumes a fix round like any other finding**
-  (see "Blind A/B judge" in stage 2), and a UI task's end gate is a clean
-  full-branch verdict plus a reveal with `regressions=0`.
-- **Caps: maximum 3 fix rounds** (rounds whose findings go back to the
-  implementer — a gate-findings round consumes one like any other) **and 2
-  full-branch gate reviews.** Budget exhausted with `patch` or
-  `decision-needed` items remaining → the task is **needs-attention**, no PR;
-  only `defer` items remaining → proceed to the PR and list them in the
-  final report.
+- **`VERDICT: clean` from **any** round is terminal for the task** — round 1
+  or any later round — because every round reviews the whole branch with the
+  full suite run fresh. Proceed to the PR. A repeated in-scope defect across
+  rounds is reviewer oscillation and escalates the reviewer tier; preventive
+  or adjacent scope is never smuggled into the branch merely because a late
+  round mentioned it — such findings get a one-line disposition in the
+  manifest (`fix`, `defer`, or `separate issue` with an issue identifier)
+  and only `fix` enters the fix prompt.
+- **A blind A/B regression consumes a counted fix round like any other
+  major finding** (see "Blind A/B judge" in stage 2), and a UI task's
+  terminal clean round also needs a reveal with `regressions=0`.
+- **Counted rounds and in-place rounds.** A round is **counted** against the
+  fix cap only when its merged findings hold at least one `major` or
+  `critical` finding, or any `decision-needed` item. A round whose findings
+  are all `minor` and all `patch` is an **in-place round**: same fix prompt,
+  same live implementer, same next reviewer, but it costs no budget. Record
+  each round in the manifest as `kind=<r1|round> counted=<yes|no>
+  max=<severity>`. In-place rounds are bounded at **3 per task**: when a 4th
+  minor-only verdict arrives, regrade every remaining minor to `defer`,
+  append them to `$RUN_DIR/deferred-work.md`, and proceed to the endgame.
+  One run parked a task overnight — 5 h 28 min — on three minor
+  test-strength findings and then spent 50 min on a fresh remediation
+  pipeline for them; a minor never buys that.
+- **Cap: maximum 3 counted fix rounds.** Budget exhausted with `major`,
+  `critical` or `decision-needed` items remaining → the task is
+  **needs-attention**, no PR. Needs-attention is reserved for counted-cap
+  exhaustion; only `defer` (or regraded minor) items remaining → proceed to
+  the PR and list them in the final report.
 
 ### 4. PR
 
@@ -1276,7 +1303,7 @@ have that child pull the failing details (`gh pr checks`,
 push. The conductor reads only the deciding green/red summary and routes the
 result.
 A mechanical fix (lint, format, flaky rerun) pushes directly; a fix that
-touches logic gets one incremental review round on the new commits
+touches logic gets one `review-round` on the new commits
 (`<reviewed-sha>` = the sha the last clean review saw) before the task can
 count as done. When a sibling PR from this run merges, rerun stage 4's
 pre-PR sync (fetch/merge base, full suite + build checks, push) for every
@@ -1857,7 +1884,7 @@ referenced. Per task:
 ```text
 ## <task title>
 - PR: <url> — checks: green | failing | none
-- Review: <N> round(s) — clean | open items: <list>
+- Review: <N> round(s), <M> counted — clean | open items: <list>
 - Models: impl <connector/model>, review <connector/model> — escalations:
   <none | what and why>
 - Screenshots: <run-dir>/<task-slug>/ (UI tasks only)
