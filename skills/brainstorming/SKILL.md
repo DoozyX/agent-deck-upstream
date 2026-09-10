@@ -47,6 +47,12 @@ Usually worth asking:
 - What breaks today that this needs to fix?
 - What must not change (behavior, interfaces, data)?
 - How is this expected to be verified — tests, manual check, both?
+- For feature work: what is the data model, and what are the contracts that
+  cross a component boundary (types, signatures, schemas, events, CLI flags,
+  API shapes)? Settle these here, in the design. A planner that later has to
+  ask a data-model question is a design gap, not a planning task — one run
+  spent two hours of planner, inspect and amend sessions re-deciding a
+  membership model the design had left open.
 
 ## 3. Approaches — 2–3, with trade-offs and a recommendation
 
@@ -70,6 +76,23 @@ justify each one.
 Present motivation, decisions, architecture, interfaces, and out-of-scope
 together in a skimmable document. Ask once: `Approve this design?` A single
 explicit approval covers all of those sections and the written document.
+
+For **feature work** (not a bug fix, not a one-file change) the design is a
+mini architecture plan, and three sections are mandatory, after Decisions:
+
+- `## Architecture` — components, their responsibilities, the data flow
+  between them, and which existing code each one touches.
+- `## Interfaces` — the concrete shared contracts, written out: short
+  signatures, schemas, message or event shapes, CLI/API surfaces, and the
+  settled data model. This is what a planner elaborates and an implementer
+  is held to; "similar to X" is not an interface.
+- `## Decomposition sketch` — ordered work units, one line each:
+  `- U<n> <title> — implements: <iface,...> depends: <U..> parallel-safe: yes|no`.
+  One unit means orchestrate launches one implementer and no planner; two or
+  more units, with every named interface defined above, means the planner
+  only elaborates them into task files and never re-decomposes.
+
+Bug fixes and one-file changes skip all three; say so in one line.
 
 Do not ask for per-section approvals. Ask again only if later self-review
 materially changes the approved scope: user-visible behavior, public
@@ -125,7 +148,11 @@ The file must exist and `status` must print nothing (ignored ⇒ invisible).
 Once written, read the document for placeholders (`TBD`, "etc.",
 "handle errors"), internal contradictions, scope creep past what was
 approved, and ambiguity a fresh reader would resolve differently than you
-meant. For contradictions, do a mechanical pass rather than a read-through:
+meant. For feature work, check that `## Architecture`, `## Interfaces` and
+`## Decomposition sketch` exist and that every interface a sketch unit names
+is defined in `## Interfaces` — a unit consuming an undefined contract is the
+gap the planner will have to invent around. For contradictions, do a
+mechanical pass rather than a read-through:
 list every named region, state, mode or component the spec defines, grep the
 document for each name, and confirm every mention agrees on its behavior. A
 design once said in prose that a region does *not* repeat a countdown while
@@ -145,9 +172,34 @@ After approval, size the work and take exactly one exit:
 
 - **Orchestrated** — several independent tasks, non-obvious decomposition, a
   dedicated PR pipeline, or separate executor/reviewer sessions are needed →
-  hand `$SPEC_PATH` (the absolute path, not the contents) to `orchestrate`. Do
-  not write the plan yourself: orchestrate's planner child writes it against
+  launch a **detached conductor** on `$SPEC_PATH` and hand this session back
+  to the user. Do not run `orchestrate` in this session: a conductor lives
+  for hours and would hold the user's session hostage for the whole run —
+  the user's next feature waits on this one's review rounds. Do not write
+  the plan yourself either: orchestrate's planner child writes it against
   the codebase.
+
+  ```bash
+  TOOL=$(agent-deck session show --json | jq -r '(.data // .).tool')   # same connector as this session
+  cat > "$RUN_ROOT/design/conductor-prompt.md" <<EOF
+  The approved design for this feature is at $SPEC_PATH — read it there by
+  absolute path; it is git-ignored on purpose. Run the \`orchestrate\` skill
+  on that path. You are the conductor and the root of your own session tree;
+  the design is approved, so never re-open it, and never brainstorm.
+  EOF
+  agent-deck launch "$ROOT_WT" -c "$TOOL" -t "conductor-$RUN_ID" --no-parent \
+    --message-file "$RUN_ROOT/design/conductor-prompt.md" --json \
+    | jq -r '(.data // .) | (.id // .session_id)' > "$RUN_ROOT/design/.conductor-id"
+  ```
+
+  `--no-parent` is the same mechanism `rotate-conductor.sh` uses for
+  successor conductors: the conductor is nobody's child, so the SessionStart
+  hook gives it the interactive preamble rather than the executor one, and
+  its questions never land in this session. Then print exactly one line and
+  end the turn — `conductor-<run-id> <id> launched; this session is free.
+  The run's questions surface as that session going \`waiting\` plus a
+  banner; attach to answer.` — and do not poll it. The user can start the
+  next brainstorm here immediately; each feature gets its own conductor.
 - **Focused** — an obvious, low-risk change, even across a few closely related
   files → implement in-session under `tdd`, then `verify` before claiming
   done. Multi-file alone does not require orchestration.

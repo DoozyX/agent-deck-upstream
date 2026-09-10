@@ -10,6 +10,13 @@ End your final message with the `===AGENTDECK_DONE=== status=<ok|fail>
 summary=<one line>` sentinel as the last line.
 
 Read the approved design at {{SPEC_PATH}} and explore the codebase as needed.
+If the design has a `## Decomposition sketch`, its units ARE your task list,
+in its order, with its `parallel-safe` marks and its `## Interfaces` as the
+shared contracts: elaborate each unit into a task (paths, verification,
+tier), do not re-decompose, do not reorder, do not redefine an interface. A
+unit you cannot elaborate is a design finding — stop and say so in one line
+for the user; do not improvise around it. Only a design without a sketch is
+decomposed by you.
 Write an implementation plan to {{TASK_DIR}}/plan.md:
 ordered, bite-sized tasks; per task: ownership and scope, relevant paths,
 dependencies and ordering, acceptance criteria, verification commands and

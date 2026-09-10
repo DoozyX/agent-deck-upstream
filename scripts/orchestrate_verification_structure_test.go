@@ -161,9 +161,10 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 			required: []string{"git merge-base main HEAD", "Review requirements block", "/tmp/orchestrate/review-r1.md"},
 		},
 		{
-			name: "review-incremental",
+			name: "review-round",
 			args: []string{
 				"AGENT_DECK_REPO=/tmp/agent-deck",
+				"BASE_REF=main",
 				"BASELINE=baseline: none",
 				"FOCUSED_TESTS=go test ./internal/usage",
 				"PREVIOUS_FINDINGS=One previous finding",
@@ -171,12 +172,13 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 				"SPEC_BLOCK=Review requirements block",
 				"VERDICT_FILE=/tmp/orchestrate/review-r2.md",
 			},
-			required: []string{"One previous finding", "git diff 0123456789abcdef...HEAD", "/tmp/orchestrate/review-r2.md"},
+			required: []string{"One previous finding", "git diff 0123456789abcdef...HEAD", "git diff main...HEAD", "/tmp/orchestrate/review-r2.md"},
 		},
 		{
 			name: "fix",
 			args: []string{
 				"FINDINGS=Fix this concrete finding",
+				"FOCUSED_TESTS=go test ./internal/usage",
 				"ROUND=2",
 			},
 			required: []string{"Review round 2", "Fix this concrete finding"},
@@ -298,8 +300,8 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 }
 
 // The review round overlaps its test run with its layers, runs focused tests
-// on incremental rounds, keeps the implementer alive for fix rounds, and
-// records per-round timing (design 2026-09-02-review-round-overlap).
+// in the foreground on later rounds, keeps the implementer alive for fix
+// rounds, and records per-round timing (design 2026-09-02-review-round-overlap).
 func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 	repoRoot := filepath.Clean("..")
 	promptDir := filepath.Join(repoRoot, "skills", "orchestrate", "references", "prompts")
@@ -348,21 +350,19 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"claims, not evidence",
 	})
 
-	incremental := render(t, "review-incremental",
-		"AGENT_DECK_REPO=/tmp/agent-deck", "BASELINE=baseline: none",
+	round := render(t, "review-round",
+		"AGENT_DECK_REPO=/tmp/agent-deck", "BASE_REF=main", "BASELINE=baseline: none",
 		"FOCUSED_TESTS=go test ./internal/usage", "PREVIOUS_FINDINGS=One previous finding",
 		"REVIEWED_SHA=0123456789abcdef", "SPEC_BLOCK=Review requirements block",
 		"VERDICT_FILE=/tmp/orchestrate/review-r2.md")
-	requireAll(t, "review-incremental", incremental, []string{
-		// D3: focused tests replace the suite on incremental rounds.
+	requireAll(t, "review-round", round, []string{
+		// D3 (superseded by 2026-09-10): focused tests run in the foreground,
+		// the full suite detached — a later round is full-branch and terminal.
 		"go test ./internal/usage",
-		"Do NOT run the full suite",
+		"Start the full suite FIRST, detached",
 		"Dispatch every layer in ONE message",
 		"Checked: tests focused cmd=",
 	})
-	if strings.Contains(incremental, "Run the test suite") {
-		t.Error("review-incremental still asks for the full test suite")
-	}
 
 	skillBytes, err := os.ReadFile(filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"))
 	if err != nil {
