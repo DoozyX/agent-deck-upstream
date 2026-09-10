@@ -3907,6 +3907,34 @@ func parsePSCommandNames(procTable []byte) map[int]string {
 	return commByPID
 }
 
+// parsePSProcessArgs reads `pid=,ppid=,args=` output into pid -> command
+// arguments. The process command may contain spaces, so everything after the
+// first two fields is retained as the command line.
+func parsePSProcessArgs(procTable []byte) (map[int]string, error) {
+	argsByPID := make(map[int]string)
+	var parseErr error
+	scanner := bufio.NewScanner(bytes.NewReader(procTable))
+	for line := 1; scanner.Scan(); line++ {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 3 {
+			parseErr = errors.Join(parseErr, fmt.Errorf("codex process probe: invalid ps args row %d: %q", line, scanner.Text()))
+			continue
+		}
+		pid, err := strconv.Atoi(fields[0])
+		if err != nil || pid <= 0 {
+			parseErr = errors.Join(parseErr, fmt.Errorf("codex process probe: invalid ps args pid on row %d: %q", line, fields[0]))
+			continue
+		}
+		ppid, err := strconv.Atoi(fields[1])
+		if err != nil || ppid < 0 {
+			parseErr = errors.Join(parseErr, fmt.Errorf("codex process probe: invalid ps args parent pid on row %d: %q", line, fields[1]))
+			continue
+		}
+		argsByPID[pid] = strings.Join(fields[2:], " ")
+	}
+	return argsByPID, errors.Join(parseErr, scanner.Err())
+}
+
 func collectProcessTreePIDsViaPgrep(rootPID int) ([]int, error) {
 	var (
 		allPIDs  []int
@@ -3955,6 +3983,26 @@ func isLikelyCodexProcessPID(pid int) (bool, error) {
 func (i *Instance) collectCodexProcessCandidates() ([]int, error) {
 	pids, probeErr := i.collectTmuxPaneProcessTreePIDs()
 	candidates := make([]int, 0, len(pids))
+	procTable, tableErr := loadCodexProcessTable()
+	if tableErr == nil {
+		argsByPID, parseErr := parsePSProcessArgs(procTable)
+		probeErr = errors.Join(probeErr, parseErr)
+		for _, pid := range pids {
+			args, ok := argsByPID[pid]
+			if !ok {
+				probeErr = errors.Join(probeErr, fmt.Errorf("codex process probe: pid %d missing from ps args table", pid))
+				continue
+			}
+			if strings.Contains(strings.ToLower(args), "codex") {
+				candidates = append(candidates, pid)
+			}
+		}
+		return candidates, probeErr
+	}
+
+	// Preserve the old per-PID inspection as a fallback when the shared
+	// process-table snapshot cannot be collected or parsed.
+	probeErr = errors.Join(probeErr, tableErr)
 	for _, pid := range pids {
 		likely, err := isLikelyCodexProcessPID(pid)
 		if err != nil {
@@ -4806,6 +4854,9 @@ func (i *Instance) DisplaySessionID() string {
 
 // CanRestartGeneric returns true if a custom tool can be restarted with session resume
 func (i *Instance) CanRestartGeneric() bool {
+	if isStaticBuiltinToolName(i.Tool) {
+		return false
+	}
 	toolDef := GetToolDef(i.Tool)
 	if toolDef == nil {
 		return false
@@ -6982,7 +7033,9 @@ func (i *Instance) UpdateStatus() error {
 				// instance. Without this, instances that share the same
 				// project_path can all claim the same Codex session file.
 				exclude := i.collectOtherCodexSessionIDs()
+				done := trace.phase(&trace.codex)
 				i.UpdateCodexSession(exclude)
+				done()
 			}
 
 			// Update OpenCode session tracking (non-blocking, best-effort).

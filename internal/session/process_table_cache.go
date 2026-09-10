@@ -44,7 +44,7 @@ func (c *processTableSnapshotCache) load(collect func() ([]byte, error)) ([]byte
 var (
 	codexProcessTableCache     = newProcessTableSnapshotCache(codexProcessTableSnapshotTTL)
 	codexProcessTableCollector = func() ([]byte, error) {
-		return exec.Command("ps", "-eo", "pid=,ppid=").Output()
+		return exec.Command("ps", "-eo", "pid=,ppid=,args=").Output()
 	}
 )
 

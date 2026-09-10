@@ -412,6 +412,27 @@ func TestIsCodexCompatible_CustomToolCommands(t *testing.T) {
 	}
 }
 
+func TestIsBuiltinToolNameCoversCanonicalTools(t *testing.T) {
+	want := make(map[string]struct{}, len(builtinTools()))
+	for _, tool := range builtinTools() {
+		want[tool.Name] = struct{}{}
+		if !IsBuiltinToolName(tool.Name) {
+			t.Errorf("IsBuiltinToolName(%q) = false, want true", tool.Name)
+		}
+	}
+	if len(staticBuiltinToolNames) != len(want) {
+		t.Fatalf("static builtin lookup has %d names, canonical source has %d", len(staticBuiltinToolNames), len(want))
+	}
+	for name := range staticBuiltinToolNames {
+		if _, ok := want[name]; !ok {
+			t.Errorf("static builtin lookup contains non-canonical tool %q", name)
+		}
+	}
+	if IsBuiltinToolName("custom-tool") {
+		t.Error("IsBuiltinToolName(custom-tool) = true, want false")
+	}
+}
+
 func TestCreateExampleConfigDocumentsCompatibleWith(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalHome := os.Getenv("HOME")

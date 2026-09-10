@@ -60,6 +60,22 @@ func TestInstanceSnapshotsPreserveEveryPersistedColumn(t *testing.T) {
 	}
 }
 
+func TestLoadRegistrySnapshotByArchiveSelectsOnePartition(t *testing.T) {
+	db := newTestDB(t)
+	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "active", Title: "active"}))
+	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "archived", Title: "archived", ArchivedAt: time.Unix(123, 0)}))
+
+	active, err := db.LoadRegistrySnapshotByArchive(false)
+	require.NoError(t, err)
+	require.Len(t, active.Instances, 1)
+	require.Equal(t, "active", active.Instances[0].ID)
+
+	archived, err := db.LoadRegistrySnapshotByArchive(true)
+	require.NoError(t, err)
+	require.Len(t, archived.Instances, 1)
+	require.Equal(t, "archived", archived.Instances[0].ID)
+}
+
 func TestInstanceSnapshotsToolDataAndAcknowledgement(t *testing.T) {
 	db := newTestDB(t)
 	require.NoError(t, db.SaveInstance(&InstanceRow{ID: "shared", Title: "original", ToolData: json.RawMessage(`{"notes":"old","custom":{"counter":9007199254740993},"codex_session_id":"kept"}`)}))

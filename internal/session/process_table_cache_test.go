@@ -57,3 +57,26 @@ func TestProcessTableSnapshotCacheCoalescesConcurrentReads(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePSProcessArgs(t *testing.T) {
+	procTable := []byte(" 100 1 /bin/bash -lc codex\n 200 100 /opt/codex/codex --foo\n 300 100 /bin/zsh\n")
+
+	got, err := parsePSProcessArgs(procTable)
+	if err != nil {
+		t.Fatalf("parsePSProcessArgs() error = %v", err)
+	}
+
+	want := map[int]string{
+		100: "/bin/bash -lc codex",
+		200: "/opt/codex/codex --foo",
+		300: "/bin/zsh",
+	}
+	if len(got) != len(want) {
+		t.Fatalf("parsePSProcessArgs() returned %d processes, want %d: %#v", len(got), len(want), got)
+	}
+	for pid, wantArgs := range want {
+		if gotArgs := got[pid]; gotArgs != wantArgs {
+			t.Errorf("parsePSProcessArgs()[%d] = %q, want %q", pid, gotArgs, wantArgs)
+		}
+	}
+}

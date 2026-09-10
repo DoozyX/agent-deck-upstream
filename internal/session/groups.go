@@ -1909,6 +1909,35 @@ func (t *GroupTree) DefaultPathForGroup(groupPath string) string {
 	return t.RecentSessionPathForGroup(groupPath)
 }
 
+// DefaultPathForDialog returns the same path preference for the TUI new-session
+// form without checking the filesystem or invoking git. Dialog opening is on
+// the input loop; the submit path performs the authoritative directory
+// validation. A path can therefore be displayed in its stored/derived form
+// immediately, even when the project lives on a slow or unavailable mount.
+func (t *GroupTree) DefaultPathForDialog(groupPath string) string {
+	group, exists := t.Groups[groupPath]
+	if !exists || group == nil {
+		return ""
+	}
+	if configured := strings.TrimSpace(group.DefaultPath); configured != "" {
+		if configured == "~" || strings.HasPrefix(configured, "~/") {
+			if home, err := os.UserHomeDir(); err == nil {
+				if configured == "~" {
+					return home
+				}
+				return filepath.Join(home, configured[2:])
+			}
+		}
+		if !filepath.IsAbs(configured) {
+			if absolute, err := filepath.Abs(configured); err == nil {
+				return absolute
+			}
+		}
+		return configured
+	}
+	return mostRecentPathForSessions(group.Sessions)
+}
+
 // SetDefaultPathForGroup sets (or clears) an explicit default path for a group.
 func (t *GroupTree) SetDefaultPathForGroup(groupPath, defaultPath string) bool {
 	group, exists := t.Groups[groupPath]
