@@ -1553,7 +1553,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 				launchMode = "isolated"
 			}
 			tmuxArgs = append(tmuxArgs, bashPath, "-c", launchAckScript,
-				"agent-deck-launch-ack", s.launchAckPath, launchMode, command, bashPath)
+				"agent-deck-launch-ack", s.launchAckPath, launchMode, command)
 		} else {
 			tmuxArgs = append(tmuxArgs, bashPath, "-c", command)
 		}
@@ -1631,7 +1631,7 @@ const launchAckDiagnosticLimit = 64 * 1024
 const launchAckScript = `ack_path="$1"
 launch_mode="$2"
 command="$3"
-bash_binary="${4:-bash}"
+bash_binary="${BASH:-bash}"
 output_path="${ack_path}.output"
 fifo_path="${ack_path}.fifo"
 capture_fifo_path="${ack_path}.capture-fifo"
