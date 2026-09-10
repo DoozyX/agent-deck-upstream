@@ -11021,7 +11021,7 @@ func (i *Instance) CanForkCodex() bool {
 		return false
 	}
 	sessionID, err := normalizeToolSessionID(FieldCodexSessionID, i.CodexSessionID)
-	return err == nil && sessionID != "" && sessionID == strings.TrimSpace(i.CodexSessionID) && codexRolloutExistsInHome(sessionID, i.getCodexHomeDir())
+	return err == nil && sessionID != "" && sessionID == strings.TrimSpace(i.CodexSessionID) && codexRolloutExistsForFork(sessionID, i.getCodexHomeDir())
 }
 
 // buildCodexForkCommandForTarget builds the one-time `codex fork <parent-sid>`
