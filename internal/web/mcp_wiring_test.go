@@ -80,22 +80,17 @@ func TestServer_MCPRoute_CredentialMatrix(t *testing.T) {
 		}
 	})
 
-	t.Run("correct bearer initializes", func(t *testing.T) {
-		rec := postMCP(t, h, MCPRoute, "Bearer "+wiringToken, mcpInitializeBody(), "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
-		}
-		if !strings.Contains(rec.Body.String(), `"protocolVersion"`) {
-			t.Fatalf("initialize body missing protocolVersion: %s", rec.Body.String())
-		}
-	})
-
-	t.Run("lowercase bearer initializes", func(t *testing.T) {
-		rec := postMCP(t, h, MCPRoute, "bearer "+wiringToken, mcpInitializeBody(), "")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
-		}
-	})
+	for _, scheme := range []string{"Bearer", "bearer", "BeArEr"} {
+		t.Run(scheme+" scheme initializes", func(t *testing.T) {
+			rec := postMCP(t, h, MCPRoute, scheme+" "+wiringToken, mcpInitializeBody(), "")
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), `"protocolVersion"`) {
+				t.Fatalf("initialize body missing protocolVersion: %s", rec.Body.String())
+			}
+		})
+	}
 }
 
 func TestServer_MCPRoute_UnavailableWithoutToken(t *testing.T) {
