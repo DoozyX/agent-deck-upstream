@@ -1,6 +1,7 @@
 package session
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 	"time"
 
 	"al.essio.dev/pkg/shellescape"
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 func seedCodexRollout(t *testing.T, codexHome, sid string) {
@@ -38,6 +40,49 @@ func TestCanForkCodex(t *testing.T) {
 	inst.CodexSessionID = "no-rollout-uuid"
 	if inst.CanForkCodex() {
 		t.Fatal("codex session without a rollout must NOT be forkable")
+	}
+}
+
+func TestPerf_CanForkCodexFleetIndexesRolloutsOnce(t *testing.T) {
+	testutil.SkipIfShort(t)
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+
+	// Mirror a long-lived Codex home: many dated directories and thousands of
+	// rollouts. None belongs to the fleet below, so a per-session wildcard scan
+	// pays the full tree walk for every row rendered by the TUI.
+	for day := 0; day < 160; day++ {
+		dir := filepath.Join(home, "sessions", "2026", fmt.Sprintf("%02d", day/31+1), fmt.Sprintf("%02d", day%31+1))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("mkdir rollout day: %v", err)
+		}
+		for file := 0; file < 20; file++ {
+			sid := fmt.Sprintf("%08x-2222-3333-4444-%012x", day, file)
+			path := filepath.Join(dir, "rollout-20260910T000000-"+sid+".jsonl")
+			if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
+				t.Fatalf("write rollout: %v", err)
+			}
+		}
+	}
+
+	instances := make([]*Instance, 64)
+	for n := range instances {
+		inst := NewInstanceWithTool("codex", "/tmp/project", "codex")
+		inst.CodexSessionID = fmt.Sprintf("%08x-aaaa-bbbb-cccc-%012x", n, n)
+		instances[n] = inst
+	}
+
+	start := time.Now()
+	for _, inst := range instances {
+		if inst.CanForkCodex() {
+			t.Fatalf("missing rollout for %q reported forkable", inst.CodexSessionID)
+		}
+	}
+	elapsed := time.Since(start)
+	budget := testutil.ColdBudget(t, 50*time.Millisecond)
+	t.Logf("64 Codex forkability checks: %v (budget %v)", elapsed, budget)
+	if elapsed > budget {
+		t.Fatalf("64 Codex forkability checks took %v, budget %v; rollout history was rescanned per session", elapsed, budget)
 	}
 }
 

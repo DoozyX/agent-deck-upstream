@@ -546,7 +546,13 @@ type Home struct {
 	lastAttachReturn   time.Time // When we returned from tea.Exec attach/detach
 	navigationHotUntil atomic.Int64
 	// Snapshot of status/tool used by render path to avoid per-row lock contention.
-	sessionRenderSnapshot atomic.Value // map[string]sessionRenderState
+	sessionRenderSnapshot        atomic.Value // map[string]sessionRenderState
+	sessionRenderSnapshotVersion atomic.Uint64
+	// Group header totals are derived from the render snapshot and group tree.
+	// View runs on every scroll event, so reuse these totals until either input
+	// changes. Owned by the Bubble Tea event loop; the snapshot version is the
+	// only cross-goroutine part of the cache key.
+	groupRenderStatsCache *groupRenderStatsCache
 	// viewTrace is owned by the Bubble Tea event-loop render call. It is only
 	// populated when debug logging is enabled, and lets the total view timing
 	// attribute time spent in the list, preview, layout, and final clamp paths.
@@ -3143,6 +3149,10 @@ func (h *Home) rebuildFlatItems() {
 }
 
 func (h *Home) rebuildFlatItemsAt(now time.Time) {
+	// Group membership and the rendered archive partition may have changed.
+	// Header totals are cheap to reuse between frames, but must be rebuilt after
+	// the flattened view's source tree changes.
+	h.groupRenderStatsCache = nil
 	h.nextTimeFilterExpiry = time.Time{}
 	h.jumpMode = false
 	h.jumpBuffer = ""
@@ -4223,7 +4233,20 @@ func (h *Home) applyRemoteFetch(msg remoteSessionsFetchedMsg) (tea.Model, tea.Cm
 			}
 		}
 	}
-	h.applyRemoteGroupLists(msg.gen, msg.groups, msg.groupsFailed, true)
+	groupsFailed := msg.groupsFailed
+	if len(msg.failed) > 0 {
+		// A failed session fetch cannot provide a trustworthy group list either.
+		// Preserve that remote's last-good folders during this partial round,
+		// while still allowing a fresh group result to win below.
+		groupsFailed = make(map[string]bool, len(msg.groupsFailed)+len(msg.failed))
+		for name, failed := range msg.groupsFailed {
+			groupsFailed[name] = failed
+		}
+		for name := range msg.failed {
+			groupsFailed[name] = true
+		}
+	}
+	h.applyRemoteGroupLists(msg.gen, msg.groups, groupsFailed, true)
 	for name := range msg.sessions {
 		if !msg.failed[name] {
 			delete(h.remoteFromCache, name)
@@ -6058,7 +6081,10 @@ func (h *Home) refreshSessionRenderSnapshot(instances []*session.Instance) {
 		}
 		snap[inst.ID] = state
 	}
+	// Store the complete snapshot before publishing its generation. View reads
+	// the generation first, so it never caches an older map under a newer key.
 	h.sessionRenderSnapshot.Store(snap)
+	h.sessionRenderSnapshotVersion.Add(1)
 }
 
 func (h *Home) getSessionRenderState(inst *session.Instance) sessionRenderState {
@@ -20007,8 +20033,9 @@ func (h *Home) renderSessionList(width, height int) (rendered string) {
 		maxVisible-- // Account for the indicator line
 	}
 
+	snapshotVersion := h.sessionRenderSnapshotVersion.Load()
 	snapshot := h.getSessionRenderSnapshot()
-	groupStats := h.buildGroupRenderStats(snapshot)
+	groupStats := h.buildGroupRenderStatsAt(snapshot, snapshotVersion)
 	var jumpHintByItemIndex map[int]string
 	if h.jumpMode {
 		selectable := selectableItemIndices(h.flatItems)
@@ -20070,7 +20097,25 @@ type groupRenderStats struct {
 	waiting      int
 }
 
+type groupRenderStatsCache struct {
+	snapshotVersion uint64
+	groupTree       *session.GroupTree
+	statusFilter    session.Status
+	stats           map[string]groupRenderStats
+}
+
 func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map[string]groupRenderStats {
+	return h.buildGroupRenderStatsAt(snapshot, h.sessionRenderSnapshotVersion.Load())
+}
+
+func (h *Home) buildGroupRenderStatsAt(snapshot map[string]sessionRenderState, version uint64) map[string]groupRenderStats {
+	if cache := h.groupRenderStatsCache; cache != nil &&
+		cache.snapshotVersion == version &&
+		cache.groupTree == h.groupTree &&
+		cache.statusFilter == h.statusFilter {
+		return cache.stats
+	}
+
 	stats := make(map[string]groupRenderStats)
 	if h.groupTree == nil {
 		return stats
@@ -20135,6 +20180,12 @@ func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map
 		}
 	}
 
+	h.groupRenderStatsCache = &groupRenderStatsCache{
+		snapshotVersion: version,
+		groupTree:       h.groupTree,
+		statusFilter:    h.statusFilter,
+		stats:           stats,
+	}
 	return stats
 }
 
