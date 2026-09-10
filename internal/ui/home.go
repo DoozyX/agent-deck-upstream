@@ -20104,6 +20104,85 @@ type groupRenderStatsCache struct {
 	stats           map[string]groupRenderStats
 }
 
+type previewLinesWindow struct {
+	lines            []string
+	truncatedFromTop bool
+	truncatedCount   int
+	scrolledBelow    int
+	offset           int
+}
+
+// previewLineWindow finds only the lines the preview can display. Terminal
+// captures can be large; splitting the entire capture on every scroll event
+// allocates one string entry per historical line even though only a screenful
+// is rendered.
+func previewLineWindow(content string, maxLines, offset int) previewLinesWindow {
+	if maxLines < 1 {
+		maxLines = 1
+	}
+
+	end := len(content)
+	for end > 0 {
+		start := strings.LastIndexByte(content[:end], '\n') + 1
+		if strings.TrimSpace(content[start:end]) != "" {
+			break
+		}
+		if start == 0 {
+			end = 0
+			break
+		}
+		end = start - 1
+	}
+	if end == 0 {
+		return previewLinesWindow{}
+	}
+
+	totalLines := strings.Count(content[:end], "\n") + 1
+	maxOffset := totalLines - maxLines
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	if offset < 0 {
+		offset = 0
+	} else if offset > maxOffset {
+		offset = maxOffset
+	}
+
+	visibleEnd := end
+	for range offset {
+		separator := strings.LastIndexByte(content[:visibleEnd], '\n')
+		if separator < 0 {
+			visibleEnd = 0
+			break
+		}
+		visibleEnd = separator
+	}
+
+	lines := make([]string, 0, min(maxLines, totalLines-offset))
+	cursor := visibleEnd
+	for cursor > 0 && len(lines) < maxLines {
+		separator := strings.LastIndexByte(content[:cursor], '\n')
+		lines = append(lines, content[separator+1:cursor])
+		if separator < 0 {
+			cursor = 0
+		} else {
+			cursor = separator
+		}
+	}
+	for left, right := 0, len(lines)-1; left < right; left, right = left+1, right-1 {
+		lines[left], lines[right] = lines[right], lines[left]
+	}
+
+	above := totalLines - offset - len(lines)
+	return previewLinesWindow{
+		lines:            lines,
+		truncatedFromTop: totalLines > maxLines,
+		truncatedCount:   above,
+		scrolledBelow:    offset,
+		offset:           offset,
+	}
+}
+
 func (h *Home) buildGroupRenderStats(snapshot map[string]sessionRenderState) map[string]groupRenderStats {
 	return h.buildGroupRenderStatsAt(snapshot, h.sessionRenderSnapshotVersion.Load())
 }
@@ -22582,17 +22661,13 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 		// This accounts for Claude sessions having more header lines than other sessions
 		currentContent := b.String()
 		headerLines := strings.Count(currentContent, "\n") + 1 // +1 for the current line
-		lines := strings.Split(preview, "\n")
-
-		// Strip trailing empty lines BEFORE truncation
-		// This ensures we show actual content, not empty trailing lines when space is limited
-		// (Terminal output often ends with empty lines at cursor position)
-		for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
-			lines = lines[:len(lines)-1]
+		maxLines := height - headerLines - 1                   // -1 for potential truncation indicator
+		if maxLines < 1 {
+			maxLines = 1
 		}
 
-		// If all lines were empty, show empty indicator
-		if len(lines) == 0 {
+		window := previewLineWindow(preview, maxLines, h.previewScrollOffset)
+		if len(window.lines) == 0 {
 			emptyTerm := lipgloss.NewStyle().
 				Foreground(ColorText).
 				Italic(true).
@@ -22600,49 +22675,16 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 			b.WriteString(emptyTerm)
 			return b.String()
 		}
-
-		maxLines := height - headerLines - 1 // -1 for potential truncation indicator
-		if maxLines < 1 {
-			maxLines = 1
-		}
-
-		// Track if we're truncating from the top (for indicator)
-		truncatedFromTop := len(lines) > maxLines
-		truncatedCount := 0
-		scrolledBelow := 0
-		if truncatedFromTop {
+		if window.truncatedFromTop {
 			// Reserve one line for the "⋮ N more above" indicator
 			maxLines--
 			if maxLines < 1 {
 				maxLines = 1
 			}
-			// #574: slide the visible window up by previewScrollOffset lines
-			// so the user can see older output instead of the tail. Clamp
-			// the offset to the valid range so arbitrary values don't go
-			// out of bounds or below zero.
-			maxOffset := len(lines) - maxLines
-			if maxOffset < 0 {
-				maxOffset = 0
-			}
-			if h.previewScrollOffset > maxOffset {
-				h.previewScrollOffset = maxOffset
-			}
-			if h.previewScrollOffset < 0 {
-				h.previewScrollOffset = 0
-			}
-			endIdx := len(lines) - h.previewScrollOffset
-			startIdx := endIdx - maxLines
-			if startIdx < 0 {
-				startIdx = 0
-			}
-			truncatedCount = startIdx
-			scrolledBelow = len(lines) - endIdx
-			lines = lines[startIdx:endIdx]
-		} else {
-			// Content fits without truncation — offset has no effect, keep state consistent.
-			h.previewScrollOffset = 0
+			window = previewLineWindow(preview, maxLines, h.previewScrollOffset)
 		}
-		_ = scrolledBelow // reserved for a future "⋮ N below" indicator; offset clamp already prevents stale state
+		h.previewScrollOffset = window.offset
+		lines := window.lines
 
 		maxWidth := width - 4
 		if maxWidth < 10 {
@@ -22650,11 +22692,11 @@ func (h *Home) renderPreviewPane(width, height int) (rendered string) {
 		}
 
 		// Show truncation indicator if content was cut from top
-		if truncatedFromTop {
+		if window.truncatedFromTop {
 			truncIndicator := lipgloss.NewStyle().
 				Foreground(ColorText).
 				Italic(true).
-				Render(fmt.Sprintf("⋮ %d more lines above", truncatedCount))
+				Render(fmt.Sprintf("⋮ %d more lines above", window.truncatedCount))
 			b.WriteString(truncIndicator)
 			b.WriteString("\n")
 		}
