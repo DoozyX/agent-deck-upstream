@@ -3212,6 +3212,28 @@ func TestStartCommandSpec_InitialProcess_ShellSyntaxValid(t *testing.T) {
 	}
 }
 
+func TestStartCommandSpec_InitialProcessUsesBashWhenPathIsMinimal(t *testing.T) {
+	minimalPath := t.TempDir()
+	t.Setenv("PATH", minimalPath)
+
+	s := &Session{
+		Name:                       "agentdeck_test_minimal_path",
+		WorkDir:                    "/tmp",
+		RunCommandAsInitialProcess: true,
+	}
+	_, args := s.startCommandSpec("/tmp", "sleep 30")
+	if len(args) < 3 {
+		t.Fatalf("startCommandSpec() returned too few args: %v", args)
+	}
+	bashPath := args[len(args)-3]
+	if !filepath.IsAbs(bashPath) {
+		t.Fatalf("initial process bash path = %q, want an absolute fallback when PATH omits bash", bashPath)
+	}
+	if err := exec.Command(bashPath, "-c", "exit 0").Run(); err != nil {
+		t.Fatalf("initial process bash fallback %q is not executable: %v", bashPath, err)
+	}
+}
+
 func TestWrapRespawnCommand_UsesBashRegardlessOfShellEnv(t *testing.T) {
 	t.Setenv("SHELL", "/usr/bin/fish")
 
