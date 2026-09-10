@@ -1543,6 +1543,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// pass through as the command argument verbatim — bash -c "bash -c '…'"
 		// tail-exec's the inner bash, so no extra lingering process and no
 		// re-escaping of the nested single quotes.
+		bashPath := initialProcessBashBinary()
 		if s.launchAckPath != "" {
 			// Keep the acknowledgement protocol out of the command string: both
 			// the marker path and user command are positional arguments, so an
@@ -1551,10 +1552,10 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 			if s.AllowInitialProcessExit {
 				launchMode = "isolated"
 			}
-			tmuxArgs = append(tmuxArgs, bashBinary, "-c", launchAckScript,
-				"agent-deck-launch-ack", s.launchAckPath, launchMode, command)
+			tmuxArgs = append(tmuxArgs, bashPath, "-c", launchAckScript,
+				"agent-deck-launch-ack", s.launchAckPath, launchMode, command, bashPath)
 		} else {
-			tmuxArgs = append(tmuxArgs, bashBinary, "-c", command)
+			tmuxArgs = append(tmuxArgs, bashPath, "-c", command)
 		}
 	}
 
@@ -1606,11 +1607,31 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	}
 }
 
+// initialProcessBashBinary returns a command name when Bash is discoverable
+// through PATH, preserving the normal argv contract. A minimal environment
+// can intentionally expose only the requested tool and tmux; in that case a
+// name-only "bash" makes the newly-created tmux server die before identity
+// capture. Use a stable system path for that case so session creation does not
+// depend on unrelated PATH entries.
+func initialProcessBashBinary() string {
+	if _, err := exec.LookPath(bashBinary); err == nil {
+		return bashBinary
+	}
+	for _, candidate := range []string{"/bin/bash", "/usr/bin/bash"} {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() && info.Mode()&0o111 != 0 {
+			return candidate
+		}
+	}
+	return bashBinary
+}
+
 const launchAckDiagnosticLimit = 64 * 1024
 
 const launchAckScript = `ack_path="$1"
 launch_mode="$2"
 command="$3"
+bash_binary="${4:-bash}"
 output_path="${ack_path}.output"
 fifo_path="${ack_path}.fifo"
 capture_fifo_path="${ack_path}.capture-fifo"
@@ -1627,10 +1648,10 @@ rm -f "$output_path" "$fifo_path" "$capture_fifo_path" "$marker_tmp"
 # output FIFO between the TUI and its PTY. Only one-shot commands use the
 # isolated diagnostic path below.
 if [ "$launch_mode" = "interactive" ]; then
-  printf 'pid:%s\n' "$$" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
-  bash -c "$command"
+  printf 'pid:%s\n' "$$" > "$ack_path"
+  "$bash_binary" -c "$command"
   exit_code=$?
-  printf 'exit:%s\n' "$exit_code" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
+  printf 'exit:%s\n' "$exit_code" > "$ack_path"
   exit "$exit_code"
 fi
 
@@ -1661,11 +1682,11 @@ tee_pid=$!
 # the direct child exits; tee still mirrors the complete direct-child stream to
 # the pane and records it for the completion marker.
 if command -v setsid >/dev/null 2>&1; then
-  setsid bash -c "$command" > "$fifo_path" 2>&1 &
+  setsid "$bash_binary" -c "$command" > "$fifo_path" 2>&1 &
 elif command -v perl >/dev/null 2>&1; then
-  perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV' bash -c "$command" > "$fifo_path" 2>&1 &
+  perl -MPOSIX -e 'POSIX::setsid() or die "setsid: $!"; exec @ARGV' "$bash_binary" -c "$command" > "$fifo_path" 2>&1 &
 else
-  bash -c "$command" > "$fifo_path" 2>&1 &
+  "$bash_binary" -c "$command" > "$fifo_path" 2>&1 &
 fi
 child_pid=$!
 printf 'pid:%s\n' "$child_pid" > "$marker_tmp" && mv -f "$marker_tmp" "$ack_path"
