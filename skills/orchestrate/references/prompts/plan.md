@@ -21,7 +21,17 @@ Write an implementation plan to {{TASK_DIR}}/plan.md:
 ordered, bite-sized tasks; per task: ownership and scope, relevant paths,
 dependencies and ordering, acceptance criteria, verification commands and
 required evidence, plus the interfaces later tasks rely on. Mark tasks that
-are safe to run in parallel only when ownership is disjoint. Tag every task
+are safe to run in parallel only when ownership is disjoint. Cut vertical
+slices — each task lands a thin end-to-end path that is green on its own —
+not horizontal layers that only work once every layer exists. Sequence a
+wide mechanical change (rename, retype, a call pattern migrated across many
+files) as expand → migrate → contract: one task adds the new shape beside the
+old, parallel-safe tasks migrate call sites in batches, one task removes the
+old shape and depends on every migrate task. Carry the design's
+`## Testing Decisions` (seam, prior-art tests) into each task's verification
+section instead of inventing a test strategy per task. If the design names
+ADR files under its `design/adr/` directory, the first task copies them to
+`docs/adr/` and commits them with its change. Tag every task
 with `tier: mid | strong` — mid when it needs only local judgment within a
 clear spec, strong when it settles a technical contract or makes a remaining
 implementation decision. There is no tier below mid: every executor still has

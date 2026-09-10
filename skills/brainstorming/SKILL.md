@@ -1,6 +1,6 @@
 ---
 name: brainstorming
-description: Collaborative design and brainstorming before any code is written — explores project context, asks one clarifying question at a time, offers 2–3 approaches with trade-offs, and writes an approved design document to its repository-local `.agent-deck/DATE-SLUG/design/` directory (git-ignored, never committed). Use before building a feature, adding functionality, or changing behavior, and whenever the user says "let's build", "I want to add", "how should we do X", or asks for a design or spec. Hard-gates implementation until the design is approved.
+description: Collaborative design and brainstorming before any code is written — explores project context, asks clarifying questions one frontier round at a time through the connector's native question tool, offers 2–3 approaches with trade-offs, and writes an approved design document to its repository-local `.agent-deck/DATE-SLUG/design/` directory (git-ignored, never committed). Use before building a feature, adding functionality, or changing behavior, and whenever the user says "let's build", "I want to add", "how should we do X", or asks for a design or spec. Hard-gates implementation until the design is approved.
 metadata:
   compatibility: "claude, opencode"
 ---
@@ -29,24 +29,61 @@ wrong one-liner.
 
 Before the first question: read the repo's `README`, `CLAUDE.md`/`AGENTS.md`,
 and `CONTRIBUTING.md`; look at how the nearest analogous feature is built.
-State what you found in a few lines.
+Then read the repo's run diary, `$ROOT_WT/.agent-deck/diary.md`, when it
+exists (`$ROOT_WT` is resolved in step 6): it holds the decisions, discarded
+approaches and lessons that earlier runs consolidated, so a trade-off settled
+last month is not re-litigated this month. Skim `docs/adr/` for standing
+decisions the same way. State what you found in a few lines.
 
 Questions asked without context waste the user's turns on things the repo
 already answers.
 
-## 2. Clarifying questions — one per message
+## 2. Clarifying questions — one frontier round at a time
 
-Ask the highest-leverage unknown, wait for the answer, then ask the next.
-A batch of five questions gets one merged answer that addresses two of
-them — the rest silently go unanswered. Stop asking once the remaining
-unknowns no longer change the shape of the design.
+Map the design as a tree of decisions. The **frontier** is every decision
+whose prerequisites are already settled; a question whose answer depends on
+another question still open belongs to a later round. Ask the whole frontier
+in one round, wait for the answers, then ask the next frontier.
 
-Usually worth asking:
+Deliver each round through the connector's native question tool — Claude:
+`AskUserQuestion` (up to four questions per call, each with 2–4 options, the
+recommended option first and labelled `(Recommended)`); Codex:
+`request_user_input`. The tool gives every question its own answer slot, so
+one merged reply can no longer swallow half the round. A frontier larger
+than one call is two calls, never a prose list. Without a native tool,
+number the questions in one message, put a recommended answer under each,
+and separate them with a rule, so the user can answer "1 yes, 2 as
+recommended, 3 the second option":
+
+```text
+❓ Q1 — <title>: <question>
+➡️ Recommended: <answer, one-line reason>
+---
+```
+
+Every question carries a recommendation. A user answering cold re-derives
+what you already know; a user confirming or overriding a recommendation
+spends one word.
+
+**Facts are your job; decisions are the user's.** A question whose answer
+lives in the environment — does the API already paginate, which table holds
+the flag, does CI run the e2e suite — is never asked. Dispatch an Explore
+agent (or read it yourself when it is one file) and put only the decision to
+the user. Questions downstream of the fact wait for it; the rest of the
+round does not.
+
+Stop when the frontier is empty: every branch of the tree visited, nothing
+left silently assumed. There is no cap on rounds — some designs need three
+questions, some need thirty — and there is no credit for finishing early
+with an assumption the user never saw.
+
+Usually on the frontier:
 
 - Who uses this, and how?
 - What breaks today that this needs to fix?
 - What must not change (behavior, interfaces, data)?
-- How is this expected to be verified — tests, manual check, both?
+- How is this expected to be verified — tests, manual check, both — and
+  through which seam (step 4)? What must a good test for this assert?
 - For feature work: what is the data model, and what are the contracts that
   cross a component boundary (types, signatures, schemas, events, CLI flags,
   API shapes)? Settle these here, in the design. A planner that later has to
@@ -71,11 +108,36 @@ question to answer out loud:
 *does any component here exist for a requirement nobody stated?* Cut or
 justify each one.
 
+Then the **seam check**: name the seam the tests drive the feature through —
+a CLI command, an HTTP handler, a package's exported function, a rendered
+component. Prefer an existing seam to a new one, the highest seam that still
+localises a failure, and ideally exactly one. A seam that exists only so a
+test can reach it is hypothetical: one adapter behind an interface means the
+interface was invented for the test; two real adapters mean the seam is real.
+Name the prior-art tests the new ones will be modelled on. Both answers go
+into `## Testing Decisions`.
+
 ## 5. Present the complete design, approve once
 
-Present motivation, decisions, architecture, interfaces, and out-of-scope
-together in a skimmable document. Ask once: `Approve this design?` A single
-explicit approval covers all of those sections and the written document.
+Present motivation, decisions, architecture, interfaces, testing decisions,
+and out-of-scope together in a skimmable document. Ask once: `Approve this
+design?` A single explicit approval covers all of those sections and the
+written document.
+
+For feature work the same approval turn carries the decomposition sketch's
+three checks, in the same native-tool call as the approval (or under it in
+prose): does the granularity feel right; does each unit depend only on units
+that genuinely gate it; should any unit be merged or split. An approval with
+no note on the checks approves the sketch as drawn.
+
+Every design, bug fix included, carries one section:
+
+- `## Testing Decisions` — the seam(s) from step 4, the prior-art tests new
+  tests are modelled on (by test name and package, not path), what a good
+  test for this feature asserts, and what is verified manually instead and
+  why. Reviewer and verify sessions are held to this section; without it
+  each one derives a different bar. For a bug fix it is the regression
+  test's seam, in two lines.
 
 For **feature work** (not a bug fix, not a one-file change) the design is a
 mini architecture plan, and three sections are mandatory, after Decisions:
@@ -85,14 +147,26 @@ mini architecture plan, and three sections are mandatory, after Decisions:
 - `## Interfaces` — the concrete shared contracts, written out: short
   signatures, schemas, message or event shapes, CLI/API surfaces, and the
   settled data model. This is what a planner elaborates and an implementer
-  is held to; "similar to X" is not an interface.
+  is held to; "similar to X" is not an interface. Write decisions, not
+  locations: names, signatures and schemas, never file paths or speculative
+  code — a path goes stale before the planner reads it, and the planner
+  finds the real one in the worktree. The one snippet that belongs here is
+  one that states a decision more precisely than prose can (a schema, a wire
+  format).
 - `## Decomposition sketch` — ordered work units, one line each:
   `- U<n> <title> — implements: <iface,...> depends: <U..> parallel-safe: yes|no`.
   One unit means orchestrate launches one implementer and no planner; two or
   more units, with every named interface defined above, means the planner
-  only elaborates them into task files and never re-decomposes.
+  only elaborates them into task files and never re-decomposes. Units are
+  vertical slices: each lands a thin end-to-end path (schema, logic, surface)
+  that is green on its own, not a horizontal layer that only works once every
+  other layer exists. A wide mechanical change — a rename, a retype, a call
+  pattern migrated across many files — is sequenced expand → migrate →
+  contract: one unit adds the new shape beside the old, parallel-safe units
+  migrate call sites in batches, and one unit removes the old shape and
+  depends on every migrate unit. A unit that commits an ADR (step 8) says so.
 
-Bug fixes and one-file changes skip all three; say so in one line.
+Bug fixes and one-file changes skip these three; say so in one line.
 
 Do not ask for per-section approvals. Ask again only if later self-review
 materially changes the approved scope: user-visible behavior, public
@@ -129,8 +203,10 @@ still fail the gate. `.probe` need not exist.
 this costs the user no commit.
 
 Never create a design, plan, task file, prompt, review, report, or retrospective
-outside `$RUN_ROOT`. The sole exception is source code checkout material, which
-belongs in the repository's `.worktrees/` directory.
+outside `$RUN_ROOT`. Two exceptions: source code checkout material, which
+belongs in the repository's `.worktrees/` directory, and the cross-run diary
+at `$ROOT_WT/.agent-deck/diary.md`, which only orchestrate's retrospective
+child writes.
 
 **Never `git add` the spec, and never verify it by looking for a commit.** Its
 absolute path is what makes it findable — downstream sessions in other
@@ -148,10 +224,12 @@ The file must exist and `status` must print nothing (ignored ⇒ invisible).
 Once written, read the document for placeholders (`TBD`, "etc.",
 "handle errors"), internal contradictions, scope creep past what was
 approved, and ambiguity a fresh reader would resolve differently than you
-meant. For feature work, check that `## Architecture`, `## Interfaces` and
-`## Decomposition sketch` exist and that every interface a sketch unit names
-is defined in `## Interfaces` — a unit consuming an undefined contract is the
-gap the planner will have to invent around. For contradictions, do a
+meant. Check that `## Testing Decisions` names a seam and a prior-art test rather
+than "add tests". For feature work, check that `## Architecture`,
+`## Interfaces` and `## Decomposition sketch` exist, that every interface a
+sketch unit names is defined in `## Interfaces` — a unit consuming an
+undefined contract is the gap the planner will have to invent around — and
+that no unit depends on a unit sequenced after it. For contradictions, do a
 mechanical pass rather than a read-through:
 list every named region, state, mode or component the spec defines, grep the
 document for each name, and confirm every mention agrees on its behavior. A
@@ -166,7 +244,27 @@ If self-review makes a material change to scope, user-visible behavior,
 interfaces, data handling, or an explicitly excluded item, stop and obtain
 one approval for that change before handing the spec on.
 
-## 8. Tiered exit
+## 8. Durable decisions (ADR)
+
+The design is scaffolding and dies with the run. Test each decision in it
+against three conditions; a decision that meets **all three** outlives the
+run as an ADR:
+
+- hard to reverse once code is built on it;
+- surprising to a reader who lacks this brainstorm's context;
+- the result of a real trade-off, not the only sensible option.
+
+An ADR is one paragraph — context, decision, the alternative rejected and
+why — destined for `docs/adr/NNNN-<slug>.md` in the repository, committed
+with the code. Write it to `$RUN_ROOT/design/adr/NNNN-<slug>.md` (this
+session sits in the primary checkout, which never takes tracked changes) and
+name it in the design: in `## Decomposition sketch` as
+`commits: adr/NNNN-<slug>.md → docs/adr/` on the first unit, or, for a design
+without a sketch, in one line under `## Decisions`. The implementer copies
+and commits it in its branch. Most designs produce zero ADRs; write none
+rather than one that fails a condition.
+
+## 9. Tiered exit
 
 After approval, size the work and take exactly one exit:
 
@@ -202,7 +300,8 @@ After approval, size the work and take exactly one exit:
   next brainstorm here immediately; each feature gets its own conductor.
 - **Focused** — an obvious, low-risk change, even across a few closely related
   files → implement in-session under `tdd`, then `verify` before claiming
-  done. Multi-file alone does not require orchestration.
+  done; any ADR from step 8 lands in the same commit under `docs/adr/`.
+  Multi-file alone does not require orchestration.
 - **Borderline →** ask **one** final question with your recommendation, and
   take the answer.
 
@@ -214,5 +313,7 @@ After approval, size the work and take exactly one exit:
 | "I'll design as I code" | That's implementation wearing a design costume. Stop and present first. |
 | "The spec dir is gitignored, I'll just keep it in the chat" | Chat isn't discoverable by the next session. Ignored is the point — write the file and hand on its absolute path. |
 | "Downstream sessions need it committed to see it" | They read it by absolute path from the root worktree. Committing it only puts scaffolding in someone's PR. |
-| "I'll ask all my questions at once to save time" | One merged answer covers two of five questions; the rest go unasked. |
+| "I'll ask all my questions at once to save time" | Ask the frontier, not the tree: a prose batch gets one merged answer that covers two of five; a native-tool round gives each question its own slot. |
+| "I'll just ask the user whether the API paginates" | That is a fact, not a decision. Look it up; ask only what the codebase cannot answer. |
+| "This trade-off is obvious, no ADR needed" | If it is obvious it fails the "surprising" condition and needs none. If a fresh reader would ask "why not the other way?", it passes, and the next brainstorm re-litigates it without one. |
 | "They said build it, so approval is implied" | "Build it" approved the idea, not the design. Present the complete design and get one explicit sign-off. |
