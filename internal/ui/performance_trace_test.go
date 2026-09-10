@@ -257,3 +257,38 @@ func BenchmarkHomeViewLargeSessionList(b *testing.B) {
 		_ = h.View()
 	}
 }
+
+// BenchmarkHomeRenderPreviewLargeHistory isolates the selected-preview work
+// that runs again when the list cursor moves. It keeps the history large enough
+// to expose accidental whole-scrollback scans without requiring a live tmux
+// server.
+func BenchmarkHomeRenderPreviewLargeHistory(b *testing.B) {
+	previousWorkers := homeBackgroundWorkersEnabled
+	homeBackgroundWorkersEnabled = false
+	b.Cleanup(func() { homeBackgroundWorkersEnabled = previousWorkers })
+
+	h := NewHome()
+	b.Cleanup(h.Close)
+	h.width = 120
+	h.height = 40
+	h.initialLoading = false
+	inst := session.NewInstanceWithTool("preview-session", "/tmp", "shell")
+	h.instances = []*session.Instance{inst}
+	h.instanceByID = map[string]*session.Instance{inst.ID: inst}
+	h.groupTree = session.NewGroupTree(h.instances)
+	h.rebuildFlatItems()
+	for i, item := range h.flatItems {
+		if item.Type == session.ItemTypeSession {
+			h.cursor = i
+			break
+		}
+	}
+	h.previewCache[inst.ID] = strings.Repeat("preview history line\n", 100000)
+	h.previewCacheTime[inst.ID] = time.Now()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		h.previewScrollOffset = i % 100
+		_ = h.renderPreviewPane(80, 30)
+	}
+}
