@@ -42,6 +42,13 @@ import (
 // What this deliberately does NOT do: claim the agent is working. The verdict is
 // "did not die within the window" — nothing more. The window rides in the JSON
 // next to the boolean so a caller can never read more into it than was measured.
+// A tool that renders a terminal error and keeps its pane up is alive by this
+// measure and would need the pane or transcript read to catch; the incident was
+// a death, and a death is what this observes.
+//
+// It is also never consulted on the queued-at-cap path, which returns before any
+// spawn: there is no session to watch, so that launch carries no liveness keys
+// at all.
 const (
 	// defaultLaunchAliveWindow is the post-spawn observation budget. The
 	// incident's death landed at ~+2.8s; 5s covers it with margin while keeping
@@ -93,8 +100,15 @@ type launchLiveness struct {
 	// WindowMS is the budget that was applied, published alongside Alive so a
 	// caller reads "survived 5s", never "healthy".
 	WindowMS int64
-	// ObservedMS is how long the check actually watched before deciding.
+	// ObservedMS is how long the check actually watched before deciding. It is
+	// watch-relative, NOT spawn-relative: PostStartSync and the session save run
+	// between the spawn and the first poll, so it can trail the real age of the
+	// process by seconds.
 	ObservedMS int64
+	// SpawnElapsedMS is the spawn-relative age of the death, taken from the
+	// fast-death record that observed it. 0 when no record explained the death,
+	// which is the only case where ObservedMS has to stand in for it.
+	SpawnElapsedMS int64
 	// Reason is the DOA classification; empty when Alive.
 	Reason string
 	// Detail is the tool's own dying output when the spawn-failure record
@@ -111,17 +125,31 @@ func (l launchLiveness) addTo(payload map[string]interface{}) {
 		return
 	}
 	payload["doa_reason"] = l.Reason
+	if l.SpawnElapsedMS > 0 {
+		payload["doa_elapsed_ms"] = l.SpawnElapsedMS
+	}
 	if l.Detail != "" {
 		payload["doa_detail"] = l.Detail
 	}
 }
 
 // message renders the human/error text for a DOA verdict.
+//
+// It quotes the spawn-relative age when the record carried one and otherwise
+// says plainly that the death happened somewhere inside the window. Printing
+// ObservedMS as "after launch" would be the same overclaim this whole change
+// exists to remove: it is measured from the first poll, not from the spawn.
 func (l launchLiveness) message(title string) string {
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "session %q died %dms after launch (reason: %s); "+
-		"the prompt was delivered but nothing ran it",
-		title, l.ObservedMS, l.Reason)
+	if l.SpawnElapsedMS > 0 {
+		fmt.Fprintf(&sb, "session %q died %dms after spawn (reason: %s); "+
+			"the prompt was delivered but nothing ran it",
+			title, l.SpawnElapsedMS, l.Reason)
+	} else {
+		fmt.Fprintf(&sb, "session %q died within the %dms liveness window (reason: %s); "+
+			"the prompt was delivered but nothing ran it",
+			title, l.WindowMS, l.Reason)
+	}
 	if l.Detail != "" {
 		sb.WriteString(": ")
 		sb.WriteString(firstLines(l.Detail, 3))
@@ -169,11 +197,12 @@ func confirmLaunchAlive(probe launchLivenessProbe, window, poll time.Duration) l
 	for {
 		if rec := probe.SpawnFailure(); rec != nil {
 			return launchLiveness{
-				Alive:      false,
-				WindowMS:   window.Milliseconds(),
-				ObservedMS: time.Since(start).Milliseconds(),
-				Reason:     rec.Reason,
-				Detail:     strings.TrimSpace(rec.DyingOutput),
+				Alive:          false,
+				WindowMS:       window.Milliseconds(),
+				ObservedMS:     time.Since(start).Milliseconds(),
+				SpawnElapsedMS: rec.ElapsedMs,
+				Reason:         rec.Reason,
+				Detail:         strings.TrimSpace(rec.DyingOutput),
 			}
 		}
 
