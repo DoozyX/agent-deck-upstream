@@ -529,6 +529,37 @@ func main() {
 		}
 	}
 
+	// The dispatch switch above has no default case, so until now an
+	// unrecognized token fell straight through into the bubbletea boot
+	// below. `agent-deck attach --help` did exactly that -- attach is
+	// `session attach`, not a top-level command -- and started a full TUI
+	// instead of printing help. Piped into `head -8` it had no visible
+	// output and no reachable quit key, so it ran 52 days at ~90% CPU,
+	// re-probing the configured remote over SSH the entire time (#stale-tui).
+	//
+	// `web` is exempt: it deliberately falls through to the TUI/server boot
+	// and parseWebCommandOptions has already validated its own flags.
+	if !webEnabled {
+		extra, wantHelp := residualTUIArgs(args)
+		if len(extra) > 0 {
+			writeUnknownCommandError(os.Stderr, extra)
+			os.Exit(1)
+		}
+		// Help alongside only TUI flags is still help, never a TUI boot.
+		if wantHelp {
+			printHelp()
+			return
+		}
+	}
+
+	// Refuse to boot a TUI that no human can see. This is the guard that
+	// would have stopped the process above even with the dispatch bug in
+	// place: its stdout was a pipe from the very first moment.
+	if headlessTUIRefused(stdinStdoutIsTerminal(), webHeadless, allowHeadlessTUI()) {
+		writeHeadlessTUIError(os.Stderr)
+		os.Exit(1)
+	}
+
 	// Every path that reaches this point boots the bubbletea TUI (which
 	// takes raw-mode ownership of stdin/stdout — term.IsTerminal stays true
 	// in raw mode, so a blocking synchronous read here would race the TUI's
