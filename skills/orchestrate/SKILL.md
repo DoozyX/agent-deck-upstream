@@ -1776,8 +1776,10 @@ Delete:
 
 **Never delete a needs-attention task's sessions** — those stay live and fully
 intact for inspection (see "Failure handling"). The rotating **conductor** is
-the one exception that still archives itself (`rotate-conductor.sh`), so the
-handoff chain stays readable after the run.
+the one exception that still archives itself (`rotate-conductor.sh`), and only
+once its successor has passed the liveness gate — a rotation that cannot bring
+up a live successor leaves the conductor unarchived. So the handoff chain stays
+readable after the run.
 
 ## Cleanup (successful tasks only)
 

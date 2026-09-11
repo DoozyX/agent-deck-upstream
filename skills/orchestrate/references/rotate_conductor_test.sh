@@ -89,7 +89,7 @@ FIXTURE
 chmod +x "$TMP/bin/agent-deck"
 export PATH="$TMP/bin:$PATH"
 
-# Fast timings. Production defaults are a 20s settle at 2s intervals; seven
+# Fast timings. Production defaults are a 20s settle at 2s intervals; nine
 # cases at that cadence is a two-minute test nobody runs.
 export ROTATE_LIVENESS_SETTLE=1
 export ROTATE_LIVENESS_INTERVAL=0.2
@@ -297,7 +297,45 @@ check_absent "never live: watchdog not repointed" "$RUN/.conductor-id"
 check_contains "never live: says the window expired" "never reached a live status"
 
 # ---------------------------------------------------------------------------
-# 6. Generation cap. Checked before anything is launched, so a capped run
+# 6. The successor is not in the deck at all: `session show` fails on every
+#    probe (no plan file, so the stub exits 2 the way the real CLI does for a
+#    not-found id). One failed read is tolerated as a startup blip; two in a
+#    row is a verdict.
+# ---------------------------------------------------------------------------
+setup_case
+run_rotate
+check_rc "gone: exit 4" 4
+check_contains "gone: says the successor is not in the deck" "not in the deck any more"
+check_absent "gone: no generation burned" "$RUN/.conductor-generation"
+check_absent "gone: watchdog not repointed" "$RUN/.conductor-id"
+check_absent "gone: no children re-parented" "$TMP/setparent.log"
+
+# ---------------------------------------------------------------------------
+# 7. Queued successor. `launch` into a group already at its max_concurrent cap
+#    STORES the session queued and never starts it — reachable precisely
+#    because the -g fix now puts the successor in the predecessor's group. A
+#    queued session supervises nothing, and a different tool cannot clear a
+#    group cap, so the retry must not fire.
+# ---------------------------------------------------------------------------
+setup_case
+cat > "$TMP/policy.json" <<'JSON'
+{"strategy":"default","fallback_tool":"codex"}
+JSON
+printf '%s\n' '{"id":"new-codex","status":"queued"}' > "$TMP/plan_new-codex"
+printf '%s\n' '{"id":"new-claude","status":"running","substate":"running"}' > "$TMP/plan_new-claude"
+run_rotate
+check_rc "queued: exit 4" 4
+check_contains "queued: names the group cap" "max_concurrent"
+check_absent "queued: watchdog not repointed" "$RUN/.conductor-id"
+check_absent "queued: no children re-parented" "$TMP/setparent.log"
+if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 1 ]; then
+  echo "ok   queued: no retry, a tool cannot clear a group cap"
+else
+  fail "queued: no retry, a tool cannot clear a group cap" "$(cat "$TMP/launch.log")"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Generation cap. Checked before anything is launched, so a capped run
 #    costs nothing.
 # ---------------------------------------------------------------------------
 setup_case
@@ -314,7 +352,7 @@ MAX_CONDUCTOR_GEN=3 run_rotate
 check_rc "cap: honours MAX_CONDUCTOR_GEN override" 3
 
 # ---------------------------------------------------------------------------
-# 7. The step-1 precondition still holds: no rotation into an empty handoff.
+# 9. The step-1 precondition still holds: no rotation into an empty handoff.
 # ---------------------------------------------------------------------------
 setup_case
 : > "$RUN/conductor-handoff.md"
