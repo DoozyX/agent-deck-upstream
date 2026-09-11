@@ -109,6 +109,9 @@ setup_case() {
   cp "$SCRIPT" "$RUN/rotate-conductor.sh"
   echo "manifest" > "$RUN/manifest.md"
   echo "handoff" > "$RUN/conductor-handoff.md"
+  # The run's goal, frozen at run start. A successor that is not handed this
+  # verbatim starts supervising a run it cannot describe.
+  printf '%s\n' '# Goal' 'Ship the widget: user asked for `X` with "quotes" and $dollars.' 'Done means: PR merged to develop.' > "$RUN/goal.md"
   # The gen-1 conductor of the incident: claude, in group ignitech/baba.
   cat > "$TMP/self.json" <<'JSON'
 {"id":"self-gen1","title":"orchestrate-c1","path":"/repo","group":"ignitech/baba","status":"running","tool":"claude"}
@@ -183,6 +186,22 @@ if log_has "$TMP/archive.log" "archive self-gen1"; then
   echo "ok   happy: self archived"
 else
   fail "happy: self archived" "$(cat "$TMP/archive.log" 2>/dev/null)"
+fi
+
+# The goal must reach the successor as text in the prompt it is launched on,
+# not as a path it may skip. Field observation: after rotation the goal was
+# reset/lost — the successor inherited task rows and a handoff but nothing
+# said what the run was for. Verbatim, so shell metacharacters survive.
+if grep -qF 'user asked for `X` with "quotes" and $dollars.' "$RUN/conductor-c2-prompt.md" &&
+   grep -qF 'Done means: PR merged to develop.' "$RUN/conductor-c2-prompt.md"; then
+  echo "ok   happy: goal inlined verbatim in successor prompt"
+else
+  fail "happy: goal inlined verbatim in successor prompt" "$(cat "$RUN/conductor-c2-prompt.md" 2>/dev/null)"
+fi
+if grep -q 'goal.md' "$RUN/conductor-c2-prompt.md"; then
+  echo "ok   happy: successor prompt names goal.md as the durable copy"
+else
+  fail "happy: successor prompt names goal.md as the durable copy"
 fi
 
 # Defect 2 regression: the predecessor's group must reach the launch. The old
@@ -359,6 +378,23 @@ setup_case
 run_rotate
 check_rc "empty handoff: exit 2" 2
 check_absent "empty handoff: nothing launched" "$TMP/launch.log"
+
+# ---------------------------------------------------------------------------
+# 10. No goal on disk, no rotation. Same cheap failure as the empty handoff:
+#     the conductor is still alive and can write the file and re-run.
+# ---------------------------------------------------------------------------
+setup_case
+rm -f "$RUN/goal.md"
+run_rotate
+check_rc "missing goal: exit 2" 2
+check_contains "missing goal: names the file" "goal.md"
+check_absent "missing goal: nothing launched" "$TMP/launch.log"
+
+setup_case
+: > "$RUN/goal.md"
+run_rotate
+check_rc "empty goal: exit 2" 2
+check_absent "empty goal: nothing launched" "$TMP/launch.log"
 
 [ "$fails" -eq 0 ] && { echo "PASS"; exit 0; }
 echo "$fails check(s) failed"
