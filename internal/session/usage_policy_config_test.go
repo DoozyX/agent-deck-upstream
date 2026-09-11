@@ -321,3 +321,75 @@ func TestLoadUserConfig_RejectsInvalidUsagePolicy(t *testing.T) {
 		})
 	}
 }
+
+func usagePolicyIntPtr(i int) *int       { return &i }
+func usagePolicyStrPtr(s string) *string { return &s }
+
+// SaveUserConfig re-encodes the WHOLE config, so the [usage.policy] mirror sits
+// on the ENCODE path too: a TUI action that saves for an unrelated reason must
+// not rewrite or drop the user's block. That path is the encoder plus
+// stripEmptyTOMLSections plus guardConfigSectionDrop, and nothing else
+// exercises it in this direction — every other usage.policy test only loads.
+//
+// The two cases carry the values a plain int/string could not express: an
+// explicit 0 threshold and an explicit empty ladder/frontier_window value on
+// one side, and omitted keys that must stay nil on the other.
+func TestSaveUserConfig_RoundTripsTheUsagePolicyBlock(t *testing.T) {
+	tests := []struct {
+		name   string
+		policy UsagePolicySettings
+	}{
+		{
+			name: "explicit zero and explicit empty values survive",
+			policy: UsagePolicySettings{
+				ExhaustedBelow:   usagePolicyIntPtr(0),
+				ConstrainedBelow: usagePolicyIntPtr(35),
+				Failover:         []string{"codex", "claude"},
+				Ladder: map[string]UsageLadderSettings{
+					"claude": {
+						Cheap:  usagePolicyStrPtr("haiku"),
+						Mid:    usagePolicyStrPtr("sonnet"),
+						Strong: usagePolicyStrPtr("opus"),
+						// An explicit empty value marks the tier unavailable;
+						// dropping it would silently re-enable the tier.
+						Frontier: usagePolicyStrPtr(""),
+					},
+					"codex": {Frontier: usagePolicyStrPtr("gpt-6-astra")},
+				},
+				// An empty window value means "no gate" and is equally load-bearing.
+				FrontierWindow: map[string]string{"claude": "fable", "codex": ""},
+			},
+		},
+		{
+			name: "omitted keys stay omitted",
+			policy: UsagePolicySettings{
+				ConstrainedBelow: usagePolicyIntPtr(50),
+				Ladder:           map[string]UsageLadderSettings{"claude": {Cheap: usagePolicyStrPtr("haiku")}},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			writeUsagePolicyConfig(t, "default_tool = \"claude\"\n")
+
+			cfg, err := LoadUserConfig()
+			if err != nil {
+				t.Fatalf("LoadUserConfig() error = %v", err)
+			}
+			cfg.Usage.Policy = tc.policy
+
+			if err := SaveUserConfig(cfg); err != nil {
+				t.Fatalf("SaveUserConfig() error = %v", err)
+			}
+			ClearUserConfigCache()
+
+			reloaded, err := LoadUserConfig()
+			if err != nil {
+				t.Fatalf("LoadUserConfig() after save error = %v", err)
+			}
+			if !reflect.DeepEqual(reloaded.Usage.Policy, tc.policy) {
+				t.Fatalf("Usage.Policy after save+reload = %#v, want %#v", reloaded.Usage.Policy, tc.policy)
+			}
+		})
+	}
+}

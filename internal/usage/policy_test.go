@@ -294,6 +294,16 @@ func TestPolicyFromConfig_RejectsInvalidValues(t *testing.T) {
 			wantErr:  `invalid [usage.policy].failover[0] "claude codex": must be a tool name without whitespace`,
 		},
 		{
+			// The failover guard is the fourth whitespace site and uses the
+			// same unicode.IsSpace predicate, so it needs the same non-space
+			// fixture: a tab is invisible in a config file and just as invalid
+			// in a tool name. Mirrors the loader's "failover entry containing a
+			// tab" row.
+			name:     "failover entry containing a tab",
+			settings: session.UsagePolicySettings{Failover: []string{"claude\tcodex"}},
+			wantErr:  `invalid [usage.policy].failover[0] "claude\tcodex": must be a tool name without whitespace`,
+		},
+		{
 			// A typo'd table name would otherwise discard the whole override
 			// and leave the defaults silently in place.
 			name: "unknown ladder table key",
@@ -308,6 +318,20 @@ func TestPolicyFromConfig_RejectsInvalidValues(t *testing.T) {
 				Ladder: map[string]session.UsageLadderSettings{"Claude": {Cheap: policyStrPtr("haiku")}},
 			},
 			wantErr: `invalid [usage.policy].ladder.Claude: unknown usage provider`,
+		},
+		{
+			// knownProvider's set is CLOSED, not merely typo-proof: a real tool
+			// name that has no usage provider must be rejected too. Widening
+			// the switch would otherwise admit it and leave a dead
+			// Policy.Ladder entry nothing reads — the silent no-op the check
+			// exists to prevent. The multi-key determinism rows below cannot
+			// catch that: they always report "Claude" first, so their other
+			// keys never reach the switch.
+			name: "ladder table key naming a tool that is not a usage provider",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"cursor": {Cheap: policyStrPtr("x")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.cursor: unknown usage provider`,
 		},
 		{
 			name:     "unknown frontier_window table key",
