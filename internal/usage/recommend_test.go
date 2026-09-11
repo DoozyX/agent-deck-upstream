@@ -521,6 +521,40 @@ func TestRecommend_NegativeRemainingIsAValueNotASentinel(t *testing.T) {
 	}
 }
 
+// -1 is BOTH the unknown sentinel and a reachable reading, so the two collide
+// in Alternative.RemainingPercent and only State tells them apart.
+func TestRecommend_NegativeOneCollidesWithTheUnknownSentinel(t *testing.T) {
+	policy := DefaultPolicy("claude")
+	policy.Failover = []string{"codex", "claude", "gemini"}
+	claudeAtNegativeOne := Snapshot{
+		Available: true, Provider: Claude, Account: "a", FetchedAt: recFetchedAt,
+		Windows: Windows{
+			Session5H: &Window{RemainingPercent: -1},
+			Weekly:    &Window{RemainingPercent: 80},
+		},
+	}
+	got := Recommend(
+		Request{Role: "planner", Tier: TierMid, Prefer: "codex"},
+		[]Snapshot{recSnapshot(Codex, "work", 90, 90, nil), claudeAtNegativeOne},
+		autoTools(), policy,
+	)
+	if got.Tool != "codex" {
+		t.Fatalf("Tool = %q, want codex (the only healthy candidate)", got.Tool)
+	}
+	want := []Alternative{
+		{Tool: "claude", State: StateExhausted, RemainingPercent: -1},
+		{Tool: "gemini", State: StateUnknown, RemainingPercent: -1},
+	}
+	if len(got.Alternatives) != len(want) {
+		t.Fatalf("Alternatives = %+v, want %+v", got.Alternatives, want)
+	}
+	for i := range want {
+		if got.Alternatives[i] != want[i] {
+			t.Errorf("Alternatives[%d] = %+v, want %+v", i, got.Alternatives[i], want[i])
+		}
+	}
+}
+
 func TestRecommend_FrontierGate(t *testing.T) {
 	basePolicy := func() Policy {
 		p := DefaultPolicy("claude")
@@ -597,6 +631,16 @@ func TestRecommend_FrontierGate(t *testing.T) {
 			models:    map[string]int{"fable": 9},
 			wantModel: "opus", wantTier: TierStrong,
 			wantReasons: []string{reasonFrontierNoModel, reasonFrontierGated},
+		},
+		{
+			// Both downgrade causes again, with the gate window ABSENT from
+			// Models rather than gating: the empty rung downgrades on its own
+			// and the absent gate is still reported alongside it.
+			name:      "empty-ladder-entry-and-an-absent-gate-window-report-both-causes",
+			mutate:    func(p *Policy) { p.Ladder[Claude] = Ladder{Cheap: "haiku", Mid: "sonnet", Strong: "opus"} },
+			models:    map[string]int{"spark": 1},
+			wantModel: "opus", wantTier: TierStrong,
+			wantReasons: []string{reasonFrontierNoModel, reasonFrontierGateAbsent},
 		},
 		{
 			name:      "no-gate-configured-keeps-frontier",
@@ -800,6 +844,34 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 	})
 }
 
+// Rule 3's tail takes the FIRST candidate that survives its eligibility
+// filter, not the last one it walks. This is the design's Motivation scenario —
+// both providers low — and it is the only shape that discriminates: claude and
+// codex are both exhausted, so neither is skipped as an ineligible unknown, and
+// the order of the candidate list is what decides.
+func TestRecommend_ExhaustedFallbackTakesTheFirstSurvivingCandidate(t *testing.T) {
+	policy := DefaultPolicy("claude")
+	policy.Failover = []string{"claude", "codex"}
+	got := Recommend(
+		Request{Role: "planner", Tier: TierMid, Prefer: "claude"},
+		[]Snapshot{
+			recSnapshot(Claude, "personal", 5, 90, nil),
+			recSnapshot(Codex, "work", 4, 90, nil),
+		},
+		autoTools(), policy,
+	)
+	if got.Tool != "claude" || got.State != StateExhausted {
+		t.Fatalf("Tool/State = %q/%q, want claude/exhausted (the first candidate, not the last)", got.Tool, got.State)
+	}
+	assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+	// The second candidate really did survive the filter — it is exhausted, not
+	// an ineligible unknown — so the first-wins ordering is what chose claude.
+	want := Alternative{Tool: "codex", State: StateExhausted, RemainingPercent: 4}
+	if len(got.Alternatives) != 1 || got.Alternatives[0] != want {
+		t.Errorf("Alternatives = %+v, want [%+v]", got.Alternatives, want)
+	}
+}
+
 func TestRecommend_ProfileSelectsSnapshot(t *testing.T) {
 	policy := DefaultPolicy("claude")
 	tools := autoTools()
@@ -938,6 +1010,24 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 		assertReason(t, got.Reason, []string{reasonNoCandidates})
 		if providers := ProvidersToQuery(req, tools, policy); len(providers) != 0 {
 			t.Errorf("ProvidersToQuery = %v, want none for the input whose decision names claude", providers)
+		}
+	})
+
+	// The collapsed path reaches the same divergence by the OTHER mechanism:
+	// the fallback tool is the sole candidate, but it maps to no usage provider
+	// and ProvidersToQuery omits such tools by design.
+	t.Run("collapsed-strategy-fallback-tool-with-no-provider-is-still-recommended", func(t *testing.T) {
+		tools := session.OrchestrateToolPolicy{
+			Strategy: "default", FallbackTool: "gemini", AvailableTools: []string{"claude", "codex", "gemini"},
+		}
+		policy := DefaultPolicy("claude")
+		req := Request{Role: "planner", Tier: TierMid}
+		got := Recommend(req, nil, tools, policy)
+		if got.Tool != "gemini" || got.State != StateUnknown {
+			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
+		}
+		if providers := ProvidersToQuery(req, tools, policy); len(providers) != 0 {
+			t.Errorf("ProvidersToQuery = %v, want none for the input whose decision names gemini", providers)
 		}
 	})
 
