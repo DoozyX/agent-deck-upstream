@@ -3,6 +3,8 @@ package usage
 import (
 	"encoding/json"
 	"fmt"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -431,8 +433,23 @@ func TestRecommend_StateUsesMinimumOfPresentWindows(t *testing.T) {
 		{"only-weekly-present", recSnapshot(Claude, "a", -1, 20, nil), StateConstrained, 20},
 		{"only-session-present", recSnapshot(Claude, "a", 20, -1, nil), StateConstrained, 20},
 		{"neither-window-present", recSnapshot(Claude, "a", -1, -1, map[string]int{"fable": 90}), StateUnknown, -1},
-		{"unavailable-snapshot", Snapshot{Provider: Claude, Account: "a", Available: false}, StateUnknown, -1},
+		{
+			// recSnapshot cannot express this: it hard-codes Available: true.
+			// The windows are deliberately populated and exhausted, so the row
+			// fails if the Available guard is deleted instead of passing via
+			// the "no window present" path.
+			"unavailable-snapshot",
+			Snapshot{Provider: Claude, Account: "a", Available: false, Windows: Windows{
+				Session5H: &Window{RemainingPercent: 5},
+				Weekly:    &Window{RemainingPercent: 5},
+			}},
+			StateUnknown, -1,
+		},
 	}
+
+	// A healthy codex snapshot keeps codex the selected tool on every row, so
+	// claude is always an alternative and wantRemaining is always asserted.
+	codexHealthy := recSnapshot(Codex, "work", 90, 90, nil)
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -445,12 +462,60 @@ func TestRecommend_StateUsesMinimumOfPresentWindows(t *testing.T) {
 			}
 			alts := Recommend(
 				Request{Role: "planner", Tier: TierMid, Prefer: "codex"},
-				[]Snapshot{tc.snapshot}, autoTools(), policy,
+				[]Snapshot{tc.snapshot, codexHealthy}, autoTools(), policy,
 			).Alternatives
+			found := false
 			for _, alt := range alts {
-				if alt.Tool == "claude" && alt.RemainingPercent != tc.wantRemaining {
+				if alt.Tool != "claude" {
+					continue
+				}
+				found = true
+				if alt.RemainingPercent != tc.wantRemaining {
 					t.Errorf("alternative remaining = %d, want %d", alt.RemainingPercent, tc.wantRemaining)
 				}
+				if alt.State != tc.wantState {
+					t.Errorf("alternative state = %q, want %q", alt.State, tc.wantState)
+				}
+			}
+			if !found {
+				t.Fatalf("Alternatives = %+v, want claude among them", alts)
+			}
+		})
+	}
+}
+
+// A negative RemainingPercent is a legitimate value, not the "no window seen
+// yet" sentinel: parseWindow never clamps, so the minimum must still be taken
+// over the windows PRESENT. recSnapshot cannot express this — it reads a
+// negative as "window absent" — so the snapshots are built by hand.
+func TestRecommend_NegativeRemainingIsAValueNotASentinel(t *testing.T) {
+	policy := DefaultPolicy("claude")
+	tools := autoTools()
+	tools.AvailableTools = []string{"claude"}
+
+	tests := []struct {
+		name              string
+		session5h, weekly int
+	}{
+		{"session-window-is-negative", -5, 80},
+		{"weekly-window-is-negative", 80, -5},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := Snapshot{
+				Available: true, Provider: Claude, Account: "a", FetchedAt: recFetchedAt,
+				Windows: Windows{
+					Session5H: &Window{RemainingPercent: tc.session5h},
+					Weekly:    &Window{RemainingPercent: tc.weekly},
+				},
+			}
+			got := Recommend(
+				Request{Role: "planner", Tier: TierMid, Prefer: "claude"},
+				[]Snapshot{snapshot}, tools, policy,
+			)
+			if got.State != StateExhausted {
+				t.Errorf("State = %q, want exhausted: -5 is the minimum and is below exhausted_below", got.State)
 			}
 		})
 	}
@@ -523,6 +588,15 @@ func TestRecommend_FrontierGate(t *testing.T) {
 			models:    map[string]int{"fable": 90},
 			wantModel: "", wantTier: TierStrong,
 			wantReasons: []string{reasonFrontierNoModel},
+		},
+		{
+			// Both downgrade causes hold at once: the reason must name both,
+			// not return on the first one it finds.
+			name:      "empty-ladder-entry-and-a-gating-window-report-both-causes",
+			mutate:    func(p *Policy) { p.Ladder[Claude] = Ladder{Cheap: "haiku", Mid: "sonnet", Strong: "opus"} },
+			models:    map[string]int{"fable": 9},
+			wantModel: "opus", wantTier: TierStrong,
+			wantReasons: []string{reasonFrontierNoModel, reasonFrontierGated},
 		},
 		{
 			name:      "no-gate-configured-keeps-frontier",
@@ -599,6 +673,9 @@ func TestRecommend_TierFloor(t *testing.T) {
 	}{
 		{"implementer-cheap-is-raised", "implementer", TierCheap, TierMid, "sonnet", true, []string{reasonTierFloor}},
 		{"reviewer-cheap-is-raised", "reviewer", TierCheap, TierMid, "sonnet", true, []string{reasonTierFloor}},
+		// The role match is case-insensitive, so a caller constructing the
+		// Request in Go cannot miss the floor by capitalising the role.
+		{"mixed-case-implementer-cheap-is-raised", "Implementer", TierCheap, TierMid, "sonnet", true, []string{reasonTierFloor}},
 		{"planner-cheap-is-not-raised", "planner", TierCheap, TierCheap, "haiku", false, nil},
 		{"empty-role-cheap-is-not-raised", "", TierCheap, TierCheap, "haiku", false, nil},
 		{"implementer-mid-is-unchanged", "implementer", TierMid, TierMid, "sonnet", false, nil},
@@ -694,6 +771,19 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
 	})
 
+	// Failover entries are matched after trimming, so an entry that survived
+	// shape-only validation with surrounding whitespace still matches.
+	t.Run("a-failover-entry-with-surrounding-whitespace-still-matches", func(t *testing.T) {
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
+			[]Snapshot{claudeExhausted}, autoTools(), policyWith(" gemini "),
+		)
+		if got.Tool != "gemini" || got.State != StateUnknown {
+			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonUnknownFailover})
+	})
+
 	t.Run("not-listed-in-failover-is-never-selected", func(t *testing.T) {
 		got := Recommend(
 			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
@@ -742,7 +832,53 @@ func TestRecommend_ProfileSelectsSnapshot(t *testing.T) {
 		if got.Account != "" {
 			t.Errorf("Account = %q, want empty", got.Account)
 		}
-		assertReason(t, got.Reason, []string{"nope"})
+		assertReason(t, got.Reason, []string{reasonProfileMiss, "nope"})
+		// The constant's WORDING, pinned literally: an assertion written in
+		// terms of the constant moves with it and cannot catch a reword.
+		if want := `no snapshot for profile "nope"`; !strings.Contains(got.Reason, want) {
+			t.Errorf("Reason = %q, want it to contain %q", got.Reason, want)
+		}
+	})
+
+	// The clause is not provider-scoped: a tool with no usage provider has no
+	// snapshot for any profile, and a named profile must still leave a trace.
+	t.Run("unmatched-profile-on-a-tool-with-no-usage-provider-says-so", func(t *testing.T) {
+		p := DefaultPolicy("claude")
+		p.Failover = []string{"gemini"}
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "gemini", Profile: "work"},
+			snapshots, autoTools(), p,
+		)
+		if got.Tool != "gemini" || got.State != StateUnknown {
+			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonProfileMiss, "work"})
+	})
+
+	// Sorting is case-insensitive, matching DedupeAndSortAccounts: lowercased,
+	// "personal" sorts before "Work"; by raw bytes it would not.
+	t.Run("empty-profile-sorts-accounts-case-insensitively", func(t *testing.T) {
+		mixed := []Snapshot{
+			recSnapshot(Claude, "Work", 90, 90, nil),
+			recSnapshot(Claude, "personal", 5, 90, nil),
+		}
+		got := Recommend(Request{Role: "planner", Tier: TierMid, Prefer: "claude"}, mixed, tools, policy)
+		if got.Account != "personal" || got.State != StateExhausted {
+			t.Fatalf("Account/State = %q/%q, want personal/exhausted", got.Account, got.State)
+		}
+	})
+
+	// Accounts that differ only by case are ordered by the raw label, so the
+	// comparison is total and the result does not depend on input order.
+	t.Run("accounts-differing-only-by-case-break-the-tie-on-the-raw-label", func(t *testing.T) {
+		cased := []Snapshot{
+			recSnapshot(Claude, "dev", 90, 90, nil),
+			recSnapshot(Claude, "Dev", 5, 90, nil),
+		}
+		got := Recommend(Request{Role: "planner", Tier: TierMid, Prefer: "claude"}, cased, tools, policy)
+		if got.Account != "Dev" || got.State != StateExhausted {
+			t.Fatalf("Account/State = %q/%q, want Dev/exhausted", got.Account, got.State)
+		}
 	})
 }
 
@@ -901,8 +1037,14 @@ func TestProvidersToQuery_AgreesWithRecommendCandidates(t *testing.T) {
 			if len(candidates) > 0 {
 				considered = append(considered, decision.Tool)
 			}
-			if len(considered) != len(candidates) {
-				t.Fatalf("Recommend considered %v, candidates are %v", considered, candidates)
+			// Compare the SETS, not just their sizes: two different tool sets
+			// of equal length would otherwise pass, as would the empty case.
+			wantConsidered := make([]string, 0, len(candidates))
+			wantConsidered = append(wantConsidered, candidates...)
+			sort.Strings(considered)
+			sort.Strings(wantConsidered)
+			if !reflect.DeepEqual(considered, wantConsidered) {
+				t.Fatalf("Recommend considered %v, candidates are %v", considered, wantConsidered)
 			}
 		})
 	}
