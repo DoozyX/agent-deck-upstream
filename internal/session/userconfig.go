@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 
@@ -214,6 +215,10 @@ type UserConfig struct {
 	// Orchestrate defines tool-selection policy for the orchestrate workflow.
 	Orchestrate OrchestrateSettings `toml:"orchestrate,omitempty"`
 
+	// Usage defines the usage-aware tool/model selection policy. Every key is
+	// optional; see UsagePolicySettings.
+	Usage UsageSettings `toml:"usage,omitempty"`
+
 	// Tmux defines tmux option overrides applied to every session
 	Tmux TmuxSettings `toml:"tmux,omitempty"`
 
@@ -280,6 +285,87 @@ type UserConfig struct {
 // child sessions. An empty strategy preserves the workflow's legacy defaults.
 type OrchestrateSettings struct {
 	ToolStrategy string `toml:"tool_strategy,omitempty"`
+}
+
+// UsageSettings is the [usage] config block. It is a plain TOML mirror: the
+// resolved policy type lives in internal/usage, which imports this package.
+// Nothing here may reference internal/usage — the import direction is
+// usage -> session only.
+type UsageSettings struct {
+	Policy UsagePolicySettings `toml:"policy,omitempty"`
+}
+
+// UsagePolicySettings mirrors [usage.policy]. Every key is optional and an
+// omitted key keeps its default, so the pointer fields are load-bearing: they
+// distinguish "the user did not set this" from a meaningful zero value. An
+// explicit exhausted_below = 0 is in range, and an explicit empty ladder entry
+// means "this tier is unavailable on that provider" — neither can be expressed
+// with a plain int/string. GroupDefaults.MaxConcurrent uses the same *int
+// pattern for the same reason.
+//
+// The loader validates shape only (see validateUsagePolicySettings); merging
+// these values onto the defaults, and validating the merged result, is
+// usage.PolicyFromConfig's job.
+type UsagePolicySettings struct {
+	// ExhaustedBelow and ConstrainedBelow are remaining-percent thresholds,
+	// integers 0-100 with ExhaustedBelow <= ConstrainedBelow.
+	ExhaustedBelow   *int `toml:"exhausted_below,omitempty"`
+	ConstrainedBelow *int `toml:"constrained_below,omitempty"`
+
+	// Failover is the tool-name order tried after the preferred tool. Entries
+	// are validated by shape only: a tool with no usage provider is legal and
+	// resolves to the "unknown" state at recommendation time.
+	Failover []string `toml:"failover,omitempty"`
+
+	// Ladder maps a provider name to its cheap/mid/strong/frontier models.
+	Ladder map[string]UsageLadderSettings `toml:"ladder,omitempty"`
+
+	// FrontierWindow maps a provider name to the per-model usage window that
+	// gates its frontier tier. An empty value means no gate.
+	FrontierWindow map[string]string `toml:"frontier_window,omitempty"`
+}
+
+// UsageLadderSettings mirrors [usage.policy.ladder.<provider>]. A nil field is
+// an omitted key (keep the default); a non-nil empty string marks the tier
+// unavailable on that provider.
+type UsageLadderSettings struct {
+	Cheap    *string `toml:"cheap,omitempty"`
+	Mid      *string `toml:"mid,omitempty"`
+	Strong   *string `toml:"strong,omitempty"`
+	Frontier *string `toml:"frontier,omitempty"`
+}
+
+// validateUsagePolicySettings rejects a malformed [usage.policy] block. It is
+// deliberately I/O-free and registry-free: LoadUserConfig is an mtime-cached
+// loader doing pure string checks, and probing the tool registry would make
+// config validity depend on what happens to be on PATH.
+func validateUsagePolicySettings(p UsagePolicySettings) error {
+	if err := validateUsagePolicyThreshold("exhausted_below", p.ExhaustedBelow); err != nil {
+		return err
+	}
+	if err := validateUsagePolicyThreshold("constrained_below", p.ConstrainedBelow); err != nil {
+		return err
+	}
+	if p.ExhaustedBelow != nil && p.ConstrainedBelow != nil && *p.ExhaustedBelow > *p.ConstrainedBelow {
+		return fmt.Errorf("invalid [usage.policy].exhausted_below %d: must be <= constrained_below %d",
+			*p.ExhaustedBelow, *p.ConstrainedBelow)
+	}
+	for i, entry := range p.Failover {
+		if entry == "" || strings.ContainsFunc(entry, unicode.IsSpace) {
+			return fmt.Errorf("invalid [usage.policy].failover[%d] %q: must be a tool name without whitespace", i, entry)
+		}
+	}
+	return nil
+}
+
+func validateUsagePolicyThreshold(key string, value *int) error {
+	if value == nil {
+		return nil
+	}
+	if *value < 0 || *value > 100 {
+		return fmt.Errorf("invalid [usage.policy].%s %d: must be between 0 and 100", key, *value)
+	}
+	return nil
 }
 
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
@@ -3593,6 +3679,14 @@ func LoadUserConfig() (*UserConfig, error) {
 		userConfigCacheMtime = currentMtime
 		SetGroupSortMode(fresh.GetGroupSort())
 		userConfigCacheErr = fmt.Errorf("invalid [orchestrate].tool_strategy %q: must be \"default\" or \"auto\"", strategy)
+		return userConfigCache, userConfigCacheErr
+	}
+	if err := validateUsagePolicySettings(config.Usage.Policy); err != nil {
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
+		userConfigCacheMtime = currentMtime
+		SetGroupSortMode(fresh.GetGroupSort())
+		userConfigCacheErr = err
 		return userConfigCache, userConfigCacheErr
 	}
 	if alternate := strings.TrimSpace(config.QuickCreate.AlternateTool); alternate != "" {
