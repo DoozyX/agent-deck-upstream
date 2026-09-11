@@ -33,7 +33,10 @@ type Request struct {
 	// Role is free text. "implementer" and "reviewer" trigger the mid floor.
 	Role string
 	Tier Tier
-	// Prefer is a tool name; empty means Policy.Failover[0].
+	// Prefer is a tool name. Empty means Policy.Failover[0] under the "auto"
+	// tool strategy; under "default" or an empty strategy it means
+	// OrchestrateToolPolicy.FallbackTool, because that strategy drops the
+	// failover list entirely. See candidateTools.
 	Prefer string
 	// Profile is an account label; empty means the first snapshot for the
 	// provider in sorted order.
@@ -93,9 +96,11 @@ func toolProvider(tool string) (Provider, bool) {
 	}
 }
 
-// preferredTool resolves Request.Prefer, defaulting to Policy.Failover[0]. A
-// zero-value Policy has no Failover, so the empty result is possible and every
-// caller must tolerate it.
+// preferredTool resolves Request.Prefer for the "auto" strategy, defaulting to
+// Policy.Failover[0]. A zero-value Policy has no Failover, so the empty result
+// is possible and every caller must tolerate it. The collapsed strategies
+// resolve their own preferred tool inside candidateTools; nothing outside that
+// function may assume this is the prefer a decision was made against.
 func preferredTool(req Request, policy Policy) string {
 	if prefer := strings.TrimSpace(req.Prefer); prefer != "" {
 		return prefer
@@ -113,10 +118,17 @@ func preferredTool(req Request, policy Policy) string {
 // exists, so nothing state-dependent (the unknown-state eligibility filter, the
 // healthy-first ordering) may live here — that work happens in Recommend.
 //
-// The second result reports that the tool strategy limited failover to a single
-// tool, which the decision's reason records.
-func candidateTools(req Request, tools session.OrchestrateToolPolicy, policy Policy) (candidates []string, limited bool) {
-	prefer := preferredTool(req, policy)
+// The second result is the preferred tool AS THIS FUNCTION RESOLVED IT, which
+// is not always preferredTool's answer: the collapsed strategies prefer
+// OrchestrateToolPolicy.FallbackTool, not Policy.Failover[0]. Recommend must
+// use this value and not re-derive one, or the two disagree (the rule 3
+// carve-out then compares against a tool that is not a candidate).
+//
+// The third result reports that the tool strategy limited failover to a single
+// tool, which the decision's reason records. It is false when the strategy
+// produced no candidate at all: "no candidate tools" and "policy limited
+// failover" are contradictory as a pair, and the first is the whole story.
+func candidateTools(req Request, tools session.OrchestrateToolPolicy, policy Policy) (candidates []string, prefer string, limited bool) {
 	strategy := strings.TrimSpace(tools.Strategy)
 
 	if strategy != "auto" {
@@ -124,18 +136,20 @@ func candidateTools(req Request, tools session.OrchestrateToolPolicy, policy Pol
 		// the collapsed candidate as "[Prefer] if set, else FallbackTool", so
 		// an unset Prefer yields the orchestrate fallback tool here rather than
 		// Failover[0] — the failover list is exactly what this strategy drops.
+		// There is deliberately no third fallback: with neither Prefer nor
+		// FallbackTool set this strategy has nothing to name, and reaching for
+		// Failover[0] would smuggle back the list it just dropped.
 		single := strings.TrimSpace(req.Prefer)
 		if single == "" {
 			single = strings.TrimSpace(tools.FallbackTool)
 		}
 		if single == "" {
-			single = prefer
+			return nil, "", false
 		}
-		if single == "" {
-			return nil, true
-		}
-		return []string{single}, true
+		return []string{single}, single, true
 	}
+
+	prefer = preferredTool(req, policy)
 
 	available := make(map[string]struct{}, len(tools.AvailableTools))
 	for _, tool := range tools.AvailableTools {
@@ -161,14 +175,14 @@ func candidateTools(req Request, tools session.OrchestrateToolPolicy, policy Pol
 	for _, tool := range policy.Failover {
 		add(tool)
 	}
-	return candidates, false
+	return candidates, prefer, false
 }
 
 // ProvidersToQuery returns the usage providers of the candidate tools, in
 // candidate order, de-duplicated, omitting tools that map to no usage provider.
 // The CLI uses it to decide what to fetch before it has any snapshot.
 func ProvidersToQuery(req Request, tools session.OrchestrateToolPolicy, policy Policy) []Provider {
-	candidates, _ := candidateTools(req, tools, policy)
+	candidates, _, _ := candidateTools(req, tools, policy)
 	var providers []Provider
 	seen := make(map[Provider]struct{}, len(candidates))
 	for _, tool := range candidates {
@@ -293,10 +307,20 @@ func eligibleUnknown(tool string, policy Policy) bool {
 // reading of the design: rule 3 lists "first healthy candidate" first, but
 // `## Decisions` scopes the carve-out as "avoided when a healthy candidate
 // exists, BUT a constrained preferred tool still wins for strong/frontier
-// tiers". The preferred tool is always first in the candidate list, so under
-// the literal ordering the carve-out could never change an outcome the
-// "first constrained candidate" step would not already produce — it would be
-// unreachable. This order is the only one in which it does work.
+// tiers". The invariant that makes the literal ordering dead code is that the
+// preferred tool is never anywhere but the FIRST position: candidateTools
+// either drops it (an "auto" strategy filtering it as unavailable) or puts it
+// at index 0. So under the literal ordering the carve-out could only ever
+// match candidates[0], which the "first constrained candidate" step already
+// returns — it would be unreachable. This order is the only one in which it
+// does work.
+//
+// prefer must be the value candidateTools RESOLVED, not preferredTool's, or
+// the invariant above does not hold: on the collapsed path with an empty
+// Request.Prefer the resolved tool is OrchestrateToolPolicy.FallbackTool while
+// preferredTool answers Policy.Failover[0], and the carve-out would then
+// compare against a tool that is not a candidate at all and silently fall
+// through to the weaker "first constrained candidate" rule.
 //
 // tier is the APPLIED tier: the implementer/reviewer floor is applied first, so
 // the carve-out sees the tier the launch will actually use. (The floor only
@@ -353,6 +377,19 @@ func ladderRung(ladder Ladder, tier Tier) string {
 // at ConstrainedBelow does not gate, matching the state comparison). A gate
 // window that is absent from Snapshot.Windows.Models does NOT gate, but the
 // reason records that so the user can see why the gate did not apply.
+//
+// Two carve-outs out of rule 5, both silent — they add no reason clause:
+//
+//   - A tool with NO usage provider (provider == "") has no ladder to read, so
+//     the model is empty and the requested tier echoes into TierApplied
+//     unchanged. A frontier request for such a tool therefore reports
+//     TierApplied == frontier with Model == "", where a real provider with an
+//     empty frontier rung would have reported strong. There is nothing to
+//     downgrade to and no evidence to downgrade on.
+//   - A Tier outside the four constants has no rung, so ladderRung returns ""
+//     and that tier echoes into TierApplied as well. The CLI rejects an
+//     unknown tier before it reaches here (exit 2), so this is reachable only
+//     through the exported Go API.
 func resolveModel(provider Provider, tier Tier, snapshot *Snapshot, policy Policy) (string, Tier, []string) {
 	if provider == "" {
 		return "", tier, nil
@@ -407,8 +444,7 @@ func applyTierFloor(role string, tier Tier) (Tier, string) {
 // and never panics on missing data — an absent snapshot, Available == false and
 // a tool with no usage provider all resolve to the unknown state.
 func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolPolicy, policy Policy) Decision {
-	prefer := preferredTool(req, policy)
-	candidates, limited := candidateTools(req, tools, policy)
+	candidates, prefer, limited := candidateTools(req, tools, policy)
 	profile := strings.TrimSpace(req.Profile)
 
 	// Rule 4 runs before rule 3 because the carve-out reads the applied tier.
@@ -419,14 +455,30 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 		evals = append(evals, evaluateTool(tool, snapshots, profile, policy))
 	}
 
-	// The tool rule 3's tail falls back to. It is the preferred tool whenever
-	// that tool is a candidate; when the preferred tool was filtered out (an
-	// "auto" strategy dropping it as unavailable, or a collapsed candidate list
-	// naming the fallback tool) the first candidate stands in, so the fallback
-	// never names a tool the policy already excluded.
+	// The tool rule 3's tail falls back to, in strict precedence:
+	//
+	//  1. the first candidate that is not an INELIGIBLE unknown — an exhausted
+	//     candidate outranks an unknown one that Policy.Failover does not list,
+	//     because selecting the latter would contradict rule 2's "not listed ->
+	//     never selected";
+	//  2. otherwise the resolved preferred tool.
+	//
+	// Step 2 is the design's "the preferred tool with State = exhausted"
+	// fallback, and it is reached both when there are no candidates at all and
+	// when every candidate is an ineligible unknown. The tool it names is NOT
+	// filtered against the orchestrate policy: it may be absent from
+	// AvailableTools, may itself be an ineligible unknown, and may have no
+	// snapshot. The consequence a caller must handle is that under
+	// Strategy "auto" ProvidersToQuery can return no providers for the very
+	// input whose decision names this tool, so a caller that fetches first will
+	// hold no snapshot for it.
 	lastResort := prefer
-	if len(candidates) > 0 {
-		lastResort = candidates[0]
+	for _, eval := range evals {
+		if eval.state == StateUnknown && !eligibleUnknown(eval.tool, policy) {
+			continue
+		}
+		lastResort = eval.tool
+		break
 	}
 
 	index, rule := selectCandidate(evals, prefer, applied, policy)
@@ -435,11 +487,12 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 	case index >= 0:
 		selected = evals[index]
 	case len(candidates) == 0:
-		// Nothing to choose from: report the preferred tool as computed.
+		// Nothing to choose from: report the resolved preferred tool, which is
+		// empty when the strategy resolved no tool at all.
 		selected = evaluateTool(lastResort, snapshots, profile, policy)
 		rule = reasonNoCandidates + fmt.Sprintf(" for tool strategy %q", strings.TrimSpace(tools.Strategy))
 	default:
-		// Rule 3's tail. The preferred tool is reported with the state it
+		// Rule 3's tail. The fallback tool is reported with the state it
 		// actually has: exhausted when a snapshot says so, unknown when there
 		// is no snapshot at all (a missing openusage never becomes exhausted).
 		selected = evaluateTool(lastResort, snapshots, profile, policy)

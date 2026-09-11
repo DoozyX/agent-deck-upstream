@@ -267,6 +267,108 @@ func TestRecommend_StrategyCollapsesCandidates(t *testing.T) {
 	}
 }
 
+// The collapsed strategies have exactly two sources for their single
+// candidate, Request.Prefer then OrchestrateToolPolicy.FallbackTool. There is
+// no third: with neither set they name nothing rather than reaching for
+// Policy.Failover[0], which is the list this strategy exists to drop.
+func TestRecommend_CollapsedStrategyHasNoThirdFallback(t *testing.T) {
+	policy := DefaultPolicy("claude") // Failover[0] is "claude".
+
+	for _, strategy := range []string{"default", ""} {
+		t.Run(fmt.Sprintf("strategy=%q", strategy), func(t *testing.T) {
+			tools := session.OrchestrateToolPolicy{
+				Strategy: strategy, AvailableTools: []string{"claude", "codex"},
+			}
+			req := Request{Role: "planner", Tier: TierMid}
+			got := Recommend(req, []Snapshot{recSnapshot(Claude, "personal", 90, 90, nil)}, tools, policy)
+
+			if got.Tool != "" {
+				t.Errorf("Tool = %q, want empty: neither Prefer nor FallbackTool names a tool", got.Tool)
+			}
+			if got.State != StateUnknown {
+				t.Errorf("State = %q, want unknown", got.State)
+			}
+			assertReason(t, got.Reason, []string{reasonNoCandidates})
+			if strings.Contains(got.Reason, reasonPolicyLimited) {
+				t.Errorf("Reason = %q, want no policy-limited clause when there are no candidates at all", got.Reason)
+			}
+
+			candidates, prefer, limited := candidateTools(req, tools, policy)
+			if len(candidates) != 0 || prefer != "" || limited {
+				t.Errorf("candidateTools = %v/%q/%v, want []/\"\"/false", candidates, prefer, limited)
+			}
+		})
+	}
+}
+
+// The rule 3 carve-out compares against the prefer candidateTools RESOLVED,
+// not preferredTool's answer: on the collapsed path an empty Request.Prefer
+// resolves to FallbackTool while Policy.Failover[0] names a different tool, so
+// re-deriving one here would compare against a non-candidate and fall through
+// to the weaker "first constrained candidate" rule.
+func TestRecommend_CollapsedStrategyCarveOutUsesTheResolvedPrefer(t *testing.T) {
+	policy := DefaultPolicy("claude") // Failover[0] is "claude", not "codex".
+	tools := session.OrchestrateToolPolicy{
+		Strategy: "default", FallbackTool: "codex", AvailableTools: []string{"claude", "codex"},
+	}
+	req := Request{Role: "planner", Tier: TierStrong}
+
+	if _, prefer, _ := candidateTools(req, tools, policy); prefer != "codex" {
+		t.Fatalf("resolved prefer = %q, want codex (the fallback tool)", prefer)
+	}
+
+	got := Recommend(req, []Snapshot{recSnapshot(Codex, "work", 20, 90, nil)}, tools, policy)
+	if got.Tool != "codex" || got.State != StateConstrained {
+		t.Fatalf("Tool/State = %q/%q, want codex/constrained", got.Tool, got.State)
+	}
+	assertReason(t, got.Reason, []string{reasonPreferredConstrained})
+	if strings.Contains(got.Reason, reasonFirstConstrained) {
+		t.Errorf("Reason = %q, want the preferred-tool carve-out, not the weaker first-constrained rule", got.Reason)
+	}
+}
+
+// The two silent carve-outs out of rule 5, exactly as resolveModel documents
+// them: neither adds a reason clause.
+func TestRecommend_ModelResolutionCarveOuts(t *testing.T) {
+	t.Run("a-tool-with-no-usage-provider-keeps-the-requested-tier", func(t *testing.T) {
+		policy := DefaultPolicy("claude")
+		policy.Failover = []string{"gemini"}
+		got := Recommend(
+			Request{Role: "planner", Tier: TierFrontier, Prefer: "gemini"},
+			nil, autoTools(), policy,
+		)
+		if got.Tool != "gemini" || got.Provider != "" {
+			t.Fatalf("Tool/Provider = %q/%q, want gemini/\"\"", got.Tool, got.Provider)
+		}
+		if got.Model != "" {
+			t.Errorf("Model = %q, want empty: there is no ladder for a tool with no usage provider", got.Model)
+		}
+		if got.TierApplied != TierFrontier {
+			t.Errorf("TierApplied = %q, want frontier: there is nothing to downgrade to", got.TierApplied)
+		}
+		if strings.Contains(got.Reason, "downgraded") {
+			t.Errorf("Reason = %q, want no downgrade clause", got.Reason)
+		}
+	})
+
+	t.Run("an-unrecognised-tier-echoes-into-tier-applied-with-no-model", func(t *testing.T) {
+		got := Recommend(
+			Request{Role: "planner", Tier: Tier("enormous"), Prefer: "claude"},
+			[]Snapshot{recSnapshot(Claude, "personal", 90, 90, nil)},
+			autoTools(), DefaultPolicy("claude"),
+		)
+		if got.Tool != "claude" {
+			t.Fatalf("Tool = %q, want claude", got.Tool)
+		}
+		if got.Model != "" {
+			t.Errorf("Model = %q, want empty: an unrecognised tier has no ladder rung", got.Model)
+		}
+		if got.TierApplied != Tier("enormous") {
+			t.Errorf("TierApplied = %q, want the requested tier echoed back", got.TierApplied)
+		}
+	})
+}
+
 // Thresholds are strict: remaining == ExhaustedBelow is constrained, remaining
 // == ConstrainedBelow is healthy. The boundaries 0, 100 and equal thresholds
 // are pinned here.
@@ -561,6 +663,37 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 		assertReason(t, got.Reason, []string{reasonFirstHealthy})
 	})
 
+	// Rule 3's tail must respect the same eligibility rule the unknown step
+	// applies: an EXHAUSTED candidate outranks an unknown one that Failover
+	// does not list, even though the unknown one is the preferred tool and sits
+	// first in the candidate list.
+	t.Run("not-listed-in-failover-loses-even-to-an-exhausted-candidate", func(t *testing.T) {
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
+			[]Snapshot{claudeExhausted}, autoTools(), policyWith("claude"),
+		)
+		if got.Tool != "claude" || got.State != StateExhausted {
+			t.Fatalf("Tool/State = %q/%q, want claude/exhausted", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+		if strings.Contains(got.Reason, reasonUnknownFailover) {
+			t.Errorf("Reason = %q, want no unknown-failover clause for a tool absent from Failover", got.Reason)
+		}
+	})
+
+	// The one case where the tail DOES name an ineligible unknown: it is the
+	// resolved preferred tool and no candidate is eligible at all.
+	t.Run("an-ineligible-unknown-preferred-tool-is-still-the-last-resort", func(t *testing.T) {
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
+			nil, autoTools(), policyWith(),
+		)
+		if got.Tool != "gemini" || got.State != StateUnknown {
+			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+	})
+
 	t.Run("not-listed-in-failover-is-never-selected", func(t *testing.T) {
 		got := Recommend(
 			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
@@ -626,6 +759,11 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 			t.Errorf("Alternatives = nil, want an empty slice so the JSON carries []")
 		}
 		assertReason(t, got.Reason, []string{reasonNoCandidates})
+		// "no candidate tools" and "policy limited failover" are contradictory
+		// as a pair: there was no failover left to limit.
+		if strings.Contains(got.Reason, reasonPolicyLimited) {
+			t.Errorf("Reason = %q, want no policy-limited clause alongside %q", got.Reason, reasonNoCandidates)
+		}
 	})
 
 	t.Run("empty-request-with-defaults-and-no-snapshots", func(t *testing.T) {
@@ -643,6 +781,45 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 			t.Errorf("FetchedAt = %v, want the zero time", got.FetchedAt)
 		}
 		assertReason(t, got.Reason, []string{reasonUnknownFailover})
+	})
+
+	// The final fallback is NOT filtered against the orchestrate policy: it
+	// names the preferred tool even when AvailableTools excludes it, and
+	// ProvidersToQuery then returns nothing for the very same input.
+	t.Run("preferred-tool-outside-available-tools-is-still-recommended", func(t *testing.T) {
+		tools := session.OrchestrateToolPolicy{
+			Strategy: "auto", FallbackTool: "codex", AvailableTools: []string{"gemini"},
+		}
+		policy := DefaultPolicy("claude")
+		req := Request{Role: "planner", Tier: TierMid, Prefer: "claude"}
+		got := Recommend(req, []Snapshot{recSnapshot(Claude, "personal", 90, 90, nil)}, tools, policy)
+		if got.Tool != "claude" {
+			t.Errorf("Tool = %q, want claude even though AvailableTools excludes it", got.Tool)
+		}
+		if got.State != StateHealthy {
+			t.Errorf("State = %q, want healthy", got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonNoCandidates})
+		if providers := ProvidersToQuery(req, tools, policy); len(providers) != 0 {
+			t.Errorf("ProvidersToQuery = %v, want none for the input whose decision names claude", providers)
+		}
+	})
+
+	// When candidates DO exist, the tail takes the first eligible one, not the
+	// preferred tool the strategy already filtered out.
+	t.Run("preferred-tool-filtered-out-falls-back-to-the-first-candidate", func(t *testing.T) {
+		tools := session.OrchestrateToolPolicy{
+			Strategy: "auto", FallbackTool: "claude", AvailableTools: []string{"codex"},
+		}
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "claude"},
+			[]Snapshot{recSnapshot(Codex, "work", 5, 90, nil)},
+			tools, DefaultPolicy("claude"),
+		)
+		if got.Tool != "codex" || got.State != StateExhausted {
+			t.Fatalf("Tool/State = %q/%q, want codex/exhausted (claude is not a candidate)", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
 	})
 
 	t.Run("auto-strategy-with-no-available-tools", func(t *testing.T) {
@@ -702,7 +879,7 @@ func TestProvidersToQuery_AgreesWithRecommendCandidates(t *testing.T) {
 			}
 
 			// The same helper backs Recommend's candidate list.
-			candidates, _ := candidateTools(req, tools, policy)
+			candidates, _, _ := candidateTools(req, tools, policy)
 			var viaCandidates []Provider
 			seen := map[Provider]bool{}
 			for _, tool := range candidates {
