@@ -144,10 +144,11 @@ frontier = ""
 // is deliberately not a tool name at all, so inserting a registry lookup would
 // break this test; "cursor" would not, because it IS a registry builtin.
 //
-// Whether an entry names a real usage provider is decided one layer up, in
-// usage.PolicyFromConfig, which rejects exactly this string — see
-// TestPolicyFromConfig_RejectsInvalidValues/failover_entry_that_is_not_a_usage_provider.
-// The two layers disagreeing on this input is the design, not an oversight.
+// usage.PolicyFromConfig does not check the entry either: failover holds TOOL
+// names, and the design's recommender rule 2 makes a tool in the "unknown"
+// state eligible precisely when it appears in failover explicitly, so an entry
+// with no usage provider must survive both layers untouched — see
+// TestPolicyFromConfig_AcceptsFailoverEntriesThatAreNotUsageProviders.
 func TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName(t *testing.T) {
 	writeUsagePolicyConfig(t, "[usage.policy]\nfailover = [\"totally-not-a-tool\"]\n")
 

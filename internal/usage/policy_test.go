@@ -186,6 +186,26 @@ func TestPolicyFromConfig_ExplicitEmptyFrontierWindowRemovesTheGate(t *testing.T
 	}
 }
 
+// Failover entries are TOOL names, not provider names, and are validated by
+// shape only at BOTH layers. The design's recommender rule 2 makes a tool in the
+// "unknown" state eligible precisely when it appears in Failover explicitly, so
+// an entry with no usage provider must survive the merge untouched — including a
+// miscased "Codex", which stays inert by design rather than being folded or
+// rejected. The loader agrees; see
+// TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName.
+func TestPolicyFromConfig_AcceptsFailoverEntriesThatAreNotUsageProviders(t *testing.T) {
+	cfg := &session.UserConfig{DefaultTool: "claude"}
+	cfg.Usage.Policy.Failover = []string{"totally-not-a-tool", "Codex", "claude"}
+
+	got, err := PolicyFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("PolicyFromConfig() error = %v", err)
+	}
+	if want := []string{"totally-not-a-tool", "Codex", "claude"}; !reflect.DeepEqual(got.Failover, want) {
+		t.Fatalf("Failover = %v, want %v", got.Failover, want)
+	}
+}
+
 // An explicit `failover = []` is treated as an omitted key. The whole pipeline
 // relies on Policy.Failover being non-empty — the design has the recommender
 // read policy.Failover[0] unguarded — so an empty list keeps the default order
@@ -272,20 +292,6 @@ func TestPolicyFromConfig_RejectsInvalidValues(t *testing.T) {
 			name:     "failover entry containing whitespace",
 			settings: session.UsagePolicySettings{Failover: []string{"claude codex"}},
 			wantErr:  `invalid [usage.policy].failover[0] "claude codex": must be a tool name without whitespace`,
-		},
-		{
-			// Shape-valid but can never match a Provider, so accepting it would
-			// be a silent no-op. The LOADER still accepts this entry — it
-			// validates shape only; see
-			// TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName.
-			name:     "failover entry that is not a usage provider",
-			settings: session.UsagePolicySettings{Failover: []string{"totally-not-a-tool"}},
-			wantErr:  `invalid [usage.policy].failover[0] "totally-not-a-tool": unknown usage provider`,
-		},
-		{
-			name:     "failover entry with the wrong case",
-			settings: session.UsagePolicySettings{Failover: []string{"Codex"}},
-			wantErr:  `invalid [usage.policy].failover[0] "Codex": unknown usage provider`,
 		},
 		{
 			// A typo'd table name would otherwise discard the whole override

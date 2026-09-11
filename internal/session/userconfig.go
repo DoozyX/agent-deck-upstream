@@ -312,12 +312,12 @@ type UsagePolicySettings struct {
 	ExhaustedBelow   *int `toml:"exhausted_below,omitempty"`
 	ConstrainedBelow *int `toml:"constrained_below,omitempty"`
 
-	// Failover is the tool-name order tried after the preferred tool. The
-	// loader validates entries by SHAPE only — non-empty, no whitespace — and
-	// never consults the tool registry; whether an entry names a real usage
-	// provider is decided by usage.PolicyFromConfig, which owns that closed
-	// set. An explicit empty list is treated as an omitted key and keeps the
-	// default order.
+	// Failover is the tool-name order tried after the preferred tool. Entries
+	// are validated by SHAPE only — non-empty, no whitespace — and neither this
+	// loader nor usage.PolicyFromConfig consults the tool registry or the usage
+	// provider set: an entry naming a tool with no usage provider is legal, and
+	// the recommender treats it as the "unknown" state. An explicit empty list
+	// is treated as an omitted key and keeps the default order.
 	Failover []string `toml:"failover,omitempty"`
 
 	// Ladder maps a provider name to its cheap/mid/strong/frontier models.
