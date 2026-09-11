@@ -194,19 +194,29 @@ func TestParseSessionFiveHourAliasDoesNotLeakIntoModels(t *testing.T) {
 	}
 }
 
-func TestParseMalformedWeeklyValueExcludedFromModelsByDedicatedKeyGuard(t *testing.T) {
-	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"weekly":"n/a"}}`))
+// TestParseWeeklyValueExcludedFromModelsByDedicatedKeyGuard uses a
+// well-formed weekly value on purpose: a value parseWindow rejects (e.g. the
+// round-2 predecessor of this test, which used "weekly":"n/a") never reaches
+// the dedicatedWindowKeys guard at all, since parseModelWindows already
+// skips it via the `w == nil` check in parseModelWindows regardless of the
+// guard. That made the round-2 test pass even with weeklyKey deleted from
+// dedicatedWindowKeys, so it wasn't testing the guard. A value parseWindow
+// *accepts* is the only way to force execution through the guard: verified
+// by deleting weeklyKey from dedicatedWindowKeys and confirming this test
+// then fails (weekly leaks into Models), then restoring the key.
+func TestParseWeeklyValueExcludedFromModelsByDedicatedKeyGuard(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"weekly":{"remaining":64}}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 90 {
 		t.Fatalf("session window = %#v, want session remaining=90", s.Windows.Session5H)
 	}
-	if s.Windows.Weekly != nil {
-		t.Fatalf("weekly window = %#v, want nil for a malformed weekly value", s.Windows.Weekly)
+	if s.Windows.Weekly == nil || s.Windows.Weekly.RemainingPercent != 64 {
+		t.Fatalf("weekly window = %#v, want weekly remaining=64", s.Windows.Weekly)
 	}
 	if s.Windows.Models != nil {
-		t.Fatalf("Models = %#v, want nil: a malformed dedicated-window value must be excluded by the dedicatedWindowKeys guard, not leak into Models", s.Windows.Models)
+		t.Fatalf("Models = %#v, want nil: a well-formed value under the dedicated weekly key must be excluded by the dedicatedWindowKeys guard, not leak into Models", s.Windows.Models)
 	}
 }
 
