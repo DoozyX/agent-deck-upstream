@@ -185,7 +185,7 @@ repository's worktree tree:
     <task-slug>/
       plan.md  tasks/task-NN-<name>.md  planner output
   orchestrate/                          = $RUN_DIR
-    manifest.md  poll.sh  heartbeat.sh  prompts/  retro.md
+    goal.md  manifest.md  poll.sh  heartbeat.sh  prompts/  retro.md
     <task-slug>/                        spec blocks, prompts, reviews, screenshots, handoffs
 
 <repo-root>/.worktrees/                = $WORKTREES_DIR
@@ -238,6 +238,35 @@ established mid-run by the conductor only *after* a child had already skipped
 a mandatory test suite believing it needed a Docker daemon it did not have.
 An hour of recon at run start is cheaper than one child discovering
 production the hard way.
+
+**Freeze the goal first, before anything else lands in the run directory.**
+You received the run's goal in your launch message and nowhere else: the
+brainstorm's `conductor-prompt.md`, the user's `/orchestrate ...` turn, an
+issue list. That message does not survive you. A successor conductor is
+launched on the manifest and the handoff, and neither carries the goal — a
+rotated run has been observed carrying on with every task row intact and
+nothing that said what the run was *for*. So write `$RUN_DIR/goal.md` now,
+and `rotate-conductor.sh` refuses to rotate without it and pastes it verbatim
+into every successor's prompt:
+
+```markdown
+# Goal
+<the user's request, verbatim — quote it, do not paraphrase it. For a
+ design entrance the launch message is generic, so quote the design's goal
+ and acceptance-criteria sections instead, by absolute path and verbatim>
+
+entrance: <design | plan | issues | freeform | verification>
+inputs: <SPEC_PATH, issue refs, or "none">
+done means: <what has to be true for this run to end — merged PR(s) on
+            which branch, a verification verdict, a report to whom>
+report to: <where the final report goes and who reads it>
+user constraints: <anything the user said that bounds the work; "none">
+```
+
+`goal.md` is append-only after this point. A scope change the user approves
+goes under `## Approved changes` with the date and who approved it; the
+original text above it is never edited, so every successor can see both what
+was asked and what was later agreed.
 
 Populate the run directory:
 
@@ -338,7 +367,10 @@ finding that says a PR is the right endgame for this one change) is a conductor
 decision recorded as a deviation, not a silent per-task improvisation.
 
 Maintain a run manifest at `$RUN_DIR/manifest.md` and update it after every
-stage transition. Start it with one shared `## Verification contract` block:
+stage transition. The manifest is state, not purpose: the goal lives in
+`$RUN_DIR/goal.md` (frozen at run start, above) and the manifest never
+restates it, so the two cannot drift. Start it with one shared
+`## Verification contract` block:
 the exact baseline, full-suite, lint/format, build/vet and E2E commands, plus
 the focused-test command shape (how to test only the packages or paths a
 diff touches — fix rounds and review rounds 2+ render it as `FOCUSED_TESTS=`); each
@@ -1633,6 +1665,14 @@ After either event, complete this recovery sequence before making new task,
 scope, or landing decisions. A compaction summary is not a substitute for
 reloading the workflow and its durable state.
 
+0. Read `$RUN_DIR/goal.md` and, in the handoff, append
+   `restored goal (c<gen>): <one sentence, your own words>`. After a rotation
+   the goal is already inlined in the prompt you were launched on; write the
+   line anyway — it is the checksum the next successor compares against
+   `goal.md`, and a conductor that cannot state the goal in one sentence has
+   not recovered it. If `goal.md` is missing, that is the first thing to
+   surface to the user: nothing below can be checked against a goal you do
+   not have, and reconstructing one from task rows is how a run drifts.
 1. Re-read this orchestrate skill, then read `$RUN_DIR/manifest.md` and
    `$RUN_DIR/conductor-handoff.md`. Restore the verification and landing
    contracts, live task stages, open decisions, and recorded user approvals.
@@ -1676,8 +1716,8 @@ any point. Then:
 
   ```bash
   agent-deck session compact \
-    --instructions "Keep: the absolute orchestrate skill path, run dir path, design source path, every live task and its stage, open questions, PR urls, HEAD shas." \
-    --resume "Run directory: $RUN_DIR. Re-read the orchestrate skill and follow Recovery after compaction or rotation: read manifest.md and conductor-handoff.md, restore approved design constraints through the bounded summary (delegate a refresh if needed), then reconcile live children with the heartbeat before new task decisions."
+    --instructions "Keep: the run goal exactly as written in $RUN_DIR/goal.md, the absolute orchestrate skill path, run dir path, design source path, every live task and its stage, open questions, PR urls, HEAD shas." \
+    --resume "Run directory: $RUN_DIR. Read goal.md first. Then re-read the orchestrate skill and follow Recovery after compaction or rotation: read manifest.md and conductor-handoff.md, restore approved design constraints through the bounded summary (delegate a refresh if needed), then reconcile live children with the heartbeat before new task decisions."
   ```
 
   With no id it compacts *you*. It returns immediately — a self-compact runs
@@ -1695,11 +1735,14 @@ any point. Then:
   bash "$RUN_DIR/rotate-conductor.sh"
   ```
 
-  It refuses to run while `conductor-handoff.md` is missing or empty (an
-  automatic rotation into an empty handoff has been observed in the field, and
-  the successor inherits the manifest with nothing about what was in flight),
-  then launches your successor on the manifest plus the handoff, **waits for it
-  to prove it is alive**, and only then re-parents every live child so waiting
+  It refuses to run while `conductor-handoff.md` or `goal.md` is missing or
+  empty (an automatic rotation into an empty handoff has been observed in the
+  field, and the successor inherits the manifest with nothing about what was
+  in flight; a rotation without a frozen goal has been observed too, and the
+  successor carried on with every task row intact and no idea what the run
+  was for), then launches your successor on the manifest plus the handoff
+  with `goal.md` pasted verbatim into its prompt, **waits for it to prove it
+  is alive**, and only then re-parents every live child so waiting
   and done notifications route to it, repoints the wall-clock watchdog, and
   archives you. It is one command because the five-step prose version it
   replaces was measured across 12 real conductors: median peak 348k, and half

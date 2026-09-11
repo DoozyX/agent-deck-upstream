@@ -17,14 +17,19 @@ set -euo pipefail
 D="$(cd "$(dirname "$0")" && pwd)"          # = $RUN_DIR
 HANDOFF="$D/conductor-handoff.md"
 MANIFEST="$D/manifest.md"
+GOAL="$D/goal.md"
 GEN_FILE="$D/.conductor-generation"
 MAX_GEN="${MAX_CONDUCTOR_GEN:-5}"
 
-# 1. Refuse to rotate into an empty handoff. A rotation that produces an empty
-#    handoff has been observed in the field, and the successor then inherits the
-#    manifest with nothing about what was in flight. Failing here is cheap — the
-#    conductor is still alive and can write the file and re-run.
-for f in "$MANIFEST" "$HANDOFF"; do
+# 1. Refuse to rotate into an empty handoff or a missing goal. A rotation that
+#    produces an empty handoff has been observed in the field, and the successor
+#    then inherits the manifest with nothing about what was in flight. A missing
+#    goal.md is the same failure one level up: the gen-1 conductor received the
+#    run's goal only in its launch message, so unless it was frozen to disk at
+#    run start the successor inherits task rows with nothing that says what the
+#    run is for — observed as "the goal is reset after rotation". Failing here is
+#    cheap — the conductor is still alive and can write the file and re-run.
+for f in "$MANIFEST" "$HANDOFF" "$GOAL"; do
   if [ ! -s "$f" ]; then
     echo "rotate-conductor: $f is missing or empty. Write it, then re-run this script." >&2
     exit 2
@@ -64,11 +69,25 @@ NEXT_TITLE="$(basename "$D")-c$GEN"
 
 # 4. Render the successor's prompt to a file rather than a shell argument, so
 #    no part of it needs quoting and the run keeps the artifact.
+#    The goal goes in as text, not as a path: a path is one more file the
+#    successor may skip, and the goal is the one thing that must survive every
+#    rotation unchanged. The durable copy stays at goal.md for the next one.
 PROMPT_FILE="$D/conductor-c$GEN-prompt.md"
-cat > "$PROMPT_FILE" <<EOF
+{
+cat <<EOF
 You are the continuation conductor for this orchestrate run, generation $GEN.
 Your predecessor reached its context ceiling and rotated out. This is a
 handoff, not a restart: the run is mid-flight and its children are live.
+
+THE GOAL OF THIS RUN, frozen at run start and unchanged by rotation — the
+durable copy is $GOAL, and your job is to finish exactly this, nothing
+narrower and nothing wider:
+
+--- begin goal.md ---
+EOF
+cat "$GOAL"
+cat <<EOF
+--- end goal.md ---
 
 Re-read the orchestrate skill first (use its absolute path recorded in the
 handoff), then follow its "Recovery after compaction or rotation" sequence.
@@ -95,7 +114,13 @@ After restoring the skill and state, reconcile live children with the heartbeat:
 Every live child has already been re-parented to you and will appear in that
 output. Do not re-launch them. Do not redo work the manifest records as done.
 Your first supervision action after recovery is the heartbeat, not a status sweep.
+
+Before that heartbeat, append one line to $HANDOFF:
+\`restored goal (c$GEN): <the goal in one sentence, in your own words>\`
+It is the cheapest proof the goal survived the rotation, and the next
+successor reads it as a checksum against goal.md.
 EOF
+} > "$PROMPT_FILE"
 
 # 5. Launch the successor. Under auto, retaining this conductor's connector
 # preserves continuity; under default, use the configured global default. An
