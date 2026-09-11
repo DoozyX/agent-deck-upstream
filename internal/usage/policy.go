@@ -2,6 +2,8 @@ package usage
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -27,8 +29,13 @@ type Policy struct {
 	ExhaustedBelow   int
 	ConstrainedBelow int
 
-	// Failover is the tool-name order tried after the preferred tool. Entries
-	// need not have a usage provider; such a tool resolves to "unknown" state.
+	// Failover is the provider order tried after the preferred tool. Every
+	// entry is a known usage provider; PolicyFromConfig rejects anything else
+	// rather than accepting a name that can never match.
+	//
+	// It is never empty, so callers may read Failover[0] unguarded: an explicit
+	// `failover = []` in the config is treated as an omitted key and keeps the
+	// default order, exactly like leaving the key out.
 	Failover []string
 
 	// Ladder holds the per-provider model ladder.
@@ -78,6 +85,14 @@ func defaultFailover(defaultTool string) []string {
 // setting only exhausted_below is well-formed on its own but may still invert
 // against the default constrained_below, and the loader must not hardcode the
 // defaults (they live here, and internal/session must not import this package).
+//
+// It also rejects what only this package can judge: a ladder or frontier_window
+// table key, or a failover entry, that is not a known usage provider, and a
+// ladder or frontier_window VALUE carrying whitespace. Each of those would
+// otherwise be a silent no-op — the override discarded or the window never
+// matched — surfacing as wrong behaviour units later instead of as a config
+// error. An empty ladder value stays legal: it is how the config marks a tier
+// unavailable on a provider, and an empty frontier_window value means no gate.
 func PolicyFromConfig(cfg *session.UserConfig) (Policy, error) {
 	if cfg == nil {
 		return DefaultPolicy(""), nil
@@ -102,40 +117,93 @@ func PolicyFromConfig(cfg *session.UserConfig) (Policy, error) {
 			policy.ExhaustedBelow, policy.ConstrainedBelow)
 	}
 
+	// An explicit `failover = []` is treated as an omitted key, so the defaults
+	// apply; see the Policy.Failover doc comment.
 	if len(settings.Failover) > 0 {
 		failover := make([]string, 0, len(settings.Failover))
 		for i, entry := range settings.Failover {
 			if entry == "" || strings.ContainsFunc(entry, unicode.IsSpace) {
 				return Policy{}, fmt.Errorf("invalid [usage.policy].failover[%d] %q: must be a tool name without whitespace", i, entry)
 			}
+			if _, ok := knownProvider(entry); !ok {
+				return Policy{}, fmt.Errorf("invalid [usage.policy].failover[%d] %q: unknown usage provider", i, entry)
+			}
 			failover = append(failover, entry)
 		}
+		// The copy is load-bearing: LoadUserConfig hands every caller the same
+		// process-cached *UserConfig, so aliasing the slice would let one
+		// caller's mutation of Policy.Failover write through into every other
+		// caller's config.
 		policy.Failover = failover
 	}
 
-	for name, ladder := range settings.Ladder {
-		provider := Provider(name)
+	// Table keys are sorted so an error message is deterministic when more than
+	// one key is wrong.
+	for _, name := range sortedKeys(settings.Ladder) {
+		provider, ok := knownProvider(name)
+		if !ok {
+			return Policy{}, fmt.Errorf("invalid [usage.policy].ladder.%s: unknown usage provider", name)
+		}
+		ladder := settings.Ladder[name]
 		merged := policy.Ladder[provider]
-		if ladder.Cheap != nil {
-			merged.Cheap = *ladder.Cheap
-		}
-		if ladder.Mid != nil {
-			merged.Mid = *ladder.Mid
-		}
-		if ladder.Strong != nil {
-			merged.Strong = *ladder.Strong
-		}
-		if ladder.Frontier != nil {
-			merged.Frontier = *ladder.Frontier
+		for _, rung := range []struct {
+			key   string
+			value *string
+			dst   *string
+		}{
+			{"cheap", ladder.Cheap, &merged.Cheap},
+			{"mid", ladder.Mid, &merged.Mid},
+			{"strong", ladder.Strong, &merged.Strong},
+			{"frontier", ladder.Frontier, &merged.Frontier},
+		} {
+			if rung.value == nil {
+				continue
+			}
+			if strings.ContainsFunc(*rung.value, unicode.IsSpace) {
+				return Policy{}, fmt.Errorf("invalid [usage.policy].ladder.%s.%s %q: must be a model name without whitespace",
+					name, rung.key, *rung.value)
+			}
+			*rung.dst = *rung.value
 		}
 		policy.Ladder[provider] = merged
 	}
 
-	for name, window := range settings.FrontierWindow {
-		policy.FrontierWindow[Provider(name)] = window
+	for _, name := range sortedKeys(settings.FrontierWindow) {
+		provider, ok := knownProvider(name)
+		if !ok {
+			return Policy{}, fmt.Errorf("invalid [usage.policy].frontier_window.%s: unknown usage provider", name)
+		}
+		window := settings.FrontierWindow[name]
+		if strings.ContainsFunc(window, unicode.IsSpace) {
+			return Policy{}, fmt.Errorf("invalid [usage.policy].frontier_window.%s %q: must be a window name without whitespace",
+				name, window)
+		}
+		policy.FrontierWindow[provider] = window
 	}
 
 	return policy, nil
+}
+
+// knownProvider reports whether name is one of the closed set of usage
+// providers. Unknown keys and entries are rejected rather than silently
+// dropped: a typo'd or miscased `[usage.policy.ladder.cluade]` would otherwise
+// discard the user's override, leave the defaults in place, and add a dead
+// Provider entry nothing reads.
+//
+// This is NOT a tool-registry probe — the Provider set is a compile-time
+// constant — and it deliberately lives here rather than in the config loader,
+// which still validates failover by shape only.
+func knownProvider(name string) (Provider, bool) {
+	switch p := Provider(name); p {
+	case Claude, Codex:
+		return p, true
+	default:
+		return "", false
+	}
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	return slices.Sorted(maps.Keys(m))
 }
 
 func validateThreshold(key string, value int) error {

@@ -186,16 +186,38 @@ func TestPolicyFromConfig_ExplicitEmptyFrontierWindowRemovesTheGate(t *testing.T
 	}
 }
 
-func TestPolicyFromConfig_AcceptsFailoverToolWithoutUsageProvider(t *testing.T) {
-	cfg := &session.UserConfig{DefaultTool: "claude"}
-	cfg.Usage.Policy.Failover = []string{"cursor", "claude"}
+// An explicit `failover = []` is treated as an omitted key. The whole pipeline
+// relies on Policy.Failover being non-empty — the design has the recommender
+// read policy.Failover[0] unguarded — so an empty list keeps the default order
+// rather than disabling failover.
+func TestPolicyFromConfig_ExplicitEmptyFailoverKeepsTheDefaultOrder(t *testing.T) {
+	cfg := &session.UserConfig{DefaultTool: "codex"}
+	cfg.Usage.Policy.Failover = []string{}
 
 	got, err := PolicyFromConfig(cfg)
 	if err != nil {
 		t.Fatalf("PolicyFromConfig() error = %v", err)
 	}
-	if want := []string{"cursor", "claude"}; !reflect.DeepEqual(got.Failover, want) {
-		t.Fatalf("Failover = %v, want %v", got.Failover, want)
+	if want := []string{"codex", "claude"}; !reflect.DeepEqual(got.Failover, want) {
+		t.Fatalf("Failover = %v, want the default %v", got.Failover, want)
+	}
+}
+
+// The returned Failover must not alias the config's slice: LoadUserConfig hands
+// every caller the same process-cached *UserConfig, so an aliasing assignment
+// would let one caller's mutation write through into every other caller's
+// config.
+func TestPolicyFromConfig_FailoverDoesNotAliasTheConfigSlice(t *testing.T) {
+	cfg := &session.UserConfig{DefaultTool: "claude"}
+	cfg.Usage.Policy.Failover = []string{"codex", "claude"}
+
+	got, err := PolicyFromConfig(cfg)
+	if err != nil {
+		t.Fatalf("PolicyFromConfig() error = %v", err)
+	}
+	got.Failover[0] = "mutated"
+	if cfg.Usage.Policy.Failover[0] != "codex" {
+		t.Fatalf("mutating Policy.Failover wrote through to the config: %q", cfg.Usage.Policy.Failover[0])
 	}
 }
 
@@ -250,6 +272,70 @@ func TestPolicyFromConfig_RejectsInvalidValues(t *testing.T) {
 			name:     "failover entry containing whitespace",
 			settings: session.UsagePolicySettings{Failover: []string{"claude codex"}},
 			wantErr:  `invalid [usage.policy].failover[0] "claude codex": must be a tool name without whitespace`,
+		},
+		{
+			// Shape-valid but can never match a Provider, so accepting it would
+			// be a silent no-op. The LOADER still accepts this entry — it
+			// validates shape only; see
+			// TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName.
+			name:     "failover entry that is not a usage provider",
+			settings: session.UsagePolicySettings{Failover: []string{"totally-not-a-tool"}},
+			wantErr:  `invalid [usage.policy].failover[0] "totally-not-a-tool": unknown usage provider`,
+		},
+		{
+			name:     "failover entry with the wrong case",
+			settings: session.UsagePolicySettings{Failover: []string{"Codex"}},
+			wantErr:  `invalid [usage.policy].failover[0] "Codex": unknown usage provider`,
+		},
+		{
+			// A typo'd table name would otherwise discard the whole override
+			// and leave the defaults silently in place.
+			name: "unknown ladder table key",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"cluade": {Cheap: policyStrPtr("haiku")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.cluade: unknown usage provider`,
+		},
+		{
+			name: "ladder table key with the wrong case",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"Claude": {Cheap: policyStrPtr("haiku")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.Claude: unknown usage provider`,
+		},
+		{
+			name:     "unknown frontier_window table key",
+			settings: session.UsagePolicySettings{FrontierWindow: map[string]string{"cluade": "fable"}},
+			wantErr:  `invalid [usage.policy].frontier_window.cluade: unknown usage provider`,
+		},
+		{
+			name:     "frontier_window table key with the wrong case",
+			settings: session.UsagePolicySettings{FrontierWindow: map[string]string{"Claude": "fable"}},
+			wantErr:  `invalid [usage.policy].frontier_window.Claude: unknown usage provider`,
+		},
+		{
+			// A ladder value carrying whitespace reaches the launch flag
+			// unchanged, so it is rejected here rather than three units later.
+			name: "ladder value containing whitespace",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"claude": {Strong: policyStrPtr("opus 4")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.claude.strong "opus 4": must be a model name without whitespace`,
+		},
+		{
+			name: "whitespace-only ladder value",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"codex": {Frontier: policyStrPtr("  ")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.codex.frontier "  ": must be a model name without whitespace`,
+		},
+		{
+			// A frontier_window value with a stray space never matches a window
+			// in Models, so the frontier gate silently stops gating — the
+			// opposite of what the user configured.
+			name:     "frontier_window value containing whitespace",
+			settings: session.UsagePolicySettings{FrontierWindow: map[string]string{"claude": " fable"}},
+			wantErr:  `invalid [usage.policy].frontier_window.claude " fable": must be a window name without whitespace`,
 		},
 	}
 	for _, tc := range tests {
