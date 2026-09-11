@@ -81,6 +81,12 @@ func TestLogCgroupIsolationDecision_WiredIntoBootstrap(t *testing.T) {
 			"AGENTDECK_DEBUG=1",
 			"AGENTDECK_SKIP_UPDATE_CHECK=1",
 			"AGENTDECK_PROFILE=test-obs01",
+			// This test deliberately boots the TUI with no PTY (exec.Command
+			// leaves stdin/stdout as pipes), which the headless-TUI guard
+			// refuses -- see headlessTUIRefused. Opt in explicitly, the same
+			// way the env filtering above opts out of the nested-session
+			// guard. The TUI is reaped by the t.Cleanup below.
+			allowHeadlessTUIEnv+"=1",
 			"TERM=dumb",
 		)
 		cmd := exec.Command(binPath)
