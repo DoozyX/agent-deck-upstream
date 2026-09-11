@@ -329,6 +329,46 @@ func TestRecommend_CollapsedStrategyCarveOutUsesTheResolvedPrefer(t *testing.T) 
 	}
 }
 
+// The collapsed branch resolves exactly one rung and deliberately does NOT
+// filter it against AvailableTools: criterion 3 scopes that filter to
+// `tools.Strategy == "auto"`. Without the pin, adding the filter here is
+// invisible — it turns both rows below into `Tool: ""` with reasonNoCandidates.
+//
+// The two rows are the two arms the unfiltered rung can land in: an exhausted
+// rung survives the eligibility loop (step 1 of rule 3's tail), while a rung
+// that maps to no usage provider and is absent from Policy.Failover is an
+// ineligible unknown and falls through to step 2 — which is what makes
+// Recommend's "may be absent from AvailableTools" clause true of step 2.
+func TestRecommend_CollapsedStrategyIgnoresAvailableTools(t *testing.T) {
+	policy := DefaultPolicy("claude") // Failover is claude, codex — not gemini.
+
+	t.Run("an-exhausted-rung-outside-available-tools-is-step-1", func(t *testing.T) {
+		tools := session.OrchestrateToolPolicy{
+			Strategy: "default", FallbackTool: "codex", AvailableTools: []string{"claude"},
+		}
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid},
+			[]Snapshot{recSnapshot(Codex, "work", 5, 90, nil)},
+			tools, policy,
+		)
+		if got.Tool != "codex" || got.State != StateExhausted {
+			t.Fatalf("Tool/State = %q/%q, want codex/exhausted even though AvailableTools lists only claude", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonExhaustedCandidate, reasonPolicyLimited})
+	})
+
+	t.Run("an-ineligible-unknown-rung-outside-available-tools-is-step-2", func(t *testing.T) {
+		tools := session.OrchestrateToolPolicy{
+			Strategy: "default", FallbackTool: "gemini", AvailableTools: []string{"claude"},
+		}
+		got := Recommend(Request{Role: "planner", Tier: TierMid}, nil, tools, policy)
+		if got.Tool != "gemini" || got.State != StateUnknown {
+			t.Fatalf("Tool/State = %q/%q, want gemini/unknown even though AvailableTools lists only claude", got.Tool, got.State)
+		}
+		assertReason(t, got.Reason, []string{reasonExhaustedFallback, reasonPolicyLimited})
+	})
+}
+
 // Request.Prefer is trimmed before the rule 3 carve-out compares against it.
 // candidateTools trims independently when it builds the list, so without the
 // trim in preferredTool the candidate list is unchanged and only the carve-out
@@ -837,6 +877,12 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
 		}
 		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+		// The mirror of the step-1 guard above: gemini was the only candidate
+		// and the loop discarded it as an ineligible unknown, so the reason
+		// must not also claim a candidate was kept.
+		if strings.Contains(got.Reason, reasonExhaustedCandidate) {
+			t.Errorf("Reason = %q, want no kept-a-candidate clause when every candidate was discarded", got.Reason)
+		}
 	})
 
 	// Failover entries are matched after trimming, so an entry that survived
@@ -1015,9 +1061,11 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 		assertReason(t, got.Reason, []string{reasonUnknownFailover})
 	})
 
-	// The final fallback is NOT filtered against the orchestrate policy: it
-	// names the preferred tool even when AvailableTools excludes it, and
-	// ProvidersToQuery then returns nothing for the very same input.
+	// The empty-candidate-list arm is NOT filtered against the orchestrate
+	// policy: under "auto", AvailableTools excluding the preferred tool empties
+	// the candidate list, the decision still names that tool and reports
+	// reasonNoCandidates, and ProvidersToQuery returns nothing for the very
+	// same input.
 	t.Run("preferred-tool-outside-available-tools-is-still-recommended", func(t *testing.T) {
 		tools := session.OrchestrateToolPolicy{
 			Strategy: "auto", FallbackTool: "codex", AvailableTools: []string{"gemini"},
@@ -1162,6 +1210,95 @@ func TestProvidersToQuery_AgreesWithRecommendCandidates(t *testing.T) {
 				t.Fatalf("Recommend considered %v, candidates are %v", considered, wantConsidered)
 			}
 		})
+	}
+}
+
+// The two tail reasons ship verbatim in Decision.Reason, a JSON field the
+// orchestrate CLI reads, so their text is output and not just an internal
+// label. Every other assertion in this file names the constant, which keeps
+// passing when the text is reworded; these two rows spell the whole string out,
+// so a reword has to come here. Both inputs produce a single-clause reason, and
+// the comparison is equality, not strings.Contains.
+func TestDecision_ReasonLiterals(t *testing.T) {
+	t.Run("step-1-kept-the-first-surviving-candidate", func(t *testing.T) {
+		policy := DefaultPolicy("claude")
+		policy.Failover = []string{"claude", "codex"}
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "claude"},
+			[]Snapshot{
+				recSnapshot(Claude, "personal", 5, 90, nil),
+				recSnapshot(Codex, "work", 4, 90, nil),
+			},
+			autoTools(), policy,
+		)
+		const want = "no eligible candidate; kept the first candidate that is not an ineligible unknown"
+		if got.Reason != want {
+			t.Errorf("Reason = %q, want exactly %q", got.Reason, want)
+		}
+	})
+
+	t.Run("step-2-kept-the-preferred-tool", func(t *testing.T) {
+		policy := DefaultPolicy("claude")
+		policy.Failover = nil
+		got := Recommend(
+			Request{Role: "planner", Tier: TierMid, Prefer: "gemini"},
+			nil, autoTools(), policy,
+		)
+		const want = "no eligible candidate; kept the preferred tool"
+		if got.Reason != want {
+			t.Errorf("Reason = %q, want exactly %q", got.Reason, want)
+		}
+	})
+}
+
+// recommend.go documents the reason constants as literal prefixes the tests pin
+// with a substring match, and assertReason is a bare strings.Contains. That only
+// discriminates while no constant is a substring of another: the moment one is,
+// an assertion naming it passes on a decision that named the other, and the
+// suite stops discriminating without failing. Nothing in the compiler enforces
+// the promise, so this test does.
+//
+// The list is maintained by hand — Go cannot enumerate unexported constants — so
+// the length check is a sync tripwire between it and recommend.go's const block:
+// it fires whenever this table stops holding 13 rows, whether a row was dropped
+// here or a constant was added there, and either way both sites are updated
+// together. It cannot see a constant added to recommend.go alone.
+func TestReasonConstantsAreNotSubstringsOfEachOther(t *testing.T) {
+	reasons := map[string]string{
+		"reasonFirstHealthy":         reasonFirstHealthy,
+		"reasonPreferredConstrained": reasonPreferredConstrained,
+		"reasonFirstConstrained":     reasonFirstConstrained,
+		"reasonUnknownFailover":      reasonUnknownFailover,
+		"reasonExhaustedCandidate":   reasonExhaustedCandidate,
+		"reasonExhaustedFallback":    reasonExhaustedFallback,
+		"reasonNoCandidates":         reasonNoCandidates,
+		"reasonPolicyLimited":        reasonPolicyLimited,
+		"reasonTierFloor":            reasonTierFloor,
+		"reasonFrontierNoModel":      reasonFrontierNoModel,
+		"reasonFrontierGated":        reasonFrontierGated,
+		"reasonFrontierGateAbsent":   reasonFrontierGateAbsent,
+		"reasonProfileMiss":          reasonProfileMiss,
+	}
+	if len(reasons) != 13 {
+		t.Fatalf("the table lists %d reason constants; recommend.go's const block must match — update both together", len(reasons))
+	}
+
+	names := make([]string, 0, len(reasons))
+	for name := range reasons {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	for _, outer := range names {
+		for _, inner := range names {
+			if outer == inner {
+				continue
+			}
+			if strings.Contains(reasons[outer], reasons[inner]) {
+				t.Errorf("%s = %q contains %s = %q; assertReason's substring match would stop telling the two apart",
+					outer, reasons[outer], inner, reasons[inner])
+			}
+		}
 	}
 }
 
