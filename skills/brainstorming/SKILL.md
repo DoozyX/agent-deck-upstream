@@ -277,13 +277,39 @@ After approval, size the work and take exactly one exit:
   the plan yourself either: orchestrate's planner child writes it against
   the codebase.
 
+  **Freeze the run's goal before launching anything.** The conductor gets its
+  goal from the launch message and nowhere else, and that message does not
+  survive a conductor rotation: orchestrate's `rotate-conductor.sh` refuses
+  to rotate without `$RUN_ROOT/orchestrate/goal.md` and pastes it verbatim
+  into every successor's prompt. This session is the only one that still
+  holds the user's original ask in their own words, so it writes the file —
+  the conductor keeps it as-is and never rewrites it.
+
   ```bash
+  mkdir -p "$RUN_ROOT/orchestrate"
+  cat > "$RUN_ROOT/orchestrate/goal.md" <<EOF
+  # Goal
+  <the user's opening request to this brainstorm, verbatim — quoted, not
+   paraphrased; then the design's one-paragraph motivation, verbatim>
+
+  entrance: design
+  inputs: $SPEC_PATH
+  done means: every unit in the design's Decomposition sketch is landed per
+              the landing policy orchestrate records in its manifest, and the
+              design's Testing Decisions hold on the landed code
+  report to: <the user, by the channel this brainstorm ran in>
+  user constraints: <the design's out-of-scope section, verbatim; "none">
+  EOF
+  test -s "$RUN_ROOT/orchestrate/goal.md"   # a conductor launched on an empty goal cannot rotate
+
   TOOL=$(agent-deck session show --json | jq -r '(.data // .).tool')   # same connector as this session
   cat > "$RUN_ROOT/design/conductor-prompt.md" <<EOF
   The approved design for this feature is at $SPEC_PATH — read it there by
   absolute path; it is git-ignored on purpose. Run the \`orchestrate\` skill
   on that path. You are the conductor and the root of your own session tree;
-  the design is approved, so never re-open it, and never brainstorm.
+  the design is approved, so never re-open it, and never brainstorm. The
+  run's goal is already frozen at $RUN_ROOT/orchestrate/goal.md — read it,
+  keep it, and append to it only for scope changes the user approves.
   EOF
   agent-deck launch "$ROOT_WT" -c "$TOOL" -t "conductor-$RUN_ID" --no-parent \
     --message-file "$RUN_ROOT/design/conductor-prompt.md" --json \
