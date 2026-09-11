@@ -165,6 +165,15 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 	if err := json.Unmarshal(limits, &windows); err != nil {
 		return Snapshot{}, fmt.Errorf("openusage response has no limits")
 	}
+	// dedicatedWindowKeys excludes session/five_hour/session_5h for every
+	// provider, not just Claude, per the task's provider-agnostic wording
+	// ("not a recognised session alias"). Session5H itself is only populated
+	// from these keys when provider == Claude below, so a non-Claude
+	// resource literally named one of them is unreachable today (Codex
+	// fixtures use weekly/spark/sparkWeekly) but would be dropped rather
+	// than land in Models. Deliberate, not an oversight: a future provider
+	// integration reusing these names should find this note instead of
+	// quietly losing data.
 	if provider == Claude {
 		s.Windows.Session5H = parseWindow(windows["session"])
 		if s.Windows.Session5H == nil {
@@ -174,7 +183,7 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 			s.Windows.Session5H = parseWindow(windows["session_5h"])
 		}
 	}
-	s.Windows.Weekly = parseWindow(windows["weekly"])
+	s.Windows.Weekly = parseWindow(windows[weeklyKey])
 	if s.Windows.Weekly == nil && s.Windows.Session5H == nil {
 		return Snapshot{}, fmt.Errorf("openusage response has no supported windows")
 	}
@@ -182,19 +191,26 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 	return s, nil
 }
 
-// sessionAliasKeys are the resource names consumed by the dedicated
-// Session5H/Weekly fields; they must never also appear in Models.
-var sessionAliasKeys = map[string]bool{
-	"session":    true,
-	"five_hour":  true,
-	"session_5h": true,
-	"weekly":     true,
+// weeklyKey is the resource name for the dedicated Weekly window, shared
+// between the direct lookup above and dedicatedWindowKeys below so the two
+// can't drift apart.
+const weeklyKey = "weekly"
+
+// dedicatedWindowKeys are the resource names consumed by the dedicated
+// Session5H/Weekly fields; they must never also appear in Models. This is
+// not only "session aliases" (see the comment above) — it also carries
+// weeklyKey, since the weekly window is dedicated too.
+var dedicatedWindowKeys = map[string]struct{}{
+	"session":    {},
+	"five_hour":  {},
+	"session_5h": {},
+	weeklyKey:    {},
 }
 
 func parseModelWindows(windows map[string]json.RawMessage) map[string]*Window {
 	var models map[string]*Window
 	for name, raw := range windows {
-		if sessionAliasKeys[name] {
+		if _, dedicated := dedicatedWindowKeys[name]; dedicated {
 			continue
 		}
 		w := parseWindow(raw)
