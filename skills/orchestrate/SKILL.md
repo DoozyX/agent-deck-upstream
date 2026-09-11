@@ -247,13 +247,20 @@ launched on the manifest and the handoff, and neither carries the goal — a
 rotated run has been observed carrying on with every task row intact and
 nothing that said what the run was *for*. So write `$RUN_DIR/goal.md` now,
 and `rotate-conductor.sh` refuses to rotate without it and pastes it verbatim
-into every successor's prompt:
+into every successor's prompt.
+
+**If `goal.md` already exists, keep it.** The brainstorming skill's
+orchestrated exit writes it before launching you, because that session is
+the only one holding the user's ask in their own words; yours is the generic
+launch message. Read it, fill any field it left blank by appending, and
+never rewrite what is there. Write the file from scratch only when it is
+missing:
 
 ```markdown
 # Goal
 <the user's request, verbatim — quote it, do not paraphrase it. For a
- design entrance the launch message is generic, so quote the design's goal
- and acceptance-criteria sections instead, by absolute path and verbatim>
+ design entrance without a brainstorm-written goal.md, quote the design's
+ motivation and acceptance sections instead, by absolute path and verbatim>
 
 entrance: <design | plan | issues | freeform | verification>
 inputs: <SPEC_PATH, issue refs, or "none">
