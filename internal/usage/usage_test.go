@@ -109,6 +109,77 @@ func TestParseCodexWeeklyOnlyAndStale(t *testing.T) {
 	}
 }
 
+func TestParseClaudeFableLandsInModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"schema":"openusage.limits.v1","providers":{"claude":{"plan":"Max","resources":{"session":{"kind":"consumption","remaining":76,"resetsAt":"2026-09-01T09:00:00Z"},"weekly":{"kind":"consumption","remaining":75,"resetsAt":"2026-09-03T08:00:00Z"},"fable":{"kind":"consumption","remaining":42,"resetsAt":"2026-09-02T10:00:00Z"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Models == nil || s.Windows.Models["fable"] == nil {
+		t.Fatalf("Models = %#v, want fable window", s.Windows.Models)
+	}
+	fable := s.Windows.Models["fable"]
+	if fable.RemainingPercent != 42 || !fable.ResetsAt.Equal(time.Date(2026, 9, 2, 10, 0, 0, 0, time.UTC)) {
+		t.Fatalf("fable window = %#v", fable)
+	}
+	if len(s.Windows.Models) != 1 {
+		t.Fatalf("Models = %#v, want only fable", s.Windows.Models)
+	}
+}
+
+func TestParseCodexSparkAndSparkWeeklyLandInModelsCreditsIgnored(t *testing.T) {
+	s, err := Parse(Codex, []byte(`{"schema":"openusage.limits.v1","providers":{"codex":{"plan":"Pro","resources":{"weekly":{"kind":"consumption","remaining":83,"resetsAt":"2026-09-07T06:59:05Z"},"spark":{"kind":"consumption","remaining":60,"resetsAt":"2026-09-04T00:00:00Z"},"sparkWeekly":{"kind":"consumption","remaining":55,"resetsAt":"2026-09-08T00:00:00Z"},"credits":{"kind":"balance","amount":12.5}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Models == nil {
+		t.Fatalf("Models = %#v, want spark and sparkWeekly", s.Windows.Models)
+	}
+	if len(s.Windows.Models) != 2 {
+		t.Fatalf("Models = %#v, want exactly spark and sparkWeekly (credits ignored)", s.Windows.Models)
+	}
+	spark := s.Windows.Models["spark"]
+	if spark == nil || spark.RemainingPercent != 60 || !spark.ResetsAt.Equal(time.Date(2026, 9, 4, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("spark window = %#v", spark)
+	}
+	sparkWeekly := s.Windows.Models["sparkWeekly"]
+	if sparkWeekly == nil || sparkWeekly.RemainingPercent != 55 || !sparkWeekly.ResetsAt.Equal(time.Date(2026, 9, 8, 0, 0, 0, 0, time.UTC)) {
+		t.Fatalf("sparkWeekly window = %#v", sparkWeekly)
+	}
+	if _, ok := s.Windows.Models["credits"]; ok {
+		t.Fatalf("Models = %#v, credits (a balance) must be ignored", s.Windows.Models)
+	}
+}
+
+func TestParseModelsNilWhenNoExtraResource(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"limits":{"five_hour":{"remaining_percent":82},"weekly":{"remaining_percent":61}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil when no extra consumption resource is present", s.Windows.Models)
+	}
+}
+
+func TestParseSessionAliasesAndWeeklyDoNotLeakIntoModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":91},"five_hour":{"remaining":37},"weekly":{"remaining":64}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 91 {
+		t.Fatalf("session window = %#v, want session to win over five_hour", s.Windows.Session5H)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil: session, five_hour and weekly must not leak into Models", s.Windows.Models)
+	}
+}
+
+func TestParseModelOnlyResponseStillErrorsWithoutDedicatedWindow(t *testing.T) {
+	_, err := Parse(Codex, []byte(`{"resources":{"spark":{"remaining":60}}}`))
+	if err == nil || err.Error() != "openusage response has no supported windows" {
+		t.Fatalf("error = %v, want no supported windows error", err)
+	}
+}
+
 func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
