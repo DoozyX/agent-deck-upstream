@@ -135,6 +135,13 @@ LIVENESS_INTERVAL="${ROTATE_LIVENESS_INTERVAL:-2}"
 # the gate on its own.
 LIVE_STATUS_RE='^(running|waiting|idle)$'
 DEAD_STATUS_RE='^(error|stopped)$'
+# "queued" is its own answer, not a slow start: a launch into a group already at
+# its max_concurrent cap is STORED queued and never started (launch_cmd.go).
+# Fixing the -g defect below makes this reachable — the successor now lands in
+# the predecessor's group, which is the group already holding this run's
+# children. A queued successor is not supervising anything, so handing it the
+# run and archiving self would strand it exactly like the corpse did.
+QUEUED_STATUS_RE='^queued$'
 # A pane can be perfectly healthy and still unable to make progress, which is
 # exactly the incident: SubstateUsageLimit pairs with idle/waiting by design,
 # "precisely why it needs its own signal, since 'idle' is the state periodic
@@ -148,6 +155,7 @@ PROBE_RAW=""
 LIVENESS_REASON=""
 LAUNCH_JSON=""
 NEW_ID=""
+QUEUED_SUCCESSOR=0
 
 # Every probe below is guarded: `session show` on a vanished session exits 2,
 # and an unguarded command substitution under `set -e` would abort the script
@@ -173,11 +181,21 @@ await_successor() {
   local deadline=$((SECONDS + LIVENESS_SETTLE))
   local saw_live=0
   local probes=0
+  local show_fails=0
+  QUEUED_SUCCESSOR=0
   while :; do
     probes=$((probes + 1))
-    if ! probe_successor; then
-      LIVENESS_REASON="\`session show $NEW_ID\` failed; the successor is not in the deck any more"
-      return 1
+    if probe_successor; then
+      show_fails=0
+    else
+      # One failed read immediately after launch can be the store not yet
+      # readable rather than a death. Two in a row — or one after the successor
+      # has already been seen alive — is a session that is gone.
+      show_fails=$((show_fails + 1))
+      if [ "$show_fails" -ge 2 ] || [ "$saw_live" -eq 1 ]; then
+        LIVENESS_REASON="\`session show $NEW_ID\` failed twice; the successor is not in the deck any more"
+        return 1
+      fi
     fi
     if [[ "$PROBE_SUBSTATE" =~ $FATAL_SUBSTATE_RE ]]; then
       LIVENESS_REASON="successor status is '$PROBE_STATUS' but its substate is '$PROBE_SUBSTATE' — the pane is up and cannot make progress"
@@ -185,6 +203,11 @@ await_successor() {
     fi
     if [[ "$PROBE_STATUS" =~ $DEAD_STATUS_RE ]]; then
       LIVENESS_REASON="successor status is '$PROBE_STATUS' — its pane terminated"
+      return 1
+    fi
+    if [[ "$PROBE_STATUS" =~ $QUEUED_STATUS_RE ]]; then
+      QUEUED_SUCCESSOR=1
+      LIVENESS_REASON="successor is 'queued' — group '${GROUP:-<none>}' is at its max_concurrent cap, so it was stored and never started. Raise the cap or free a session in that group; a different tool cannot help."
       return 1
     fi
     if [[ "$PROBE_STATUS" =~ $LIVE_STATUS_RE ]]; then
@@ -212,7 +235,13 @@ launch_successor() {
   cmd=(launch "$REPO" -t "$NEXT_TITLE" -c "$tool" --no-parent
        --message-file "$PROMPT_FILE")
   [ -n "$GROUP" ] && cmd+=(-g "$GROUP")
+  # Clear the previous attempt's readings, so a retry that never gets far
+  # enough to probe cannot log the FIRST attempt's session show under its own
+  # heading in rotate-failure-*.log.
   NEW_ID=""
+  PROBE_RAW=""
+  PROBE_STATUS=""
+  PROBE_SUBSTATE=""
   LAUNCH_JSON="$(agent-deck "${cmd[@]}" --json 2>&1)" || rc=$?
   LAUNCH_RC="$rc"
   NEW_ID="$(jq -r '(.data // .) | (.id // .session_id // empty)' <<<"$LAUNCH_JSON" 2>/dev/null)" || NEW_ID=""
@@ -281,7 +310,8 @@ else
   # successor is confirmed alive, so a rejected attempt costs a session id and
   # no generation. The retry is not conditioned on WHY the first one died —
   # by that point a different tool is the only lever this script has.
-  if [ "${ROTATE_NO_RETRY:-0}" != "1" ] && [ -n "$SELF_TOOL" ] && [ "$SELF_TOOL" != "$FIRST_TOOL" ]; then
+  if [ "${ROTATE_NO_RETRY:-0}" != "1" ] && [ "$QUEUED_SUCCESSOR" -eq 0 ] && \
+     [ -n "$SELF_TOOL" ] && [ "$SELF_TOOL" != "$FIRST_TOOL" ]; then
     echo "rotate-conductor: retrying once on this conductor's own tool '$SELF_TOOL'." >&2
     if attempt_rotation "$SELF_TOOL"; then
       NEXT_TOOL="$SELF_TOOL"
