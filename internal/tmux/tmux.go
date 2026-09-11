@@ -3927,11 +3927,15 @@ func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 	logFile := s.LogFile()
 	os.Remove(logFile) // Ignore errors
 
-	// Capture process tree BEFORE killing so we can verify they die
-	_, oldPIDs := s.getPaneProcessTreeFor(target)
-	oldProcesses := CaptureProcessIdentities(oldPIDs)
-	if len(oldPIDs) > 0 {
-		respawnLog.Info("pre_kill_process_tree", slog.String("session", logging.SanitizeValue(s.Name)), slog.Any("pids", oldPIDs))
+	// Capture the reap scope BEFORE killing so we can verify they die. The
+	// scope is the parent-link walk UNION every process on the session's pane
+	// ttys: a descendant already reparented to PID 1 has left the walk but not
+	// the pty, and the pty is gone the instant kill-session runs. See
+	// teardown_reap_scope.go (2026-09-11 orphan-leak incident).
+	scope := s.teardownReapScopeFor(target)
+	oldProcesses := CaptureProcessIdentities(scope.PIDs)
+	if len(scope.PIDs) > 0 {
+		respawnLog.Info("pre_kill_process_tree", slog.String("session", logging.SanitizeValue(s.Name)), slog.Any("pids", scope.PIDs))
 	}
 
 	// Kill the tmux session. Bounded — see tmuxMutationTimeout. A client
@@ -3944,9 +3948,9 @@ func (s *Session) teardown(target string, owned bool, synchronous bool) error {
 	// process exists on this path — the session is gone — so nothing is spared.
 	if len(oldProcesses) > 0 {
 		if synchronous {
-			EnsureProcessIdentitiesDead(oldProcesses, 3*time.Second)
+			ensureTeardownScopeDead(scope, oldProcesses, 3*time.Second)
 		} else {
-			go EnsureProcessIdentitiesDead(oldProcesses, 3*time.Second)
+			go ensureTeardownScopeDead(scope, oldProcesses, 3*time.Second)
 		}
 	}
 
