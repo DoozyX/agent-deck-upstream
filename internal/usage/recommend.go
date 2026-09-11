@@ -119,10 +119,11 @@ func preferredTool(req Request, policy Policy) string {
 // healthy-first ordering) may live here — that work happens in Recommend.
 //
 // The second result is the preferred tool AS THIS FUNCTION RESOLVED IT, which
-// is not always preferredTool's answer: the collapsed strategies prefer
-// OrchestrateToolPolicy.FallbackTool, not Policy.Failover[0]. Recommend must
-// use this value and not re-derive one, or the two disagree (the rule 3
-// carve-out then compares against a tool that is not a candidate).
+// is not always preferredTool's answer: with an EMPTY Request.Prefer the
+// collapsed strategies resolve to OrchestrateToolPolicy.FallbackTool, where
+// preferredTool answers Policy.Failover[0]. (With Request.Prefer set the two
+// agree.) Recommend must use this value and not re-derive one, or they
+// disagree and the rule 3 carve-out compares against a non-candidate.
 //
 // The third result reports that the tool strategy limited failover to a single
 // tool, which the decision's reason records. It is false when the strategy
@@ -245,20 +246,25 @@ func selectSnapshot(snapshots []Snapshot, provider Provider, profile string) (*S
 // exhausted; remaining == ConstrainedBelow is healthy, not constrained. Equal
 // thresholds are legal and make "constrained" unreachable: everything below the
 // shared value is exhausted and everything at or above it is healthy.
+//
+// "Present" is tracked with a separate flag rather than a negative sentinel:
+// parseWindow never clamps, so a negative RemainingPercent is a value a
+// snapshot may legitimately carry, and folding the two meanings together would
+// silently drop it from the minimum.
 func snapshotState(snapshot *Snapshot, policy Policy) (state string, remaining int) {
 	if snapshot == nil || !snapshot.Available {
 		return StateUnknown, -1
 	}
-	remaining = -1
+	found := false
 	for _, window := range []*Window{snapshot.Windows.Session5H, snapshot.Windows.Weekly} {
 		if window == nil {
 			continue
 		}
-		if remaining < 0 || window.RemainingPercent < remaining {
-			remaining = window.RemainingPercent
+		if !found || window.RemainingPercent < remaining {
+			remaining, found = window.RemainingPercent, true
 		}
 	}
-	if remaining < 0 {
+	if !found {
 		return StateUnknown, -1
 	}
 	switch {
@@ -275,6 +281,11 @@ func evaluateTool(tool string, snapshots []Snapshot, profile string, policy Poli
 	eval := evaluation{tool: tool, state: StateUnknown, remaining: -1}
 	provider, ok := toolProvider(tool)
 	if !ok {
+		// A named profile misses here too: a tool with no usage provider has
+		// no snapshot for any profile. Recording it keeps the clause from
+		// being silently provider-scoped, which would let a request name a
+		// profile that matched nothing and say nothing about it.
+		eval.profileMiss = profile != ""
 		return eval
 	}
 	eval.provider = provider
@@ -376,7 +387,8 @@ func ladderRung(ladder Ladder, tier Tier) string {
 // whose remaining is below ConstrainedBelow (strictly: a window sitting exactly
 // at ConstrainedBelow does not gate, matching the state comparison). A gate
 // window that is absent from Snapshot.Windows.Models does NOT gate, but the
-// reason records that so the user can see why the gate did not apply.
+// reason records that so the user can see why the gate did not apply. The two
+// downgrade causes are independent and both are reported when both hold.
 //
 // Two carve-outs out of rule 5, both silent — they add no reason clause:
 //
@@ -399,30 +411,37 @@ func resolveModel(provider Provider, tier Tier, snapshot *Snapshot, policy Polic
 		return ladderRung(ladder, tier), tier, nil
 	}
 
+	// Both downgrade causes are evaluated, not just the first: an empty
+	// frontier rung does not short-circuit the gate, so when both hold the
+	// reason names both rather than hiding one behind the other.
+	var clauses []string
 	frontier := ladderRung(ladder, TierFrontier)
 	if frontier == "" {
-		clause := reasonFrontierNoModel + fmt.Sprintf(" for %s", provider)
-		return ladderRung(ladder, TierStrong), TierStrong, []string{clause}
+		clauses = append(clauses, reasonFrontierNoModel+fmt.Sprintf(" for %s", provider))
 	}
 
-	window := strings.TrimSpace(policy.FrontierWindow[provider])
-	if window == "" {
-		return frontier, TierFrontier, nil
+	gated := false
+	if window := strings.TrimSpace(policy.FrontierWindow[provider]); window != "" {
+		var gate *Window
+		if snapshot != nil {
+			gate = snapshot.Windows.Models[window]
+		}
+		switch {
+		case gate == nil:
+			clauses = append(clauses, reasonFrontierGateAbsent+
+				fmt.Sprintf(" %q; the gate did not apply", window))
+		case gate.RemainingPercent < policy.ConstrainedBelow:
+			gated = true
+			clauses = append(clauses, reasonFrontierGated+
+				fmt.Sprintf(" %q at %d%% is below constrained_below %d",
+					window, gate.RemainingPercent, policy.ConstrainedBelow))
+		}
 	}
-	var gate *Window
-	if snapshot != nil {
-		gate = snapshot.Windows.Models[window]
+
+	if frontier == "" || gated {
+		return ladderRung(ladder, TierStrong), TierStrong, clauses
 	}
-	if gate == nil {
-		clause := reasonFrontierGateAbsent + fmt.Sprintf(" %q; the gate did not apply", window)
-		return frontier, TierFrontier, []string{clause}
-	}
-	if gate.RemainingPercent < policy.ConstrainedBelow {
-		clause := reasonFrontierGated + fmt.Sprintf(" %q at %d%% is below constrained_below %d",
-			window, gate.RemainingPercent, policy.ConstrainedBelow)
-		return ladderRung(ladder, TierStrong), TierStrong, []string{clause}
-	}
-	return frontier, TierFrontier, nil
+	return frontier, TierFrontier, clauses
 }
 
 // applyTierFloor is the design's rule 4: the implementer and reviewer roles

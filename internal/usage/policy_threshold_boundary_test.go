@@ -21,31 +21,31 @@ import (
 // comparisons in Recommend.
 func TestPolicyFromConfig_AcceptsThresholdBoundaries(t *testing.T) {
 	tests := []struct {
-		name                            string
-		exhausted, constrained          *int
-		wantExhausted, wantConstrained  int
-		mutationThisRowIsTheOnlyGuardOf string
+		name                           string
+		exhausted, constrained         *int
+		wantExhausted, wantConstrained int
+		guards                         string
 	}{
 		{
 			name: "both at zero", exhausted: policyIntPtr(0), constrained: policyIntPtr(0),
 			wantExhausted: 0, wantConstrained: 0,
-			mutationThisRowIsTheOnlyGuardOf: "validateThreshold value < 0 -> <= 0",
+			guards: "validateThreshold value < 0 -> <= 0",
 		},
 		{
 			name: "both at one hundred", exhausted: policyIntPtr(100), constrained: policyIntPtr(100),
 			wantExhausted: 100, wantConstrained: 100,
-			mutationThisRowIsTheOnlyGuardOf: "validateThreshold value > 100 -> >= 100",
+			guards: "validateThreshold value > 100 -> >= 100",
 		},
 		{
 			name: "constrained_below alone at one hundred", constrained: policyIntPtr(100),
 			wantExhausted: 15, wantConstrained: 100,
-			mutationThisRowIsTheOnlyGuardOf: "validateThreshold value > 100 -> >= 100",
+			guards: "validateThreshold value > 100 -> >= 100",
 		},
 		{
 			name:      "equal thresholds in the middle of the range",
 			exhausted: policyIntPtr(35), constrained: policyIntPtr(35),
 			wantExhausted: 35, wantConstrained: 35,
-			mutationThisRowIsTheOnlyGuardOf: "merge ExhaustedBelow > ConstrainedBelow -> >=",
+			guards: "merge ExhaustedBelow > ConstrainedBelow -> >=",
 		},
 		{
 			// Only exhausted_below is set and it equals the DEFAULT
@@ -53,7 +53,7 @@ func TestPolicyFromConfig_AcceptsThresholdBoundaries(t *testing.T) {
 			name:          "exhausted_below equal to the default constrained_below",
 			exhausted:     policyIntPtr(35),
 			wantExhausted: 35, wantConstrained: 35,
-			mutationThisRowIsTheOnlyGuardOf: "merge ExhaustedBelow > ConstrainedBelow -> >=",
+			guards: "merge ExhaustedBelow > ConstrainedBelow -> >=",
 		},
 	}
 
@@ -66,7 +66,7 @@ func TestPolicyFromConfig_AcceptsThresholdBoundaries(t *testing.T) {
 			}
 			got, err := PolicyFromConfig(cfg)
 			if err != nil {
-				t.Fatalf("PolicyFromConfig() error = %v, want nil (guards: %s)", err, tc.mutationThisRowIsTheOnlyGuardOf)
+				t.Fatalf("PolicyFromConfig() error = %v, want nil (guards: %s)", err, tc.guards)
 			}
 			if got.ExhaustedBelow != tc.wantExhausted {
 				t.Errorf("ExhaustedBelow = %d, want %d", got.ExhaustedBelow, tc.wantExhausted)
