@@ -57,7 +57,11 @@ exit 0
 	}
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	stdout, stderr, code := runAgentDeck(t, home, "launch", home, "-c", "shell", "--account", "work", "--no-wait")
+	// --no-confirm-alive: the fake tmux above answers `has-session` with exit 1,
+	// so the now-default post-spawn liveness check correctly reads the pane as
+	// gone and fails the launch. This test is about the account slot reaching
+	// the saved row, not about liveness, and the stub cannot model a live pane.
+	stdout, stderr, code := runAgentDeck(t, home, "launch", home, "-c", "shell", "--account", "work", "--no-wait", "--no-confirm-alive")
 	if code != 0 {
 		t.Fatalf("launch exit = %d\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}

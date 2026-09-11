@@ -85,7 +85,8 @@ agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
 agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
 agent-deck launch . -w feature/a -b --base dev -c claude  # new branch explicitly based on dev
-agent-deck launch . -c codex -m "Task" --confirm-alive --json  # fail if the session dies on arrival
+agent-deck launch . -c codex -m "Task" --json                  # fails by default if the session dies on arrival
+agent-deck launch . -c codex -m "Task" --no-confirm-alive --json  # accepted-don't-look: report success as soon as the spawn is accepted
 ```
 
 Notes:
@@ -93,13 +94,16 @@ Notes:
 - `--base <revision>` requires `-w/--worktree` and `-b/--new-branch`. It resolves the revision to an immutable commit before creating the worktree and prints the verified base revision and sha.
 - `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
 - `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
-- `--confirm-alive` watches the new session for `--alive-window` (default `5s`) before reporting. Use it in any script that acts on the result, because without it `launch` can report `"success": true, "delivery": "submitted"` for a session that is dead seconds later — a fresh `-c codex -m …` launch embeds the prompt in the command and returns as soon as tmux accepts the spawn, before the agent's first turn, so nothing in the default output observes the agent at all.
+- **Post-spawn liveness check (on by default).** `launch` watches the new session for `--alive-window` (default `5s`) before reporting, so `"success": true` means "this session was observed running". Without it — and it was opt-in until this release — `launch` reported `"success": true, "delivery": "submitted"` for a session that was dead seconds later: a fresh `-c codex -m …` launch embeds the prompt in the command and returns as soon as tmux accepts the spawn, before the agent's first turn, so nothing in the old default output observed the agent at all.
   - On a death: exit 1, `"success": false`, `"alive": false`, `"code": "SESSION_DOA"`, plus `doa_reason` and — when the tool printed one — `doa_detail` carrying the tool's own error text (a codex usage limit, a crash). The session `id`/`session_id` stay in the payload so the caller can remove the row.
   - On survival: exit 0 and `"alive": true`. This means **"did not die within the window"**, not "is healthy" — `liveness_window_ms` and `liveness_observed_ms` are published next to it so the claim cannot be read as more than it is. A death after the window is not caught, and neither is a tool that prints a terminal error and keeps its pane up.
   - `liveness_observed_ms` counts from the *first liveness poll*, not from the spawn — the session save runs in between. On a death, `doa_elapsed_ms` gives the spawn-relative age when agent-deck's own fast-death record measured it.
   - A launch that lands in a group at its concurrency cap returns `"status": "queued"` and exit 0 with **no `alive` key**: nothing was spawned, so there was nothing to observe. Check for the key rather than indexing it blindly.
   - Waiting also lets agent-deck's fast-death watcher record the failure, so `session show --json` carries `spawn_failure` (with the tool's dying output) for these sessions instead of a bare `stopped`.
-  - Off by default: without the flag the JSON keys are exactly what they have always been. A one-shot invocation (`codex exec`, the DeepSeek headless profile) is not reported DOA for exiting normally, but a non-zero exit still fails. `--alive-window` without `--confirm-alive` is an error.
+  - **Cost:** a surviving launch now blocks for the full window (5s by default) — aliveness can only be established by not dying. `--alive-window 2s` trades detection for latency.
+  - `--no-confirm-alive` opts out and restores the old fire-and-forget contract exactly: exit 0 as soon as the spawn is accepted, and none of the `alive`/`liveness_*`/`doa_*` keys. Use it only where the caller does not act on the result.
+  - `--confirm-alive` is still accepted and is now a no-op (the check it requested is the default). `--alive-window` no longer needs it. Passing `--confirm-alive` and `--no-confirm-alive` together, or `--alive-window` with `--no-confirm-alive`, is an error rather than a silently ignored flag.
+  - A one-shot invocation (`codex exec`, the DeepSeek headless profile) is not reported DOA for exiting normally, but a non-zero exit still fails.
 
 ### accounts - List named account slots
 
