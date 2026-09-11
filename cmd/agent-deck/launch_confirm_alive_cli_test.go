@@ -165,6 +165,15 @@ func TestLaunchConfirmAlive_DyingToolIsReportedDeadOnArrival(t *testing.T) {
 	if payload["doa_reason"] != "spawn_died_fast" {
 		t.Errorf("doa_reason = %v, want spawn_died_fast", payload["doa_reason"])
 	}
+	// doa_elapsed_ms is how old the process was when it died, measured from the
+	// spawn. liveness_observed_ms is how long this check watched, measured from
+	// its first poll — which happens after PostStartSync and the session save.
+	// They are different numbers and must not be conflated.
+	elapsed, _ := payload["doa_elapsed_ms"].(float64)
+	if elapsed <= 0 {
+		t.Errorf("doa_elapsed_ms = %v, want the spawn-relative age from the fast-death record",
+			payload["doa_elapsed_ms"])
+	}
 	// The `error` string has to stand on its own: an operator reading a log line
 	// should not have to cross-reference doa_detail to learn why.
 	errText, _ := payload["error"].(string)
@@ -266,8 +275,32 @@ func TestLaunchConfirmAlive_RejectsAWindowWithoutTheFlag(t *testing.T) {
 			payload["success"], payload["code"], ErrCodeInvalidOperation, stderr)
 	}
 	// Nothing may have been created: the refusal is a precondition, not a
-	// cleanup.
-	if _, ok := payload["session_id"]; ok {
-		t.Errorf("a refused launch created a session anyway: %v", payload)
+	// cleanup. Asked of the state DB, because the error payload carries only
+	// success/error/code and so could never have shown a session id anyway.
+	listed, listCode, listStderr := runAgentDeckCLI(t, home, binDir, "list", "--json")
+	if listCode != 0 {
+		t.Fatalf("list after the refused launch exited %d: %s", listCode, listStderr)
 	}
+	if strings.Contains(listed, "orphan-window") {
+		t.Errorf("a refused launch created a session anyway: %s", listed)
+	}
+}
+
+// runAgentDeckCLI runs one agent-deck subprocess under the same isolated HOME
+// and PATH as runLaunchCLI and returns its raw stdout.
+func runAgentDeckCLI(t *testing.T, home, binDir string, args ...string) (stdout string, exitCode int, stderr string) {
+	t.Helper()
+	cmd := exec.Command(channelsCLIBinary(t), args...)
+	cmd.Env = launchCLIEnv(home, binDir)
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("%v did not run: %v\nstderr: %s", args, err, errBuf.String())
+		}
+		exitCode = exitErr.ExitCode()
+	}
+	return outBuf.String(), exitCode, errBuf.String()
 }

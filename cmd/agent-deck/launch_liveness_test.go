@@ -90,7 +90,11 @@ func TestConfirmLaunchAlive_SpawnFailureRecordIsTheVerdictAndCarriesToolText(t *
 		if elapsed < 30*time.Millisecond {
 			return nil
 		}
-		return &session.SpawnFailureRecord{Reason: "spawn_died_fast", DyingOutput: "  " + toolText + "\n"}
+		return &session.SpawnFailureRecord{
+			Reason:      "spawn_died_fast",
+			DyingOutput: "  " + toolText + "\n",
+			ElapsedMs:   2263,
+		}
 	}
 
 	got := confirmLaunchAlive(probe, 3*time.Second, 10*time.Millisecond)
@@ -108,9 +112,19 @@ func TestConfirmLaunchAlive_SpawnFailureRecordIsTheVerdictAndCarriesToolText(t *
 		t.Errorf("ObservedMS = %d: a proven death must end the watch, not wait out the window",
 			got.ObservedMS)
 	}
-	if msg := got.message("orchestrate-c2"); !strings.Contains(msg, toolText) ||
-		!strings.Contains(msg, "orchestrate-c2") {
+	// The age quoted to the operator must be the record's spawn-relative one.
+	// ObservedMS is measured from the first poll, which runs after PostStartSync
+	// and the session save — printing it as "after launch" would be the same
+	// overclaim this change exists to remove.
+	if got.SpawnElapsedMS != 2263 {
+		t.Errorf("SpawnElapsedMS = %d, want the record's 2263", got.SpawnElapsedMS)
+	}
+	msg := got.message("orchestrate-c2")
+	if !strings.Contains(msg, toolText) || !strings.Contains(msg, "orchestrate-c2") {
 		t.Errorf("message() must name the session and quote the tool, got %q", msg)
+	}
+	if !strings.Contains(msg, "2263ms after spawn") {
+		t.Errorf("message() must quote the spawn-relative age, got %q", msg)
 	}
 }
 
@@ -132,6 +146,15 @@ func TestConfirmLaunchAlive_VanishedPaneWithoutRecordIsStillDOA(t *testing.T) {
 	}
 	if got.Detail != "" {
 		t.Errorf("Detail = %q, want empty: nothing explained this death", got.Detail)
+	}
+	// With no record there is no spawn-relative age to quote, so the message
+	// must bound the death by the window instead of passing off the
+	// watch-relative number as the process's age.
+	if got.SpawnElapsedMS != 0 {
+		t.Errorf("SpawnElapsedMS = %d, want 0 when no record explained the death", got.SpawnElapsedMS)
+	}
+	if msg := got.message("ghost"); !strings.Contains(msg, "within the 3000ms liveness window") {
+		t.Errorf("message() = %q, want it bounded by the window rather than claiming an exact age", msg)
 	}
 	if got.ObservedMS < 60 {
 		t.Errorf("ObservedMS = %d: the grace must be spent giving the fast-death watcher a "+
@@ -233,15 +256,27 @@ func TestLaunchLivenessAddTo_PublishesTheMeasurementAndOnlyTheMeasurement(t *tes
 	}
 
 	dead := map[string]interface{}{}
-	launchLiveness{WindowMS: 5000, ObservedMS: 2363, Reason: "spawn_died_fast", Detail: "boom"}.addTo(dead)
+	launchLiveness{
+		WindowMS: 5000, ObservedMS: 2363, SpawnElapsedMS: 2263,
+		Reason: "spawn_died_fast", Detail: "boom",
+	}.addTo(dead)
 	if dead["alive"] != false || dead["doa_reason"] != "spawn_died_fast" || dead["doa_detail"] != "boom" {
 		t.Errorf("dead payload = %v", dead)
+	}
+	// The two ages are different measurements and both are published: one is
+	// how long this check watched, the other how old the process was when it
+	// died. Collapsing them would misstate one of the two.
+	if dead["doa_elapsed_ms"] != int64(2263) || dead["liveness_observed_ms"] != int64(2363) {
+		t.Errorf("dead payload must keep the spawn-relative and watch-relative ages apart: %v", dead)
 	}
 
 	noDetail := map[string]interface{}{}
 	launchLiveness{Reason: launchDOAReasonSessionGone}.addTo(noDetail)
 	if _, ok := noDetail["doa_detail"]; ok {
 		t.Error("doa_detail must be omitted when nothing explained the death, not empty-stringed")
+	}
+	if _, ok := noDetail["doa_elapsed_ms"]; ok {
+		t.Error("doa_elapsed_ms must be omitted when no record measured the death, not zeroed")
 	}
 }
 
