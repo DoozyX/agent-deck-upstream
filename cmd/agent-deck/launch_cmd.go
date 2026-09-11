@@ -272,8 +272,12 @@ func handleLaunch(profile string, args []string) {
 	// byte-for-byte what it has always been, because other scripts and skills
 	// parse this JSON. See launch_liveness.go for what the verdict does and
 	// does not assert.
-	confirmAlive := fs.Bool("confirm-alive", false, "After spawning, watch the session for --alive-window and fail (exit 1, alive:false) if it died; without this a session that dies seconds later still reports success")
-	aliveWindow := fs.String("alive-window", "", "How long --confirm-alive watches the new session (Go duration; default 5s)")
+	// On by default: `success: true` has to mean "this session was observed
+	// running". --confirm-alive is kept as an accepted no-op so the callers
+	// written against the opt-in shape keep working unchanged.
+	confirmAlive := fs.Bool("confirm-alive", false, "No-op; the post-spawn liveness check is on by default (kept for compatibility)")
+	noConfirmAlive := fs.Bool("no-confirm-alive", false, "Skip the post-spawn liveness check and report success as soon as the spawn is accepted; a session that dies seconds later will still report success")
+	aliveWindow := fs.String("alive-window", "", "How long the post-spawn liveness check watches the new session (Go duration; default 5s)")
 
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
@@ -365,7 +369,7 @@ func handleLaunch(profile string, args []string) {
 	}
 	// Resolve the liveness budget BEFORE anything is created: a typo in the
 	// duration must not cost a spawned session that then goes unreported.
-	aliveBudget, aliveErr := resolveLaunchAliveWindow(*confirmAlive, *aliveWindow)
+	aliveBudget, aliveErr := resolveLaunchAliveWindow(*confirmAlive, *noConfirmAlive, *aliveWindow)
 	if aliveErr != nil {
 		out.Error(aliveErr.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
@@ -1181,13 +1185,17 @@ func handleLaunch(profile string, args []string) {
 		}
 	}
 
-	// --confirm-alive: the one thing every field above still cannot tell a
-	// caller apart — "the session is up and working" from "the session is up
-	// and already dead". Off by default so existing readers of this JSON see
-	// exactly the keys they saw before; see launch_liveness.go for why
-	// `delivery: "submitted"` is silent about this on the codex argv path, and
-	// why staying alive here is also what lets the existing fast-death watcher
-	// record its diagnosis for `session show --json`.
+	// The post-spawn liveness check: the one thing every field above still
+	// cannot tell a caller apart — "the session is up and working" from "the
+	// session is up and already dead". ON by default, because `success: true`
+	// is the only thing an orchestrating parent has to go on, and an opt-in
+	// check leaves every caller that never heard of the flag acting on a
+	// child that is already gone. --no-confirm-alive opts out.
+	//
+	// See launch_liveness.go for why `delivery: "submitted"` is silent about
+	// this on the codex argv path, and why staying alive here is also what lets
+	// the existing fast-death watcher record its diagnosis for
+	// `session show --json`.
 	if aliveBudget > 0 {
 		liveness := confirmLaunchAlive(newInstance, aliveBudget, launchAlivePollInterval)
 		liveness.addTo(jsonData)
@@ -1207,15 +1215,26 @@ func handleLaunch(profile string, args []string) {
 	out.Success(msg, jsonData)
 }
 
-// resolveLaunchAliveWindow turns the --confirm-alive/--alive-window pair into a
-// budget, returning 0 when the check is off. An --alive-window without
-// --confirm-alive is refused rather than ignored: silently doing nothing with a
-// flag a caller set is how this class of bug starts.
-func resolveLaunchAliveWindow(confirmAlive bool, rawWindow string) (time.Duration, error) {
+// resolveLaunchAliveWindow turns the liveness flags into a budget, returning 0
+// only when the caller explicitly opted out with --no-confirm-alive.
+//
+// The default is the fix. Before this, the check was opt-in, so every caller
+// that had not heard of --confirm-alive -- which is every caller written before
+// it existed -- got `success: true` the moment tmux accepted `new-session`,
+// with nothing having looked at the spawned process at all.
+//
+// Two combinations are refused rather than resolved in one flag's favour,
+// because silently ignoring a flag the caller set is the same class of quiet
+// failure this whole change exists to remove: both flags at once, and a window
+// asked for alongside the opt-out.
+func resolveLaunchAliveWindow(confirmAlive, noConfirmAlive bool, rawWindow string) (time.Duration, error) {
 	raw := strings.TrimSpace(rawWindow)
-	if !confirmAlive {
+	if confirmAlive && noConfirmAlive {
+		return 0, fmt.Errorf("--confirm-alive and --no-confirm-alive cannot be used together")
+	}
+	if noConfirmAlive {
 		if raw != "" {
-			return 0, fmt.Errorf("--alive-window requires --confirm-alive")
+			return 0, fmt.Errorf("--alive-window cannot be used with --no-confirm-alive")
 		}
 		return 0, nil
 	}
