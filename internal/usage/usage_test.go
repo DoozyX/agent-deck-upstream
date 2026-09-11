@@ -2,6 +2,7 @@ package usage
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -177,6 +178,61 @@ func TestParseModelOnlyResponseStillErrorsWithoutDedicatedWindow(t *testing.T) {
 	_, err := Parse(Codex, []byte(`{"resources":{"spark":{"remaining":60}}}`))
 	if err == nil || err.Error() != "openusage response has no supported windows" {
 		t.Fatalf("error = %v, want no supported windows error", err)
+	}
+}
+
+func TestParseSessionFiveHourAliasDoesNotLeakIntoModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session_5h":{"remaining":48},"weekly":{"remaining":64}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 48 {
+		t.Fatalf("session window = %#v, want session_5h to populate Session5H", s.Windows.Session5H)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil: session_5h must not leak into Models", s.Windows.Models)
+	}
+}
+
+func TestSnapshotJSONOmitsModelsFieldWhenNil(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"limits":{"five_hour":{"remaining_percent":82},"weekly":{"remaining_percent":61}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), `"models"`) {
+		t.Fatalf("marshaled snapshot = %s, want no \"models\" key when Models is nil", out)
+	}
+	var roundTrip Snapshot
+	if err := json.Unmarshal(out, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.Windows.Models != nil {
+		t.Fatalf("round-tripped Models = %#v, want nil", roundTrip.Windows.Models)
+	}
+}
+
+func TestSnapshotJSONIncludesPopulatedModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"schema":"openusage.limits.v1","providers":{"claude":{"plan":"Max","resources":{"session":{"kind":"consumption","remaining":76,"resetsAt":"2026-09-01T09:00:00Z"},"weekly":{"kind":"consumption","remaining":75,"resetsAt":"2026-09-03T08:00:00Z"},"fable":{"kind":"consumption","remaining":42,"resetsAt":"2026-09-02T10:00:00Z"}}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var roundTrip Snapshot
+	if err := json.Unmarshal(out, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.Windows.Models == nil || roundTrip.Windows.Models["fable"] == nil || roundTrip.Windows.Models["fable"].RemainingPercent != 42 {
+		t.Fatalf("round-tripped Models = %#v, want fable=42 to survive marshal/unmarshal", roundTrip.Windows.Models)
+	}
+	if !strings.Contains(string(out), `"models":{"fable":{"remaining_percent":42`) {
+		t.Fatalf("marshaled snapshot = %s, want models.fable serialized with remaining_percent", out)
 	}
 }
 
