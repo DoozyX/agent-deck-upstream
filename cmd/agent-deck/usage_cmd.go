@@ -69,6 +69,13 @@ func usageAccountForSession(inst *session.Instance) (usage.Account, error) {
 }
 
 func handleUsage(profile string, args []string) {
+	// `recommend` dispatches before the flagset below: flag.Parse stops at the
+	// leading "recommend" token, so every flag after it stays positional and
+	// the NArg() > 1 guard rejects the subcommand as extra session targets.
+	if len(args) > 0 && args[0] == "recommend" {
+		handleUsageRecommend(args[1:])
+		return
+	}
 	fs := flag.NewFlagSet("usage", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	all := fs.Bool("all", false, "query all configured local accounts")
@@ -76,6 +83,7 @@ func handleUsage(profile string, args []string) {
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: agent-deck usage --all [--json]")
 		fmt.Fprintln(fs.Output(), "Usage: agent-deck usage <session> [--json]")
+		fmt.Fprintln(fs.Output(), usageRecommendUsageLine)
 	}
 	if err := fs.Parse(usageArgsWithFlagsFirst(args)); err != nil {
 		if err != flag.ErrHelp {
