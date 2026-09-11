@@ -195,15 +195,20 @@ func TestParseSessionFiveHourAliasDoesNotLeakIntoModels(t *testing.T) {
 }
 
 // TestParseWeeklyValueExcludedFromModelsByDedicatedKeyGuard uses a
-// well-formed weekly value on purpose: a value parseWindow rejects (e.g. the
-// round-2 predecessor of this test, which used "weekly":"n/a") never reaches
-// the dedicatedWindowKeys guard at all, since parseModelWindows already
-// skips it via the `w == nil` check in parseModelWindows regardless of the
-// guard. That made the round-2 test pass even with weeklyKey deleted from
-// dedicatedWindowKeys, so it wasn't testing the guard. A value parseWindow
-// *accepts* is the only way to force execution through the guard: verified
-// by deleting weeklyKey from dedicatedWindowKeys and confirming this test
-// then fails (weekly leaks into Models), then restoring the key.
+// well-formed weekly value on purpose. The guard (the dedicatedWindowKeys
+// membership check in parseModelWindows, usage.go:216) runs BEFORE
+// parseWindow is ever called for that key (usage.go:219): with the guard
+// present, a dedicated key's raw value never reaches parseWindow at all. The
+// round-2 predecessor of this test used a malformed "weekly":"n/a" value,
+// which parseWindow rejects (returns nil) on its own regardless of the
+// guard — so that fixture couldn't distinguish the guard's short-circuit
+// from parseWindow's own rejection, and removing weeklyKey from
+// dedicatedWindowKeys did not fail it (see
+// TestParseMalformedWeeklyValueYieldsNilWeeklyAndNilModels below for that
+// coverage, restored separately). A value parseWindow *accepts* is the only
+// way to make the guard's exclusion observable: verified by deleting
+// weeklyKey from dedicatedWindowKeys and confirming this test then fails
+// (weekly leaks into Models), then restoring the key.
 func TestParseWeeklyValueExcludedFromModelsByDedicatedKeyGuard(t *testing.T) {
 	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"weekly":{"remaining":64}}}`))
 	if err != nil {
@@ -217,6 +222,67 @@ func TestParseWeeklyValueExcludedFromModelsByDedicatedKeyGuard(t *testing.T) {
 	}
 	if s.Windows.Models != nil {
 		t.Fatalf("Models = %#v, want nil: a well-formed value under the dedicated weekly key must be excluded by the dedicatedWindowKeys guard, not leak into Models", s.Windows.Models)
+	}
+}
+
+// TestParseMalformedWeeklyValueYieldsNilWeeklyAndNilModels restores the
+// round-2 malformed-value coverage that round 3 dropped when it rewrote
+// TestParseMalformedWeeklyValueExcludedFromModelsByDedicatedKeyGuard in
+// place instead of adding this alongside it: a malformed value under a
+// dedicated key must safely yield err == nil, Weekly == nil, Models == nil,
+// rather than erroring. This is a different property than the guard test
+// above (which needs a well-formed value to make the guard observable) —
+// both fixtures are needed, not one or the other.
+func TestParseMalformedWeeklyValueYieldsNilWeeklyAndNilModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"weekly":"n/a"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 90 {
+		t.Fatalf("session window = %#v, want session remaining=90", s.Windows.Session5H)
+	}
+	if s.Windows.Weekly != nil {
+		t.Fatalf("weekly window = %#v, want nil for a malformed weekly value", s.Windows.Weekly)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil for a malformed weekly value", s.Windows.Models)
+	}
+}
+
+// TestParseCodexSessionKeyExcludedFromModelsThoughSession5HStaysNil pins the
+// round-1 claim (usage.go:190-198) that dedicatedWindowKeys excludes
+// session/five_hour/session_5h for every provider, not only Claude: a Codex
+// resource literally named "session" must be dropped, not stored in Models.
+// Prior art (TestParseCodexWeeklyOnlyAndStale) only incidentally asserts
+// Session5H == nil, since its fixture carries no such key at all — it does
+// not exercise the guard.
+func TestParseCodexSessionKeyExcludedFromModelsThoughSession5HStaysNil(t *testing.T) {
+	s, err := Parse(Codex, []byte(`{"resources":{"session":{"remaining":55},"weekly":{"remaining":64}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H != nil {
+		t.Fatalf("session window = %#v, want nil: Session5H is only populated for Claude", s.Windows.Session5H)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil: a Codex resource named \"session\" must be excluded by dedicatedWindowKeys, not stored in Models", s.Windows.Models)
+	}
+}
+
+// TestParseZeroRemainingModelPreservesZeroInModels pins the *int-based
+// absent-vs-zero distinction at the exact value task-03's frontier gate
+// depends on: a remaining:0 resource must land in Models with
+// RemainingPercent == 0 preserved, not be dropped as if absent.
+func TestParseZeroRemainingModelPreservesZeroInModels(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"fable":{"remaining":0}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Models == nil || s.Windows.Models["fable"] == nil {
+		t.Fatalf("Models = %#v, want a fable entry", s.Windows.Models)
+	}
+	if s.Windows.Models["fable"].RemainingPercent != 0 {
+		t.Fatalf("Models[\"fable\"].RemainingPercent = %d, want 0 preserved (not dropped as absent)", s.Windows.Models["fable"].RemainingPercent)
 	}
 }
 
