@@ -193,7 +193,9 @@ func (h *Home) evaluateContextBudgetHandoff(instances []*session.Instance) {
 }
 
 // requestWrap creates the handoff dir and injects the wrap-up instruction,
-// telling the agent to finish, persist, and write a continuation PROMPT.md.
+// telling the agent to finish, persist, and write a continuation PROMPT.md
+// that opens with the goal of the work — see wrapUpMessage for why the goal
+// is named explicitly rather than left to whatever the agent thinks to include.
 func (h *Home) requestWrap(inst *session.Instance) {
 	dir, err := session.EnsureHandoffDir(inst)
 	if err != nil {
@@ -208,8 +210,7 @@ func (h *Home) requestWrap(inst *session.Instance) {
 		return
 	}
 	prompt := filepath.Join(dir, "PROMPT.md")
-	msg := "Context budget reached. Finish and save your current work now, then write a continuation prompt for a fresh session to " +
-		prompt + " (and any work notes alongside it). Do not start new work. When PROMPT.md is written, stop and wait."
+	msg := wrapUpMessage(prompt)
 	safego.Go(uiLog, "context_budget_wrapup", func() {
 		time.Sleep(500 * time.Millisecond)
 		_ = ts.SendKeysAndEnter(msg)
@@ -286,8 +287,7 @@ func (h *Home) forkContinuation(inst *session.Instance, reason string) {
 				slog.Bool("truncated", resolved.Info.Truncated))
 			h.notifyBudgetCrossing(inst, session.BudgetOver)
 		}
-		seed := "You are a continuation of a previous session that reached its context budget. " +
-			"Resume from this handoff prompt:\n\n" + resolved.Text
+		seed := continuationSeed(resolved.Text)
 
 		if !strings.EqualFold(targetTool, inst.Tool) {
 			h.spawnCrossToolContinuation(inst, targetTool, seed, generation+1)
