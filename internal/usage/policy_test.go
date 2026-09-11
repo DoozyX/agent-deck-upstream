@@ -343,6 +343,71 @@ func TestPolicyFromConfig_RejectsInvalidValues(t *testing.T) {
 			settings: session.UsagePolicySettings{FrontierWindow: map[string]string{"claude": " fable"}},
 			wantErr:  `invalid [usage.policy].frontier_window.claude " fable": must be a window name without whitespace`,
 		},
+		{
+			// The per-rung label is part of the contract: the message must name
+			// the rung the user actually got wrong. Without a row per rung, the
+			// cheap and mid labels are asserted by nothing and could be swapped.
+			name: "ladder cheap value containing whitespace",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"claude": {Cheap: policyStrPtr("haiku 4")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.claude.cheap "haiku 4": must be a model name without whitespace`,
+		},
+		{
+			name: "ladder mid value containing whitespace",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"codex": {Mid: policyStrPtr("gpt 5")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.codex.mid "gpt 5": must be a model name without whitespace`,
+		},
+		{
+			// sortedKeys exists so the message is deterministic when more than
+			// one table key is wrong. With unordered map iteration any of these
+			// five keys could be named; sorted, it is always "Claude" (0x43
+			// sorts ahead of every lowercase key here).
+			name: "several unknown ladder table keys report the first in sorted order",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{
+					"cluade": {Cheap: policyStrPtr("haiku")},
+					"Claude": {Cheap: policyStrPtr("haiku")},
+					"gemini": {Cheap: policyStrPtr("haiku")},
+					"openai": {Cheap: policyStrPtr("haiku")},
+					"zzz":    {Cheap: policyStrPtr("haiku")},
+				},
+			},
+			wantErr: `invalid [usage.policy].ladder.Claude: unknown usage provider`,
+		},
+		{
+			// The same determinism contract on the frontier_window loop, which
+			// sorts its keys through the same helper.
+			name: "several unknown frontier_window table keys report the first in sorted order",
+			settings: session.UsagePolicySettings{
+				FrontierWindow: map[string]string{
+					"cluade": "fable",
+					"Claude": "fable",
+					"gemini": "fable",
+					"openai": "fable",
+					"zzz":    "fable",
+				},
+			},
+			wantErr: `invalid [usage.policy].frontier_window.Claude: unknown usage provider`,
+		},
+		{
+			// The guard is unicode.IsSpace, not a literal-space check: a tab
+			// carried into a model name reaches the launch flag exactly as a
+			// space would.
+			name: "ladder value containing a tab",
+			settings: session.UsagePolicySettings{
+				Ladder: map[string]session.UsageLadderSettings{"claude": {Strong: policyStrPtr("opus\t4")}},
+			},
+			wantErr: `invalid [usage.policy].ladder.claude.strong "opus\t4": must be a model name without whitespace`,
+		},
+		{
+			// The same, for the frontier_window value guard, with a newline.
+			name:     "frontier_window value containing a newline",
+			settings: session.UsagePolicySettings{FrontierWindow: map[string]string{"claude": "fable\n"}},
+			wantErr:  `invalid [usage.policy].frontier_window.claude "fable\n": must be a window name without whitespace`,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

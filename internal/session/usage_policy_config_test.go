@@ -161,6 +161,52 @@ func TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName(t *tes
 	}
 }
 
+// The loader never checks ladder or frontier_window TABLE KEYS against the
+// usage provider set: that set lives in internal/usage, and internal/session
+// must not import it (cross-task contract 4). A typo'd table name therefore
+// loads with a nil error and lands in cfg.Usage.Policy verbatim;
+// usage.PolicyFromConfig is the layer that rejects it — see
+// TestPolicyFromConfig_RejectsInvalidValues, "unknown ladder table key".
+// Adding key validation to validateUsagePolicySettings would break this test,
+// which is the point: the two layers must disagree in exactly this direction.
+func TestLoadUserConfig_AcceptsUsagePolicyLadderTableKeyThatIsNotAUsageProvider(t *testing.T) {
+	writeUsagePolicyConfig(t, "[usage.policy.ladder.cluade]\ncheap = \"haiku\"\n")
+
+	cfg, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig() error = %v", err)
+	}
+	got := cfg.Usage.Policy
+	if len(got.Ladder) != 1 {
+		t.Fatalf("Ladder = %#v, want only the cluade entry", got.Ladder)
+	}
+	cluade, ok := got.Ladder["cluade"]
+	if !ok {
+		t.Fatalf("Ladder has no cluade entry: %#v", got.Ladder)
+	}
+	if cluade.Cheap == nil || *cluade.Cheap != "haiku" {
+		t.Errorf("cluade ladder cheap = %v, want haiku, unchanged by the loader", cluade.Cheap)
+	}
+}
+
+// The VALUE mirror of the table-key case. A frontier_window value carrying
+// whitespace never matches a window name, but only internal/usage knows what a
+// window is, so the loader passes it through with a nil error and
+// usage.PolicyFromConfig rejects it — see
+// TestPolicyFromConfig_RejectsInvalidValues, "frontier_window value containing
+// whitespace". Adding value validation here would break this test.
+func TestLoadUserConfig_AcceptsUsagePolicyFrontierWindowValueWithWhitespace(t *testing.T) {
+	writeUsagePolicyConfig(t, "[usage.policy.frontier_window]\nclaude = \" fable\"\n")
+
+	cfg, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig() error = %v", err)
+	}
+	if want := (map[string]string{"claude": " fable"}); !reflect.DeepEqual(cfg.Usage.Policy.FrontierWindow, want) {
+		t.Fatalf("FrontierWindow = %#v, want %#v, unchanged by the loader", cfg.Usage.Policy.FrontierWindow, want)
+	}
+}
+
 func TestLoadUserConfig_AcceptsZeroUsagePolicyThresholds(t *testing.T) {
 	writeUsagePolicyConfig(t, "[usage.policy]\nexhausted_below = 0\nconstrained_below = 0\n")
 
@@ -232,6 +278,14 @@ func TestLoadUserConfig_RejectsInvalidUsagePolicy(t *testing.T) {
 			name:    "failover entry containing whitespace",
 			content: "[usage.policy]\nfailover = [\"claude codex\"]\n",
 			wantErr: `invalid [usage.policy].failover[0] "claude codex": must be a tool name without whitespace`,
+		},
+		{
+			// The guard is unicode.IsSpace, not a literal-space check: a tab is
+			// just as invalid in a tool name, and just as invisible in a config
+			// file.
+			name:    "failover entry containing a tab",
+			content: "[usage.policy]\nfailover = [\"claude\tcodex\"]\n",
+			wantErr: `invalid [usage.policy].failover[0] "claude\tcodex": must be a tool name without whitespace`,
 		},
 	}
 	for _, tc := range tests {

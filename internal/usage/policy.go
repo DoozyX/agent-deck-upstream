@@ -92,11 +92,16 @@ func defaultFailover(defaultTool string) []string {
 //
 // It also rejects what only this package can judge: a ladder or frontier_window
 // table key that is not a known usage provider, and a ladder or frontier_window
-// VALUE carrying whitespace. Each of those would otherwise be a silent no-op —
-// the override discarded or the window never matched — surfacing as wrong
-// behaviour units later instead of as a config error. An empty ladder value
-// stays legal: it is how the config marks a tier unavailable on a provider, and
-// an empty frontier_window value means no gate.
+// VALUE carrying whitespace. A value this catches would otherwise be a silent
+// no-op — the override discarded or the window never matched — surfacing as
+// wrong behaviour units later instead of as a config error. "Whitespace" here
+// is what unicode.IsSpace reports: the ASCII blanks, NBSP (U+00A0), NEL
+// (U+0085) and the Unicode space separators (U+2000-U+200A, U+2028, U+2029,
+// U+202F, U+205F, U+3000). It does NOT cover the zero-width format characters
+// U+200B, U+FEFF and U+2060, so a value carrying one of those is still
+// accepted and reaches the launch flag verbatim. An empty ladder value stays
+// legal: it is how the config marks a tier unavailable on a provider, and an
+// empty frontier_window value means no gate.
 //
 // Failover entries are deliberately NOT checked against the provider set; see
 // the Policy.Failover doc comment.
