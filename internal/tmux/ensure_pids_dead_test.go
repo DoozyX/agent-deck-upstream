@@ -169,10 +169,16 @@ func TestSessionKillUsesIdentityReaper(t *testing.T) {
 		t.Fatal("could not locate Session.Kill")
 	}
 	body := src[start : start+end]
-	if !strings.Contains(body, "CaptureProcessIdentities(oldPIDs)") {
+	// The reap set must come from the teardown SCOPE, not the bare parent-link
+	// walk: the walk cannot see a descendant already reparented to PID 1, which
+	// is how a dev stack outlived its session by 18 minutes on 2026-09-11.
+	if !strings.Contains(body, "s.teardownReapScopeFor(target)") {
+		t.Fatal("Session.Kill must build its reap set from the teardown scope (parent walk UNION pane ttys)")
+	}
+	if !strings.Contains(body, "CaptureProcessIdentities(scope.PIDs)") {
 		t.Fatal("Session.Kill must capture descendant identities before tmux kill")
 	}
-	if !strings.Contains(body, "EnsureProcessIdentitiesDead(oldProcesses") {
+	if !strings.Contains(body, "ensureTeardownScopeDead(scope, oldProcesses") {
 		t.Fatal("Session.Kill must reap captured identities without an executable-name allowlist")
 	}
 }
