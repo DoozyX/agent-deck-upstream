@@ -220,7 +220,7 @@ func TestRecommend_StrategyCollapsesCandidates(t *testing.T) {
 				Account: "personal", State: StateExhausted, FetchedAt: recFetchedAt,
 				Alternatives: []Alternative{},
 			},
-			wantReasons: []string{reasonPolicyLimited, reasonExhaustedFallback},
+			wantReasons: []string{reasonPolicyLimited, reasonExhaustedCandidate},
 		},
 		{
 			name: "empty/claude-healthy", strategy: "", prefer: "claude",
@@ -326,6 +326,25 @@ func TestRecommend_CollapsedStrategyCarveOutUsesTheResolvedPrefer(t *testing.T) 
 	assertReason(t, got.Reason, []string{reasonPreferredConstrained})
 	if strings.Contains(got.Reason, reasonFirstConstrained) {
 		t.Errorf("Reason = %q, want the preferred-tool carve-out, not the weaker first-constrained rule", got.Reason)
+	}
+}
+
+// Request.Prefer is trimmed before the rule 3 carve-out compares against it.
+// candidateTools trims independently when it builds the list, so without the
+// trim in preferredTool the candidate list is unchanged and only the carve-out
+// silently stops firing: claude would lose to the healthy codex behind it.
+func TestRecommend_PreferWithSurroundingWhitespaceStillWinsTheCarveOut(t *testing.T) {
+	got := Recommend(
+		Request{Role: "planner", Tier: TierStrong, Prefer: " claude "},
+		[]Snapshot{recSnapshot(Claude, "personal", 20, 90, nil), recSnapshot(Codex, "work", 90, 90, nil)},
+		autoTools(), DefaultPolicy("claude"),
+	)
+	if got.Tool != "claude" || got.State != StateConstrained {
+		t.Fatalf("Tool/State = %q/%q, want claude/constrained", got.Tool, got.State)
+	}
+	assertReason(t, got.Reason, []string{reasonPreferredConstrained})
+	if strings.Contains(got.Reason, reasonFirstHealthy) {
+		t.Errorf("Reason = %q, want the constrained-preferred carve-out, not the healthy codex behind it", got.Reason)
 	}
 }
 
@@ -633,10 +652,10 @@ func TestRecommend_FrontierGate(t *testing.T) {
 			wantReasons: []string{reasonFrontierNoModel, reasonFrontierGated},
 		},
 		{
-			// Both downgrade causes again, with the gate window ABSENT from
-			// Models rather than gating: the empty rung downgrades on its own
-			// and the absent gate is still reported alongside it.
-			name:      "empty-ladder-entry-and-an-absent-gate-window-report-both-causes",
+			// One downgrade cause (the empty rung) plus a non-gating note: the
+			// gate window is ABSENT from Models rather than gating, so it does
+			// not downgrade, and it is still reported alongside the rung.
+			name:      "empty-ladder-entry-and-an-absent-gate-window-reports-the-downgrade-and-the-absent-gate",
 			mutate:    func(p *Policy) { p.Ladder[Claude] = Ladder{Cheap: "haiku", Mid: "sonnet", Strong: "opus"} },
 			models:    map[string]int{"spark": 1},
 			wantModel: "opus", wantTier: TierStrong,
@@ -796,7 +815,12 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 		if got.Tool != "claude" || got.State != StateExhausted {
 			t.Fatalf("Tool/State = %q/%q, want claude/exhausted", got.Tool, got.State)
 		}
-		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+		// Step 1 of the tail, not step 2: the preferred tool was gemini and the
+		// loop discarded it, so the reason must not claim it was kept.
+		assertReason(t, got.Reason, []string{reasonExhaustedCandidate})
+		if strings.Contains(got.Reason, reasonExhaustedFallback) {
+			t.Errorf("Reason = %q, want no kept-the-preferred-tool clause when gemini was discarded", got.Reason)
+		}
 		if strings.Contains(got.Reason, reasonUnknownFailover) {
 			t.Errorf("Reason = %q, want no unknown-failover clause for a tool absent from Failover", got.Reason)
 		}
@@ -845,11 +869,11 @@ func TestRecommend_UnknownEligibility(t *testing.T) {
 }
 
 // Rule 3's tail takes the FIRST candidate that survives its eligibility
-// filter, not the last one it walks. This is the design's Motivation scenario —
-// both providers low — and it is the only shape that discriminates: claude and
-// codex are both exhausted, so neither is skipped as an ineligible unknown, and
-// the order of the candidate list is what decides.
-func TestRecommend_ExhaustedFallbackTakesTheFirstSurvivingCandidate(t *testing.T) {
+// filter, not the last one it walks. Two exhausted candidates are what it takes
+// — the minimal shape that discriminates: claude and codex are both exhausted,
+// so neither is skipped as an ineligible unknown, and the order of the
+// candidate list is what decides.
+func TestRecommend_LastResortTakesTheFirstSurvivingCandidate(t *testing.T) {
 	policy := DefaultPolicy("claude")
 	policy.Failover = []string{"claude", "codex"}
 	got := Recommend(
@@ -863,7 +887,7 @@ func TestRecommend_ExhaustedFallbackTakesTheFirstSurvivingCandidate(t *testing.T
 	if got.Tool != "claude" || got.State != StateExhausted {
 		t.Fatalf("Tool/State = %q/%q, want claude/exhausted (the first candidate, not the last)", got.Tool, got.State)
 	}
-	assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+	assertReason(t, got.Reason, []string{reasonExhaustedCandidate})
 	// The second candidate really did survive the filter — it is exhausted, not
 	// an ineligible unknown — so the first-wins ordering is what chose claude.
 	want := Alternative{Tool: "codex", State: StateExhausted, RemainingPercent: 4}
@@ -1026,6 +1050,7 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 		if got.Tool != "gemini" || got.State != StateUnknown {
 			t.Fatalf("Tool/State = %q/%q, want gemini/unknown", got.Tool, got.State)
 		}
+		assertReason(t, got.Reason, []string{reasonExhaustedFallback, reasonPolicyLimited})
 		if providers := ProvidersToQuery(req, tools, policy); len(providers) != 0 {
 			t.Errorf("ProvidersToQuery = %v, want none for the input whose decision names gemini", providers)
 		}
@@ -1045,7 +1070,7 @@ func TestRecommend_DegenerateInputs(t *testing.T) {
 		if got.Tool != "codex" || got.State != StateExhausted {
 			t.Fatalf("Tool/State = %q/%q, want codex/exhausted (claude is not a candidate)", got.Tool, got.State)
 		}
-		assertReason(t, got.Reason, []string{reasonExhaustedFallback})
+		assertReason(t, got.Reason, []string{reasonExhaustedCandidate})
 	})
 
 	t.Run("auto-strategy-with-no-available-tools", func(t *testing.T) {

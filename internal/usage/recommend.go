@@ -77,6 +77,7 @@ const (
 	reasonPreferredConstrained = "kept the constrained preferred tool"
 	reasonFirstConstrained     = "selected the first constrained candidate"
 	reasonUnknownFailover      = "selected the first unknown-state failover candidate"
+	reasonExhaustedCandidate   = "no eligible candidate; kept the first candidate that is not an ineligible unknown"
 	reasonExhaustedFallback    = "no eligible candidate; kept the preferred tool"
 	reasonNoCandidates         = "no candidate tools"
 	reasonPolicyLimited        = "policy limited failover"
@@ -486,29 +487,39 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 	//     never selected";
 	//  2. otherwise the resolved preferred tool.
 	//
+	// The `default:` arm below is that tail: it is the arm reached when no
+	// candidate is eligible — every candidate exhausted, an ineligible unknown,
+	// or a mix. Step 1 answers all of those but one: the loop's break takes any
+	// eval that is not an ineligible unknown, so step 2 runs only when every
+	// candidate is an ineligible unknown, or there are none at all. The two
+	// steps therefore record DIFFERENT reasons —
+	// reasonExhaustedCandidate for step 1, reasonExhaustedFallback for step 2 —
+	// and the empty candidate list, though its tool also comes from step 2, has
+	// an arm and a reason of its own, reasonNoCandidates.
+	//
 	// Step 2 is the design's "the preferred tool with State = exhausted"
-	// fallback, and it is reached both when there are no candidates at all and
-	// when no candidate is eligible — every candidate exhausted, an ineligible
-	// unknown, or a mix. The two arms record DIFFERENT reasons:
-	// reasonNoCandidates for the former, reasonExhaustedFallback for the
-	// latter. The tool step 2 names is NOT filtered against the orchestrate
+	// fallback. The tool it names is NOT filtered against the orchestrate
 	// policy: it may be absent from AvailableTools, may itself be an ineligible
-	// unknown, and may have no snapshot.
+	// unknown, may have no snapshot, and may be "" — a collapsed strategy that
+	// resolves neither Request.Prefer nor FallbackTool names no tool at all,
+	// and that is reported as-is rather than guarded here.
 	//
 	// The consequence a caller must handle is that ProvidersToQuery can return
-	// no providers for the very input whose decision names this tool, by either
-	// of two mechanisms: AvailableTools filtered the named tool out of the
-	// candidate list (reachable under "auto"), or the named tool maps to no
-	// usage provider, which ProvidersToQuery omits by design (the only
-	// mechanism left on a collapsed strategy, where the named tool is the sole
-	// candidate). Either way a caller that fetches first will hold no snapshot
-	// for it.
+	// no providers for the very input whose decision names this tool.
+	// ProvidersToQuery is empty exactly when no candidate maps to a usage
+	// provider; for instance AvailableTools can filter the named tool out of
+	// the candidate list (reachable under "auto"), and on a collapsed strategy
+	// whose single rung did name a tool, that sole candidate mapping to no
+	// usage provider is the only mechanism left. Either way a caller that
+	// fetches first will hold no snapshot for it.
 	lastResort := prefer
+	fromCandidate := false
 	for _, eval := range evals {
 		if eval.state == StateUnknown && !eligibleUnknown(eval.tool, policy) {
 			continue
 		}
 		lastResort = eval.tool
+		fromCandidate = true
 		break
 	}
 
@@ -526,8 +537,14 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 		// Rule 3's tail. The fallback tool is reported with the state it
 		// actually has: exhausted when a snapshot says so, unknown when there
 		// is no snapshot at all (a missing openusage never becomes exhausted).
+		// fromCandidate, not lastResort == prefer, is what says which step
+		// assigned: the first surviving candidate may itself BE the preferred
+		// tool, and the two steps are different rules with different reasons.
 		selected = evaluateTool(lastResort, snapshots, profile, policy)
 		rule = reasonExhaustedFallback
+		if fromCandidate {
+			rule = reasonExhaustedCandidate
+		}
 	}
 
 	model, applied, modelClauses := resolveModel(selected.provider, applied, selected.snapshot, policy)
