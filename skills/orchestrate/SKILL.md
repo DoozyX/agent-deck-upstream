@@ -1698,11 +1698,28 @@ any point. Then:
   It refuses to run while `conductor-handoff.md` is missing or empty (an
   automatic rotation into an empty handoff has been observed in the field, and
   the successor inherits the manifest with nothing about what was in flight),
-  then launches your successor on the manifest plus the handoff, re-parents
-  every live child so waiting and done notifications route to it, repoints the
-  wall-clock watchdog, and archives you. It is one command because the
-  five-step prose version it replaces was measured across 12 real conductors:
-  median peak 348k, and half the runs sailed straight past this line.
+  then launches your successor on the manifest plus the handoff, **waits for it
+  to prove it is alive**, and only then re-parents every live child so waiting
+  and done notifications route to it, repoints the wall-clock watchdog, and
+  archives you. It is one command because the five-step prose version it
+  replaces was measured across 12 real conductors: median peak 348k, and half
+  the runs sailed straight past this line.
+
+  **If the successor is dead on arrival, the rotation fails and you stay.** A
+  session id is not a live conductor: on 2026-09-11 a successor was launched,
+  ran for three seconds and died on a usage limit, and the script — which then
+  checked only that an id came back — re-parented five live children onto the
+  corpse and archived the one session that knew what was in flight. The gate
+  now polls `session show` for ~20s and rejects a terminated pane, a
+  `usage-limit` / `auth-401` / `model-unavailable` substate, or a successor
+  that never reaches a live status. On rejection it retries **once** on your
+  own tool (the one tool known to work, since it is running you), and if that
+  also fails it exits 4 having changed nothing: you are not archived, no child
+  moved, no generation burned, and the watchdog still points at you. Evidence
+  lands in `$RUN_DIR/rotate-failure-c<gen>-<tool>.log`. You are then the only
+  thing still watching the run and you are at your ceiling — **tell the user
+  immediately** and quote the reason; retrying will not help until a usable
+  tool exists.
 
   **`poll.sh` exits 3 from here on, every beat, until you go** — your
   heartbeat is a failing command now, not a warning you can read past. A
