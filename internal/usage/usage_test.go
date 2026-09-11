@@ -194,6 +194,22 @@ func TestParseSessionFiveHourAliasDoesNotLeakIntoModels(t *testing.T) {
 	}
 }
 
+func TestParseMalformedWeeklyValueExcludedFromModelsByDedicatedKeyGuard(t *testing.T) {
+	s, err := Parse(Claude, []byte(`{"resources":{"session":{"remaining":90},"weekly":"n/a"}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Windows.Session5H == nil || s.Windows.Session5H.RemainingPercent != 90 {
+		t.Fatalf("session window = %#v, want session remaining=90", s.Windows.Session5H)
+	}
+	if s.Windows.Weekly != nil {
+		t.Fatalf("weekly window = %#v, want nil for a malformed weekly value", s.Windows.Weekly)
+	}
+	if s.Windows.Models != nil {
+		t.Fatalf("Models = %#v, want nil: a malformed dedicated-window value must be excluded by the dedicatedWindowKeys guard, not leak into Models", s.Windows.Models)
+	}
+}
+
 func TestSnapshotJSONOmitsModelsFieldWhenNil(t *testing.T) {
 	s, err := Parse(Claude, []byte(`{"limits":{"five_hour":{"remaining_percent":82},"weekly":{"remaining_percent":61}}}`))
 	if err != nil {
@@ -205,6 +221,12 @@ func TestSnapshotJSONOmitsModelsFieldWhenNil(t *testing.T) {
 	}
 	if strings.Contains(string(out), `"models"`) {
 		t.Fatalf("marshaled snapshot = %s, want no \"models\" key when Models is nil", out)
+	}
+	if !strings.Contains(string(out), `"session_5h":{"remaining_percent":82`) {
+		t.Fatalf("marshaled snapshot = %s, want session_5h tag with remaining_percent=82", out)
+	}
+	if !strings.Contains(string(out), `"weekly":{"remaining_percent":61`) {
+		t.Fatalf("marshaled snapshot = %s, want weekly tag with remaining_percent=61", out)
 	}
 	var roundTrip Snapshot
 	if err := json.Unmarshal(out, &roundTrip); err != nil {
@@ -233,6 +255,12 @@ func TestSnapshotJSONIncludesPopulatedModels(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"models":{"fable":{"remaining_percent":42`) {
 		t.Fatalf("marshaled snapshot = %s, want models.fable serialized with remaining_percent", out)
+	}
+	if !strings.Contains(string(out), `"session_5h":{"remaining_percent":76`) {
+		t.Fatalf("marshaled snapshot = %s, want session_5h tag with remaining_percent=76", out)
+	}
+	if !strings.Contains(string(out), `"weekly":{"remaining_percent":75`) {
+		t.Fatalf("marshaled snapshot = %s, want weekly tag with remaining_percent=75", out)
 	}
 }
 
