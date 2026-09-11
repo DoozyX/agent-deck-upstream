@@ -196,8 +196,12 @@ func (s *Session) KillAndWait() error {
 	}
 	_ = os.Remove(s.LogFile())
 
-	_, oldPIDs := s.getPaneProcessTree()
-	oldProcesses := CaptureProcessIdentities(oldPIDs)
+	// Same reap scope as Session.teardown: parent-link walk UNION the pane
+	// ttys, captured while the pane (and therefore the pty) still exists.
+	// Without the tty half, `agent-deck session remove --force` leaves any
+	// already-orphaned descendant running — see teardown_reap_scope.go.
+	scope := s.teardownReapScopeFor(s.Name)
+	oldProcesses := CaptureProcessIdentities(scope.PIDs)
 
 	// Bounded — see tmuxMutationTimeout. This is the CLI path (`agent-deck
 	// remove`), where an unbounded wedge hangs the user's terminal outright
@@ -218,7 +222,7 @@ func (s *Session) KillAndWait() error {
 	killErr := s.runBoundedMutation("kill-session", "-t", s.Name)
 
 	if len(oldProcesses) > 0 {
-		EnsureProcessIdentitiesDead(oldProcesses, 3*time.Second)
+		ensureTeardownScopeDead(scope, oldProcesses, 3*time.Second)
 	}
 
 	// Killing an already-dead session is success (see Session.Kill): tmux
