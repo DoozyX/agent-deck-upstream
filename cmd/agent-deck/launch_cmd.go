@@ -268,6 +268,13 @@ func handleLaunch(profile string, args []string) {
 	// Issue #1143: auto-stop dormant child sessions.
 	idleTimeout := fs.String("idle-timeout", "", "Auto-stop session after this duration of no tmux output (Go duration: 30m, 1h, 24h). 0 or unset = disabled")
 
+	// Dead-on-arrival detection. Opt-in: without it this command's output is
+	// byte-for-byte what it has always been, because other scripts and skills
+	// parse this JSON. See launch_liveness.go for what the verdict does and
+	// does not assert.
+	confirmAlive := fs.Bool("confirm-alive", false, "After spawning, watch the session for --alive-window and fail (exit 1, alive:false) if it died; without this a session that dies seconds later still reports success")
+	aliveWindow := fs.String("alive-window", "", "How long --confirm-alive watches the new session (Go duration; default 5s)")
+
 	fs.Usage = func() {
 		fmt.Println("Usage: agent-deck launch [path] [options]")
 		fmt.Println()
@@ -354,6 +361,13 @@ func handleLaunch(profile string, args []string) {
 	sessionParent := mergeFlags(*parent, *parentShort)
 	if sessionParent != "" && *noParent {
 		out.Error("--parent and --no-parent cannot be used together", ErrCodeInvalidOperation)
+		os.Exit(1)
+	}
+	// Resolve the liveness budget BEFORE anything is created: a typo in the
+	// duration must not cost a spawned session that then goes unreported.
+	aliveBudget, aliveErr := resolveLaunchAliveWindow(*confirmAlive, *aliveWindow)
+	if aliveErr != nil {
+		out.Error(aliveErr.Error(), ErrCodeInvalidOperation)
 		os.Exit(1)
 	}
 	initialMessage, err := resolveMessageInput(mergeFlags(*message, *messageShort), *messageFile, os.Stdin)
@@ -1166,7 +1180,56 @@ func handleLaunch(profile string, args []string) {
 			msg += " (message sent)"
 		}
 	}
+
+	// --confirm-alive: the one thing every field above still cannot tell a
+	// caller apart — "the session is up and working" from "the session is up
+	// and already dead". Off by default so existing readers of this JSON see
+	// exactly the keys they saw before; see launch_liveness.go for why
+	// `delivery: "submitted"` is silent about this on the codex argv path, and
+	// why staying alive here is also what lets the existing fast-death watcher
+	// record its diagnosis for `session show --json`.
+	if aliveBudget > 0 {
+		liveness := confirmLaunchAlive(newInstance, aliveBudget, launchAlivePollInterval)
+		liveness.addTo(jsonData)
+		if !liveness.Alive {
+			// The id stays in the payload: a caller that learns its child is
+			// dead still has to clean the row up, and an error with no handle
+			// leaves it stranded. `delivery` is left exactly as it was —
+			// the prompt really did reach the process's argv; what failed is
+			// one layer further in, and relabelling it would put a second
+			// meaning on a word other scripts already read.
+			out.ErrorWithData(liveness.message(newInstance.Title), ErrCodeSessionDOA, jsonData)
+			os.Exit(1)
+		}
+		msg += fmt.Sprintf(" (alive after %dms)", liveness.ObservedMS)
+	}
+
 	out.Success(msg, jsonData)
+}
+
+// resolveLaunchAliveWindow turns the --confirm-alive/--alive-window pair into a
+// budget, returning 0 when the check is off. An --alive-window without
+// --confirm-alive is refused rather than ignored: silently doing nothing with a
+// flag a caller set is how this class of bug starts.
+func resolveLaunchAliveWindow(confirmAlive bool, rawWindow string) (time.Duration, error) {
+	raw := strings.TrimSpace(rawWindow)
+	if !confirmAlive {
+		if raw != "" {
+			return 0, fmt.Errorf("--alive-window requires --confirm-alive")
+		}
+		return 0, nil
+	}
+	if raw == "" {
+		return defaultLaunchAliveWindow, nil
+	}
+	window, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("invalid --alive-window %q: %v", rawWindow, err)
+	}
+	if window <= 0 {
+		return 0, fmt.Errorf("invalid --alive-window %q: must be positive", rawWindow)
+	}
+	return window, nil
 }
 
 // resolveLaunchPath resolves the project path for `agent-deck launch`.
