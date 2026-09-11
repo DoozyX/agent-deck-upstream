@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -391,5 +392,40 @@ func TestSaveUserConfig_RoundTripsTheUsagePolicyBlock(t *testing.T) {
 				t.Fatalf("Usage.Policy after save+reload = %#v, want %#v", reloaded.Usage.Policy, tc.policy)
 			}
 		})
+	}
+}
+
+// The loader's threshold range is INCLUSIVE at both ends: 0 and 100 are legal
+// values, and only < 0 or > 100 is rejected. The 0 end is pinned by
+// TestLoadUserConfig_AcceptsZeroUsagePolicyThresholds above; this pins the 100
+// end, which is otherwise invisible — loosening validateUsagePolicyThreshold's
+// `*value > 100` to `>= 100` leaves every other loader test green.
+// usage.TestPolicyFromConfig_AcceptsThresholdBoundaries pins the same boundary
+// on the merge side.
+func TestLoadUserConfig_AcceptsUsagePolicyThresholdsAtOneHundred(t *testing.T) {
+	writeUsagePolicyConfig(t, "[usage.policy]\nexhausted_below = 100\nconstrained_below = 100\n")
+
+	cfg, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig() error = %v", err)
+	}
+	got := cfg.Usage.Policy
+	if got.ExhaustedBelow == nil || *got.ExhaustedBelow != 100 {
+		t.Errorf("ExhaustedBelow = %v, want an explicit 100", got.ExhaustedBelow)
+	}
+	if got.ConstrainedBelow == nil || *got.ConstrainedBelow != 100 {
+		t.Errorf("ConstrainedBelow = %v, want an explicit 100", got.ConstrainedBelow)
+	}
+}
+
+// One past the top end is still rejected, so the guard cannot be deleted
+// outright.
+func TestLoadUserConfig_RejectsUsagePolicyThresholdAtOneHundredAndOne(t *testing.T) {
+	writeUsagePolicyConfig(t, "[usage.policy]\nconstrained_below = 101\n")
+
+	_, err := LoadUserConfig()
+	want := "invalid [usage.policy].constrained_below 101: must be between 0 and 100"
+	if err == nil || !strings.Contains(err.Error(), want) {
+		t.Fatalf("LoadUserConfig() error = %v, want it to contain %q", err, want)
 	}
 }
