@@ -744,6 +744,11 @@ const (
 	// older than the last message delivered to the session — the agent has not
 	// answered the newest request, so the content belongs to a previous turn.
 	ErrCodeStaleOutput = "STALE_OUTPUT"
+	// ErrCodeSessionDOA: `launch --confirm-alive` spawned the session, saw the
+	// prompt delivered, and then watched the session die inside the liveness
+	// window — dead on arrival. The payload still carries the session id so the
+	// caller can clean the row up.
+	ErrCodeSessionDOA = "SESSION_DOA"
 )
 
 // ResolveSession finds a session by flexible matching (title, ID prefix, or path)

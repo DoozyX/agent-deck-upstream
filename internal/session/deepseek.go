@@ -1155,3 +1155,13 @@ func (i *Instance) acknowledgeInitialProcess(command string) error {
 	}
 	return fmt.Errorf("initial session command did not launch: %w", diagnostic)
 }
+
+// ExpectsFastExit reports whether this session's initial process is a one-shot
+// invocation that is SUPPOSED to exit on its own (a bounded `codex exec`, the
+// DeepSeek headless profile). Exported for `agent-deck launch --confirm-alive`,
+// which must not report a one-shot's normal completion as a dead-on-arrival
+// spawn. A one-shot that exits NON-zero still reaches the caller, as a
+// spawn-failure record written by acknowledgeInitialProcess's completion watch.
+func (i *Instance) ExpectsFastExit() bool {
+	return i.expectsFastExit()
+}
