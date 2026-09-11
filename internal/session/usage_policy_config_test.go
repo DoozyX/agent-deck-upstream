@@ -138,16 +138,24 @@ frontier = ""
 	}
 }
 
-// A failover entry naming a connector with no usage provider is legal: the
-// loader validates shape only and never probes the tool registry.
-func TestLoadUserConfig_AcceptsUsagePolicyFailoverToolWithoutUsageProvider(t *testing.T) {
-	writeUsagePolicyConfig(t, "[usage.policy]\nfailover = [\"cursor\", \"claude\"]\n")
+// The loader validates failover entries by SHAPE only and never consults the
+// tool registry — config validity must not depend on what happens to be on
+// PATH, and this mtime-cached loader must stay free of that I/O. The entry here
+// is deliberately not a tool name at all, so inserting a registry lookup would
+// break this test; "cursor" would not, because it IS a registry builtin.
+//
+// Whether an entry names a real usage provider is decided one layer up, in
+// usage.PolicyFromConfig, which rejects exactly this string — see
+// TestPolicyFromConfig_RejectsInvalidValues/failover_entry_that_is_not_a_usage_provider.
+// The two layers disagreeing on this input is the design, not an oversight.
+func TestLoadUserConfig_AcceptsUsagePolicyFailoverEntryThatIsNotAToolName(t *testing.T) {
+	writeUsagePolicyConfig(t, "[usage.policy]\nfailover = [\"totally-not-a-tool\"]\n")
 
 	cfg, err := LoadUserConfig()
 	if err != nil {
 		t.Fatalf("LoadUserConfig() error = %v", err)
 	}
-	if want := []string{"cursor", "claude"}; !reflect.DeepEqual(cfg.Usage.Policy.Failover, want) {
+	if want := []string{"totally-not-a-tool"}; !reflect.DeepEqual(cfg.Usage.Policy.Failover, want) {
 		t.Fatalf("Failover = %v, want %v", cfg.Usage.Policy.Failover, want)
 	}
 }
@@ -241,8 +249,11 @@ func TestLoadUserConfig_RejectsInvalidUsagePolicy(t *testing.T) {
 			if cfg == nil {
 				t.Fatal("LoadUserConfig() returned a nil config alongside the error")
 			}
-			if cfg.DefaultTool == "codex" {
-				t.Errorf("LoadUserConfig() returned the half-parsed config (default_tool = %q), want defaults", cfg.DefaultTool)
+			// Equality against the shipped default, not "!= codex": an
+			// inequality assertion would quietly stop testing anything if the
+			// default tool ever became "codex".
+			if want := cloneDefaultUserConfig().DefaultTool; cfg.DefaultTool != want {
+				t.Errorf("DefaultTool = %q, want the default %q (the half-parsed config leaked through)", cfg.DefaultTool, want)
 			}
 			if !reflect.DeepEqual(cfg.Usage, UsageSettings{}) {
 				t.Errorf("Usage = %#v, want the zero UsageSettings from the default config", cfg.Usage)
