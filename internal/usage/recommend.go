@@ -487,12 +487,12 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 	//     never selected";
 	//  2. otherwise the resolved preferred tool.
 	//
-	// The `default:` arm below is that tail: it is the arm reached when no
-	// candidate is eligible — every candidate exhausted, an ineligible unknown,
-	// or a mix. Step 1 answers all of those but one: the loop's break takes any
-	// eval that is not an ineligible unknown, so step 2 runs only when every
-	// candidate is an ineligible unknown, or there are none at all. The two
-	// steps therefore record DIFFERENT reasons —
+	// The `default:` arm below is that tail: it is the arm reached when
+	// candidates exist and none is eligible — every candidate exhausted, an
+	// ineligible unknown, or a mix. Step 1 answers all of those but one: the
+	// loop's break takes any eval that is not an ineligible unknown, so step 2
+	// runs only when every candidate is an ineligible unknown, or there are
+	// none at all. The two steps therefore record DIFFERENT reasons —
 	// reasonExhaustedCandidate for step 1, reasonExhaustedFallback for step 2 —
 	// and the empty candidate list, though its tool also comes from step 2, has
 	// an arm and a reason of its own, reasonNoCandidates.
@@ -500,18 +500,22 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 	// Step 2 is the design's "the preferred tool with State = exhausted"
 	// fallback. The tool it names is NOT filtered against the orchestrate
 	// policy: it may be absent from AvailableTools, may itself be an ineligible
-	// unknown, may have no snapshot, and may be "" — a collapsed strategy that
-	// resolves neither Request.Prefer nor FallbackTool names no tool at all,
-	// and that is reported as-is rather than guarded here.
+	// unknown, may have no snapshot, and may be "" (only via the
+	// empty-candidate-list arm below) — a collapsed strategy that resolves
+	// neither Request.Prefer nor FallbackTool names no tool at all, and that is
+	// reported as-is rather than guarded here.
 	//
 	// The consequence a caller must handle is that ProvidersToQuery can return
 	// no providers for the very input whose decision names this tool.
 	// ProvidersToQuery is empty exactly when no candidate maps to a usage
-	// provider; for instance AvailableTools can filter the named tool out of
-	// the candidate list (reachable under "auto"), and on a collapsed strategy
-	// whose single rung did name a tool, that sole candidate mapping to no
-	// usage provider is the only mechanism left. Either way a caller that
-	// fetches first will hold no snapshot for it.
+	// provider. Under "auto", AvailableTools filtering the named tool out is
+	// one way to get there, but it leaves the candidate list EMPTY, so that
+	// input lands in the empty-candidate-list arm below and reports
+	// reasonNoCandidates rather than either reason here. Step 2 gets there
+	// instead with a candidate that maps to no usage provider at all — such a
+	// tool is unknown, and ineligible whenever Policy.Failover does not list
+	// it, which is exactly what reaching step 2 requires. Either way a caller
+	// that fetches first will hold no snapshot for it.
 	lastResort := prefer
 	fromCandidate := false
 	for _, eval := range evals {
