@@ -1785,10 +1785,16 @@ re-parenting), so you are not made to stop earlier. If agent-deck's own budget
 handler rotates you first, **check the handoff directory is actually non-empty
 before trusting it** — an automatic rotation has been observed producing an
 empty one. It writes `$ROOT_WT/.agent-deck/handoff/<session-id>/PROMPT.md`, the
-same repository-local tree as `$RUN_ROOT`. Note that handler only runs while the TUI is open
-(`internal/ui/context_budget_ui.go`), so on a headless run these thresholds
-and `rotate-conductor.sh` are the only thing standing between you and a
-million-token conductor.
+same repository-local tree as `$RUN_ROOT`. Its wrap-up instruction asks for the
+goal restated verbatim at the top of that file, so a handoff it produces should
+carry the goal as well as the state — if the one you inherit does not, treat it
+as the degraded transcript-rebuilt case and recover the goal from
+`$RUN_DIR/goal.md` before acting on anything else in it. Note that handler only
+runs while the TUI is open (`internal/ui/context_budget_ui.go`), and no hook can
+stand in for it: Claude's `PreCompact` hook can only allow or deny a compaction,
+not inject anything into what survives one. So on a headless run these
+thresholds and `rotate-conductor.sh` are the only thing standing between you and
+a million-token conductor.
 
 ## Failure handling
 

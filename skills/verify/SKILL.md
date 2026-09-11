@@ -26,6 +26,8 @@ metadata:
 | "it's deployed / running" | A request against the running thing, with its response. |
 | "the type checker is happy" | The type-check command run now, exit 0 — distinct from tests and from a build. |
 | "the migration is safe" | A run against a copy of real (or representative) data, not just the migration applying cleanly on an empty schema. |
+| "the feature is done" / "this matches the design" | The design's acceptance criteria and `## Testing Decisions`, **re-read now** (not recalled), each criterion quoted and mapped to the command that proves it or named as a gap. Tests passing proves the code does what the tests say; only the criteria say what was asked for. |
+| "the task/run is complete" | The same, against the run's stated goal — plus every criterion accounted for, including the ones no test covers. "All units landed" is a claim about your task list, not about the goal. |
 
 ## How to show evidence
 
@@ -43,6 +45,35 @@ failures against that recorded baseline. A baseline claimed from memory
 run it before you changed anything, you don't have one, and every failure
 is yours until proven otherwise.
 
+## Check against what was asked, not only what you built
+
+Evidence that a command passed is only half a completion claim. The other
+half is *what was asked for*, re-read at the moment you claim it — because
+the version in your head has been drifting since you started, and a long
+session or a compaction is exactly when it drifts silently.
+
+So before any "done" or "it works", read the source of truth again, in this
+order, and use the first that exists:
+
+- **An orchestrate run** — `$RUN_DIR/goal.md` (the run's frozen goal) and the
+  approved design at the path it names, usually `$RUN_ROOT/design/design.md`.
+  Quote the acceptance criteria and `## Testing Decisions` verbatim. These are
+  written to survive rotation and compaction precisely so this check still
+  works in a session that has lost the original conversation.
+- **A design or spec** named anywhere in the task — read it at its path.
+- **Neither** — the request as the user actually stated it. Most sessions are
+  this case: there is no design, and inventing a requirement to check against
+  is worse than checking against the ask. Do not go hunting for a design
+  document that was never written.
+
+Then say, per criterion, which command proves it or that nothing does. A
+criterion no command covers is a gap to name, not a box to tick — see "When
+evidence cannot be gathered".
+
+If the goal or design **cannot be read** (missing file, unreadable path),
+that is itself the finding. Say so and stop; a completion claim checked
+against a remembered goal is the failure this section exists to prevent.
+
 ## Red flags
 
 | Red flag | Why it's a tell |
@@ -54,6 +85,8 @@ is yours until proven otherwise.
 | "The test file exists, so it's covered." | A file existing proves nothing about whether it runs or passes. |
 | "It worked when I ran it manually earlier" | "Earlier" precedes the latest edit; re-run against the current tree. |
 | Silence about a step that failed, followed by a claim about the step after it | A skipped failure doesn't disappear — it invalidates everything downstream. |
+| "All the tests pass, so it's done." | The suite proves the code matches the tests. Nobody has checked it against the acceptance criteria, and a test suite cannot notice a requirement that was never implemented. |
+| Stating the goal or the acceptance criteria from memory after a long session or a compaction | That is the copy most likely to have drifted. Re-read the file; the drift is invisible from the inside. |
 
 ## When evidence cannot be gathered
 
