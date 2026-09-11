@@ -29,9 +29,13 @@ type Policy struct {
 	ExhaustedBelow   int
 	ConstrainedBelow int
 
-	// Failover is the provider order tried after the preferred tool. Every
-	// entry is a known usage provider; PolicyFromConfig rejects anything else
-	// rather than accepting a name that can never match.
+	// Failover is the TOOL-name order tried after the preferred tool. Entries
+	// are validated by shape only, at both layers, and need not name a usage
+	// provider: the design's recommender rule 2 makes a tool in the "unknown"
+	// state eligible precisely when it appears here explicitly, so restricting
+	// this list to the two providers would delete a behaviour the design
+	// requires. A consequence is that a miscased entry such as "Codex" stays
+	// inert — that is designed, not a defect.
 	//
 	// It is never empty, so callers may read Failover[0] unguarded: an explicit
 	// `failover = []` in the config is treated as an omitted key and keeps the
@@ -87,12 +91,15 @@ func defaultFailover(defaultTool string) []string {
 // defaults (they live here, and internal/session must not import this package).
 //
 // It also rejects what only this package can judge: a ladder or frontier_window
-// table key, or a failover entry, that is not a known usage provider, and a
-// ladder or frontier_window VALUE carrying whitespace. Each of those would
-// otherwise be a silent no-op — the override discarded or the window never
-// matched — surfacing as wrong behaviour units later instead of as a config
-// error. An empty ladder value stays legal: it is how the config marks a tier
-// unavailable on a provider, and an empty frontier_window value means no gate.
+// table key that is not a known usage provider, and a ladder or frontier_window
+// VALUE carrying whitespace. Each of those would otherwise be a silent no-op —
+// the override discarded or the window never matched — surfacing as wrong
+// behaviour units later instead of as a config error. An empty ladder value
+// stays legal: it is how the config marks a tier unavailable on a provider, and
+// an empty frontier_window value means no gate.
+//
+// Failover entries are deliberately NOT checked against the provider set; see
+// the Policy.Failover doc comment.
 func PolicyFromConfig(cfg *session.UserConfig) (Policy, error) {
 	if cfg == nil {
 		return DefaultPolicy(""), nil
@@ -124,9 +131,6 @@ func PolicyFromConfig(cfg *session.UserConfig) (Policy, error) {
 		for i, entry := range settings.Failover {
 			if entry == "" || strings.ContainsFunc(entry, unicode.IsSpace) {
 				return Policy{}, fmt.Errorf("invalid [usage.policy].failover[%d] %q: must be a tool name without whitespace", i, entry)
-			}
-			if _, ok := knownProvider(entry); !ok {
-				return Policy{}, fmt.Errorf("invalid [usage.policy].failover[%d] %q: unknown usage provider", i, entry)
 			}
 			failover = append(failover, entry)
 		}
@@ -185,14 +189,12 @@ func PolicyFromConfig(cfg *session.UserConfig) (Policy, error) {
 }
 
 // knownProvider reports whether name is one of the closed set of usage
-// providers. Unknown keys and entries are rejected rather than silently
-// dropped: a typo'd or miscased `[usage.policy.ladder.cluade]` would otherwise
-// discard the user's override, leave the defaults in place, and add a dead
-// Provider entry nothing reads.
+// providers. It guards the ladder and frontier_window table KEYS only, which
+// are keyed by Provider and so cannot hold anything else: a typo'd or miscased
+// `[usage.policy.ladder.cluade]` would otherwise discard the user's override,
+// leave the defaults in place, and add a dead Provider entry nothing reads.
 //
-// This is NOT a tool-registry probe — the Provider set is a compile-time
-// constant — and it deliberately lives here rather than in the config loader,
-// which still validates failover by shape only.
+// It deliberately does NOT guard failover entries, which are tool names.
 func knownProvider(name string) (Provider, bool) {
 	switch p := Provider(name); p {
 	case Claude, Codex:
