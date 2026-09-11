@@ -27,8 +27,9 @@ type Window struct {
 }
 
 type Windows struct {
-	Session5H *Window `json:"session_5h,omitempty"`
-	Weekly    *Window `json:"weekly,omitempty"`
+	Session5H *Window            `json:"session_5h,omitempty"`
+	Weekly    *Window            `json:"weekly,omitempty"`
+	Models    map[string]*Window `json:"models,omitempty"`
 }
 
 type Snapshot struct {
@@ -165,19 +166,66 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("openusage response has no limits")
 	}
 	if provider == Claude {
-		s.Windows.Session5H = parseWindow(windows["session"])
+		s.Windows.Session5H = parseWindow(windows[sessionKey])
 		if s.Windows.Session5H == nil {
-			s.Windows.Session5H = parseWindow(windows["five_hour"])
+			s.Windows.Session5H = parseWindow(windows[fiveHourKey])
 		}
 		if s.Windows.Session5H == nil {
-			s.Windows.Session5H = parseWindow(windows["session_5h"])
+			s.Windows.Session5H = parseWindow(windows[session5HKey])
 		}
 	}
-	s.Windows.Weekly = parseWindow(windows["weekly"])
+	s.Windows.Weekly = parseWindow(windows[weeklyKey])
 	if s.Windows.Weekly == nil && s.Windows.Session5H == nil {
 		return Snapshot{}, fmt.Errorf("openusage response has no supported windows")
 	}
+	s.Windows.Models = parseModelWindows(windows)
 	return s, nil
+}
+
+// sessionKey, fiveHourKey and session5HKey are Claude's dedicated 5-hour
+// session aliases; weeklyKey is the dedicated weekly window, shared by every
+// provider. Declared once and reused both where Session5H/Weekly are
+// extracted above and in dedicatedWindowKeys below, so the extraction and
+// the exclusion set can't drift apart.
+//
+// dedicatedWindowKeys excludes these keys for every provider, not just
+// Claude, per the task's provider-agnostic wording ("not a recognised
+// session alias"). Session5H itself is only populated from the session keys
+// when provider == Claude above, so a non-Claude resource literally named
+// one of them is unreachable today (Codex fixtures use
+// weekly/spark/sparkWeekly) but would be dropped rather than land in Models.
+// Deliberate, not an oversight: a future provider integration reusing these
+// names should find this note instead of quietly losing data.
+const (
+	sessionKey   = "session"
+	fiveHourKey  = "five_hour"
+	session5HKey = "session_5h"
+	weeklyKey    = "weekly"
+)
+
+var dedicatedWindowKeys = map[string]struct{}{
+	sessionKey:   {},
+	fiveHourKey:  {},
+	session5HKey: {},
+	weeklyKey:    {},
+}
+
+func parseModelWindows(windows map[string]json.RawMessage) map[string]*Window {
+	var models map[string]*Window
+	for name, raw := range windows {
+		if _, dedicated := dedicatedWindowKeys[name]; dedicated {
+			continue
+		}
+		w := parseWindow(raw)
+		if w == nil {
+			continue
+		}
+		if models == nil {
+			models = make(map[string]*Window)
+		}
+		models[name] = w
+	}
+	return models
 }
 
 func boolField(m map[string]json.RawMessage, key string) (bool, bool) {
