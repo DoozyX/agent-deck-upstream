@@ -45,9 +45,13 @@ type Request struct {
 
 // Alternative is a candidate tool that was considered and not selected.
 type Alternative struct {
-	Tool             string `json:"tool"`
-	State            string `json:"state"`
-	RemainingPercent int    `json:"remaining_percent"` // -1 when unknown
+	Tool  string `json:"tool"`
+	State string `json:"state"`
+	// RemainingPercent is -1 when the state is unknown, and -1 is also a
+	// reachable real reading: a negative remaining percentage is a value, not a
+	// sentinel, so an exhausted candidate can report -1 too. State, not this
+	// field, tells the two apart.
+	RemainingPercent int `json:"remaining_percent"`
 }
 
 // Decision is the recommender's answer. Every decision is advisory: Recommend
@@ -206,7 +210,7 @@ type evaluation struct {
 	provider    Provider
 	snapshot    *Snapshot
 	state       string
-	remaining   int // -1 when unknown
+	remaining   int // -1 when unknown, and also a reachable real reading; state disambiguates
 	profileMiss bool
 }
 
@@ -484,13 +488,21 @@ func Recommend(req Request, snapshots []Snapshot, tools session.OrchestrateToolP
 	//
 	// Step 2 is the design's "the preferred tool with State = exhausted"
 	// fallback, and it is reached both when there are no candidates at all and
-	// when every candidate is an ineligible unknown. The tool it names is NOT
-	// filtered against the orchestrate policy: it may be absent from
-	// AvailableTools, may itself be an ineligible unknown, and may have no
-	// snapshot. The consequence a caller must handle is that under
-	// Strategy "auto" ProvidersToQuery can return no providers for the very
-	// input whose decision names this tool, so a caller that fetches first will
-	// hold no snapshot for it.
+	// when no candidate is eligible — every candidate exhausted, an ineligible
+	// unknown, or a mix. The two arms record DIFFERENT reasons:
+	// reasonNoCandidates for the former, reasonExhaustedFallback for the
+	// latter. The tool step 2 names is NOT filtered against the orchestrate
+	// policy: it may be absent from AvailableTools, may itself be an ineligible
+	// unknown, and may have no snapshot.
+	//
+	// The consequence a caller must handle is that ProvidersToQuery can return
+	// no providers for the very input whose decision names this tool, by either
+	// of two mechanisms: AvailableTools filtered the named tool out of the
+	// candidate list (reachable under "auto"), or the named tool maps to no
+	// usage provider, which ProvidersToQuery omits by design (the only
+	// mechanism left on a collapsed strategy, where the named tool is the sole
+	// candidate). Either way a caller that fetches first will hold no snapshot
+	// for it.
 	lastResort := prefer
 	for _, eval := range evals {
 		if eval.state == StateUnknown && !eligibleUnknown(eval.tool, policy) {
