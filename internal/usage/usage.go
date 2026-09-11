@@ -27,8 +27,9 @@ type Window struct {
 }
 
 type Windows struct {
-	Session5H *Window `json:"session_5h,omitempty"`
-	Weekly    *Window `json:"weekly,omitempty"`
+	Session5H *Window            `json:"session_5h,omitempty"`
+	Weekly    *Window            `json:"weekly,omitempty"`
+	Models    map[string]*Window `json:"models,omitempty"`
 }
 
 type Snapshot struct {
@@ -177,7 +178,35 @@ func Parse(provider Provider, raw []byte) (Snapshot, error) {
 	if s.Windows.Weekly == nil && s.Windows.Session5H == nil {
 		return Snapshot{}, fmt.Errorf("openusage response has no supported windows")
 	}
+	s.Windows.Models = parseModelWindows(windows)
 	return s, nil
+}
+
+// sessionAliasKeys are the resource names consumed by the dedicated
+// Session5H/Weekly fields; they must never also appear in Models.
+var sessionAliasKeys = map[string]bool{
+	"session":    true,
+	"five_hour":  true,
+	"session_5h": true,
+	"weekly":     true,
+}
+
+func parseModelWindows(windows map[string]json.RawMessage) map[string]*Window {
+	var models map[string]*Window
+	for name, raw := range windows {
+		if sessionAliasKeys[name] {
+			continue
+		}
+		w := parseWindow(raw)
+		if w == nil {
+			continue
+		}
+		if models == nil {
+			models = make(map[string]*Window)
+		}
+		models[name] = w
+	}
+	return models
 }
 
 func boolField(m map[string]json.RawMessage, key string) (bool, bool) {
