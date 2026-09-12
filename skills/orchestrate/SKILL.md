@@ -28,14 +28,31 @@ agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --js
 ```
 
 The command is read-only and advisory. It exits 0 for every decision — including
-`state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag
-(a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
-positional). Exit 1 means the configuration could not be loaded or validated —
-check the exit code before reading the saved file, because the `>` redirect
-creates that file even when nothing was written to it. A machine with no
-`openusage` binary gets `state: unknown` and the
-preferred tool when one resolves, which is an answer, not a failure; continue
-unchanged there.
+`state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag:
+a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
+positional, and anything else `flag.Parse` rejects, which is wider than that
+list — an undefined flag such as `--bogus`, or a defined flag given no value.
+Exit 1 means the configuration could not be loaded or validated, or the JSON
+could not be encoded — check the exit code before reading the saved file,
+because the `>` redirect creates that file even when nothing was written to it.
+A machine with no `openusage` binary gets `state: unknown` and the preferred
+tool when one resolves, which is an answer, not a failure; continue unchanged
+there.
+
+**Check that the decision is launchable before you build the launch.** A
+`reason` that *contains* `no candidate tools` means no candidate tool resolved
+at all, and nothing in that decision may be launched. Match on the substring:
+that clause comes first, but a tier floor or a model clause can follow it after
+a `;`. Do not use `tool == ""` as the test — `tool` is empty only when the
+strategy resolved no name either. When a name survives the empty candidate list,
+`tool` is that name, `provider` and `model` come back filled in whenever it maps
+to a usage provider, `state` is `unknown`, and **stderr is empty**, so a
+`tool == ""` guard passes that decision straight through and the launch below is
+built — with a `--model` — for a tool the policy just filtered out. The exit
+code is 0 either way. The remedy hint reaches stderr on the empty-`tool` branch
+only: capture stderr for that one, but never read a silent stderr as a
+launchable decision. Re-run the call with `--prefer <tool>`, or set
+`default_tool` in `config.toml`, before launching anything for that wave.
 
 Launch with the decision's `tool`, and with its `model` when that field is
 non-empty:
@@ -50,12 +67,6 @@ agent-deck launch <worktree-path> -c <tool> \
 Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is
 empty — an empty model is the decision telling you to run the connector's own
 default.
-
-An empty `tool` is different: there is no `-c <tool>` to pass and the launch
-above cannot be built. It means no candidate tool resolved at all — the exit
-code is still 0 and the remedy reaches **stderr only**, so capture stderr, not
-just the `>` redirect. Re-run the call with `--prefer <tool>`, or set
-`default_tool` in `config.toml`, before launching anything for that wave.
 
 **Re-run rule.** Reuse the saved decision for the rest of its wave. Call
 `recommend` again only after a child reports the existing `usage-limit`
@@ -233,7 +244,10 @@ AVAILABLE_TOOLS=$(jq -r '.available_tools | join(", ")' "$RUN_DIR/tool-policy.js
   prefer another connector. If it is unavailable, select an available tool and
   record that fallback.
 - An explicit workflow choice (for example the cross-provider Codex reviewer)
-  overrides the policy.
+  overrides the policy. "The policy" here is the tool policy from `agent-deck
+  config orchestrate` — a different object from the usage recommendation, which
+  the same choice yields to only when that provider's state is `exhausted`, as
+  "Explicit workflow tool choices" above qualifies it.
 - Before launching, append the full manifest line defined under "Record every
   launch" above — `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`,
   all six fields — to `$RUN_DIR/manifest.md`. Automatic selection that is not

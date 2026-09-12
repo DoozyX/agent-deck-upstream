@@ -448,11 +448,21 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// paraphrase both used to survive here.
 		`agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --json \
   > "$RUN_DIR/usage/<wave>-<role>-<tier>.json"`,
-		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag (a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional).",
+		// Round-5 finding 5: the exit-2 enumeration read as a CLOSED list and
+		// omitted `flag.Parse`'s own rejections, which
+		// cmd/agent-deck/usage_recommend_cmd.go:155-159 names as a fifth exit-2
+		// path and itself calls "wider than a bad flag". Driven: `--bogus` ->
+		// EXIT=2 "flag provided but not defined: -bogus", and `--tier` with no
+		// value -> EXIT=2 "flag needs an argument: -tier". The open clause is
+		// pinned with the list so the list cannot re-close.
+		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value.",
 		// Exit 1 was enumerated nowhere in the skill, though this section's own
 		// recipe redirects stdout into a file the shell creates either way — a
 		// conductor with no reason to check the code saves a zero-byte "decision".
-		"Exit 1 means the configuration could not be loaded or validated — check the exit code before reading the saved file, because the `>` redirect creates that file even when nothing was written to it.",
+		// Round-5 finding 6: the skill's exit-1 clause omitted the JSON-encode
+		// path that config-reference.md carries, so two documents stated one
+		// contract with different content. The encode clause is pinned here.
+		"Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded — check the exit code before reading the saved file, because the `>` redirect creates that file even when nothing was written to it.",
 		// Criterion 4 and criterion 5, second halves: the exhausted pause owes a
 		// recorded, reported decision and the yield owes a recorded override.
 		// Both were deletable without turning this test red.
@@ -533,14 +543,54 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Frontier's two entry points, without claiming every escalation
 		// starts from strong (the reviewer's baseline is mid).
 		"or by an escalation, which reaches it through strong",
-		// The empty-`tool` decision is a decision, and its remedy is on
-		// stderr only — the section's own `>` redirect does not capture it.
-		"An empty `tool` is different",
-		"the remedy reaches **stderr only**",
+		// Round-5 finding 1 (major): the old guard here tested `tool == ""` and
+		// promised the remedy "reaches **stderr only**". Both fail on the
+		// surviving-name branch. Driven against a built binary with a fake
+		// `openusage` shadowing the real one:
+		//   failover = ["Codex","Claude"] under tool_strategy = "auto"
+		//     -> EXIT=0 {"tool":"Codex","provider":"","model":"", ...
+		//        "reason":"no candidate tools for tool strategy \"auto\""}
+		//        with STDERR EMPTY;
+		//   hidden_tools = ["codex","claude"] + failover = ["codex","claude"]
+		//     -> EXIT=0 {"tool":"codex","provider":"codex",
+		//        "model":"gpt-5.6-sol", ...} — same reason, STDERR still EMPTY.
+		// So neither `tool == ""` NOR `provider == ""` discriminates; only the
+		// `reason` does. cmd/agent-deck/usage_recommend_cmd.go:238 gates the
+		// remedy on `if decision.Tool == ""`, which is why stderr is silent.
+		// The guard is pinned ahead of the launch block because `model` is
+		// filled in on that branch too.
+		"A `reason` that *contains* `no candidate tools` means no candidate tool resolved at all, and nothing in that decision may be launched.",
+		"Do not use `tool == \"\"` as the test — `tool` is empty only when the strategy resolved no name either.",
+		"`tool` is that name, `provider` and `model` come back filled in whenever it maps to a usage provider, `state` is `unknown`, and **stderr is empty**",
+		"The remedy hint reaches stderr on the empty-`tool` branch only: capture stderr for that one, but never read a silent stderr as a launchable decision.",
 		// Round-4 finding 7: the two pins above hold the surrounding sentences
 		// but not the remedy itself, which survived replacement by "Launch
 		// without `-c` and let the connector default apply."
 		"Re-run the call with `--prefer <tool>`, or set `default_tool` in `config.toml`, before launching anything for that wave.",
+		// Round-5 finding 13: this clause inverted into a wrong operational
+		// action while green — a mutant reading "which is a failure: stop the
+		// wave and report it rather than launching" SURVIVED. The lead confirms
+		// the clause is UNDRIVABLE on this machine (usage.Runner is built with
+		// an empty Path, so exec.LookPath("openusage") always runs and there is
+		// no env override), so a pin is the only protection it can have.
+		"A machine with no `openusage` binary gets `state: unknown` and the preferred tool when one resolves, which is an answer, not a failure; continue unchanged there.",
+		// Round-5 finding 14: the negative half of the re-run rule inverted
+		// while green — "Query it during ordinary polling, focused single
+		// tasks, and every-turn hooks as well." SURVIVED.
+		"Do not query it during ordinary polling, focused single tasks, or every-turn hooks.",
+		// Round-5 finding 15: the manifest cross-reference checks below cite
+		// this heading BY NAME, but nothing pinned the heading itself — a
+		// mutant renaming it to "**Launch bookkeeping** on one manifest line:"
+		// SURVIVED and left those references dangling.
+		"**Record every launch** on one manifest line:",
+		// Round-5 finding 17: the launch-time checklist bullet asserted the
+		// explicit-choice rule unqualified, naming the SAME example as the
+		// qualified rule above with no pointer between them and no pin. The
+		// bullet is NOT false — "the policy" there is the tool policy from
+		// `agent-deck config orchestrate`, a different object from the usage
+		// recommendation — and it is pre-existing, so only the missing pointer
+		// is added, and pinned.
+		"\"The policy\" here is the tool policy from `agent-deck config orchestrate` — a different object from the usage recommendation, which the same choice yields to only when that provider's state is `exhausted`, as \"Explicit workflow tool choices\" above qualifies it.",
 	})
 	// Criterion 3: the manifest line is owed at three sites — the code block
 	// and both cross-references. A whole-file Contains passed with BOTH
@@ -576,6 +626,30 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 			t.Errorf("criterion 3's manifest line must be cited within 6 lines of %q; it is not", site.anchor)
 		}
 	}
+
+	// Round-5 finding 16: criterion 7 requires the frontier row to be IN the
+	// "Baseline tier per session" table, but its assertion was a whole-file
+	// Contains — a mutant that DELETED the row from that table and re-added it
+	// verbatim under an unrelated heading SURVIVED (deleting it outright
+	// KILLED, which is why the gap was invisible). The same test already
+	// enforces adjacency for the `usage recommend` command row and both
+	// manifest cross-references, so this was inconsistent rigor rather than a
+	// plain omission. Anchored to its table's lead-in line.
+	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
+	frontierRowInTable := false
+	for i, line := range skillLines {
+		if !strings.Contains(line, "Baseline tier per session:") {
+			continue
+		}
+		for j := i; j < len(skillLines) && j <= i+12; j++ {
+			if strings.Contains(normalize(skillLines[j]), normalize(frontierBaselineRow)) {
+				frontierRowInTable = true
+			}
+		}
+	}
+	if !frontierRowInTable {
+		t.Errorf("criterion 7's frontier row %q must appear inside the \"Baseline tier per session\" table, within 12 lines of its lead-in; it does not", frontierBaselineRow)
+	}
 	// Round-4 finding 5: the third per-launch instruction carried the
 	// pre-existing THREE-field form while the code block and both
 	// cross-references mandate the six-field one, so the document gave two
@@ -587,8 +661,44 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	requireAll("orchestrate skill third manifest site", skill, []string{
 		"append the full manifest line defined under \"Record every launch\" above — `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`, all six fields — to `$RUN_DIR/manifest.md`",
 	})
+	// fold is deliberately LOCAL to the negative checks rather than folded into
+	// normalize: normalize backs every positive pin above, and making those
+	// case-insensitive and markup-blind would weaken ~60 assertions to
+	// strengthen these. The negative checks need it because their whole content
+	// is a removal, and a bare Contains was case-sensitive and markup-blind
+	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
+	// an explicit tool choice: never." all survived it.
+	// Backticks are stripped for the same reason as `*` and `_`: this document
+	// backticks `tool` everywhere, so "It overrides an explicit `tool` choice."
+	// and "It never `blocks a launch`." both revert the dead clauses while
+	// reading as ordinary prose, and both survived the emphasis-only fold.
+	//
+	// Round-5 finding 4: emphasis and backticks are still not enough, and
+	// round 4's patch killed only four of the five mutants its own finding
+	// listed. Inline HTML (`<em>`, `<strong>`, `<b>`, `<code>`), HTML comments,
+	// character entities and markdown link syntax each revert a dead clause
+	// while reading as ordinary prose. ORDER MATTERS: tags, comments and link
+	// wrappers collapse to nothing, but an entity must become a SPACE —
+	// stripping `&nbsp;` to nothing folds "blocks&nbsp;a launch" into
+	// "blocksa launch", which survives again.
+	htmlish := regexp.MustCompile(`<!--[\s\S]*?-->|</?[A-Za-z][^>]*>`)
+	entityish := regexp.MustCompile(`&(?:[A-Za-z]+|#[0-9]+|#[xX][0-9A-Fa-f]+);`)
+	linkish := regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	fold := func(s string) string {
+		s = htmlish.ReplaceAllString(s, "")
+		s = entityish.ReplaceAllString(s, " ")
+		s = linkish.ReplaceAllString(s, "${1}")
+		return strings.NewReplacer("*", "", "_", "", "`", "").Replace(strings.ToLower(normalize(s)))
+	}
+
 	// ...and the short form it replaced must not come back alongside it.
-	if strings.Contains(normalize(skill), "`role=<role> tool=<tool> reason=<one line>`") {
+	// Round-5 finding 3: this sibling used `normalize` with a BACKTICKED
+	// literal while the dead-clause loop below uses `fold` precisely because a
+	// bare Contains was found insufficient in round 4 — same commit, same
+	// defect class. Folded and unbackticked, it now also catches the
+	// unbackticked form, per-field backticks, the capitalised form and a
+	// reworded `reason=<reason>` variant.
+	if strings.Contains(fold(skill), fold("role=<role> tool=<tool> reason=")) {
 		t.Errorf("orchestrate skill still gives the three-field manifest form; the six-field form at \"Record every launch\" is the only one")
 	}
 
@@ -596,20 +706,6 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// A document asserting both the old rule and the new one is worse than one
 	// asserting only the old one, so this is checked over the whole file.
 	//
-	// fold is deliberately LOCAL to this negative loop rather than folded into
-	// normalize: normalize backs every positive pin above, and making those
-	// case-insensitive and emphasis-blind would weaken ~60 assertions to
-	// strengthen one. The loop needs it because the criterion's whole content
-	// is a removal, and the bare Contains was case-sensitive and markup-blind
-	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
-	// an explicit tool choice: never." all survived it.
-	// Backticks are stripped for the same reason as `*` and `_`: this document
-	// backticks `tool` everywhere, so "It overrides an explicit `tool` choice."
-	// and "It never `blocks a launch`." both revert the dead clauses while
-	// reading as ordinary prose, and both survived the emphasis-only fold.
-	fold := func(s string) string {
-		return strings.NewReplacer("*", "", "_", "", "`", "").Replace(strings.ToLower(normalize(s)))
-	}
 	for _, dead := range []string{"never blocks a launch", "overrides an explicit tool"} {
 		if strings.Contains(fold(skill), fold(dead)) {
 			t.Errorf("orchestrate skill still asserts the now-false clause %q", dead)
@@ -699,9 +795,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Round-4 finding 7: round 3 added this block to the TOML example
 		// because round-2 finding 2 asked for it, and criterion 11 owes "a TOML
 		// example matching the design's block" — yet the block survived
-		// deletion. Pinned with its trailing blank line so it also holds its
-		// position immediately ahead of `[usage.policy]`.
-		"[orchestrate]\ntool_strategy = \"auto\"\n\n[usage.policy]",
+		// deletion. It is pinned for CONTENT here; its blank line and its
+		// position are held by the raw whole-block check below, because
+		// `normalize` collapses `\n\n` and cannot hold either (round-5
+		// finding 7).
+		"[orchestrate] tool_strategy = \"auto\" [usage.policy]",
 		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
 		// The failover row was entirely rewritten and gained ZERO pins: the
 		// three above are context lines that rewrite never touched, so the
@@ -753,13 +851,67 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Criterion 12: all ten JSON keys, named in order. Nine of them had no
 		// assertion at all — only the `fetched_at` sub-clause was anchored.
 		"`--json` prints the decision as ten snake_case keys: `tool`, `provider`, `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`, `alternatives` (each entry `tool` / `state` / `remaining_percent`), and `fetched_at`",
+		// Round-5 finding 9: the read-only claim was invertible while green — a
+		// mutant asserting the command persists its decision into `config.toml`
+		// as the new `default_tool` SURVIVED.
+		"The command is read-only: it queries usage and prints a decision, and writes no configuration, session or account.",
+		// Round-5 finding 10: this clause inverted while green — a mutant
+		// asserting `-1` "always means the reading was not available, so it
+		// never reflects a real provider response" SURVIVED. That is the exact
+		// claim the lead drove FALSE: `-5`/`-7` are real readings reported with
+		// `state: exhausted`.
+		"A `remaining_percent` of `-1` covers both a reading that was not available and a provider that genuinely reported a negative remaining; read `state` to tell those apart.",
+		// Round-5 finding 11: only the key NAMES were pinned (inside the
+		// ten-keys string), so the tier-movement sentence inverted in BOTH
+		// directions while green — floor lowering `strong` to `mid`, gate
+		// raising `strong` to `frontier`. The direction is now held.
+		"a role floor raises `cheap` to `mid` for an implementer or reviewer, and an empty `frontier` ladder rung or a fired frontier-window gate lowers `frontier` to `strong`",
+		// Round-5 finding 12: the whole deferred-48 "Known limitation"
+		// paragraph was DELETABLE while green, and it is the one documentation
+		// item this unit owns outright.
+		"Known limitation: `agent-deck usage <session>` dispatches on the literal word `recommend` before it looks a session up, so a session titled exactly `recommend` is unreachable that way — pass the flag first (`agent-deck usage --json recommend`) to reach the session instead.",
 		"exits 0 for every decision",
 		"Exit 2 is reserved for a bad flag",
 		// ...and the whole exit contract as one sentence. The two fragments
 		// above are kept, but neither held the exit-1 clause, so the config
 		// reference could drop it while the skill side stayed pinned.
-		"It exits 0 for every decision — including `exhausted`, `unknown`, and the case where no candidate tool could be chosen at all (the decision then carries an empty `tool`, and a remedy hint goes to stderr) — so a caller reads `state`, not the exit code. Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, or a stray positional argument. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
+		// Round-5 finding 2 (major): the sentence pinned here asserted "the
+		// decision then carries an empty `tool`, and a remedy hint goes to
+		// stderr" — FALSE for the surviving-name branch, and contradicted by
+		// this same file 13 lines above (":679", the `failover` row). A pin on
+		// a false claim freezes the falsehood, so prose and pin changed in the
+		// same commit. Same driven evidence as finding 1 above.
+		"That last case is not always an empty `tool`: it always carries a `reason` beginning `no candidate tools for tool strategy`, but only when the strategy resolved no name either does `tool` come back empty with a remedy hint on stderr; when a name survives, as the `failover` row above describes, `tool` is that name, `provider` and `model` are filled in whenever it maps to a usage provider, and stderr stays silent. Read the `reason`, not the emptiness of `tool`.",
+		// Round-5 finding 5, config-reference half: the same closed exit-2
+		// enumeration as the skill's, widened to `flag.Parse` and pinned.
+		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
 	})
+	// Round-5 findings 7 and 8, checked RAW — no normalize — so whitespace,
+	// position and every VALUE are held together.
+	//
+	// Finding 7: the comment on the `[orchestrate]` pin above claimed it held
+	// the trailing blank line "so it also holds its position immediately ahead
+	// of `[usage.policy]`". It did not: `normalize` collapses `\n\n`. Driven,
+	// [M1-drop-blank-line] SURVIVED against [M2-delete-orchestrate-block] and
+	// [M3-auto-to-default] KILLED.
+	//
+	// Finding 8: criterion 11's TOML example pinned only section HEADERS, never
+	// values — a mutant setting exhausted_below = 99, constrained_below = 1,
+	// failover = ["Codex","Claud"], cheap = "fable", claude frontier = "haiku"
+	// and codex frontier = "gpt-5.6-nova" SURVIVED with the headers intact, so
+	// the round-3 fix held only against wholesale deletion. Criterion 11 owes
+	// "a TOML example matching the design's block", and the values are part of
+	// that block.
+	const usagePolicyTOMLBlock = "```toml\n" +
+		"[orchestrate]\ntool_strategy = \"auto\"\n\n" +
+		"[usage.policy]\nexhausted_below = 15\nconstrained_below = 35\nfailover = [\"codex\", \"claude\"]\n\n" +
+		"[usage.policy.ladder.claude]\ncheap = \"haiku\"\nmid = \"sonnet\"\nstrong = \"opus\"\nfrontier = \"fable\"\n\n" +
+		"[usage.policy.ladder.codex]\ncheap = \"gpt-5.6-luna\"\nmid = \"gpt-5.6-terra\"\nstrong = \"gpt-5.6-sol\"\nfrontier = \"gpt-6-astra\"\n\n" +
+		"[usage.policy.frontier_window]\nclaude = \"fable\"\n```"
+	if !strings.Contains(configReference, usagePolicyTOMLBlock) {
+		t.Errorf("config reference: the [usage.policy] TOML example must appear verbatim — every section in order, every value, and the blank line that puts [orchestrate] immediately ahead of [usage.policy]")
+	}
+
 	// The section is placed where its table-of-contents entry says it is.
 	orchestrateSection := strings.Index(configReference, "\n## [orchestrate] Section")
 	usagePolicySection := strings.Index(configReference, "\n## [usage.policy] Section")
