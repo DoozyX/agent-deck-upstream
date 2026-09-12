@@ -77,6 +77,23 @@ func TestPricerExactDatedOverridePrecedesNormalizedBuiltIn(t *testing.T) {
 	}
 }
 
+func TestPricerExactDatedCacheEntryPrecedesNormalizedBuiltIn(t *testing.T) {
+	dir := t.TempDir()
+	p := NewPricer(PricerConfig{CachePath: dir})
+	if err := p.SaveCache(map[string]pricingCacheModel{
+		"claude-sonnet-5-20260301": {InputPerMtok: 77, SourceURL: "synthetic-cache"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.LoadCache(); err != nil {
+		t.Fatal(err)
+	}
+	quote := p.Quote("claude-sonnet-5-20260301", TokenUsage{InputTokens: 1_000_000})
+	if quote.Source != "synthetic-cache" || quote.CostMicrodollars != 77_000_000 {
+		t.Fatalf("quote=%+v, want exact dated cache entry", quote)
+	}
+}
+
 func TestPricingCatalogOnlyMarksEvidenceBackedEntriesKnown(t *testing.T) {
 	p := NewPricer(PricerConfig{})
 	verified := map[string]string{

@@ -201,3 +201,61 @@ func TestIngestCorrectionPriceMatchesFinalMergedDurationUsage(t *testing.T) {
 		t.Fatalf("stored cost=%d merged-usage cost=%d write5m=%d write1h=%d", cost, mergedQuote.CostMicrodollars, write5m, write1h)
 	}
 }
+
+func TestIngestUnknownPricedCorrectionPreservesKnownEstimate(t *testing.T) {
+	store := testStore(t)
+	base := costs.UsageEvent{
+		ID: "stale", Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeHook,
+		SourceIdentity: "claude:msg:stale", TranscriptIdentity: "claude:stale", SessionID: "session",
+		Timestamp: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC), Model: "retired-model",
+		Usage: costs.TokenUsage{InputTokens: 10}, CostMicrodollars: 42,
+		PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}
+	if _, err := store.Ingest(context.Background(), []costs.UsageEvent{base}, nil); err != nil {
+		t.Fatal(err)
+	}
+	correction := base
+	correction.Usage.InputTokens = 20
+	correction.CostMicrodollars = 0
+	correction.PricingStatus = costs.PricingUnknown
+	if _, err := store.IngestPriced(context.Background(), []costs.UsageEvent{correction}, nil, costs.NewPricer(costs.PricerConfig{})); err != nil {
+		t.Fatal(err)
+	}
+	var cost int64
+	var status string
+	if err := store.DB().QueryRow(`SELECT cost_microdollars, pricing_status FROM cost_events WHERE id = 'stale'`).Scan(&cost, &status); err != nil {
+		t.Fatal(err)
+	}
+	if cost != 42 || status != string(costs.PricingUnknown) {
+		t.Fatalf("cost=%d status=%q; unknown correction must demote status without erasing prior estimate", cost, status)
+	}
+}
+
+func TestIngestCorrectionUsesSuppliedOverridePricing(t *testing.T) {
+	store := testStore(t)
+	base := costs.UsageEvent{
+		ID: "override", Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeHook,
+		SourceIdentity: "claude:msg:override", TranscriptIdentity: "claude:override", SessionID: "session",
+		Timestamp: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC), Model: "claude-sonnet-5",
+		Usage: costs.TokenUsage{InputTokens: 1_000_000}, CostMicrodollars: 2_000_000,
+		PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}
+	if _, err := store.Ingest(context.Background(), []costs.UsageEvent{base}, nil); err != nil {
+		t.Fatal(err)
+	}
+	correction := base
+	correction.Usage.InputTokens = 2_000_000
+	pricer := costs.NewPricer(costs.PricerConfig{Overrides: map[string]costs.PriceOverride{
+		"claude-sonnet-5": {InputPerMtok: 99},
+	}})
+	if _, err := store.IngestPriced(context.Background(), []costs.UsageEvent{correction}, nil, pricer); err != nil {
+		t.Fatal(err)
+	}
+	var cost int64
+	if err := store.DB().QueryRow(`SELECT cost_microdollars FROM cost_events WHERE id = 'override'`).Scan(&cost); err != nil {
+		t.Fatal(err)
+	}
+	if cost != 198_000_000 {
+		t.Fatalf("cost=%d, want supplied override correction price 198000000", cost)
+	}
+}

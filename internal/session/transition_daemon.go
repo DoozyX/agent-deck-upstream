@@ -638,7 +638,7 @@ func (d *TransitionDaemon) seedDesktopNotificationBaseline(profile string, byID 
 	}
 	for id, hook := range hookStatuses {
 		if inst := byID[id]; inst != nil {
-			if signal, ok := d.doneSignalFor(profile, id, hook); ok {
+			if signal, ok := d.doneSignalFor(profile, id, inst, hook); ok {
 				baseline(desktopnotify.SourceEvent{SessionID: id, Title: inst.Title, Profile: profile, Project: inst.ProjectPath, Kind: transitionKindFinished, DoneStatus: signal.Status, Summary: signal.Summary, Timestamp: hook.UpdatedAt})
 			}
 		}
@@ -843,11 +843,11 @@ func (d *TransitionDaemon) emitDoneSignals(profile string, byID map[string]*Inst
 		if hs == nil {
 			continue
 		}
-		sig, ok := d.doneSignalFor(profile, id, hs)
+		inst := byID[id]
+		sig, ok := d.doneSignalFor(profile, id, inst, hs)
 		if !ok {
 			continue
 		}
-		inst := byID[id]
 		desktopDispatch := d.initialized[profile] && d.desktopNotificationDispatchReady(profile)
 		legacyDispatch := notifyEnabled
 		desktopObserved := d.desktopDoneObserved(profile, id, sig, hs.UpdatedAt)
@@ -959,7 +959,7 @@ func doneSignalObserved(observed map[string]map[string]DoneSignal, profile, id s
 //
 // Both sources respect the #1214 completion-wrapper ownership gate and the
 // freshness window exactly like the pre-existing done-fields path.
-func (d *TransitionDaemon) doneSignalFor(profile, id string, hs *HookStatus) (DoneSignal, bool) {
+func (d *TransitionDaemon) doneSignalFor(profile, id string, inst *Instance, hs *HookStatus) (DoneSignal, bool) {
 	fresh := hs.UpdatedAt.IsZero() || time.Since(hs.UpdatedAt) <= hookFreshWindow
 
 	if strings.TrimSpace(hs.DoneStatus) != "" {
@@ -1003,7 +1003,7 @@ func (d *TransitionDaemon) doneSignalFor(profile, id string, hs *HookStatus) (Do
 	if CompletionRecordExists(profile, id) {
 		return DoneSignal{}, false
 	}
-	cleanPath, ok := ValidateTranscriptPath(hs.TranscriptPath)
+	cleanPath, ok := ValidateTranscriptPathForInstance(hs.TranscriptPath, inst)
 	if !ok {
 		d.markDoneScanResolved(profile, id, hs.UpdatedAt)
 		return DoneSignal{}, false

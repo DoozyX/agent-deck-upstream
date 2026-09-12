@@ -260,8 +260,8 @@ func handleCostsRecompute(profile string, args []string) {
 		case "-h", "--help":
 			fmt.Println("Usage: agent-deck costs recompute [--dry-run]")
 			fmt.Println("\nRecalculate cost_microdollars for every cost_events row using current")
-			fmt.Println("pricing data (defaults + user overrides). Rows whose model is unknown to")
-			fmt.Println("the pricer are left untouched. Idempotent.")
+			fmt.Println("pricing data (defaults + user overrides). For unknown models, the prior amount is preserved")
+			fmt.Println("while any stale known status is demoted to unknown. Idempotent.")
 			return
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)

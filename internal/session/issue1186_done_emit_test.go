@@ -1,7 +1,9 @@
 package session
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -446,5 +448,60 @@ func TestDaemon_FlushRaceRescan_PathOutsideClaudeRejected(t *testing.T) {
 	}
 	if _, resolved := d.lastDoneScan[profile][childID]; !resolved {
 		t.Fatalf("rejected path should be marked resolved so the daemon does not retry it")
+	}
+}
+
+func TestDaemon_FlushRaceRescan_AcceptsRetainedInstanceAccountHome(t *testing.T) {
+	home := t.TempDir()
+	accountHome := filepath.Join(home, "claude-account")
+	profile := "work"
+	t.Setenv("HOME", home)
+	t.Setenv("AGENT_DECK_HOME", "")
+	t.Setenv("AGENT_DECK_PROFILE", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	configPath := filepath.Join(home, ".config", "agent-deck", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte(fmt.Sprintf("[profiles.account-a.claude]\nconfig_dir = %q\n", accountHome)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	storage, err := NewStorageWithProfile(profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent := &Instance{ID: "parent-account-home", Title: "parent", ProjectPath: home, Tool: "claude", Status: StatusIdle, CreatedAt: time.Now()}
+	child := &Instance{ID: "child-account-home", Title: "child", ProjectPath: home, ParentSessionID: parent.ID, Tool: "claude", Status: StatusWaiting, Account: "account-a", CreatedAt: time.Now()}
+	if err := storage.SaveWithGroups([]*Instance{parent, child}, nil); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	byID := loadInstancesByID(t, profile)
+
+	path := filepath.Join(accountHome, "projects", "p", "transcript.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := scanAssistantLine(t, "===AGENTDECK_DONE=== status=ok summary=account home")
+	if err := os.WriteFile(path, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := NewTransitionDaemon()
+	t.Cleanup(d.notifier.Close)
+	d.emitDoneSignals(profile, byID, map[string]*HookStatus{child.ID: {
+		Status: "waiting", Event: "Stop", TranscriptPath: path, UpdatedAt: time.Now(),
+	}})
+	d.notifier.Flush()
+	got := readInboxLines(t, parent.ID)
+	if len(got) != 1 || got[0].DoneStatus != "ok" || got[0].DoneSummary != "account home" {
+		t.Fatalf("account-home completion=%+v, want one ok signal", got)
 	}
 }

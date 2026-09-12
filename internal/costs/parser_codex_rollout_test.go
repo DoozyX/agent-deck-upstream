@@ -211,3 +211,20 @@ func TestCodexRolloutInputOutputOnlyResetStartsNewSegment(t *testing.T) {
 		t.Fatalf("coordinated sparse reset must remain complete: complete=%v warnings=%v", result.Complete, result.Warnings)
 	}
 }
+
+func TestCodexRolloutMixedCounterRegressionIsAmbiguous(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	body := `{"timestamp":"2026-09-01T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}` + "\n" +
+		`{"timestamp":"2026-09-01T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":20,"reasoning_output_tokens":5}}}}` + "\n" +
+		`{"timestamp":"2026-09-01T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":90,"cached_input_tokens":30,"output_tokens":10,"reasoning_output_tokens":6}}}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&costs.CodexRolloutParser{}).Parse(context.Background(), codexSource(path, "codex:mixed-regression"), costs.ScanCheckpoint{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 || result.Complete || len(result.Warnings) == 0 {
+		t.Fatalf("events=%+v warnings=%v complete=%v; mixed regression must remain an explicit coverage gap", result.Events, result.Warnings, result.Complete)
+	}
+}
