@@ -270,9 +270,14 @@ func handleCostsRecompute(profile string, args []string) {
 		}
 	}
 
+	userConfig, err := session.LoadUserConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+		os.Exit(1)
+	}
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
-	pricer := newPricerFromConfig()
+	pricer := newPricerFromUserConfig(userConfig)
 
 	if dryRun {
 		fmt.Println("Recomputing cost_events (dry-run, no rows will be modified)...")

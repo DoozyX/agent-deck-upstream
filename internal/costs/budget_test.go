@@ -104,3 +104,39 @@ func TestBudgetCoverageUnknownPriceIsNotFreeHeadroom(t *testing.T) {
 		t.Fatalf("budget metadata=%+v", result)
 	}
 }
+
+func TestBudgetStopPreservesEarlierScopeIncompleteCoverage(t *testing.T) {
+	s := testStore(t)
+	old := time.Now().Add(-48 * time.Hour)
+	if err := s.WriteCostEvent(costs.CostEvent{
+		ID: "old-unknown", SessionID: "session", Timestamp: old,
+		Provider: "test", SourceKind: "test", SourceIdentity: "old-unknown",
+		Model: "unknown", InputTokens: 11, PricingStatus: costs.PricingUnknown,
+		ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.WriteCostEvent(costs.CostEvent{
+		ID: "today-known", SessionID: "other", Timestamp: time.Now(),
+		Provider: "test", SourceKind: "test", SourceIdentity: "today-known",
+		Model: "known", CostMicrodollars: 100, PricingStatus: costs.PricingKnown,
+		ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	checker := costs.NewBudgetChecker(costs.BudgetConfig{
+		SessionLimits: map[string]int64{"session": 1000}, DailyLimit: 50, Timezone: time.UTC,
+	}, s)
+	tx, err := s.DB().Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	result, err := checker.CheckTx(tx, "session", "", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Action != costs.BudgetActionStop || !result.CoverageIncomplete || result.UnknownPriceTokens != 11 {
+		t.Fatalf("budget result=%+v; stop must retain earlier incomplete coverage", result)
+	}
+}

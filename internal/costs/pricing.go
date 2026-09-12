@@ -80,7 +80,7 @@ func (p *Pricer) Quote(model string, usage TokenUsage) PriceQuote {
 	if err := usage.Validate(); err != nil {
 		return PriceQuote{Status: PricingUnknown, NormalizedModel: normalized, Valid: false, Error: err.Error()}
 	}
-	price, source, ok := p.lookupPrice(normalized)
+	price, source, ok := p.lookupPrice(model)
 	if !ok {
 		return PriceQuote{Status: PricingUnknown, NormalizedModel: normalized, Valid: true}
 	}
@@ -139,23 +139,6 @@ func builtInPricingCatalog() map[string]ModelPrice {
 		"claude-opus-5":    verifiedPrice(5.00, 25.00, 0.50, 6.25, 6.25, 10.00, anthropicPriceSource),
 		"claude-sonnet-5":  verifiedPrice(2.00, 10.00, 0.20, 2.50, 2.50, 4.00, anthropicPriceSource),
 		"claude-haiku-4-5": verifiedPrice(1.00, 5.00, 0.10, 1.25, 1.25, 2.00, anthropicPriceSource),
-
-		// Retained supported catalog entries used by existing non-transcript
-		// providers. They share this single catalog rather than a fetcher copy.
-		"claude-opus-4-7":        verifiedPrice(5.0, 25.0, 0.50, 6.25, 6.25, 10.0, anthropicPriceSource),
-		"claude-opus-4-6":        verifiedPrice(5.0, 25.0, 0.50, 6.25, 6.25, 10.0, anthropicPriceSource),
-		"claude-sonnet-4-6":      verifiedPrice(3.0, 15.0, 0.30, 3.75, 3.75, 6.0, anthropicPriceSource),
-		"gemini-2.5-pro":         priceFromUSD(1.25, 10.0, 0, 0),
-		"gemini-2.5-flash":       priceFromUSD(0.15, 0.60, 0, 0),
-		"gpt-4o":                 priceFromUSD(2.50, 10.0, 0, 0),
-		"gpt-4.1":                priceFromUSD(2.0, 8.0, 0, 0),
-		"o3":                     priceFromUSD(2.0, 8.0, 0, 0),
-		"o4-mini":                priceFromUSD(1.10, 4.40, 0, 0),
-		"MiniMax-M3":             priceFromUSD(0.60, 2.40, 0.12, 0),
-		"MiniMax-M2.7":           priceFromUSD(0.30, 1.20, 0.06, 0.375),
-		"MiniMax-M2.7-highspeed": priceFromUSD(0.35, 1.40, 0, 0),
-		"MiniMax-M2.5":           priceFromUSD(0.50, 2.00, 0, 0),
-		"MiniMax-M2.5-highspeed": priceFromUSD(0.15, 0.60, 0, 0),
 	}
 }
 
@@ -288,27 +271,51 @@ func (p *Pricer) CacheAge() time.Duration {
 
 // GetPrice returns the price for a model with fallback: override > cache > hardcoded.
 func (p *Pricer) GetPrice(model string) (ModelPrice, bool) {
-	mp, _, ok := p.lookupPrice(normalizeModel(model))
+	mp, _, ok := p.lookupPrice(model)
 	return mp, ok
 }
 
-func (p *Pricer) lookupPrice(normalized string) (ModelPrice, string, bool) {
-	if mp, ok := p.overrides[normalized]; ok {
+func (p *Pricer) lookupPrice(model string) (ModelPrice, string, bool) {
+	normalized := normalizeModel(model)
+	if mp, ok := p.overrides[model]; ok {
 		return mp, "override", true
 	}
-	if mp, ok := p.cached[normalized]; ok {
+	if normalized != model {
+		if mp, ok := p.overrides[normalized]; ok {
+			return mp, "override", true
+		}
+	}
+	if mp, ok := p.cached[model]; ok {
 		source := mp.SourceURL
 		if source == "" {
 			source = "cache"
 		}
 		return mp, source, true
 	}
-	if mp, ok := p.defaults[normalized]; ok {
+	if normalized != model {
+		if mp, ok := p.cached[normalized]; ok {
+			source := mp.SourceURL
+			if source == "" {
+				source = "cache"
+			}
+			return mp, source, true
+		}
+	}
+	if mp, ok := p.defaults[model]; ok {
 		source := mp.SourceURL
 		if source == "" {
 			source = "builtin"
 		}
 		return mp, source, true
+	}
+	if normalized != model {
+		if mp, ok := p.defaults[normalized]; ok {
+			source := mp.SourceURL
+			if source == "" {
+				source = "builtin"
+			}
+			return mp, source, true
+		}
 	}
 	return ModelPrice{}, "", false
 }

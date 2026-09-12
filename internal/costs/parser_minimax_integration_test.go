@@ -22,8 +22,8 @@ func TestMiniMaxEndToEnd_M3(t *testing.T) {
 	ev := events[0]
 	assert.Equal(t, "integration-m3", ev.SessionID)
 	assert.Equal(t, "MiniMax-M3", ev.Model)
-	// 1M input at $0.60/Mtok plus 500K output at $2.40/Mtok totals $1.80.
-	assert.Equal(t, int64(1_800_000), ev.CostMicrodollars)
+	assert.Equal(t, int64(0), ev.CostMicrodollars)
+	assert.Equal(t, PricingUnknown, ev.PricingStatus)
 }
 
 func TestMiniMaxEndToEnd_M27(t *testing.T) {
@@ -40,8 +40,8 @@ func TestMiniMaxEndToEnd_M27(t *testing.T) {
 	assert.Equal(t, "MiniMax-M2.7", ev.Model)
 	assert.Equal(t, int64(500_000), ev.InputTokens)
 	assert.Equal(t, int64(100_000), ev.OutputTokens)
-	// 500K input at $0.30/Mtok plus 100K output at $1.20/Mtok totals $0.27.
-	assert.Equal(t, int64(270_000), ev.CostMicrodollars)
+	assert.Equal(t, int64(0), ev.CostMicrodollars)
+	assert.Equal(t, PricingUnknown, ev.PricingStatus)
 }
 
 func TestMiniMaxEndToEnd_M25Highspeed(t *testing.T) {
@@ -55,10 +55,8 @@ func TestMiniMaxEndToEnd_M25Highspeed(t *testing.T) {
 
 	ev := events[0]
 	assert.Equal(t, "MiniMax-M2.5-highspeed", ev.Model)
-	// 1M input at $0.15/Mtok = $0.15 = 150,000 microdollars
-	// 500K output at $0.60/Mtok = $0.30 = 300,000 microdollars
-	// Total = 450,000 microdollars
-	assert.Equal(t, int64(450_000), ev.CostMicrodollars)
+	assert.Equal(t, int64(0), ev.CostMicrodollars)
+	assert.Equal(t, PricingUnknown, ev.PricingStatus)
 }
 
 func TestMiniMaxEndToEnd_UnknownTool(t *testing.T) {

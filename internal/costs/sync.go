@@ -157,7 +157,7 @@ func Sync(ctx context.Context, store *Store, pricer *Pricer, sources []Transcrip
 			receipt.Backoff = parsed.BlockedBackoff
 		}
 		parsed.Checkpoint.Receipt = &receipt
-		ingested, err := store.Ingest(ctx, parsed.Events, []ScanCheckpoint{parsed.Checkpoint})
+		ingested, err := store.IngestPriced(ctx, parsed.Events, []ScanCheckpoint{parsed.Checkpoint}, pricer)
 		if err != nil {
 			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: ingest: %v", source.Identity, err))
 			continue
@@ -278,21 +278,8 @@ func sourceFingerprint(path string, boundary int64) (string, error) {
 		return "", fmt.Errorf("checkpoint boundary %d outside source size %d", boundary, info.Size())
 	}
 	hash := sha256.New()
-	const window = int64(4096)
-	firstLength := boundary
-	if firstLength > window {
-		firstLength = window
-	}
-	if firstLength > 0 {
-		if _, err := io.CopyN(hash, file, firstLength); err != nil {
-			return "", err
-		}
-	}
-	if boundary > window {
-		if _, err := file.Seek(boundary-window, io.SeekStart); err != nil {
-			return "", err
-		}
-		if _, err := io.CopyN(hash, file, window); err != nil {
+	if boundary > 0 {
+		if _, err := io.CopyN(hash, file, boundary); err != nil {
 			return "", err
 		}
 	}
@@ -300,7 +287,7 @@ func sourceFingerprint(path string, boundary int64) (string, error) {
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
 		device, inode = uint64(stat.Dev), uint64(stat.Ino)
 	}
-	return fmt.Sprintf("v1:%d:%d:%d:%s", device, inode, boundary, hex.EncodeToString(hash.Sum(nil))), nil
+	return fmt.Sprintf("v2:%d:%d:%d:%s", device, inode, boundary, hex.EncodeToString(hash.Sum(nil))), nil
 }
 
 func applyEventPrice(event *UsageEvent, pricer *Pricer) {

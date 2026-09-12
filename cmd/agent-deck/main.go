@@ -908,8 +908,13 @@ func main() {
 
 			// Process incoming cost events from hooks
 			go func() {
-				for raw := range costWatcher.EventCh() {
-					_ = costStore.WriteRawCostEvent(raw, pricer)
+				for delivery := range costWatcher.EventCh() {
+					if err := persistCostEventDelivery(delivery, costStore, pricer); err != nil {
+						logging.ForComponent(logging.CompWatcher).Error("cost_event_persist_failed",
+							slog.String("instance", delivery.InstanceID),
+							slog.String("error", err.Error()),
+						)
+					}
 				}
 			}()
 		}
@@ -1073,6 +1078,14 @@ func main() {
 		fmt.Printf("Error: %v\n", runErr)
 		os.Exit(1)
 	}
+}
+
+func persistCostEventDelivery(delivery *costs.CostEventDelivery, store *costs.Store, pricer *costs.Pricer) error {
+	if err := store.WriteRawCostEvent(delivery.RawCostEvent, pricer); err != nil {
+		delivery.Retry()
+		return err
+	}
+	return delivery.Ack()
 }
 
 // commandRegistry lists every token that main()'s dispatch switch treats

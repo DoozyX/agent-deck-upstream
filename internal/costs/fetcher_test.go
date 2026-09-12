@@ -49,12 +49,12 @@ func TestFetcherWritesCache(t *testing.T) {
 	if err := pricer.LoadCache(); err != nil {
 		t.Fatal(err)
 	}
-	price, ok := pricer.GetPrice("claude-sonnet-4-6")
+	price, ok := pricer.GetPrice("claude-sonnet-5")
 	if !ok {
 		t.Fatal("missing price after cache load")
 	}
-	if price.InputPerMtokMicro != 3_000_000 {
-		t.Errorf("input = %d, want 3000000", price.InputPerMtokMicro)
+	if price.InputPerMtokMicro != 2_000_000 {
+		t.Errorf("input = %d, want 2000000", price.InputPerMtokMicro)
 	}
 	data, err := os.ReadFile(cachePath)
 	if err != nil {

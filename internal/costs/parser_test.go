@@ -136,7 +136,7 @@ func TestCollector(t *testing.T) {
 	pricer := NewPricer(PricerConfig{})
 	collector := NewCollector(pricer)
 
-	input := `{"hook_event_name":"Stop","session_id":"test","source":"claude","result":{"usage":{"input_tokens":1000,"output_tokens":500},"model":"claude-sonnet-4-6"}}`
+	input := `{"hook_event_name":"Stop","session_id":"test","source":"claude","result":{"usage":{"input_tokens":1000,"output_tokens":500},"model":"claude-sonnet-5"}}`
 
 	events, err := collector.Collect("claude", "session-123", input)
 	require.NoError(t, err)
@@ -144,7 +144,7 @@ func TestCollector(t *testing.T) {
 
 	ev := events[0]
 	assert.Equal(t, "session-123", ev.SessionID)
-	assert.Equal(t, "claude-sonnet-4-6", ev.Model)
+	assert.Equal(t, "claude-sonnet-5", ev.Model)
 	assert.NotEmpty(t, ev.ID)
 	assert.Greater(t, ev.CostMicrodollars, int64(0))
 	assert.Equal(t, "claude", ev.Provider)
@@ -167,5 +167,6 @@ func TestCollectorMiniMax(t *testing.T) {
 	assert.Equal(t, "session-456", ev.SessionID)
 	assert.Equal(t, "MiniMax-M2.7", ev.Model)
 	assert.NotEmpty(t, ev.ID)
-	assert.Greater(t, ev.CostMicrodollars, int64(0))
+	assert.Equal(t, int64(0), ev.CostMicrodollars)
+	assert.Equal(t, PricingUnknown, ev.PricingStatus)
 }
