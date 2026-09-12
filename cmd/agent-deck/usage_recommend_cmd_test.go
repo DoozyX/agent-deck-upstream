@@ -184,7 +184,14 @@ func TestUsageRecommendRejectsBadFlags(t *testing.T) {
 			args:   []string{"--role", "implementer", "--tier", "mid", "stray"},
 			stderr: "flags only",
 		},
-		{name: "unknown flag", args: []string{"--role", "implementer", "--tier", "mid", "--nope"}},
+		{
+			// The one exit-2 path whose message comes from the flag package
+			// rather than from this file: "flag provided but not defined:
+			// -nope", then usageRecommendUsageLine.
+			name:   "unknown flag",
+			args:   []string{"--role", "implementer", "--tier", "mid", "--nope"},
+			stderr: "not defined",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -352,25 +359,45 @@ func TestUsageRecommendJSONShape(t *testing.T) {
 // TestUsageRecommendJSONMirrorsDecisionKeys pins usageRecommendJSON against
 // usage.Decision, so a field added to the Decision cannot be dropped from the
 // CLI's output unnoticed.
+//
+// It compares the key sets the two struct TYPES declare, not the keys two zero
+// values marshal to: a field added with omitempty is absent from a marshalled
+// zero value on both sides, so a marshal-based comparison would pass while the
+// CLI dropped the field.
 func TestUsageRecommendJSONMirrorsDecisionKeys(t *testing.T) {
-	decision, err := json.Marshal(usage.Decision{})
-	if err != nil {
-		t.Fatalf("marshal decision: %v", err)
-	}
-	payload, err := json.Marshal(usageRecommendJSON{})
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
-	}
-	var decisionKeys, payloadKeys map[string]any
-	if err := json.Unmarshal(decision, &decisionKeys); err != nil {
-		t.Fatalf("decode decision: %v", err)
-	}
-	if err := json.Unmarshal(payload, &payloadKeys); err != nil {
-		t.Fatalf("decode payload: %v", err)
-	}
-	if got, want := sortedJSONKeys(payloadKeys), sortedJSONKeys(decisionKeys); !reflect.DeepEqual(got, want) {
+	got := usageRecommendJSONKeys(t, reflect.TypeOf(usageRecommendJSON{}))
+	want := usageRecommendJSONKeys(t, reflect.TypeOf(usage.Decision{}))
+	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("payload keys = %v, want usage.Decision's %v", got, want)
 	}
+}
+
+// usageRecommendJSONKeys returns the sorted JSON key set a struct type
+// declares, following encoding/json's naming: the tag name when there is one,
+// the Go field name when there is not, and nothing at all for an unexported
+// field or a `json:"-"` one.
+func usageRecommendJSONKeys(t *testing.T, typ reflect.Type) []string {
+	t.Helper()
+	if typ.Kind() != reflect.Struct {
+		t.Fatalf("%s is not a struct", typ)
+	}
+	keys := make([]string, 0, typ.NumField())
+	for i := range typ.NumField() {
+		field := typ.Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		switch name {
+		case "-":
+			continue
+		case "":
+			name = field.Name
+		}
+		keys = append(keys, name)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func TestUsageRecommendInvalidUsagePolicyIsFatal(t *testing.T) {
@@ -614,9 +641,11 @@ func TestUsageRecommendPayloadKeepsRealFetchTime(t *testing.T) {
 //
 // No other test in this file can see either. They pass --tier mid, where the
 // floor returns early, or --tier frontier, where the OTHER rule that can make
-// TierApplied differ from TierRequested — the frontier gate, which falls back
-// to the strong rung when it fires — reports "the gate did not apply" on a
-// machine with no snapshot and leaves tier=frontier.
+// TierApplied differ from TierRequested — resolveModel's frontier downgrade,
+// which falls back to the strong rung on an empty frontier rung OR a gate that
+// fires — does neither: the claude ladder's frontier rung is set, and the gate
+// reports "the gate did not apply" on a machine with no snapshot, so tier stays
+// frontier.
 func TestUsageRecommendRoleReachesTheTierFloor(t *testing.T) {
 	t.Run("implementer asking for cheap is raised to mid", func(t *testing.T) {
 		stdout, stderr, code := runUsageRecommendHelper(t,
