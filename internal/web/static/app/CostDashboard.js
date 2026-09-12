@@ -49,6 +49,38 @@ function fmt(v) {
   return currencyFormatter.format(v || 0)
 }
 
+export function coverageLine(coverage) {
+  if (!coverage) return 'coverage unknown'
+  const parts = []
+  if (coverage.unknown_price_event_count > 0) {
+    const n = coverage.unknown_price_event_count
+    parts.push(`${n} unpriced event${n === 1 ? '' : 's'} / ${coverage.unknown_price_tokens || 0} tokens`)
+  }
+  if (coverage.unreconciled_event_count > 0) {
+    const n = coverage.unreconciled_event_count
+    parts.push(`${n} unreconciled event${n === 1 ? '' : 's'} / ${coverage.unreconciled_tokens || 0} tokens`)
+  }
+  if (parts.length > 0) return parts.join('; ')
+  return coverage.coverage_known === false ? 'coverage unknown' : 'coverage complete'
+}
+
+export function costDisplay(amount, coverage, projection = false) {
+  let value
+  if (!coverage || coverage.coverage_known === false) {
+    value = 'coverage unknown'
+  } else if (coverage.event_count > 0 && coverage.known_price_event_count === 0 &&
+      (coverage.unknown_price_event_count > 0 || coverage.unreconciled_event_count > 0)) {
+    value = 'price unknown'
+  } else if (coverage.complete) {
+    value = fmt(amount)
+    if (amount === 0 && coverage.event_count > 0) value += ' (verified)'
+  } else {
+    value = `${fmt(amount)} known subtotal`
+  }
+  if (projection && (!coverage || !coverage.complete)) value += ' · incomplete projection'
+  return value
+}
+
 // readChartTheme reads chart palette CSS variables from the document root.
 // Variables are defined in internal/web/static/styles.src.css under :root
 // (light) and html.dark (dark override). The MutationObserver wired up
@@ -113,7 +145,7 @@ export function CostDashboard() {
         const [Chart, dailyData, modelsData] = await Promise.all([
           loadChartJs(),
           apiFetch('GET', '/api/costs/daily?days=30'),
-          apiFetch('GET', '/api/costs/models'),
+          apiFetch('GET', '/api/costs/models?coverage=1'),
         ])
 
         if (cancelled) return
@@ -166,7 +198,7 @@ export function CostDashboard() {
           },
         })
 
-        const models = modelsData || {}
+        const models = modelsData?.costs || modelsData || {}
         const mLabels = Object.keys(models)
         const mData = Object.values(models)
 
@@ -251,23 +283,23 @@ export function CostDashboard() {
       <div class="stat-grid">
         <div class="stat">
           <div class="lab">TODAY</div>
-          <div class="val">${fmt(summary.today_usd)}</div>
-          <div class="delta">${summary.today_events} events</div>
+		  <div class="val">${costDisplay(summary.today_usd, summary.today_coverage)}</div>
+		  <div class="delta">${summary.today_events} events · ${coverageLine(summary.today_coverage)}</div>
         </div>
         <div class="stat">
           <div class="lab">THIS WEEK</div>
-          <div class="val">${fmt(summary.week_usd)}</div>
-          <div class="delta">${summary.week_events} events</div>
+		  <div class="val">${costDisplay(summary.week_usd, summary.week_coverage)}</div>
+		  <div class="delta">${summary.week_events} events · ${coverageLine(summary.week_coverage)}</div>
         </div>
         <div class="stat">
           <div class="lab">THIS MONTH</div>
-          <div class="val">${fmt(summary.month_usd)}</div>
-          <div class="delta">${summary.month_events} events</div>
+		  <div class="val">${costDisplay(summary.month_usd, summary.month_coverage)}</div>
+		  <div class="delta">${summary.month_events} events · ${coverageLine(summary.month_coverage)}</div>
         </div>
         <div class="stat">
           <div class="lab">PROJECTED</div>
-          <div class="val">${fmt(summary.projected_usd)}</div>
-          <div class="delta">based on 7-day avg</div>
+		  <div class="val">${costDisplay(summary.projected_usd, summary.projection_coverage, true)}</div>
+		  <div class="delta">based on 7-day known-price subtotal · ${coverageLine(summary.projection_coverage)}</div>
         </div>
       </div>
       <div style="display: grid; grid-template-columns: 2fr 1fr; gap: 12px;">

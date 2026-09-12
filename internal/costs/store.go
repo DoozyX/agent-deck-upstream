@@ -589,32 +589,41 @@ func (s *Store) CoveredProjectedMonthly() (int64, Coverage, error) {
 }
 
 func (s *Store) CoveredCostByDay() ([]CostBreakdown, error) {
-	return s.coveredBreakdown("date(timestamp)")
+	return s.coveredBreakdown("date(timestamp)", "", nil)
 }
 
 func (s *Store) CoveredCostByProvider() ([]CostBreakdown, error) {
-	return s.coveredBreakdown("provider")
+	return s.coveredBreakdown("provider", "", nil)
 }
 
 func (s *Store) CoveredCostByModel() ([]CostBreakdown, error) {
-	return s.coveredBreakdown("model")
+	return s.coveredBreakdown("model", "", nil)
 }
 
 func (s *Store) CoveredCostBySession() ([]CostBreakdown, error) {
-	return s.coveredBreakdown("session_id")
+	return s.coveredBreakdown("session_id", "", nil)
 }
 
 func (s *Store) CoveredCostByRun() ([]CostBreakdown, error) {
-	return s.coveredBreakdown("run_id")
+	return s.coveredBreakdown("run_id", "", nil)
 }
 
-func (s *Store) coveredBreakdown(expression string) ([]CostBreakdown, error) {
+func (s *Store) CoveredCostByDayForSession(sessionID string) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)", " AND session_id = ?", []any{sessionID})
+}
+
+func (s *Store) CoveredCostByModelForSession(sessionID string) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("model", " AND session_id = ?", []any{sessionID})
+}
+
+func (s *Store) coveredBreakdown(expression, filter string, filterArgs []any) ([]CostBreakdown, error) {
 	allowed := map[string]bool{"date(timestamp)": true, "provider": true, "model": true, "session_id": true, "run_id": true}
 	if !allowed[expression] {
 		return nil, fmt.Errorf("unsupported cost breakdown %q", expression)
 	}
 	// #nosec G201 -- expression is selected from the fixed allowlist above.
-	rows, err := s.db.Query(`SELECT DISTINCT `+expression+` FROM cost_events WHERE reconciliation_status <> ? ORDER BY 1`, ReconciliationLegacySuperseded)
+	distinctArgs := append([]any{ReconciliationLegacySuperseded}, filterArgs...)
+	rows, err := s.db.Query(`SELECT DISTINCT `+expression+` FROM cost_events WHERE reconciliation_status <> ?`+filter+` ORDER BY 1`, distinctArgs...)
 	if err != nil {
 		return nil, err
 	}
@@ -633,8 +642,9 @@ func (s *Store) coveredBreakdown(expression string) ([]CostBreakdown, error) {
 
 	result := make([]CostBreakdown, 0, len(keys))
 	for _, key := range keys {
-		where := `WHERE ` + expression + ` = ?`
-		summary, err := s.queryCovered(where, key)
+		where := `WHERE ` + expression + ` = ?` + filter
+		summaryArgs := append([]any{key}, filterArgs...)
+		summary, err := s.queryCovered(where, summaryArgs...)
 		if err != nil {
 			return nil, err
 		}
@@ -643,7 +653,8 @@ func (s *Store) coveredBreakdown(expression string) ([]CostBreakdown, error) {
 		item.KnownCostMicrodollars = summary.TotalCostMicrodollars
 		item.Coverage = summary.Coverage
 		// #nosec G201 -- expression is selected from the fixed allowlist above.
-		err = s.db.QueryRow(`SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(cache_write_5m_tokens),0), COALESCE(SUM(cache_write_1h_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0) FROM cost_events `+where+` AND reconciliation_status <> ?`, key, ReconciliationLegacySuperseded).Scan(
+		tokenArgs := append(summaryArgs, ReconciliationLegacySuperseded)
+		err = s.db.QueryRow(`SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(cache_write_5m_tokens),0), COALESCE(SUM(cache_write_1h_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0) FROM cost_events `+where+` AND reconciliation_status <> ?`, tokenArgs...).Scan(
 			&item.UncachedInputTokens, &item.CacheReadInputTokens, &item.CacheWriteInputTokens,
 			&item.CacheWrite5mInputTokens, &item.CacheWrite1hInputTokens, &item.OutputTokens, &item.ReasoningOutputTokens)
 		if err != nil {
@@ -1043,6 +1054,47 @@ func (s *Store) PageEventsAfter(afterRowID int64, limit int) ([]CostEvent, int64
 		result = append(result, ev)
 	}
 	return result, lastRowID, rows.Err()
+}
+
+// EventsByDateRange returns auditable ledger rows for reports and exports.
+// Superseded estimates remain stored but are excluded from current totals.
+func (s *Store) EventsByDateRange(from, to time.Time) ([]CostEvent, error) {
+	rows, err := s.db.Query(`
+		SELECT id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		FROM cost_events
+		WHERE timestamp >= ? AND timestamp < ? AND reconciliation_status <> ?
+		ORDER BY timestamp, id`, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339), ReconciliationLegacySuperseded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []CostEvent
+	for rows.Next() {
+		var ev CostEvent
+		var ts string
+		var providerInput sql.NullInt64
+		if err := rows.Scan(
+			&ev.ID, &ev.SessionID, &ev.ParentSessionID, &ev.RunID, &ts,
+			&ev.Provider, &ev.SourceKind, &ev.SourceIdentity, &ev.TranscriptIdentity, &ev.Model,
+			&ev.InputTokens, &ev.OutputTokens, &ev.CacheReadTokens, &ev.CacheWriteTokens,
+			&ev.CacheWrite5mTokens, &ev.CacheWrite1hTokens, &ev.ReasoningTokens,
+			&providerInput, &ev.CostMicrodollars, &ev.PricingStatus, &ev.ReconciliationStatus,
+		); err != nil {
+			return nil, err
+		}
+		if providerInput.Valid {
+			value := providerInput.Int64
+			ev.ProviderInputTokens = &value
+		}
+		ev.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		result = append(result, ev)
+	}
+	return result, rows.Err()
 }
 
 type PricingUpdate struct {
