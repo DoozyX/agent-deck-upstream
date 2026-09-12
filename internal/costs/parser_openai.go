@@ -6,7 +6,9 @@ import (
 
 var openaiTokenRe = regexp.MustCompile(`Tokens used:\s*([\d,]+)\s*prompt\s*\+\s*([\d,]+)\s*completion\s*\(([^)]+)\)`)
 
-// OpenAIOutputParser parses OpenAI/Codex CLI token usage output.
+// OpenAIOutputParser parses OpenAI/Codex CLI token usage output as a limited
+// terminal-rendering fallback. Structured Codex rollout ingestion is the
+// authoritative path.
 type OpenAIOutputParser struct {
 	pricer *Pricer
 }
