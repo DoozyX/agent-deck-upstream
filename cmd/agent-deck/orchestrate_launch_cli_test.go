@@ -215,7 +215,7 @@ func TestLaunchOrchestrateRole_CodexExtraArgFormsReachPersistedCLIReceipt(t *tes
 		"launch", "--title", "role-cli-codex", "--cmd", "codex",
 		"--orchestrate-role", "routine",
 		"--extra-arg", "--model=gpt-5.5",
-		"--extra-arg", "--config", "--extra-arg", "model_reasoning_effort=minimal",
+		"--extra-arg", "--config", "--extra-arg", `model_reasoning_effort="xhigh"`,
 		"--no-parent", "--no-wait", "--tmux-socket", socket, "--json", project,
 	)
 	if code != 0 {
@@ -228,8 +228,62 @@ func TestLaunchOrchestrateRole_CodexExtraArgFormsReachPersistedCLIReceipt(t *tes
 		t.Fatalf("parse launch response: id=%q err=%v\nstdout: %s", launched.ID, err, stdout)
 	}
 	receipt := readOrchestrateReceiptFromShow(t, home, launched.ID)
-	if receipt.Model != "gpt-5.5" || receipt.Effort != "minimal" || receipt.ModelSource != "explicit" || receipt.EffortSource != "explicit" {
+	if receipt.Model != "gpt-5.5" || receipt.Effort != "xhigh" || receipt.ModelSource != "explicit" || receipt.EffortSource != "explicit" {
 		t.Fatalf("Codex extra-arg precedence missing from CLI receipt: %#v", receipt)
+	}
+}
+
+func TestLaunchOrchestrateRole_SupportedModelArgumentMatrixPersistsTruthfulReceipt(t *testing.T) {
+	if testing.Short() {
+		t.Skip("subprocess CLI test skipped in short mode")
+	}
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("tmux not on PATH; launch CLI needs a real tmux server")
+	}
+
+	tests := []struct {
+		name             string
+		tool             string
+		role             string
+		flags            []string
+		wantModel        string
+		wantEffort       string
+		wantModelSource  string
+		wantEffortSource string
+	}{
+		{name: "Codex short model and quoted effort", tool: "codex", role: "routine", flags: []string{"--extra-arg", "-m", "--extra-arg", "gpt-5.5", "--extra-arg", "-c", "--extra-arg", `model_reasoning_effort="xhigh"`}, wantModel: "gpt-5.5", wantEffort: "xhigh", wantModelSource: "explicit", wantEffortSource: "explicit"},
+		{name: "Codex TOML model", tool: "codex", role: "routine", flags: []string{"--extra-arg", "-c", "--extra-arg", `model="gpt-5.5"`}, wantModel: "gpt-5.5", wantEffort: "medium", wantModelSource: "explicit", wantEffortSource: "builtin:role:routine"},
+		{name: "Codex first class model", tool: "codex", role: "routine", flags: []string{"--model", "gpt-5.5"}, wantModel: "gpt-5.5", wantEffort: "medium", wantModelSource: "explicit", wantEffortSource: "builtin:role:routine"},
+		{name: "Claude split effort", tool: "claude", role: "routine", flags: []string{"--extra-arg", "--effort", "--extra-arg", "high"}, wantModel: "sonnet", wantEffort: "high", wantModelSource: "builtin:role:routine", wantEffortSource: "explicit"},
+		{name: "explicit Opus", tool: "claude", role: "routine", flags: []string{"--model", "opus"}, wantModel: "opus", wantEffort: "medium", wantModelSource: "explicit", wantEffortSource: "builtin:role:routine"},
+		{name: "explicit Astra", tool: "codex", role: "routine", flags: []string{"--model", "gpt-6-astra"}, wantModel: "gpt-6-astra", wantEffort: "medium", wantModelSource: "explicit", wantEffortSource: "builtin:role:routine"},
+		{name: "approved architecture Opus", tool: "claude", role: "architecture", wantModel: "opus", wantEffort: "medium", wantModelSource: "builtin:role:architecture", wantEffortSource: "builtin:role:architecture"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			project := filepath.Join(home, "project")
+			if err := os.MkdirAll(project, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"launch", "--title", "role-cli-matrix", "--cmd", tt.tool, "--orchestrate-role", tt.role}
+			args = append(args, tt.flags...)
+			args = append(args, "--no-parent", "--no-wait", "--tmux-socket", isolatedTmuxSocket1031(t), "--json", project)
+			stdout, stderr, code := runAgentDeckWithEnv(t, home, []string{"PATH=" + writeFakeOrchestrateTool(t, home, tt.tool)}, args...)
+			if code != 0 {
+				t.Fatalf("role launch failed (exit %d)\nstdout: %s\nstderr: %s", code, stdout, stderr)
+			}
+			var launched struct {
+				ID string `json:"id"`
+			}
+			if err := json.Unmarshal([]byte(stdout), &launched); err != nil || launched.ID == "" {
+				t.Fatalf("parse launch response: id=%q err=%v\nstdout: %s", launched.ID, err, stdout)
+			}
+			receipt := readOrchestrateReceiptFromShow(t, home, launched.ID)
+			if receipt.Model != tt.wantModel || receipt.Effort != tt.wantEffort || receipt.ModelSource != tt.wantModelSource || receipt.EffortSource != tt.wantEffortSource {
+				t.Fatalf("persisted receipt = %#v; want model=%q effort=%q sources=%q/%q", receipt, tt.wantModel, tt.wantEffort, tt.wantModelSource, tt.wantEffortSource)
+			}
+		})
 	}
 }
 

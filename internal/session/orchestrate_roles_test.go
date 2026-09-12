@@ -154,6 +154,34 @@ func TestResolveOrchestrateLaunch_UsesConnectorModelAndEffortCapabilities(t *tes
 	}
 }
 
+func TestCodexOrchestrateModelEffortCapabilities_MatchInstalledBoundaries(t *testing.T) {
+	tests := []struct {
+		model          string
+		acceptedEffort string
+		rejectedEffort string
+	}{
+		{model: "gpt-6-astra", acceptedEffort: "ultra", rejectedEffort: "minimal"},
+		{model: "gpt-5.6-sol", acceptedEffort: "ultra", rejectedEffort: "minimal"},
+		{model: "gpt-5.6-terra", acceptedEffort: "ultra", rejectedEffort: "minimal"},
+		{model: "gpt-5.6-luna", acceptedEffort: "max", rejectedEffort: "ultra"},
+		{model: "gpt-5.5", acceptedEffort: "xhigh", rejectedEffort: "max"},
+		{model: "gpt-5.4", acceptedEffort: "xhigh", rejectedEffort: "max"},
+		{model: "gpt-5.4-mini", acceptedEffort: "xhigh", rejectedEffort: "max"},
+		{model: "gpt-5.2", acceptedEffort: "xhigh", rejectedEffort: "max"},
+		{model: "codex-auto-review", acceptedEffort: "max", rejectedEffort: "ultra"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.model, func(t *testing.T) {
+			if !supportsOrchestrateModelEffort("codex", tt.model, tt.acceptedEffort) {
+				t.Fatalf("installed boundary %s/%s rejected", tt.model, tt.acceptedEffort)
+			}
+			if supportsOrchestrateModelEffort("codex", tt.model, tt.rejectedEffort) {
+				t.Fatalf("unsupported neighbor %s/%s accepted", tt.model, tt.rejectedEffort)
+			}
+		})
+	}
+}
+
 func TestResolveOrchestrateLaunch_ExpensiveModelSelectionOrigins(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -289,8 +317,8 @@ func TestInstanceApplyResolvedOrchestrateLaunch_CodexExtraArgsStayTruthfulInComm
 		name  string
 		extra []string
 	}{
-		{name: "split", extra: []string{"--model", "gpt-5.5", "--config", "model_reasoning_effort=minimal"}},
-		{name: "equals", extra: []string{"--model=gpt-5.5", "--config=model_reasoning_effort=minimal"}},
+		{name: "split", extra: []string{"--model", "gpt-5.5", "--config", "model_reasoning_effort=low"}},
+		{name: "equals", extra: []string{"--model=gpt-5.5", "--config=model_reasoning_effort=low"}},
 		{name: "short and quoted TOML effort", extra: []string{"-m", "gpt-5.5", "-c", `model_reasoning_effort="xhigh"`}},
 		{name: "TOML model and effort", extra: []string{"-c", `model="gpt-5.5"`, "-c", `model_reasoning_effort="xhigh"`}},
 	}
@@ -299,7 +327,7 @@ func TestInstanceApplyResolvedOrchestrateLaunch_CodexExtraArgsStayTruthfulInComm
 			inst := NewInstanceWithTool("codex-explicit-command", t.TempDir(), "codex")
 			inst.Command = "codex"
 			inst.ExtraArgs = append([]string(nil), tt.extra...)
-			effort := "minimal"
+			effort := "low"
 			if strings.Contains(strings.Join(tt.extra, " "), "xhigh") {
 				effort = "xhigh"
 			}

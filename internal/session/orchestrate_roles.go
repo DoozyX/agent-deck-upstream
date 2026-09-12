@@ -21,6 +21,7 @@ type OrchestrateLaunchExplicit struct {
 	Provider            string
 	Model               string
 	Effort              string
+	UserSelectedModel   bool
 	GroupPath           string
 	Browser             bool
 	MCPs                []string
@@ -105,11 +106,11 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 
 	if cfg != nil {
 		if provider == "codex" {
-			if model := cfg.GetGroupCodexModel(explicit.GroupPath); result.Model == "" && model != "" {
-				result.Model, result.ModelSource = model, "group:"+strings.TrimSpace(explicit.GroupPath)
+			if model, group := cfg.findGroupCodexSetting(strings.TrimSpace(explicit.GroupPath), func(s GroupCodexSettings) string { return strings.TrimSpace(s.Model) }); result.Model == "" && model != "" {
+				result.Model, result.ModelSource = model, "group:"+group
 			}
-			if effort := cfg.GetGroupCodexReasoningEffort(explicit.GroupPath); result.Effort == "" && effort != "" {
-				result.Effort, result.EffortSource = effort, "group:"+strings.TrimSpace(explicit.GroupPath)
+			if effort, group := cfg.findGroupCodexSetting(strings.TrimSpace(explicit.GroupPath), func(s GroupCodexSettings) string { return strings.TrimSpace(s.ReasoningEffort) }); result.Effort == "" && effort != "" {
+				result.Effort, result.EffortSource = effort, "group:"+group
 			}
 			if result.Model == "" && strings.TrimSpace(cfg.Codex.DefaultModel) != "" {
 				result.Model, result.ModelSource = strings.TrimSpace(cfg.Codex.DefaultModel), "config:codex.default_model"
@@ -119,8 +120,8 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 			}
 		} else {
 			if result.Model == "" {
-				if model := cfg.GetGroupClaudeModel(strings.TrimSpace(explicit.GroupPath)); model != "" {
-					result.Model, result.ModelSource = model, "group:"+strings.TrimSpace(explicit.GroupPath)
+				if model, group := cfg.findGroupClaudeSetting(strings.TrimSpace(explicit.GroupPath), func(s GroupClaudeSettings) string { return strings.TrimSpace(s.Model) }); model != "" {
+					result.Model, result.ModelSource = model, "group:"+group
 				}
 			}
 			if result.Model == "" && strings.TrimSpace(cfg.Claude.DefaultModel) != "" {
@@ -153,7 +154,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if result.ResolutionSource == "" {
 		result.ResolutionSource = result.EffortSource
 	}
-	if !supportedOrchestrateChoice(provider, result.Model, result.Effort, explicit.JustifiedEscalation) {
+	if !supportedOrchestrateChoice(role, provider, result.Model, result.Effort, result.ModelSource, explicit.UserSelectedModel, explicit.JustifiedEscalation) {
 		return result.parked("unsupported " + provider + " model or effort")
 	}
 	return result, nil
@@ -251,17 +252,18 @@ func (d OrchestrateRoleDefault) hasValues() bool {
 	return d.CodexModel != "" || d.CodexEffort != "" || d.ClaudeModel != "" || d.ClaudeEffort != ""
 }
 
-func supportedOrchestrateChoice(provider, model, effort string, justified bool) bool {
-	if !isKnownOrchestrateModel(provider, model) {
+func supportedOrchestrateChoice(role OrchestrateRole, provider, model, effort, modelSource string, userSelected, justified bool) bool {
+	if !supportsOrchestrateModelEffort(provider, model, effort) {
 		return false
 	}
-	if provider == "codex" && model == "gpt-6-astra" && !justified {
-		return false
+	expensive := (provider == "codex" && model == "gpt-6-astra") || (provider == "claude" && (model == "opus" || strings.HasPrefix(model, "claude-opus-")))
+	if !expensive || justified || userSelected {
+		return true
 	}
-	if provider == "claude" && (model == "opus" || strings.HasPrefix(model, "claude-opus-")) && !justified {
-		return false
+	if strings.HasPrefix(modelSource, "group:") || strings.HasPrefix(modelSource, "config:") {
+		return true
 	}
-	return ValidateLaunchReasoningEffort(provider, effort) == nil
+	return role == OrchestrateRoleArchitecture && modelSource == "builtin:role:architecture"
 }
 
 func validateOrchestrateRoleDefaults(cfg *UserConfig) error {

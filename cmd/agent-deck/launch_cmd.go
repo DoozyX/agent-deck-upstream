@@ -167,48 +167,8 @@ func defaultAssertDoneForTool(tool string) bool {
 }
 
 func orchestrateExplicitExtraArgs(tool string, args []string) (model, effort string, err error) {
-	for idx := 0; idx < len(args); idx++ {
-		arg := strings.TrimSpace(args[idx])
-		nextValue := func(flagName string) (string, error) {
-			if idx+1 >= len(args) || strings.HasPrefix(strings.TrimSpace(args[idx+1]), "-") {
-				return "", fmt.Errorf("%s in --extra-arg requires a following value for an orchestrated launch", flagName)
-			}
-			idx++
-			return strings.TrimSpace(args[idx]), nil
-		}
-
-		switch {
-		case arg == "--model":
-			model, err = nextValue("--model")
-		case strings.HasPrefix(arg, "--model="):
-			model = strings.TrimSpace(strings.TrimPrefix(arg, "--model="))
-			if model == "" {
-				err = fmt.Errorf("--model= in --extra-arg requires a value for an orchestrated launch")
-			}
-		case session.IsClaudeCompatible(tool) && arg == "--effort":
-			effort, err = nextValue("--effort")
-		case session.IsClaudeCompatible(tool) && strings.HasPrefix(arg, "--effort="):
-			effort = strings.TrimSpace(strings.TrimPrefix(arg, "--effort="))
-			if effort == "" {
-				err = fmt.Errorf("--effort= in --extra-arg requires a value for an orchestrated launch")
-			}
-		case session.IsCodexCompatible(tool) && (arg == "--config" || arg == "-c"):
-			var value string
-			value, err = nextValue(arg)
-			if strings.HasPrefix(value, "model_reasoning_effort=") {
-				effort = strings.TrimSpace(strings.TrimPrefix(value, "model_reasoning_effort="))
-			}
-		case session.IsCodexCompatible(tool) && (strings.HasPrefix(arg, "--config=model_reasoning_effort=") || strings.HasPrefix(arg, "-c=model_reasoning_effort=")):
-			effort = strings.TrimSpace(arg[strings.Index(arg, "model_reasoning_effort=")+len("model_reasoning_effort="):])
-			if effort == "" {
-				err = fmt.Errorf("model_reasoning_effort in --extra-arg requires a value for an orchestrated launch")
-			}
-		}
-		if err != nil {
-			return "", "", err
-		}
-	}
-	return model, effort, nil
+	selected, err := session.ParseLaunchExtraArgSelections(tool, args)
+	return selected.Model, selected.Effort, err
 }
 
 // handleLaunch combines add + start + optional send into a single command.
@@ -892,7 +852,7 @@ func handleLaunch(profile string, args []string) {
 			explicitModel = extraModel
 		}
 		_, resolveErr := newInstance.ApplyResolvedOrchestrateLaunch(session.OrchestrateRole(role), session.OrchestrateLaunchExplicit{
-			Model: explicitModel, Effort: extraEffort, GroupPath: newInstance.GroupPath, Browser: *orchestrateBrowser, MCPs: append([]string(nil), mcpFlags...), JustifiedEscalation: *orchestrateEscalation,
+			Model: explicitModel, Effort: extraEffort, UserSelectedModel: explicitModel != "", GroupPath: newInstance.GroupPath, Browser: *orchestrateBrowser, MCPs: append([]string(nil), mcpFlags...), JustifiedEscalation: *orchestrateEscalation,
 		}, cfg)
 		if resolveErr != nil {
 			out.Error(resolveErr.Error(), ErrCodeInvalidOperation)
