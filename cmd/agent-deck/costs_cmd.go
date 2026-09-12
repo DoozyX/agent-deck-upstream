@@ -68,19 +68,25 @@ func newPricerFromConfig() *costs.Pricer {
 }
 
 func newPricerFromUserConfig(cfg *session.UserConfig) *costs.Pricer {
+	return costs.NewPricer(pricerConfigFromUserConfig(cfg))
+}
+
+func pricerConfigFromUserConfig(cfg *session.UserConfig) costs.PricerConfig {
 	pricerCfg := costs.PricerConfig{}
 	if cfg != nil && len(cfg.Costs.Pricing.Overrides) > 0 {
 		pricerCfg.Overrides = make(map[string]costs.PriceOverride)
 		for model, ov := range cfg.Costs.Pricing.Overrides {
 			pricerCfg.Overrides[model] = costs.PriceOverride{
-				InputPerMtok:      ov.InputPerMtok,
-				OutputPerMtok:     ov.OutputPerMtok,
-				CacheReadPerMtok:  ov.CacheReadPerMtok,
-				CacheWritePerMtok: ov.CacheWritePerMtok,
+				InputPerMtok:        ov.InputPerMtok,
+				OutputPerMtok:       ov.OutputPerMtok,
+				CacheReadPerMtok:    ov.CacheReadPerMtok,
+				CacheWritePerMtok:   ov.CacheWritePerMtok,
+				CacheWrite5mPerMtok: ov.CacheWrite5mPerMtok,
+				CacheWrite1hPerMtok: ov.CacheWrite1hPerMtok,
 			}
 		}
 	}
-	return costs.NewPricer(pricerCfg)
+	return pricerCfg
 }
 
 func handleCostsSync(profile string) {

@@ -215,6 +215,24 @@ func TestCostsRecomputeRejectsMalformedPricingConfig(t *testing.T) {
 	}
 }
 
+func TestPricerConfigFromUserConfigPreservesCacheWriteDurations(t *testing.T) {
+	cfg := &session.UserConfig{Costs: session.CostsSettings{Pricing: session.PricingSettings{
+		Overrides: map[string]session.PricingOverride{
+			"custom-duration-model": {
+				InputPerMtok: 1, OutputPerMtok: 2, CacheReadPerMtok: 3,
+				CacheWritePerMtok: 4, CacheWrite5mPerMtok: 5, CacheWrite1hPerMtok: 6,
+			},
+		},
+	}}}
+	quote := newPricerFromUserConfig(cfg).Quote("custom-duration-model", costs.TokenUsage{
+		InputTokens: 1_000_000, OutputTokens: 1_000_000, CacheReadTokens: 1_000_000,
+		CacheWriteTokens: 3_000_000, CacheWrite5mTokens: 1_000_000, CacheWrite1hTokens: 1_000_000,
+	})
+	if !quote.Valid || quote.CostMicrodollars != 21_000_000 {
+		t.Fatalf("duration override quote=%+v, want known $21.00", quote)
+	}
+}
+
 func TestCostsSummaryReportsPricingCoverageWithoutChangingNumericJSON(t *testing.T) {
 	cases := []struct {
 		name       string
