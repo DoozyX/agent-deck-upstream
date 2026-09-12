@@ -20,11 +20,19 @@ case "$1 $2" in
     cat "$T/children.json"
     ;;
   "session show")
-    [ ! -e "$T/hang-show-$3" ] || sleep 10
+    if [ -e "$T/hang-show-$3" ]; then
+      touch "$T/began-show-$3"
+      trap 'touch "$T/terminated-show-$3"; exit 143' TERM INT
+      sleep 30
+    fi
     [ -f "$T/show-$3.json" ] && cat "$T/show-$3.json" || printf '{}\n'
     ;;
   "session output")
-    [ ! -e "$T/hang-output-$3" ] || sleep 10
+    if [ -e "$T/hang-output-$3" ]; then
+      touch "$T/began-output-$3"
+      trap 'touch "$T/terminated-output-$3"; exit 143' TERM INT
+      sleep 30
+    fi
     [ -f "$T/output-$3.json" ] || exit 2
     cat "$T/output-$3.json"
     [ ! -f "$T/output-$3.rc" ] || exit "$(cat "$T/output-$3.rc")"
@@ -151,19 +159,32 @@ observe 4321
 jq -e '.pending | any(.child_id == "stalled" and .kind == "stalled")' <<<"$(status)" >/dev/null
 
 # The installed completion fallback uses supported `session output` data when
-# children JSON lacks done fields. It independently rejects an output timestamp
-# older than the child's newer last_sent_at, even if output says stale=false.
+# children JSON lacks done fields or carries an explicitly stale done record.
+# It rejects nonterminal/quoted sentinels and stale freshness metadata. Codex
+# may legitimately return an empty timestamp, so the successful --require-fresh
+# contract plus the exact output/row last_sent_at identity is the fallback.
 cat > "$RUN/children.json" <<'JSON'
-{"children":[{"id":"fallback-fresh","title":"fresh","status":"waiting","last_sent_at":"2026-09-12T09:00:00Z"},{"id":"fallback-stale","title":"stale","status":"waiting","last_sent_at":"2026-09-12T10:00:00Z"}]}
+{"children":[{"id":"fallback-fresh","title":"fresh","status":"waiting","done_status":"ok","done_stale":true,"last_sent_at":"2026-09-12T09:00:00Z","stall_deadline":1},{"id":"fallback-empty-ts","title":"codex fresh","status":"waiting","last_sent_at":"2026-09-12T16:26:29+04:00"},{"id":"fallback-stale","title":"stale","status":"waiting","last_sent_at":"2026-09-12T10:00:00Z"},{"id":"fallback-quoted","title":"quoted","status":"waiting","last_sent_at":"2026-09-12T10:00:00Z"}]}
 JSON
 printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-fresh.json"
+printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-empty-ts.json"
 printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-stale.json"
+printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-quoted.json"
 printf '%s\n' '{"success":true,"stale":false,"timestamp":"2026-09-12T09:01:00Z","content":"done\n===AGENTDECK_DONE=== status=ok summary=fresh output fallback"}' > "$RUN/output-fallback-fresh.json"
-printf '%s\n' '{"success":true,"stale":false,"timestamp":"2026-09-12T09:59:00Z","content":"===AGENTDECK_DONE=== status=ok summary=old pane"}' > "$RUN/output-fallback-stale.json"
+printf '%s\n' '{"success":true,"role":"assistant","stale":false,"last_sent_at":"2026-09-12T16:26:29+04:00","timestamp":"","content":"work complete\n===AGENTDECK_DONE=== status=ok summary=fresh Codex metadata"}' > "$RUN/output-fallback-empty-ts.json"
+printf '%s\n' '{"success":true,"stale":false,"last_sent_at":"2026-09-12T09:00:00Z","timestamp":"","content":"===AGENTDECK_DONE=== status=ok summary=old pane"}' > "$RUN/output-fallback-stale.json"
+printf '%s\n' '{"success":true,"stale":false,"last_sent_at":"2026-09-12T10:00:00Z","timestamp":"2026-09-12T10:01:00Z","content":"quoted: \\\"===AGENTDECK_DONE=== status=ok summary=not terminal\\\"\nafter sentinel"}' > "$RUN/output-fallback-quoted.json"
 observe 4260
 jq -e '.pending | any(.child_id == "fallback-fresh" and .kind == "completed")' <<<"$(status)" >/dev/null
+jq -e '.pending | any(.child_id == "fallback-empty-ts" and .kind == "completed" and .detail == "fresh Codex metadata")' <<<"$(status)" >/dev/null
+if jq -e '.pending | any(.child_id == "fallback-fresh" and .kind == "stalled")' <<<"$(status)" >/dev/null; then
+  echo 'fresh completion also emitted a stall' >&2; exit 1
+fi
 if jq -e '.pending | any(.child_id == "fallback-stale" and .kind == "completed")' <<<"$(status)" >/dev/null; then
   echo 'stale output sentinel became completion' >&2; exit 1
+fi
+if jq -e '.pending | any(.child_id == "fallback-quoted" and .kind == "completed")' <<<"$(status)" >/dev/null; then
+  echo 'quoted or nonterminal sentinel became completion' >&2; exit 1
 fi
 
 # A stale done sentinel is not completion. Known quota waits until reset;
@@ -181,6 +202,24 @@ quota_id="$(jq -r '.pending[] | select(.child_id == "quota" and .kind == "quota-
 [ "$(bash "$RUN/supervisor.sh" ack "$RUN" "$quota_id" | jq -r '.result')" = allowed ]
 duplicate_ack="$(bash "$RUN/supervisor.sh" ack "$RUN" "$quota_id" || true)"
 [ "$(jq -r '.result' <<<"$duplicate_ack")" = already-recorded ]
+
+# Usage-limit is authoritative across idle/waiting/error. An unknown reset
+# becoming known replaces only that quota incident; changed reset metadata
+# updates eligibility without duplicating the blocked event.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"quota-idle","title":"idle quota","status":"idle"},{"id":"quota-transition","title":"transition quota","status":"waiting"}]}
+JSON
+printf '{"substate":"usage-limit","reset_at":7000}\n' > "$RUN/show-quota-idle.json"
+printf '{"substate":"usage-limit"}\n' > "$RUN/show-quota-transition.json"
+observe 6000
+jq -e '.pending | any(.child_id == "quota-idle" and .kind == "quota-blocked" and .backoff_until == 7000 and (.blocked | not))' <<<"$(status)" >/dev/null
+jq -e '.pending | any(.child_id == "quota-transition" and .kind == "quota-blocked" and .blocked == true)' <<<"$(status)" >/dev/null
+printf '{"substate":"usage-limit","reset_at":7100}\n' > "$RUN/show-quota-transition.json"
+observe 6010
+jq -e '[.pending[] | select(.child_id == "quota-transition" and .kind == "quota-blocked")] | length == 1 and .[0].blocked != true and .[0].backoff_until == 7100' <<<"$(status)" >/dev/null
+printf '{"substate":"usage-limit","reset_at":7200}\n' > "$RUN/show-quota-transition.json"
+observe 6020
+jq -e '[.pending[] | select(.child_id == "quota-transition" and .kind == "quota-blocked")] | length == 1 and .[0].backoff_until == 7200' <<<"$(status)" >/dev/null
 
 # Error subtype changes are new incidents; recovery clears the generation so
 # the same later error can deliver again. A hard-to-soft context downshift does
@@ -235,6 +274,10 @@ printf 'watchdog-1\n' > "$RUN/.watchdog-id"
 printf '{"substate":"stalled"}\n' > "$RUN/show-cond-2.json"
 observe 5460
 grep -q '^watchdog-1|' "$RUN/nudges.log"
+watchdog_wakes="$(grep -c '^watchdog-1|' "$RUN/nudges.log")"
+observe 6360
+observe 8160
+[ "$(grep -c '^watchdog-1|' "$RUN/nudges.log")" -eq "$watchdog_wakes" ]
 
 # Truly unreachable delivery stops after the configured bound, remains visible
 # as blocked operator attention, and does not keep waking models.
@@ -243,15 +286,22 @@ while pending_id="$(jq -r '.pending[0].id // empty' <<<"$(status)")" && [ -n "$p
 done
 printf 'uncertain\n' > "$RUN/delivery"
 cat > "$RUN/children.json" <<'JSON'
-{"children":[{"id":"unreachable","title":"unreachable","status":"error","substate":"auth-401","error":"auth"}]}
+{"children":[{"id":"unreachable","title":"unreachable","status":"error","substate":"auth-401","error":"auth"},{"id":"rotation-quota","title":"rotation quota","status":"waiting"}]}
 JSON
-SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5500
-SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5501
+printf '{"substate":"usage-limit"}\n' > "$RUN/show-rotation-quota.json"
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 8200
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 8201
 unreachable_state="$(status)"
 jq -e '.pending | any(.child_id == "unreachable" and .blocked == true and .operator_attention == true and .attempts == 2)' <<<"$unreachable_state" >/dev/null
 unreachable_nudges="$(grep -c 'failed — unreachable' "$RUN/nudges.log")"
-SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5590
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 8290
 [ "$(grep -c 'failed — unreachable' "$RUN/nudges.log")" -eq "$unreachable_nudges" ]
+# Rotation re-arms delivery-derived attention but preserves quota blocks.
+printf 'cond-3\n' > "$RUN/.conductor-id"
+printf 'delivered\n' > "$RUN/delivery"
+observe 8300
+jq -e '.pending | any(.child_id == "unreachable") | not' <<<"$(status)" >/dev/null
+jq -e '.pending | any(.child_id == "rotation-quota" and .kind == "quota-blocked" and .blocked == true)' <<<"$(status)" >/dev/null
 printf 'delivered\n' > "$RUN/delivery"
 
 # Replay wake count: the legacy 15-minute loop wakes 4 times/hour; this
@@ -280,6 +330,20 @@ if SUPERVISOR_MAX_TICKS=1 SUPERVISOR_DETECT_INTERVAL=0 bash "$RUN/supervisor.sh"
   echo 'second supervisor acquired before owner publication' >&2; wait "$race1" || true; exit 1
 fi
 wait "$race1"
+
+# Two stale reclaimers are serialized. Exactly one may own the replacement
+# claim even when all contenders validated the same stale owner first.
+printf '{"pid":999999,"process_start":"stale","run_dir":"%s"}\n' "$RUN" > "$RUN/.supervisor.lock"
+: > "$RUN/reclaim-winners"
+reclaim_pids=()
+for n in 1 2 3 4 5 6 7 8; do
+  (SUPERVISOR_TEST_OWNER_DELAY=1 SUPERVISOR_MAX_TICKS=1 SUPERVISOR_DETECT_INTERVAL=0 \
+    bash "$RUN/supervisor.sh" run "$RUN" >/dev/null 2>&1 && printf '%s\n' "$n" >> "$RUN/reclaim-winners") &
+  reclaim_pids+=("$!")
+done
+for reclaim_pid in "${reclaim_pids[@]}"; do wait "$reclaim_pid" || true; done
+[ "$(wc -l < "$RUN/reclaim-winners" | tr -d ' ')" -eq 1 ] || {
+  echo 'multiple supervisors won simultaneous stale reclamation' >&2; exit 1; }
 
 # A reused/live PID alone is not ownership: the recorded process-start token
 # must also match before takeover is refused.

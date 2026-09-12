@@ -54,7 +54,7 @@ PY
 }
 
 acquire() {
-  local candidate started claim_attempt=0 owner_path
+  local candidate started rc
   candidate="$(mktemp "$RUN_DIR/.supervisor-owner.XXXXXX")" || { json_error lock-create-failed; return 1; }
   started="$(process_start $$)"
   OWNER_PATH="$candidate" RUN_DIR="$RUN_DIR" SCRIPT="$SCRIPT" STARTED="$started" python3 - <<'PY'
@@ -65,45 +65,56 @@ fd,tmp=tempfile.mkstemp(dir=os.path.dirname(path),prefix="owner.",suffix=".tmp")
 with os.fdopen(fd,"w") as f: json.dump(value,f,sort_keys=True,separators=(",",":")); f.write("\n"); f.flush(); os.fsync(f.fileno())
 os.replace(tmp,path)
 PY
-  while [ "$claim_attempt" -lt 2 ]; do
-    if [ ! -e "$LOCK" ] && ln "$candidate" "$LOCK" 2>/dev/null; then
-      rm -f "$candidate"
-      [ -z "${SUPERVISOR_TEST_OWNER_DELAY:-}" ] || sleep "$SUPERVISOR_TEST_OWNER_DELAY"
-      return 0
-    fi
-    if owner_live; then
-      owner_path="$OWNER"; [ ! -d "$LOCK" ] || owner_path="$LOCK/owner.json"
-      python3 - "$owner_path" <<'PY'
-import json,sys
-o=json.load(open(sys.argv[1])); print(json.dumps({"result":"already-running","owner":o},sort_keys=True,separators=(",",":")))
+  CANDIDATE="$candidate" LOCK_PATH="$LOCK" GUARD_PATH="$LOCK.guard" RUN_VALUE="$RUN_DIR" \
+    python3 - <<'PY'
+import fcntl,json,os,shutil,subprocess,sys
+candidate=os.environ["CANDIDATE"]; path=os.environ["LOCK_PATH"]
+guard=open(os.environ["GUARD_PATH"],"a+");fcntl.flock(guard.fileno(),fcntl.LOCK_EX)
+owner_path=os.path.join(path,"owner.json") if os.path.isdir(path) else path
+owner=None
+try:
+    with open(owner_path,encoding="utf-8") as fh:owner=json.load(fh)
+except (FileNotFoundError,json.JSONDecodeError,OSError):pass
+live=False
+if isinstance(owner,dict):
+    try:
+        pid=int(owner.get("pid") or 0)
+        os.kill(pid,0)
+        actual=subprocess.check_output(["ps","-o","lstart=","-p",str(pid)],text=True).strip()
+        live=(pid>0 and actual and actual==str(owner.get("process_start") or "").strip()
+              and owner.get("run_dir")==os.environ["RUN_VALUE"])
+    except (ValueError,ProcessLookupError,PermissionError,subprocess.SubprocessError):pass
+if live:
+    print(json.dumps({"result":"already-running","owner":owner},sort_keys=True,separators=(",",":")))
+    raise SystemExit(3)
+if os.path.isdir(path):shutil.rmtree(path)
+else:
+    try:os.unlink(path)
+    except FileNotFoundError:pass
+os.link(candidate,path)
 PY
-      rm -f "$candidate"
-      return 1
-    fi
-    # Recovery follows a failed process-identity validation. Remove only the
-    # exact lock claim, then contend again through atomic hard-link creation.
-    if [ -d "$LOCK" ]; then
-      rm -f "$LOCK/owner.json"; rmdir "$LOCK" 2>/dev/null || { rm -f "$candidate"; json_error lock-corrupt; return 1; }
-    else
-      rm -f "$LOCK"
-    fi
-    claim_attempt=$((claim_attempt+1))
-  done
+  rc=$?
   rm -f "$candidate"
-  json_error lock-raced
-  return 1
+  [ "$rc" -eq 0 ] || return 1
+  [ -z "${SUPERVISOR_TEST_OWNER_DELAY:-}" ] || sleep "$SUPERVISOR_TEST_OWNER_DELAY"
+  return 0
 }
 
-release() {
-  local owner_path="$OWNER"
-  [ ! -d "$LOCK" ] || owner_path="$LOCK/owner.json"
-  if [ -e "$LOCK" ] && [ -s "$owner_path" ]; then
-    local pid
-    pid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid", ""))' "$owner_path" 2>/dev/null)"
-    [ "$pid" = "$$" ] || return 0
-  fi
-  if [ -d "$LOCK" ]; then rm -f "$LOCK/owner.json"; rmdir "$LOCK" 2>/dev/null || true; else rm -f "$LOCK"; fi
+release_claim() {
+  LOCK_PATH="$LOCK" GUARD_PATH="$LOCK.guard" EXPECT_PID="$1" python3 - <<'PY' >/dev/null 2>&1 || true
+import fcntl,json,os,shutil
+path=os.environ["LOCK_PATH"];guard=open(os.environ["GUARD_PATH"],"a+");fcntl.flock(guard.fileno(),fcntl.LOCK_EX)
+owner_path=os.path.join(path,"owner.json") if os.path.isdir(path) else path
+try:
+    with open(owner_path,encoding="utf-8") as fh:owner=json.load(fh)
+except (FileNotFoundError,json.JSONDecodeError,OSError):raise SystemExit
+if str(owner.get("pid") or "")!=os.environ["EXPECT_PID"]:raise SystemExit
+if os.path.isdir(path):shutil.rmtree(path)
+else:os.unlink(path)
+PY
 }
+
+release() { release_claim "$$"; }
 
 state_status() {
   local owner_path="$OWNER"; [ ! -d "$LOCK" ] || owner_path="$LOCK/owner.json"
@@ -165,7 +176,13 @@ s["observation_count"]=s.get("observation_count",0)+1
 s["config"]={"detect_interval":int(os.environ.get("SUPERVISOR_DETECT_INTERVAL","90")),"health_interval":health}
 conductor=os.environ["CID"]
 if s.get("conductor_id") not in (None,conductor):
-    for pending in s.get("pending",[]): pending["backoff_until"]=now
+    for pending in s.get("pending",[]):
+        if pending.get("blocked") and pending.get("operator_attention"):
+            pending.pop("blocked",None);pending.pop("operator_attention",None)
+            pending["attempts"]=0;pending["backoff_until"]=now
+        elif not pending.get("blocked"):
+            pending["backoff_until"]=now
+    s["conductor_condition"]={}
 s["conductor_id"]=conductor
 
 def eid(kind,child,fingerprint):
@@ -181,6 +198,8 @@ def incident(key,signature):
     return True,generation
 def clear_incident(key):
     s.setdefault("conditions",{}).pop(key,None)
+def drop_pending(child,kinds):
+    s["pending"]=[e for e in s.get("pending",[]) if not (e.get("child_id")==child and e.get("kind") in kinds)]
 def add(kind,child,title,fingerprint,detail=None,backoff=None,blocked=False):
     ident=eid(kind,child,fingerprint)
     if any(e.get("id")==ident for e in s.get("pending",[])+s.get("delivered",[])): return
@@ -213,20 +232,28 @@ else:
         fresh_done=row.get("done_status") and not row.get("done_stale")
         if initialized or fresh_done or status in {"error","waiting"} or bucket in {"soft","hard"}:
             if fresh_done:
+                drop_pending(cid,{"failed","input-needed","quota-blocked","stalled"})
                 done_signature=json.dumps([row.get("done_at"),row.get("done_status"),row.get("done_summary")],separators=(",",":"))
                 new_done,generation=incident("done:"+cid,done_signature)
                 kind="failed" if row.get("done_status")=="fail" else "completed"
                 if new_done:add(kind,cid,title,generation,row.get("done_summary"))
                 clear_incident("error:"+cid); clear_incident("input:"+cid); clear_incident("stall:"+cid)
+            elif row.get("substate")=="usage-limit":
+                clear_incident("done:"+cid);clear_incident("error:"+cid);clear_incident("input:"+cid)
+                reset=row.get("reset_at")
+                quota_signature=json.dumps(["usage-limit",reset],separators=(",",":"))
+                new_quota,generation=incident("quota:"+cid,quota_signature)
+                if new_quota:
+                    drop_pending(cid,{"quota-blocked"})
+                    add("quota-blocked",cid,title,generation,reset,backoff=int(reset) if reset else None,blocked=not bool(reset))
             elif status=="error":
+                clear_incident("quota:"+cid);drop_pending(cid,{"quota-blocked"})
                 clear_incident("done:"+cid); clear_incident("input:"+cid)
                 error_signature=json.dumps([row.get("substate"),row.get("error") or status],separators=(",",":"))
                 new_error,generation=incident("error:"+cid,error_signature)
-                if row.get("substate")=="usage-limit":
-                    reset=row.get("reset_at")
-                    if new_error:add("quota-blocked",cid,title,generation,reset,backoff=int(reset) if reset else None,blocked=not bool(reset))
-                elif new_error:add("failed",cid,title,generation,row.get("error") or status)
+                if new_error:add("failed",cid,title,generation,row.get("error") or status)
             else:
+                clear_incident("quota:"+cid);drop_pending(cid,{"quota-blocked"})
                 clear_incident("done:"+cid); clear_incident("error:"+cid)
                 actionable_input=status=="waiting" and row.get("substate") in {"awaiting-choice","awaiting-input","input-needed"}
                 if actionable_input:
@@ -244,7 +271,9 @@ else:
                 incident("context:"+cid,bucket)
         stall_deadline=int(row.get("stall_deadline") or 0)
         stall_due=(row.get("substate")=="stalled" and now-changed_at>=stall) or (stall_deadline>0 and now>=stall_deadline)
-        if stall_due:
+        if fresh_done:
+            clear_incident("stall:"+cid)
+        elif stall_due:
             first_due=stall_deadline if stall_deadline>0 else changed_at+stall
             stall_key="stall:"+cid
             cond=s.setdefault("conditions",{}).get(stall_key)
@@ -262,7 +291,7 @@ else:
             if cid not in cur:
                 fresh,generation=incident("removed:"+cid,"removed")
                 if fresh:add("removed",cid,row.get("title",cid),generation,row.get("fingerprint","removed"))
-                for prefix in ("done:","error:","input:","context:","stall:"):clear_incident(prefix+cid)
+                for prefix in ("done:","error:","quota:","input:","context:","stall:"):clear_incident(prefix+cid)
     for cid in cur:clear_incident("removed:"+cid)
     s["observed"]=cur; s["initialized"]=True
 if now-s.get("last_health_at",now)>=health:s["last_health_at"]=now
@@ -306,21 +335,26 @@ import datetime as dt,json,os,re,sys
 with open(os.environ["INPUT_JSON"],encoding="utf-8") as fh:data=json.load(fh)
 with open(os.environ["OUTPUT_JSON"],encoding="utf-8") as fh:out=json.load(fh)
 if not isinstance(out,dict) or out.get("stale") or not out.get("success",False):sys.exit(1)
-timestamp=out.get("timestamp") or ""
-try: output_at=dt.datetime.fromisoformat(timestamp.replace("Z","+00:00"))
-except (TypeError,ValueError):sys.exit(1)
 rows=data if isinstance(data,list) else data.get("children",[])
 row=next((r for r in rows if str(r.get("id",""))==os.environ["CHILD_ID"]),None)
-if row is None or row.get("done_status"):sys.exit(1)
-last_sent=row.get("last_sent_at")
-if last_sent:
-    try: sent_at=dt.datetime.fromisoformat(str(last_sent).replace("Z","+00:00"))
-    except ValueError:sys.exit(1)
-    if output_at < sent_at + dt.timedelta(seconds=1):sys.exit(1)
-signals=list(re.finditer(r"===AGENTDECK_DONE===\s+status=(ok|fail)\s+summary=([^\r\n]*)",str(out.get("content") or "")))
-if not signals:sys.exit(1)
-signal=signals[-1]
-row.update({"done_status":signal.group(1),"done_summary":signal.group(2).strip(),"done_at":timestamp,"done_stale":False,"done_source":"session-output"})
+if row is None or (row.get("done_status") and not row.get("done_stale")):sys.exit(1)
+def parse_time(value):
+    if not isinstance(value,str) or not value:return None
+    try:return dt.datetime.fromisoformat(value.replace("Z","+00:00"))
+    except ValueError:return None
+sent_at=parse_time(row.get("last_sent_at"));output_at=parse_time(out.get("timestamp"))
+source="response-timestamp"
+if output_at is not None:
+    if sent_at is not None and output_at < sent_at + dt.timedelta(seconds=1):sys.exit(1)
+else:
+    output_sent=parse_time(out.get("last_sent_at"))
+    if out.get("role")!="assistant" or sent_at is None or output_sent is None or output_sent!=sent_at:sys.exit(1)
+    source="require-fresh-last-sent"
+signal=re.search(r'(?:^|\n)===AGENTDECK_DONE===\s+status=(ok|fail)\s+summary=([^\r\n]*)\r?\n?\Z',str(out.get("content") or ""))
+if not signal:sys.exit(1)
+row.update({"done_status":signal.group(1),"done_summary":signal.group(2).strip(),
+            "done_at":out.get("timestamp") or None,"done_stale":False,
+            "done_source":"session-output","done_freshness_source":source})
 with open(os.environ["RESULT_JSON"],"w",encoding="utf-8") as fh:json.dump(data,fh,separators=(",",":"));fh.write("\n")
 PY
 }
@@ -346,9 +380,7 @@ if sub=="awaiting-choice":
     if now>=int(c.get("next_notice",now)):
         action="notify-choice";c["next_notice"]=now+int(os.environ["HEALTH"])
 elif sub=="stalled":
-    if c.get("substate")!=sub:action="diagnose-stall";c={"substate":sub,"since":now,"next_diagnosis":now+int(os.environ["HEALTH"])}
-    elif now>=int(c.get("next_diagnosis",now+1)):
-        action="diagnose-stall";c["next_diagnosis"]=now+int(os.environ["HEALTH"])
+    if c.get("substate")!=sub:action="diagnose-stall";c={"substate":sub,"since":now,"diagnoses":1}
 else:c={}
 s["conductor_condition"]=c
 fd,tmp=tempfile.mkstemp(dir=os.path.dirname(p),prefix="supervisor.",suffix=".tmp")
@@ -386,9 +418,6 @@ run_loop() {
     ok=1
     if ! "$TIMEOUT_HELPER" "$COMMAND_TIMEOUT" agent-deck session children "$cid" --json >"$obs" 2>&1; then ok=0; fi
     if [ "$ok" -eq 1 ] && ! python3 -m json.tool "$obs" >/dev/null 2>&1; then ok=0; fi
-    # `session children` owns completion/context fields; `session show` owns
-    # live substates such as usage-limit and stalled. Enrich locally when the
-    # latter is available, without making its failure an observation failure.
     if [ "$ok" -eq 1 ]; then
       enriched="$(mktemp "$RUN_DIR/.supervisor-enriched.XXXXXX")"
       cp "$obs" "$enriched" || ok=0
@@ -482,7 +511,7 @@ case "$ACTION" in
       i=0; while [ "$i" -lt 40 ] && owner_live; do sleep 0.05; i=$((i+1)); done
     fi
     owner_live && { json_error supervisor-did-not-stop; exit 1; }
-    if [ -d "$LOCK" ]; then rm -f "$LOCK/owner.json"; rmdir "$LOCK" 2>/dev/null || true; else rm -f "$LOCK"; fi
+    [ -z "${pid:-}" ] || release_claim "$pid"
     printf '{"result":"allowed","reason":"supervisor-stopped"}\n'
     ;;
   *) usage ;;
