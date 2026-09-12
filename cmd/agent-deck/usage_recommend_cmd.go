@@ -156,10 +156,14 @@ func usageRecommendSnapshots(req usage.Request, config *session.UserConfig, tool
 // --role, an unknown --tier, an unknown --prefer tool, flag.Parse's own
 // rejections, and a stray positional argument — which is not a flag at all,
 // since flag.Parse accepts it and leaves it in NArg(). All five are driven by
-// TestUsageRecommendRejectsBadFlags' table. Exit 1 is a third case and not an
+// TestUsageRecommendRejectsBadFlags' table. -h and --help are the one
+// flag.Parse rejection that is NOT an invocation error: they print
+// usageRecommendUsageLine on stderr, leave stdout empty and exit 0, which
+// TestUsageRecommendHelpExitsZero drives. Exit 1 is a third case and not an
 // invocation error at all: it reports this command's own machinery failing,
-// on the three os.Exit(1) paths below (config load, policy merge, JSON
-// encode).
+// on the three os.Exit(1) paths below — config load, driven by
+// TestUsageRecommendUnloadableConfigIsFatal, policy merge, driven by
+// TestUsageRecommendInvalidUsagePolicyIsFatal, and JSON encode.
 func handleUsageRecommend(args []string) {
 	fs := flag.NewFlagSet("usage recommend", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
