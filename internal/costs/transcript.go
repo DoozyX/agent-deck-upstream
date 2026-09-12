@@ -31,10 +31,13 @@ type ScanCheckpoint struct {
 }
 
 type ParseResult struct {
-	Events        []UsageEvent
-	Checkpoint    ScanCheckpoint
-	Warnings      []string
-	BlockedStatus string
+	Events            []UsageEvent
+	Checkpoint        ScanCheckpoint
+	Warnings          []string
+	BlockedStatus     string
+	BlockedUntil      time.Time
+	BlockedResetKnown bool
+	BlockedBackoff    time.Duration
 }
 
 type TranscriptParser interface {

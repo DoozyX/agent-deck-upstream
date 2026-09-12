@@ -48,8 +48,12 @@ func (c *Collector) Collect(toolType, sessionID, input string) ([]CostEvent, err
 			events[i].Timestamp = now
 			events[i].Provider = p.Name()
 			events[i].SourceKind = "terminal"
-			if p.Name() == "claude" {
+			switch toolType {
+			case "claude":
 				events[i].SourceKind = "hook"
+			case "codex":
+				events[i].Provider = ProviderCodex
+				events[i].SourceKind = SourceKindCodexTerminalLimited
 			}
 			events[i].ReconciliationStatus = ReconciliationLegacyUnreconciled
 			if events[i].ID == "" {
