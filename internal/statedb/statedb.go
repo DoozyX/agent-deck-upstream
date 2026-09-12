@@ -99,7 +99,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 19
+const SchemaVersion = 20
 
 type LifecycleIntent struct {
 	InstanceID        string
@@ -616,11 +616,53 @@ func (s *StateDB) Migrate() error {
 			source_identity TEXT NOT NULL,
 			offset INTEGER NOT NULL DEFAULT 0,
 			fingerprint TEXT NOT NULL DEFAULT '',
+			source_fingerprint TEXT NOT NULL DEFAULT '',
 			updated_at TEXT NOT NULL,
 			PRIMARY KEY (provider, source_kind, source_identity)
 		)
 	`); err != nil {
 		return fmt.Errorf("statedb: create usage scan checkpoints: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS usage_event_aliases (
+			provider TEXT NOT NULL,
+			alias TEXT NOT NULL,
+			source_identity TEXT NOT NULL,
+			PRIMARY KEY (provider, alias)
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create usage event aliases: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS usage_pending_coverage (
+			provider TEXT NOT NULL,
+			source_kind TEXT NOT NULL,
+			source_identity TEXT NOT NULL,
+			session_id TEXT NOT NULL,
+			start_at TEXT NOT NULL,
+			end_at TEXT NOT NULL,
+			PRIMARY KEY (provider, source_kind, source_identity)
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create pending usage coverage: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS usage_sync_receipts (
+			provider TEXT NOT NULL,
+			source_kind TEXT NOT NULL,
+			source_identity TEXT NOT NULL,
+			account TEXT NOT NULL DEFAULT '',
+			blocked_status TEXT NOT NULL DEFAULT '',
+			blocked_until TEXT NOT NULL DEFAULT '',
+			reset_known INTEGER NOT NULL DEFAULT 0,
+			backoff_seconds INTEGER NOT NULL DEFAULT 0,
+			coverage_complete INTEGER NOT NULL DEFAULT 0,
+			warnings_json TEXT NOT NULL DEFAULT '[]',
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (provider, source_kind, source_identity)
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create usage sync receipts: %w", err)
 	}
 
 	// watchers table (v5)
@@ -698,6 +740,7 @@ func (s *StateDB) Migrate() error {
 		"ALTER TABLE cost_events ADD COLUMN provider_input_tokens INTEGER",
 		"ALTER TABLE cost_events ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'legacy_unresolved'",
 		"ALTER TABLE cost_events ADD COLUMN reconciliation_status TEXT NOT NULL DEFAULT 'legacy_unreconciled'",
+		"ALTER TABLE usage_scan_checkpoints ADD COLUMN source_fingerprint TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE lifecycle_intents ADD COLUMN phase TEXT NOT NULL DEFAULT 'prepared'",
 		"ALTER TABLE lifecycle_intents ADD COLUMN token TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE lifecycle_intents ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",

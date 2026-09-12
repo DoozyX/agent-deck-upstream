@@ -166,3 +166,28 @@ func TestCodexRolloutTerminalFallbackIsCoverageLimited(t *testing.T) {
 		t.Fatalf("fallback metadata = provider=%q source_kind=%q", events[0].Provider, events[0].SourceKind)
 	}
 }
+
+func TestCodexRolloutSingleCounterRegressionDoesNotRebillUnaffectedCounters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	data := []byte(
+		`{"timestamp":"2026-09-01T18:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}` + "\n" +
+			`{"timestamp":"2026-09-01T18:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":20,"output_tokens":10,"reasoning_output_tokens":3}}}}` + "\n" +
+			`{"timestamp":"2026-09-01T18:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":120,"cached_input_tokens":20,"output_tokens":12,"reasoning_output_tokens":0}}}}` + "\n")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&costs.CodexRolloutParser{}).Parse(context.Background(), codexSource(path, "codex:single-regression"), costs.ScanCheckpoint{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 2 {
+		t.Fatalf("events=%d warnings=%v", len(result.Events), result.Warnings)
+	}
+	usage := result.Events[1].Usage
+	if usage.InputTokens != 20 || usage.CacheReadTokens != 0 || usage.OutputTokens != 2 || usage.ReasoningTokens != 0 {
+		t.Fatalf("regression delta=%+v warnings=%v", usage, result.Warnings)
+	}
+	if result.Complete || len(result.Warnings) == 0 {
+		t.Fatalf("ambiguous regression must leave a visible coverage gap: complete=%v warnings=%v", result.Complete, result.Warnings)
+	}
+}

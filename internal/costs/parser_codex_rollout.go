@@ -139,8 +139,12 @@ func (p *CodexRolloutParser) Parse(ctx context.Context, source TranscriptSource,
 		if len(line) == 0 {
 			continue
 		}
-		if warning := p.parseRecord(line, recordOffset, source, &state, &result); warning != "" {
+		warning, coverageGap := p.parseRecord(line, recordOffset, source, &state, &result)
+		if warning != "" {
 			result.Warnings = append(result.Warnings, warning)
+		}
+		if coverageGap {
+			result.Complete = false
 		}
 	}
 	if len(bytes.TrimSpace(data)) > 0 {
@@ -151,19 +155,20 @@ func (p *CodexRolloutParser) Parse(ctx context.Context, source TranscriptSource,
 		return ParseResult{}, fmt.Errorf("encode codex checkpoint state: %w", err)
 	}
 	result.Checkpoint.Fingerprint = string(fingerprint)
+	result.Checkpoint.Complete = result.Complete
 	return result, nil
 }
 
-func (p *CodexRolloutParser) parseRecord(line []byte, offset int64, source TranscriptSource, state *codexCheckpointState, result *ParseResult) string {
+func (p *CodexRolloutParser) parseRecord(line []byte, offset int64, source TranscriptSource, state *codexCheckpointState, result *ParseResult) (string, bool) {
 	var record codexRolloutRecord
 	if err := json.Unmarshal(line, &record); err != nil {
-		return fmt.Sprintf("malformed codex rollout record at byte %d", offset)
+		return fmt.Sprintf("malformed codex rollout record at byte %d", offset), true
 	}
 	switch record.Type {
 	case "turn_context":
 		var turn codexTurnContext
 		if err := json.Unmarshal(record.Payload, &turn); err != nil {
-			return fmt.Sprintf("malformed codex turn context at byte %d", offset)
+			return fmt.Sprintf("malformed codex turn context at byte %d", offset), true
 		}
 		if turn.Model != "" {
 			state.Model = turn.Model
@@ -171,7 +176,7 @@ func (p *CodexRolloutParser) parseRecord(line []byte, offset int64, source Trans
 	case "session_meta":
 		var metadata codexSessionMeta
 		if err := json.Unmarshal(record.Payload, &metadata); err != nil {
-			return fmt.Sprintf("malformed codex session metadata at byte %d", offset)
+			return fmt.Sprintf("malformed codex session metadata at byte %d", offset), true
 		}
 		if metadata.ForkedFromID != "" || bytes.Contains(bytes.ToLower(metadata.Source), []byte(`"fork`)) {
 			state.ForkBaseline = true
@@ -179,24 +184,26 @@ func (p *CodexRolloutParser) parseRecord(line []byte, offset int64, source Trans
 	case "event_msg":
 		return p.parseTokenCount(record, offset, source, state, result)
 	}
-	return ""
+	return "", false
 }
 
-func (p *CodexRolloutParser) parseTokenCount(record codexRolloutRecord, offset int64, source TranscriptSource, state *codexCheckpointState, result *ParseResult) string {
+func (p *CodexRolloutParser) parseTokenCount(record codexRolloutRecord, offset int64, source TranscriptSource, state *codexCheckpointState, result *ParseResult) (string, bool) {
 	var message codexTokenCount
 	if err := json.Unmarshal(record.Payload, &message); err != nil {
-		return fmt.Sprintf("malformed codex token count at byte %d", offset)
+		return fmt.Sprintf("malformed codex token count at byte %d", offset), true
 	}
 	if message.Type != "token_count" {
-		return ""
+		return "", false
 	}
 	if message.Info == nil {
-		setCodexBlockedStatus(message, result)
-		return ""
+		if !setCodexBlockedStatus(message, result) {
+			return fmt.Sprintf("codex token count at byte %d omitted usage without rate-limit status", offset), true
+		}
+		return "", false
 	}
 	timestamp, err := time.Parse(time.RFC3339Nano, record.Timestamp)
 	if err != nil {
-		return fmt.Sprintf("codex token count at byte %d has invalid timestamp", offset)
+		return fmt.Sprintf("codex token count at byte %d has invalid timestamp", offset), true
 	}
 	current := codexCounters{
 		Input: message.Info.Total.Input, CacheRead: message.Info.Total.CacheRead,
@@ -206,20 +213,29 @@ func (p *CodexRolloutParser) parseTokenCount(record codexRolloutRecord, offset i
 	if state.ForkBaseline && !state.ForkBaselineTaken && state.Previous == nil {
 		state.Previous = &current
 		state.ForkBaselineTaken = true
-		return ""
+		return "", false
 	}
 	if state.Previous != nil && current == *state.Previous {
-		return ""
+		return "", false
 	}
 	delta := current
+	nextBaseline := current
+	coverageGap := false
+	warning := ""
 	if state.Previous != nil {
-		if countersReset(current, *state.Previous) {
+		previous := *state.Previous
+		regressions := countersRegressed(current, previous)
+		if wholeCountersReset(current, previous) {
 			state.Segment++
+		} else if regressions > 0 {
+			delta = subtractNonNegativeCounters(current, previous)
+			nextBaseline = maximumCounters(current, previous)
+			coverageGap = true
+			warning = fmt.Sprintf("ambiguous codex counter regression at byte %d; unaffected counters were not rebilled", offset)
 		} else {
-			delta = subtractCounters(current, *state.Previous)
+			delta = subtractCounters(current, previous)
 		}
 	}
-	state.Previous = &current
 
 	providerInput := delta.Input
 	usage := TokenUsage{
@@ -229,7 +245,11 @@ func (p *CodexRolloutParser) parseTokenCount(record codexRolloutRecord, offset i
 		ProviderInputTokens: &providerInput,
 	}
 	if err := usage.Validate(); err != nil {
-		return fmt.Sprintf("invalid codex token counters at byte %d: %v", offset, err)
+		return fmt.Sprintf("invalid codex token counters at byte %d: %v", offset, err), true
+	}
+	state.Previous = &nextBaseline
+	if usage.TotalTokens() == 0 {
+		return warning, coverageGap
 	}
 	identity := codexEventIdentity(source.Identity, state.Segment, current, record.Timestamp)
 	result.Events = append(result.Events, UsageEvent{
@@ -239,10 +259,13 @@ func (p *CodexRolloutParser) parseTokenCount(record codexRolloutRecord, offset i
 		Timestamp: timestamp.UTC(), Model: state.Model, Usage: usage,
 		PricingStatus: PricingUnknown, ReconciliationStatus: ReconciliationAuthoritative,
 	})
-	return ""
+	return warning, coverageGap
 }
 
-func setCodexBlockedStatus(message codexTokenCount, result *ParseResult) {
+func setCodexBlockedStatus(message codexTokenCount, result *ParseResult) bool {
+	if message.RateLimits.ReachedType == "" && message.RateLimits.Primary == nil && message.RateLimits.Secondary == nil && message.RateLimits.Individual == nil {
+		return false
+	}
 	result.BlockedStatus = message.RateLimits.ReachedType
 	if result.BlockedStatus == "" {
 		result.BlockedStatus = "blocked"
@@ -259,15 +282,30 @@ func setCodexBlockedStatus(message codexTokenCount, result *ParseResult) {
 	if limit != nil && limit.ResetsAt > 0 {
 		result.BlockedResetKnown = true
 		result.BlockedUntil = time.Unix(limit.ResetsAt, 0).UTC()
-		return
+		return true
 	}
 	result.BlockedBackoff = codexUnknownResetBackoff
+	return true
 }
 
-func countersReset(current, previous codexCounters) bool {
-	return current.Input < previous.Input || current.CacheRead < previous.CacheRead ||
-		current.CacheWrite < previous.CacheWrite || current.Output < previous.Output ||
-		current.Reasoning < previous.Reasoning
+func countersRegressed(current, previous codexCounters) int {
+	count := 0
+	for _, regressed := range []bool{
+		current.Input < previous.Input,
+		current.CacheRead < previous.CacheRead,
+		current.CacheWrite < previous.CacheWrite,
+		current.Output < previous.Output,
+		current.Reasoning < previous.Reasoning,
+	} {
+		if regressed {
+			count++
+		}
+	}
+	return count
+}
+
+func wholeCountersReset(current, previous codexCounters) bool {
+	return current.Input < previous.Input && current.Output < previous.Output && countersRegressed(current, previous) >= 3
 }
 
 func subtractCounters(current, previous codexCounters) codexCounters {
@@ -276,6 +314,46 @@ func subtractCounters(current, previous codexCounters) codexCounters {
 		CacheWrite: current.CacheWrite - previous.CacheWrite, Output: current.Output - previous.Output,
 		Reasoning: current.Reasoning - previous.Reasoning,
 	}
+}
+
+func subtractNonNegativeCounters(current, previous codexCounters) codexCounters {
+	delta := subtractCounters(current, previous)
+	if delta.Input < 0 {
+		delta.Input = 0
+	}
+	if delta.CacheRead < 0 {
+		delta.CacheRead = 0
+	}
+	if delta.CacheWrite < 0 {
+		delta.CacheWrite = 0
+	}
+	if delta.Output < 0 {
+		delta.Output = 0
+	}
+	if delta.Reasoning < 0 {
+		delta.Reasoning = 0
+	}
+	return delta
+}
+
+func maximumCounters(current, previous codexCounters) codexCounters {
+	result := current
+	if previous.Input > result.Input {
+		result.Input = previous.Input
+	}
+	if previous.CacheRead > result.CacheRead {
+		result.CacheRead = previous.CacheRead
+	}
+	if previous.CacheWrite > result.CacheWrite {
+		result.CacheWrite = previous.CacheWrite
+	}
+	if previous.Output > result.Output {
+		result.Output = previous.Output
+	}
+	if previous.Reasoning > result.Reasoning {
+		result.Reasoning = previous.Reasoning
+	}
+	return result
 }
 
 func codexEventIdentity(transcriptIdentity string, segment int, counters codexCounters, timestamp string) string {

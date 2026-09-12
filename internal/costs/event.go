@@ -105,6 +105,10 @@ type UsageEvent struct {
 	PricingStatus        PricingStatus
 	ReconciliationStatus ReconciliationStatus
 	SupersedesEventIDs   []string
+	// SourceAliases are alternate provider-native identities for the same
+	// observation (for example Claude request and message IDs). They are used
+	// only for durable deduplication and are never displayed as ledger rows.
+	SourceAliases []string
 }
 
 // UsageEventFromCostEvent keeps legacy callers source-compatible while making
