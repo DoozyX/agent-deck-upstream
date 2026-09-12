@@ -1652,6 +1652,7 @@ func (s *Storage) hydrateRegistry(dbRows []*statedb.InstanceRow, dbGroups []*sta
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
 		}
 	}
 
