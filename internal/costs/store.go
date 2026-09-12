@@ -3,6 +3,7 @@ package costs
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -15,6 +16,7 @@ type Store struct {
 
 type IngestResult struct {
 	Inserted            int
+	Updated             int
 	Duplicates          int
 	Superseded          int
 	CheckpointsAdvanced int
@@ -49,11 +51,13 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	}
 
 	for _, event := range events {
-		inserted, err := insertUsageEventTx(tx, event)
+		inserted, updated, err := insertUsageEventTx(tx, event)
 		if err != nil {
 			return IngestResult{}, fmt.Errorf("insert usage event %q: %w", event.ID, err)
 		}
-		if !inserted {
+		if updated {
+			result.Updated++
+		} else if !inserted {
 			result.Duplicates++
 		} else {
 			result.Inserted++
@@ -81,6 +85,14 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	}
 
 	for _, checkpoint := range checkpoints {
+		if checkpoint.Receipt != nil {
+			if err := persistSyncReceiptTx(ctx, tx, *checkpoint.Receipt); err != nil {
+				return IngestResult{}, err
+			}
+		}
+		if err := persistCoverageAndReconcileTx(ctx, tx, checkpoint, &result); err != nil {
+			return IngestResult{}, err
+		}
 		if !checkpoint.Complete {
 			continue
 		}
@@ -93,14 +105,16 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 		}
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO usage_scan_checkpoints (
-				provider, source_kind, source_identity, offset, fingerprint, updated_at
-			) VALUES (?, ?, ?, ?, ?, ?)
+				provider, source_kind, source_identity, offset, fingerprint, source_fingerprint, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
 				offset = excluded.offset,
 				fingerprint = excluded.fingerprint,
+				source_fingerprint = excluded.source_fingerprint,
 				updated_at = excluded.updated_at`,
 			checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity,
-			checkpoint.Offset, checkpoint.Fingerprint, updatedAt.UTC().Format(time.RFC3339Nano))
+			checkpoint.Offset, checkpoint.Fingerprint, checkpoint.SourceFingerprint,
+			updatedAt.UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return IngestResult{}, fmt.Errorf("advance checkpoint %q: %w", checkpoint.SourceIdentity, err)
 		}
@@ -113,11 +127,147 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	return result, nil
 }
 
+func persistSyncReceiptTx(ctx context.Context, tx *sql.Tx, receipt SyncReceipt) error {
+	warnings, err := json.Marshal(receipt.Warnings)
+	if err != nil {
+		return fmt.Errorf("encode sync receipt warnings: %w", err)
+	}
+	blockedUntil := ""
+	if !receipt.BlockedUntil.IsZero() {
+		blockedUntil = receipt.BlockedUntil.UTC().Format(time.RFC3339Nano)
+	}
+	resetKnown := 0
+	if receipt.ResetKnown {
+		resetKnown = 1
+	}
+	coverageComplete := 0
+	if receipt.CoverageComplete {
+		coverageComplete = 1
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO usage_sync_receipts (
+			provider, source_kind, source_identity, account, blocked_status,
+			blocked_until, reset_known, backoff_seconds, coverage_complete,
+			warnings_json, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+			account = excluded.account,
+			blocked_status = excluded.blocked_status,
+			blocked_until = excluded.blocked_until,
+			reset_known = excluded.reset_known,
+			backoff_seconds = excluded.backoff_seconds,
+			coverage_complete = excluded.coverage_complete,
+			warnings_json = excluded.warnings_json,
+			updated_at = excluded.updated_at`,
+		receipt.Provider, receipt.SourceKind, receipt.SourceIdentity, receipt.Account,
+		receipt.Status, blockedUntil, resetKnown, int64(receipt.Backoff/time.Second),
+		coverageComplete, string(warnings), receipt.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("persist sync receipt %q: %w", receipt.SourceIdentity, err)
+	}
+	return nil
+}
+
+func persistCoverageAndReconcileTx(ctx context.Context, tx *sql.Tx, checkpoint ScanCheckpoint, result *IngestResult) error {
+	if checkpoint.Provider == "" || checkpoint.SourceKind == "" || checkpoint.SourceIdentity == "" {
+		return nil
+	}
+	hasCurrentRange := checkpoint.CoverageSessionID != "" &&
+		checkpoint.CoverageSessionID != UnassignedSessionID &&
+		!checkpoint.CoverageStart.IsZero() && !checkpoint.CoverageEnd.IsZero()
+	if !checkpoint.Complete {
+		if !hasCurrentRange {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO usage_pending_coverage (
+				provider, source_kind, source_identity, session_id, start_at, end_at
+			) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+				session_id = excluded.session_id,
+				start_at = MIN(usage_pending_coverage.start_at, excluded.start_at),
+				end_at = MAX(usage_pending_coverage.end_at, excluded.end_at)`,
+			checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity,
+			checkpoint.CoverageSessionID, checkpoint.CoverageStart.UTC().Format(time.RFC3339Nano),
+			checkpoint.CoverageEnd.UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return fmt.Errorf("persist pending coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		return nil
+	}
+
+	sessionID := checkpoint.CoverageSessionID
+	from, to := checkpoint.CoverageStart, checkpoint.CoverageEnd
+	var pendingSession, pendingStart, pendingEnd string
+	err := tx.QueryRowContext(ctx, `
+		SELECT session_id, start_at, end_at FROM usage_pending_coverage
+		WHERE provider = ? AND source_kind = ? AND source_identity = ?`,
+		checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity).Scan(
+		&pendingSession, &pendingStart, &pendingEnd)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("load pending coverage %q: %w", checkpoint.SourceIdentity, err)
+	}
+	if err == nil {
+		pendingFrom, parseErr := time.Parse(time.RFC3339Nano, pendingStart)
+		if parseErr != nil {
+			return fmt.Errorf("parse pending coverage start %q: %w", checkpoint.SourceIdentity, parseErr)
+		}
+		pendingTo, parseErr := time.Parse(time.RFC3339Nano, pendingEnd)
+		if parseErr != nil {
+			return fmt.Errorf("parse pending coverage end %q: %w", checkpoint.SourceIdentity, parseErr)
+		}
+		if sessionID == "" {
+			sessionID = pendingSession
+		}
+		if from.IsZero() || pendingFrom.Before(from) {
+			from = pendingFrom
+		}
+		if to.IsZero() || pendingTo.After(to) {
+			to = pendingTo
+		}
+	}
+	if sessionID != "" && sessionID != UnassignedSessionID && !from.IsZero() && !to.IsZero() {
+		update, err := tx.ExecContext(ctx, `
+			UPDATE cost_events SET reconciliation_status = ?
+			WHERE session_id = ? AND timestamp >= ? AND timestamp <= ?
+				AND reconciliation_status = ?`,
+			ReconciliationLegacySuperseded, sessionID,
+			from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano),
+			ReconciliationLegacyUnreconciled)
+		if err != nil {
+			return fmt.Errorf("reconcile coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		count, err := update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count reconciled coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		result.Superseded += int(count)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_pending_coverage WHERE provider = ? AND source_kind = ? AND source_identity = ?`, checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity); err != nil {
+		return fmt.Errorf("clear pending coverage %q: %w", checkpoint.SourceIdentity, err)
+	}
+	return nil
+}
+
 func checkpointKey(provider, sourceIdentity string) string {
 	return provider + "\x00" + sourceIdentity
 }
 
-func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, error) {
+func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, bool, error) {
+	existingID, existingSource, found, err := findUsageEventByAliases(tx, event)
+	if err != nil {
+		return false, false, err
+	}
+	if found {
+		updated, err := updateUsageEventCorrection(tx, existingID, event)
+		if err != nil {
+			return false, false, err
+		}
+		if err := registerUsageEventAliases(tx, event.Provider, existingSource, append(event.SourceAliases, event.SourceIdentity)); err != nil {
+			return false, false, err
+		}
+		return false, updated, nil
+	}
 	providerInput := any(nil)
 	if event.Usage.ProviderInputTokens != nil {
 		providerInput = *event.Usage.ProviderInputTokens
@@ -139,10 +289,156 @@ func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, error) {
 		event.Usage.CacheWrite1hTokens, event.Usage.ReasoningTokens, providerInput,
 		event.CostMicrodollars, event.PricingStatus, event.ReconciliationStatus)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	count, err := result.RowsAffected()
-	return count == 1, err
+	if err != nil {
+		return false, false, err
+	}
+	if count != 1 {
+		return false, false, nil
+	}
+	if err := registerUsageEventAliases(tx, event.Provider, event.SourceIdentity, append(event.SourceAliases, event.SourceIdentity)); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+func findUsageEventByAliases(tx *sql.Tx, event UsageEvent) (id, sourceIdentity string, found bool, err error) {
+	aliases := uniqueNonEmpty(append(event.SourceAliases, event.SourceIdentity))
+	for _, alias := range aliases {
+		err = tx.QueryRow(`
+			SELECT ce.id, ce.source_identity
+			FROM usage_event_aliases a
+			JOIN cost_events ce ON ce.provider = a.provider AND ce.source_identity = a.source_identity
+			WHERE a.provider = ? AND a.alias = ?`, event.Provider, alias).Scan(&id, &sourceIdentity)
+		if err == nil {
+			return id, sourceIdentity, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, err
+		}
+		err = tx.QueryRow(`SELECT id, source_identity FROM cost_events WHERE provider = ? AND source_identity = ?`, event.Provider, alias).Scan(&id, &sourceIdentity)
+		if err == nil {
+			return id, sourceIdentity, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, err
+		}
+	}
+	return "", "", false, nil
+}
+
+func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEvent) (bool, error) {
+	var current TokenUsage
+	var providerInput sql.NullInt64
+	var reconciliation string
+	err := tx.QueryRow(`
+		SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, reconciliation_status
+		FROM cost_events WHERE id = ?`, existingID).Scan(
+		&current.InputTokens, &current.OutputTokens, &current.CacheReadTokens,
+		&current.CacheWriteTokens, &current.CacheWrite5mTokens,
+		&current.CacheWrite1hTokens, &current.ReasoningTokens,
+		&providerInput, &reconciliation)
+	if err != nil {
+		return false, err
+	}
+	if providerInput.Valid {
+		value := providerInput.Int64
+		current.ProviderInputTokens = &value
+	}
+	if ReconciliationStatus(reconciliation) != ReconciliationAuthoritative || incoming.ReconciliationStatus != ReconciliationAuthoritative {
+		return false, nil
+	}
+	merged, changed := mergeMonotoneUsage(current, incoming.Usage)
+	if !changed {
+		return false, nil
+	}
+	providerInputValue := any(nil)
+	if merged.ProviderInputTokens != nil {
+		providerInputValue = *merged.ProviderInputTokens
+	}
+	_, err = tx.Exec(`
+		UPDATE cost_events SET
+			session_id = ?, parent_session_id = ?, run_id = ?, timestamp = ?,
+			source_kind = ?, transcript_identity = ?, model = ?,
+			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+			cache_write_5m_tokens = ?, cache_write_1h_tokens = ?, reasoning_tokens = ?,
+			provider_input_tokens = ?, cost_microdollars = ?, pricing_status = ?
+		WHERE id = ?`,
+		incoming.SessionID, incoming.ParentSessionID, incoming.RunID,
+		incoming.Timestamp.UTC().Format(time.RFC3339Nano), incoming.SourceKind,
+		incoming.TranscriptIdentity, incoming.Model,
+		merged.InputTokens, merged.OutputTokens, merged.CacheReadTokens,
+		merged.CacheWriteTokens, merged.CacheWrite5mTokens, merged.CacheWrite1hTokens,
+		merged.ReasoningTokens, providerInputValue, incoming.CostMicrodollars,
+		incoming.PricingStatus, existingID)
+	return err == nil, err
+}
+
+func mergeMonotoneUsage(current, incoming TokenUsage) (TokenUsage, bool) {
+	if incoming.InputTokens < current.InputTokens || incoming.OutputTokens < current.OutputTokens ||
+		incoming.CacheReadTokens < current.CacheReadTokens || incoming.CacheWriteTokens < current.CacheWriteTokens {
+		return current, false
+	}
+	merged := incoming
+	if current.ReasoningTokens > merged.ReasoningTokens {
+		merged.ReasoningTokens = current.ReasoningTokens
+	}
+	currentDetail := current.CacheWrite5mTokens + current.CacheWrite1hTokens
+	incomingDetail := incoming.CacheWrite5mTokens + incoming.CacheWrite1hTokens
+	if currentDetail > incomingDetail {
+		merged.CacheWrite5mTokens = current.CacheWrite5mTokens
+		merged.CacheWrite1hTokens = current.CacheWrite1hTokens
+	}
+	if current.ProviderInputTokens != nil && (merged.ProviderInputTokens == nil || *current.ProviderInputTokens > *merged.ProviderInputTokens) {
+		value := *current.ProviderInputTokens
+		merged.ProviderInputTokens = &value
+	}
+	if err := merged.Validate(); err != nil {
+		return current, false
+	}
+	return merged, !tokenUsageEqual(current, merged)
+}
+
+func tokenUsageEqual(left, right TokenUsage) bool {
+	if left.InputTokens != right.InputTokens || left.OutputTokens != right.OutputTokens ||
+		left.CacheReadTokens != right.CacheReadTokens || left.CacheWriteTokens != right.CacheWriteTokens ||
+		left.CacheWrite5mTokens != right.CacheWrite5mTokens || left.CacheWrite1hTokens != right.CacheWrite1hTokens ||
+		left.ReasoningTokens != right.ReasoningTokens {
+		return false
+	}
+	if left.ProviderInputTokens == nil || right.ProviderInputTokens == nil {
+		return left.ProviderInputTokens == nil && right.ProviderInputTokens == nil
+	}
+	return *left.ProviderInputTokens == *right.ProviderInputTokens
+}
+
+func registerUsageEventAliases(tx *sql.Tx, provider, sourceIdentity string, aliases []string) error {
+	for _, alias := range uniqueNonEmpty(aliases) {
+		if _, err := tx.Exec(`
+			INSERT INTO usage_event_aliases (provider, alias, source_identity)
+			VALUES (?, ?, ?)
+			ON CONFLICT(provider, alias) DO NOTHING`, provider, alias, sourceIdentity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
 }
 
 // NewStore creates a Store using an existing database connection.

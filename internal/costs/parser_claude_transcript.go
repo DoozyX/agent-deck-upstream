@@ -62,7 +62,6 @@ type claudeUsage struct {
 
 type claudeCandidate struct {
 	event UsageEvent
-	score int64
 }
 
 func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSource, checkpoint ScanCheckpoint) (ParseResult, error) {
@@ -100,6 +99,7 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 	}
 
 	candidates := make(map[string]claudeCandidate)
+	aliasOwners := make(map[string]string)
 	var order []string
 	consumed := int64(0)
 	for len(data) > 0 {
@@ -133,12 +133,28 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 			continue
 		}
 		identity := candidate.event.SourceIdentity
+		for _, alias := range candidate.event.SourceAliases {
+			if owner := aliasOwners[alias]; owner != "" {
+				identity = owner
+				break
+			}
+		}
 		existing, found := candidates[identity]
 		if !found {
 			order = append(order, identity)
-		}
-		if !found || candidate.score >= existing.score {
 			candidates[identity] = *candidate
+		} else if merged, changed := mergeMonotoneUsage(existing.event.Usage, candidate.event.Usage); changed {
+			candidate.event.ID = existing.event.ID
+			candidate.event.SourceIdentity = existing.event.SourceIdentity
+			candidate.event.SourceAliases = uniqueNonEmpty(append(existing.event.SourceAliases, candidate.event.SourceAliases...))
+			candidate.event.Usage = merged
+			candidates[identity] = *candidate
+		} else {
+			existing.event.SourceAliases = uniqueNonEmpty(append(existing.event.SourceAliases, candidate.event.SourceAliases...))
+			candidates[identity] = existing
+		}
+		for _, alias := range candidates[identity].event.SourceAliases {
+			aliasOwners[alias] = identity
 		}
 	}
 	if len(bytes.TrimSpace(data)) > 0 {
@@ -148,6 +164,7 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 	for _, identity := range order {
 		result.Events = append(result.Events, candidates[identity].event)
 	}
+	result.Checkpoint.Complete = result.Complete
 	return result, nil
 }
 
@@ -194,28 +211,33 @@ func parseClaudeRecord(line []byte, offset int64, source TranscriptSource) (*cla
 	if err != nil {
 		return nil, fmt.Sprintf("claude usage at byte %d has invalid or missing timestamp", offset), false
 	}
-	identity := claudeMessageIdentity(record, message, source.Identity)
+	identity, aliases := claudeMessageIdentities(record, message, source.Identity)
 	event := UsageEvent{
 		ID: identity, Provider: ProviderClaude, SourceKind: sourceKind,
 		SourceIdentity: identity, TranscriptIdentity: source.Identity,
 		SessionID: source.SessionID, ParentSessionID: source.ParentSessionID, RunID: source.RunID,
 		Timestamp: timestamp.UTC(), Model: message.Model, Usage: usage,
 		PricingStatus: PricingUnknown, ReconciliationStatus: ReconciliationAuthoritative,
+		SourceAliases: aliases,
 	}
-	return &claudeCandidate{event: event, score: usage.TotalTokens()}, "", false
+	return &claudeCandidate{event: event}, "", false
 }
 
-func claudeMessageIdentity(record claudeTranscriptRecord, message claudeMessage, transcriptIdentity string) string {
+func claudeMessageIdentities(record claudeTranscriptRecord, message claudeMessage, transcriptIdentity string) (string, []string) {
+	var aliases []string
 	if message.ID != "" {
-		return "claude:msg:" + message.ID
+		aliases = append(aliases, "claude:msg:"+message.ID)
 	}
 	if record.RequestID != "" {
-		return "claude:req:" + record.RequestID
+		aliases = append(aliases, "claude:req:"+record.RequestID)
 	}
 	if record.UUID != "" {
-		return "claude:uuid:" + record.UUID
+		aliases = append(aliases, "claude:uuid:"+record.UUID)
 	}
-	value := transcriptIdentity + "\x00" + message.Model + "\x00" + string(message.Content)
-	sum := sha256.Sum256([]byte(value))
-	return "claude:content:" + hex.EncodeToString(sum[:16])
+	if len(aliases) == 0 {
+		value := transcriptIdentity + "\x00" + message.Model + "\x00" + string(message.Content)
+		sum := sha256.Sum256([]byte(value))
+		aliases = append(aliases, "claude:content:"+hex.EncodeToString(sum[:16]))
+	}
+	return aliases[0], aliases
 }

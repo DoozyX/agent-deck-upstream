@@ -152,3 +152,24 @@ func TestClaudeTranscriptMalformedAndPartialDoNotAdvanceCheckpoint(t *testing.T)
 		t.Fatalf("events=%d checkpoint=%d warnings=%v", len(result.Events), result.Checkpoint.Offset, result.Warnings)
 	}
 }
+
+func TestClaudeTranscriptEqualTotalRetainsMostCompleteUsageDetails(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "claude.jsonl")
+	lines := []byte(
+		`{"type":"assistant","uuid":"detail-a","requestId":"req-detail","timestamp":"2026-09-01T17:00:00Z","message":{"id":"msg-detail","model":"claude-test","usage":{"input_tokens":2,"cache_creation_input_tokens":10,"output_tokens":9,"cache_creation":{"ephemeral_5m_input_tokens":4,"ephemeral_1h_input_tokens":6},"output_tokens_details":{"thinking_tokens":3}}}}` + "\n" +
+			`{"type":"assistant","uuid":"detail-b","requestId":"req-detail","timestamp":"2026-09-01T17:00:01Z","message":{"id":"msg-detail","model":"claude-test","usage":{"input_tokens":2,"cache_creation_input_tokens":10,"output_tokens":9}}}` + "\n")
+	if err := os.WriteFile(path, lines, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&costs.ClaudeTranscriptParser{}).Parse(context.Background(), claudeSource(path, "claude:detail", costs.SourceKindClaudeDirect), costs.ScanCheckpoint{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 1 {
+		t.Fatalf("events=%d warnings=%v", len(result.Events), result.Warnings)
+	}
+	usage := result.Events[0].Usage
+	if usage.CacheWrite5mTokens != 4 || usage.CacheWrite1hTokens != 6 || usage.ReasoningTokens != 3 {
+		t.Fatalf("detail regressed: %+v", usage)
+	}
+}
