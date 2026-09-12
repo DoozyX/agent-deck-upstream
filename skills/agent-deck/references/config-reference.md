@@ -21,6 +21,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[fork] Section](#fork-section)
 - [[conductor] Section](#conductor-section)
 - [[orchestrate] Section](#orchestrate-section)
+- [[usage.policy] Section](#usagepolicy-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[interval_hooks.*] Section](#interval_hooks-section)
@@ -639,6 +640,74 @@ agent-deck config orchestrate
 Tool availability reuses Agent Deck's existing registry and command lookup.
 It detects installation, not provider authentication. Explicit workflow tool
 choices continue to override this strategy.
+
+## [usage.policy] Section
+
+Thresholds, cross-provider failover order and the per-provider model ladder used
+by `agent-deck usage recommend`. Every key is optional; an omitted block uses
+the defaults below.
+
+```toml
+[usage.policy]
+exhausted_below = 15
+constrained_below = 35
+failover = ["codex", "claude"]
+
+[usage.policy.ladder.claude]
+cheap = "haiku"
+mid = "sonnet"
+strong = "opus"
+frontier = "fable"
+
+[usage.policy.ladder.codex]
+cheap = "gpt-5.6-luna"
+mid = "gpt-5.6-terra"
+strong = "gpt-5.6-sol"
+frontier = "gpt-6-astra"
+
+[usage.policy.frontier_window]
+claude = "fable"
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted` and is never selected. Must be `<= constrained_below`. |
+| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`: avoided while a healthy candidate exists, but a constrained *preferred* tool still wins for the `strong` and `frontier` tiers. |
+| `failover` | array of strings | `[default_tool, then the other usage provider]` | Tool-name order tried after the requested `--prefer` tool. Entries are validated by shape only and are never matched against the set of known tools, so a misspelled or miscased entry is carried through verbatim and can come back as the decision's `tool` with an empty `provider` and no model. |
+| `[usage.policy.ladder.<tool>]` | table of strings | Claude `haiku`/`sonnet`/`opus`/`fable`; Codex `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol`/`gpt-6-astra` | Model per tier (`cheap`, `mid`, `strong`, `frontier`) for that tool. An explicitly empty rung marks that tier unavailable on that provider and the recommendation falls back to `strong`; an absent rung keeps the default. |
+| `[usage.policy.frontier_window]` | table of strings | `{ claude = "fable" }` | Per-provider name of the separate OpenUsage consumption window that gates the `frontier` tier. When that window is below `constrained_below`, `frontier` is applied as `strong`. Unset means no gate. |
+
+Read the current decision for a role and tier:
+
+```bash
+agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]
+```
+
+The command is read-only: it queries usage and prints a decision, and writes no
+configuration, session or account. It exits 0 for every decision — including
+`exhausted`, `unknown`, and the case where no candidate tool could be chosen at
+all (the decision then carries an empty `tool`, and a remedy hint goes to
+stderr) — so a caller reads `state`, not the exit code. Exit 2 is reserved for a
+bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool,
+or a stray positional argument. Exit 1 means the configuration could not be
+loaded or validated, or the JSON could not be encoded.
+
+`--json` prints the decision as ten snake_case keys: `tool`, `provider`,
+`model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`,
+`alternatives` (each entry `tool` / `state` / `remaining_percent`), and
+`fetched_at` (`null` when no snapshot was fetched, an RFC 3339 timestamp
+otherwise). A `remaining_percent` of `-1` covers both a reading that was not
+available and a provider that genuinely reported a negative remaining; read
+`state` to tell those apart. `tier_requested` and `tier_applied` differ whenever
+the recommendation moved the tier: a role floor raises `cheap` to `mid` for an
+implementer or reviewer, and an empty `frontier` ladder rung or a fired
+frontier-window gate lowers `frontier` to `strong`. The `reason` line says which
+happened.
+
+Known limitation: `agent-deck usage <session>` dispatches on the literal word
+`recommend` before it looks a session up, so a session titled exactly
+`recommend` is unreachable that way — pass the flag first
+(`agent-deck usage --json recommend`) to reach the session instead.
 
 ## [logs] Section
 

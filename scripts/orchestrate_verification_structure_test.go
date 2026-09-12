@@ -392,3 +392,113 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"pass threshold",
 	})
 }
+
+// TestUsageAwareLaunchContract pins the usage-aware launch contract the
+// orchestrate workflow gained once `agent-deck usage recommend` shipped. The
+// decision is made by a Go function behind a CLI, so what the documents owe is
+// the exact call, the exact place the answer is stored, the exact launch shape
+// it produces, and the exact manifest line it is recorded on — each of which a
+// later run reads back as a contract.
+func TestUsageAwareLaunchContract(t *testing.T) {
+	repoRoot := filepath.Clean("..")
+	normalize := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	read := func(parts ...string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(append([]string{repoRoot}, parts...)...))
+		if err != nil {
+			t.Fatalf("read %v: %v", parts, err)
+		}
+		return string(b)
+	}
+	requireAll := func(label, text string, rules []string) {
+		t.Helper()
+		flat := normalize(text)
+		for _, rule := range rules {
+			if !strings.Contains(flat, normalize(rule)) {
+				t.Errorf("%s missing %q", label, rule)
+			}
+		}
+	}
+
+	skill := read("skills", "orchestrate", "SKILL.md")
+	requireAll("orchestrate skill", skill, []string{
+		// One call per distinct role+tier per wave, saved under $RUN_DIR.
+		"once per distinct role+tier",
+		"$RUN_DIR/usage/<wave>-<role>-<tier>.json",
+		// The re-run rule, including the null-fetched_at case the CLI really
+		// emits when no snapshot was fetched.
+		"`usage-limit` substate",
+		"older than five minutes",
+		// The launch shape the decision produces, and the empty-model rule.
+		`agent-deck launch <worktree-path> -c <tool> \
+  -t "impl-<task-slug>" \
+  --extra-arg --model --extra-arg <model> \
+  --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"`,
+		"Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is empty",
+		// The manifest line, verbatim in the design's form.
+		"role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>",
+		// Exhausted pauses the wave and waits on the real reset time.
+		"do not launch that wave",
+		"earliest `resets_at` from `agent-deck usage --all --json`",
+		// Explicit choices yield only on exhausted, and the override is recorded.
+		"yield to the recommendation **only** when that provider's state is `exhausted`",
+		// The one guarantee that survives unchanged.
+		"never switches an account automatically",
+		// The frontier tier: its baseline-table row, its ladder entries, and
+		// the rule that it is never a baseline.
+		"| Implementer of a plan task tagged `tier: frontier` | frontier |",
+		"frontier is never a baseline",
+		"`fable`",
+		"`gpt-6-astra`",
+		// Escalations now land on frontier, not on strong.
+		"escalate the reviewer to strong → frontier",
+		// The planner's tier vocabulary, restated in the skill.
+		"It tags every task `tier: mid | strong | frontier`",
+	})
+	// Criterion 6a: the two clauses this change falsifies must not survive.
+	// A document asserting both the old rule and the new one is worse than one
+	// asserting only the old one, so this is checked over the whole file.
+	for _, dead := range []string{"never blocks a launch", "overrides an explicit tool"} {
+		if strings.Contains(normalize(skill), dead) {
+			t.Errorf("orchestrate skill still asserts the now-false clause %q", dead)
+		}
+	}
+
+	requireAll("plan prompt", read("skills", "orchestrate", "references", "prompts", "plan.md"), []string{
+		"`tier: mid | strong | frontier`",
+		"There is no tier below mid",
+	})
+
+	requireAll("fleet skill", read("skills", "fleet", "SKILL.md"), []string{
+		"agent-deck usage recommend",
+		"skills/orchestrate/SKILL.md",
+	})
+
+	configReference := read("skills", "agent-deck", "references", "config-reference.md")
+	requireAll("config reference", configReference, []string{
+		"## [usage.policy] Section",
+		"- [[usage.policy] Section](#usagepolicy-section)",
+		"`exhausted_below`",
+		"`constrained_below`",
+		"`failover`",
+		"[usage.policy.ladder.claude]",
+		"[usage.policy.frontier_window]",
+		"agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]",
+		"exits 0 for every decision",
+		"Exit 2 is reserved for a bad flag",
+	})
+	// The section is placed where its table-of-contents entry says it is.
+	orchestrateSection := strings.Index(configReference, "\n## [orchestrate] Section")
+	usagePolicySection := strings.Index(configReference, "\n## [usage.policy] Section")
+	logsSection := strings.Index(configReference, "\n## [logs] Section")
+	if orchestrateSection < 0 || usagePolicySection < 0 || logsSection < 0 {
+		t.Fatalf("config reference sections: orchestrate=%d usage.policy=%d logs=%d", orchestrateSection, usagePolicySection, logsSection)
+	}
+	if !(orchestrateSection < usagePolicySection && usagePolicySection < logsSection) {
+		t.Errorf("[usage.policy] must sit between [orchestrate] and [logs]: orchestrate=%d usage.policy=%d logs=%d", orchestrateSection, usagePolicySection, logsSection)
+	}
+
+	requireAll("agent-deck skill command table", read("skills", "agent-deck", "SKILL.md"), []string{
+		"| `agent-deck usage recommend --role <role> --tier <tier>` |",
+	})
+}

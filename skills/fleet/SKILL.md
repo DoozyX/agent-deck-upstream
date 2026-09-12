@@ -51,6 +51,10 @@ Spell out the long form: **never use the short `-p` to set a parent** (see the
   child's `-m` prompt install them — and for a locked monorepo, install *from the
   frozen lockfile, never regenerate it* (e.g. `pnpm install --frozen-lockfile`).
   Otherwise the child's first test/build/e2e fails confusingly.
+- **Picking a connector and model per child.** `agent-deck usage recommend
+  --role <role> --tier <tier>` returns a read-only, advisory tool/model choice
+  from live quota; `skills/orchestrate/SKILL.md` carries the full contract for
+  using it.
 - **Long prompts: pass via a file.** For a big multi-line task, write it to a
   file and pass `--message-file task.md` (or `--message-file -` to read stdin)
   instead of `-m`. The file is read directly by agent-deck, so backticks, `$`,

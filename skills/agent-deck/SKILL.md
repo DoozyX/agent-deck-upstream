@@ -115,6 +115,7 @@ The table above is what *agent-deck* does. This one is what the *CLI inside a se
 | `agent-deck launch . -c claude --account <name>` | Create and start a session under a named account slot |
 | `agent-deck accounts [--json]` | List configured named account slots |
 | `agent-deck usage --all [--json]` | Advisory live Claude/Codex quota snapshot; query only when it informs a launch decision |
+| `agent-deck usage recommend --role <role> --tier <tier>` | Read-only, advisory connector + model pick for that role and tier from live quota; add `--json` for the decision object |
 | `agent-deck session start/stop/restart <name>` | Control session |
 | `agent-deck session send <name> "message"` | Send message |
 | `agent-deck session send <name> --message-file <file>` | Send message from file (`-` = stdin); no shell quoting. Also on `launch`/`session start` |
