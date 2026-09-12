@@ -9,6 +9,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestPricingQuoteStatusesDurationsAndVerifiedSources(t *testing.T) {
+	p := NewPricer(PricerConfig{
+		Overrides: map[string]PriceOverride{
+			"configured-free": {},
+		},
+	})
+	tests := []struct {
+		name, model, status, source string
+		usage                       TokenUsage
+		cost                        int64
+		valid                       bool
+	}{
+		{
+			name: "verified OpenAI standard", model: "gpt-5.6-sol", status: string(PricingKnown), source: "https://developers.openai.com/api/docs/pricing",
+			usage: TokenUsage{InputTokens: 1_000_000, CacheReadTokens: 1_000_000, CacheWriteTokens: 1_000_000, OutputTokens: 1_000_000},
+			cost:  29_400_000, valid: true,
+		},
+		{
+			name: "Claude duration subsets and residual", model: "claude-opus-5", status: string(PricingKnown), source: "https://platform.claude.com/docs/en/about-claude/pricing",
+			usage: TokenUsage{InputTokens: 1_000_000, CacheReadTokens: 1_000_000, CacheWriteTokens: 3_000_000, CacheWrite5mTokens: 1_000_000, CacheWrite1hTokens: 1_000_000, OutputTokens: 1_000_000},
+			cost:  53_000_000, valid: true,
+		},
+		{name: "configured known zero", model: "configured-free", status: string(PricingKnownZero), source: "override", usage: TokenUsage{InputTokens: 1_000_000}, cost: 0, valid: true},
+		{name: "unknown alias", model: "gpt-5.5", status: string(PricingUnknown), usage: TokenUsage{InputTokens: 1_000_000}, cost: 0, valid: true},
+		{name: "unverified exact alias", model: "claude-fable-5-1", status: string(PricingUnknown), usage: TokenUsage{InputTokens: 1_000_000}, cost: 0, valid: true},
+		{name: "invalid cache duration subsets", model: "claude-opus-5", status: string(PricingUnknown), usage: TokenUsage{CacheWriteTokens: 1, CacheWrite5mTokens: 1, CacheWrite1hTokens: 1}, valid: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			quote := p.Quote(tt.model, tt.usage)
+			if string(quote.Status) != tt.status || quote.CostMicrodollars != tt.cost || quote.Valid != tt.valid {
+				t.Fatalf("quote=%+v", quote)
+			}
+			if tt.source != "" && quote.Source != tt.source {
+				t.Fatalf("source=%q want %q", quote.Source, tt.source)
+			}
+			if tt.source != "" && tt.source != "override" && quote.VerifiedAt != "2026-09-12" {
+				t.Fatalf("verified_at=%q", quote.VerifiedAt)
+			}
+		})
+	}
+}
+
 func TestHardcodedPricing(t *testing.T) {
 	p := NewPricer(PricerConfig{})
 	mp, ok := p.GetPrice("claude-sonnet-4-6")

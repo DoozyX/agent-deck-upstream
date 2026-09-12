@@ -19,7 +19,7 @@ func TestBudgetCheck_NoBudget(t *testing.T) {
 func TestBudgetCheck_Warning(t *testing.T) {
 	s := testStore(t)
 	now := time.Now()
-	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 40_000_000}); err != nil {
+	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 40_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -33,7 +33,7 @@ func TestBudgetCheck_Warning(t *testing.T) {
 func TestBudgetCheck_Stop(t *testing.T) {
 	s := testStore(t)
 	now := time.Now()
-	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 51_000_000}); err != nil {
+	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 51_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -47,7 +47,7 @@ func TestBudgetCheck_Stop(t *testing.T) {
 func TestBudgetCheckTx_SessionLimit(t *testing.T) {
 	s := testStore(t)
 	now := time.Now()
-	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 100_000_000}); err != nil {
+	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 100_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -76,7 +76,7 @@ func TestBudgetCheckTx_SessionLimit(t *testing.T) {
 func TestBudgetCheck_UnderThreshold(t *testing.T) {
 	s := testStore(t)
 	now := time.Now()
-	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 10_000_000}); err != nil {
+	if err := s.WriteCostEvent(costs.CostEvent{ID: "e1", SessionID: "s1", Timestamp: now, Model: "m", CostMicrodollars: 10_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -84,5 +84,23 @@ func TestBudgetCheck_UnderThreshold(t *testing.T) {
 	result := b.Check("s1", "group-1")
 	if result.Action != costs.BudgetActionNone {
 		t.Errorf("action = %v, want None (20%%)", result.Action)
+	}
+}
+
+func TestBudgetCoverageUnknownPriceIsNotFreeHeadroom(t *testing.T) {
+	s := testStore(t)
+	if err := s.WriteCostEvent(costs.CostEvent{
+		ID: "unknown", SessionID: "s1", Timestamp: time.Now(), Provider: "codex", SourceKind: "rollout", SourceIdentity: "unknown-request",
+		Model: "gpt-5.5", InputTokens: 1_000_000, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	b := costs.NewBudgetChecker(costs.BudgetConfig{DailyLimit: 50_000_000}, s)
+	result := b.Check("s1", "group")
+	if result.Action != costs.BudgetActionWarn || !result.CoverageIncomplete || result.UnknownPriceTokens != 1_000_000 {
+		t.Fatalf("budget result=%+v", result)
+	}
+	if result.Reason != "budget price coverage incomplete" || result.UsedMicro != 0 || result.LimitMicro != 50_000_000 {
+		t.Fatalf("budget metadata=%+v", result)
 	}
 }

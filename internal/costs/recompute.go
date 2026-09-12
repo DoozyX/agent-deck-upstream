@@ -41,23 +41,31 @@ func Recompute(ctx context.Context, store *Store, pricer *Pricer, dryRun bool) (
 			return updated, skipped, nil
 		}
 
-		batchUpdates := make(map[string]int64, len(events))
+		batchUpdates := make(map[string]PricingUpdate, len(events))
 		for _, ev := range events {
-			if _, ok := pricer.GetPrice(ev.Model); !ok {
+			quote := pricer.Quote(ev.Model, TokenUsage{
+				InputTokens: ev.InputTokens, OutputTokens: ev.OutputTokens,
+				CacheReadTokens: ev.CacheReadTokens, CacheWriteTokens: ev.CacheWriteTokens,
+				CacheWrite5mTokens: ev.CacheWrite5mTokens, CacheWrite1hTokens: ev.CacheWrite1hTokens,
+				ReasoningTokens: ev.ReasoningTokens, ProviderInputTokens: ev.ProviderInputTokens,
+			})
+			if !quote.Valid {
+				return updated, skipped, fmt.Errorf("quote event %s: %s", ev.ID, quote.Error)
+			}
+			if quote.Status == PricingUnknown {
 				skipped++
 				continue
 			}
-			recomputed := pricer.ComputeCost(ev.Model, ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens)
-			if recomputed == ev.CostMicrodollars {
+			if quote.CostMicrodollars == ev.CostMicrodollars && quote.Status == ev.PricingStatus {
 				skipped++
 				continue
 			}
-			batchUpdates[ev.ID] = recomputed
+			batchUpdates[ev.ID] = PricingUpdate{CostMicrodollars: quote.CostMicrodollars, Status: quote.Status}
 			updated++
 		}
 
 		if !dryRun && len(batchUpdates) > 0 {
-			if err := store.ApplyCostUpdates(ctx, batchUpdates); err != nil {
+			if err := store.ApplyPricingUpdates(ctx, batchUpdates); err != nil {
 				return updated, skipped, fmt.Errorf("apply updates: %w", err)
 			}
 		}

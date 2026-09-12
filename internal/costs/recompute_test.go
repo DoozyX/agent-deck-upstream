@@ -63,6 +63,9 @@ func TestRecompute_SkipsAlreadyCorrectRows(t *testing.T) {
 	s := testStore(t)
 	// 1M input + 1M output on Sonnet 4.6 = $3 + $15 = $18 = 18,000,000.
 	seedEvent(t, s, "evt-1", "sess-1", "claude-sonnet-4-6", 1_000_000, 1_000_000, 0, 0, 18_000_000)
+	if _, err := s.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'evt-1'`, costs.PricingKnown); err != nil {
+		t.Fatal(err)
+	}
 
 	updated, skipped, err := costs.Recompute(context.Background(), s, costs.NewPricer(costs.PricerConfig{}), false)
 	if err != nil {
@@ -142,6 +145,9 @@ func TestRecompute_MixedRows(t *testing.T) {
 	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
 	// Already-correct Sonnet 4.6 row.
 	seedEvent(t, s, "evt-2", "sess-1", "claude-sonnet-4-6", 1_000_000, 1_000_000, 0, 0, 18_000_000)
+	if _, err := s.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'evt-2'`, costs.PricingKnown); err != nil {
+		t.Fatal(err)
+	}
 	// Stale Opus 4.6 row at the old (3x too high) rate of $90M -- should be corrected to $30M.
 	seedEvent(t, s, "evt-3", "sess-1", "claude-opus-4-6", 1_000_000, 1_000_000, 0, 0, 90_000_000)
 	// Unknown model with non-zero cost: leave alone.
@@ -189,5 +195,56 @@ func TestRecompute_CancelledContext(t *testing.T) {
 	_, _, err := costs.Recompute(ctx, s, costs.NewPricer(costs.PricerConfig{}), false)
 	if err == nil {
 		t.Fatal("expected error for cancelled context, got nil")
+	}
+}
+
+func TestRecomputeUpdatesPricingStatusWithoutChangingReconciliationOrRowCount(t *testing.T) {
+	s := testStore(t)
+	providerInput := int64(1_000_000)
+	events := []costs.CostEvent{
+		{ID: "known", SessionID: "s", Timestamp: time.Now(), Provider: "claude", SourceKind: "transcript", SourceIdentity: "known", Model: "claude-opus-5", InputTokens: 1_000_000, OutputTokens: 1_000_000, ProviderInputTokens: &providerInput, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "zero", SessionID: "s", Timestamp: time.Now(), Provider: "test", SourceKind: "transcript", SourceIdentity: "zero", Model: "configured-free", InputTokens: 10, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "legacy", SessionID: "s", Timestamp: time.Now(), Model: "gpt-5.5", InputTokens: 10, CostMicrodollars: 42},
+	}
+	for _, event := range events {
+		if err := s.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pricer := costs.NewPricer(costs.PricerConfig{Overrides: map[string]costs.PriceOverride{"configured-free": {}}})
+	updated, skipped, err := costs.Recompute(context.Background(), s, pricer, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated != 2 || skipped != 1 {
+		t.Fatalf("first recompute updated=%d skipped=%d", updated, skipped)
+	}
+	rows, err := s.DB().Query(`SELECT id, cost_microdollars, pricing_status, reconciliation_status FROM cost_events ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	got := make(map[string]struct {
+		cost                    int64
+		pricing, reconciliation string
+	})
+	for rows.Next() {
+		var id, pricing, reconciliation string
+		var cost int64
+		if err := rows.Scan(&id, &cost, &pricing, &reconciliation); err != nil {
+			t.Fatal(err)
+		}
+		got[id] = struct {
+			cost                    int64
+			pricing, reconciliation string
+		}{cost, pricing, reconciliation}
+	}
+	if len(got) != 3 || got["known"].cost != 30_000_000 || got["known"].pricing != string(costs.PricingKnown) || got["known"].reconciliation != string(costs.ReconciliationAuthoritative) ||
+		got["zero"].pricing != string(costs.PricingKnownZero) || got["legacy"].cost != 42 || got["legacy"].pricing != string(costs.PricingLegacyUnresolved) || got["legacy"].reconciliation != string(costs.ReconciliationLegacyUnreconciled) {
+		t.Fatalf("recomputed rows=%+v", got)
+	}
+	updated, skipped, err = costs.Recompute(context.Background(), s, pricer, false)
+	if err != nil || updated != 0 || skipped != 3 {
+		t.Fatalf("second recompute updated=%d skipped=%d err=%v", updated, skipped, err)
 	}
 }
