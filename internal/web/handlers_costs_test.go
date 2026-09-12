@@ -1,6 +1,7 @@
 package web
 
 import (
+	"encoding/csv"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +13,118 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
+
+func writeCoverageWebFixtures(t *testing.T, store *costs.Store) {
+	t.Helper()
+	events := []costs.CostEvent{
+		{ID: "known", SessionID: "session-a", ParentSessionID: "parent", RunID: "run-a", Timestamp: time.Now().UTC(), Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeDirect, SourceIdentity: "claude:msg:known", TranscriptIdentity: "claude:session", Model: "known-model", InputTokens: 10, CacheReadTokens: 20, CacheWriteTokens: 30, CacheWrite5mTokens: 11, CacheWrite1hTokens: 13, OutputTokens: 40, ReasoningTokens: 7, CostMicrodollars: 1_250_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "unknown", SessionID: "session-b", RunID: "run-b", Timestamp: time.Now().UTC(), Provider: costs.ProviderCodex, SourceKind: costs.SourceKindCodexRollout, SourceIdentity: "codex:event:unknown", TranscriptIdentity: "codex:session", Model: "future-model", InputTokens: 5, CacheReadTokens: 3, OutputTokens: 2, ReasoningTokens: 1, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "legacy", SessionID: "session-b", Timestamp: time.Now().UTC(), Model: "legacy", InputTokens: 9, CostMicrodollars: 9_000_000},
+	}
+	for _, event := range events {
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestCostsSummaryCoveragePreservesNumericFields(t *testing.T) {
+	store := newTestCostStore(t)
+	writeCoverageWebFixtures(t, store)
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/summary", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var got map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"today_usd", "week_usd", "month_usd", "projected_usd"} {
+		if _, ok := got[key].(float64); !ok {
+			t.Fatalf("legacy field %s changed type: %#v", key, got[key])
+		}
+	}
+	today, ok := got["today_coverage"].(map[string]any)
+	if !ok || today["unknown_price_tokens"] != float64(10) || today["unreconciled_tokens"] != float64(9) || today["complete"] != false {
+		t.Fatalf("today coverage=%#v body=%s", today, rr.Body.String())
+	}
+	if got["projection_complete"] != false || got["date_basis"] != "UTC calendar dates" || got["timezone"] != "UTC" {
+		t.Fatalf("projection/date metadata missing: %s", rr.Body.String())
+	}
+	for _, key := range []string{"days", "providers", "models", "sessions", "runs"} {
+		if _, ok := got[key].([]any); !ok {
+			t.Fatalf("covered breakdown %s missing: %s", key, rr.Body.String())
+		}
+	}
+}
+
+func TestCostsExportIncludesCanonicalAuditFields(t *testing.T) {
+	store := newTestCostStore(t)
+	writeCoverageWebFixtures(t, store)
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/export?format=json&days=1", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("json status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var rows []map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("rows=%d body=%s", len(rows), rr.Body.String())
+	}
+	var known map[string]any
+	for _, row := range rows {
+		if row["source_identity"] == "claude:msg:known" {
+			known = row
+		}
+		if _, exists := row["conversation_text"]; exists {
+			t.Fatalf("export leaked conversation text: %#v", row)
+		}
+	}
+	if known == nil || known["provider"] != "claude" || known["run_id"] != "run-a" || known["uncached_input_tokens"] != float64(10) || known["cache_write_input_tokens"] != float64(30) || known["cache_write_5m_input_tokens"] != float64(11) || known["cache_write_1h_input_tokens"] != float64(13) || known["cache_write_duration_unknown_input_tokens"] != float64(6) || known["reasoning_output_tokens"] != float64(7) || known["known_cost_usd"] != 1.25 || known["pricing_status"] != "known" || known["reconciliation_status"] != "authoritative" || known["timezone"] != "UTC" {
+		t.Fatalf("known export row=%#v", known)
+	}
+
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/export?format=csv&days=1", nil))
+	records, err := csv.NewReader(strings.NewReader(rr.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.Join(records[0], ",")
+	for _, field := range []string{"provider", "source_kind", "source_identity", "parent_session_id", "run_id", "cache_write_input_tokens", "cache_write_5m_input_tokens", "cache_write_1h_input_tokens", "reasoning_output_tokens", "pricing_status", "reconciliation_status", "timezone"} {
+		if !strings.Contains(header, field) {
+			t.Fatalf("CSV header missing %s: %s", field, header)
+		}
+	}
+}
+
+func TestCostsBatchAddsCoverageBesideLegacyCosts(t *testing.T) {
+	store := newTestCostStore(t)
+	writeCoverageWebFixtures(t, store)
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/batch?ids=session-a,session-b", nil))
+	var got map[string]any
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["costs"].(map[string]any)["session-a"].(float64); !ok {
+		t.Fatalf("legacy batch cost changed type: %s", rr.Body.String())
+	}
+	coverage, ok := got["coverage"].(map[string]any)
+	if !ok || coverage["session-b"].(map[string]any)["complete"] != false {
+		t.Fatalf("batch coverage missing: %s", rr.Body.String())
+	}
+}
 
 // newTestCostStore creates an in-memory cost store backed by a temp-dir SQLite database.
 func newTestCostStore(t *testing.T) *costs.Store {
@@ -38,6 +151,7 @@ func TestCostsBatch(t *testing.T) {
 		Timestamp:        time.Now(),
 		Model:            "claude-sonnet-4-6",
 		CostMicrodollars: 50000,
+		PricingStatus:    costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
 	}); err != nil {
 		t.Fatalf("WriteCostEvent sess1: %v", err)
 	}
@@ -49,6 +163,7 @@ func TestCostsBatch(t *testing.T) {
 		Timestamp:        time.Now(),
 		Model:            "claude-sonnet-4-6",
 		CostMicrodollars: 1200000,
+		PricingStatus:    costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
 	}); err != nil {
 		t.Fatalf("WriteCostEvent sess2: %v", err)
 	}
@@ -177,6 +292,7 @@ func TestCostsBatchPOSTJSONBody(t *testing.T) {
 		Timestamp:        time.Now(),
 		Model:            "claude-sonnet-4-6",
 		CostMicrodollars: 75000,
+		PricingStatus:    costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
 	}); err != nil {
 		t.Fatalf("WriteCostEvent sessA: %v", err)
 	}

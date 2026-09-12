@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 )
 
@@ -27,35 +28,52 @@ func (s *Server) handleCostsSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	today, err := s.costStore.TotalToday()
+	today, err := s.costStore.CoveredTotalToday()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query today costs")
 		return
 	}
-	week, err := s.costStore.TotalThisWeek()
+	week, err := s.costStore.CoveredTotalThisWeek()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query week costs")
 		return
 	}
-	month, err := s.costStore.TotalThisMonth()
+	month, err := s.costStore.CoveredTotalThisMonth()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query month costs")
 		return
 	}
-	projected, err := s.costStore.ProjectedMonthly()
+	projected, projectionCoverage, err := s.costStore.CoveredProjectedMonthly()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to calculate projection")
 		return
 	}
 
+	days, _ := s.costStore.CoveredCostByDay()
+	providers, _ := s.costStore.CoveredCostByProvider()
+	models, _ := s.costStore.CoveredCostByModel()
+	sessions, _ := s.costStore.CoveredCostBySession()
+	runs, _ := s.costStore.CoveredCostByRun()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"today_usd":     microToUSD(today.TotalCostMicrodollars),
-		"week_usd":      microToUSD(week.TotalCostMicrodollars),
-		"month_usd":     microToUSD(month.TotalCostMicrodollars),
-		"projected_usd": microToUSD(projected),
-		"today_events":  today.EventCount,
-		"week_events":   week.EventCount,
-		"month_events":  month.EventCount,
+		"today_usd":           microToUSD(today.TotalCostMicrodollars),
+		"week_usd":            microToUSD(week.TotalCostMicrodollars),
+		"month_usd":           microToUSD(month.TotalCostMicrodollars),
+		"projected_usd":       microToUSD(projected),
+		"today_events":        today.EventCount,
+		"week_events":         week.EventCount,
+		"month_events":        month.EventCount,
+		"today_coverage":      today.Coverage,
+		"week_coverage":       week.Coverage,
+		"month_coverage":      month.Coverage,
+		"projection_coverage": projectionCoverage,
+		"projection_complete": projectionCoverage.CoverageKnown && projectionCoverage.Complete,
+		"date_basis":          "UTC calendar dates",
+		"timezone":            "UTC",
+		"days":                days,
+		"providers":           providers,
+		"models":              models,
+		"sessions":            sessions,
+		"runs":                runs,
 	})
 }
 
@@ -84,22 +102,36 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 	from := now.AddDate(0, 0, -days).Truncate(24 * time.Hour)
 	to := now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
 
-	dailyCosts, err := s.costStore.TotalByDateRange(from, to)
+	dailyCosts, err := s.costStore.CoveredCostByDay()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query daily costs")
 		return
 	}
 
 	type dailyEntry struct {
-		Date    string  `json:"date"`
-		CostUSD float64 `json:"cost_usd"`
+		Date                    string         `json:"date"`
+		CostUSD                 float64        `json:"cost_usd"`
+		Coverage                costs.Coverage `json:"coverage"`
+		UncachedInputTokens     int64          `json:"uncached_input_tokens"`
+		CacheReadInputTokens    int64          `json:"cache_read_input_tokens"`
+		CacheWriteInputTokens   int64          `json:"cache_write_input_tokens"`
+		CacheWrite5mInputTokens int64          `json:"cache_write_5m_input_tokens"`
+		CacheWrite1hInputTokens int64          `json:"cache_write_1h_input_tokens"`
+		OutputTokens            int64          `json:"output_tokens"`
+		ReasoningOutputTokens   int64          `json:"reasoning_output_tokens"`
 	}
 
 	result := make([]dailyEntry, 0, len(dailyCosts))
 	for _, dc := range dailyCosts {
+		date, parseErr := time.Parse("2006-01-02", dc.Key)
+		if parseErr != nil || date.Before(from) || !date.Before(to) {
+			continue
+		}
 		result = append(result, dailyEntry{
-			Date:    dc.Date.Format("2006-01-02"),
-			CostUSD: microToUSD(dc.CostMicrodollars),
+			Date: dc.Key, CostUSD: microToUSD(dc.KnownCostMicrodollars), Coverage: dc.Coverage,
+			UncachedInputTokens: dc.UncachedInputTokens, CacheReadInputTokens: dc.CacheReadInputTokens,
+			CacheWriteInputTokens: dc.CacheWriteInputTokens, CacheWrite5mInputTokens: dc.CacheWrite5mInputTokens,
+			CacheWrite1hInputTokens: dc.CacheWrite1hInputTokens, OutputTokens: dc.OutputTokens, ReasoningOutputTokens: dc.ReasoningOutputTokens,
 		})
 	}
 
@@ -127,21 +159,27 @@ func (s *Server) handleCostsSessions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type sessionEntry struct {
-		SessionID string  `json:"session_id"`
-		Title     string  `json:"title"`
-		Group     string  `json:"group"`
-		CostUSD   float64 `json:"cost_usd"`
-		Events    int     `json:"events"`
+		SessionID string         `json:"session_id"`
+		Title     string         `json:"title"`
+		Group     string         `json:"group"`
+		CostUSD   float64        `json:"cost_usd"`
+		Events    int            `json:"events"`
+		Coverage  costs.Coverage `json:"coverage"`
 	}
 
 	result := make([]sessionEntry, 0, len(sessions))
 	for _, sc := range sessions {
+		covered, queryErr := s.costStore.CoveredTotalBySession(sc.SessionID)
+		if queryErr != nil {
+			continue
+		}
 		result = append(result, sessionEntry{
 			SessionID: sc.SessionID,
 			Title:     sc.SessionTitle,
 			Group:     sc.Group,
-			CostUSD:   microToUSD(sc.CostMicrodollars),
-			Events:    sc.EventCount,
+			CostUSD:   microToUSD(covered.TotalCostMicrodollars),
+			Events:    covered.EventCount,
+			Coverage:  covered.Coverage,
 		})
 	}
 
@@ -162,18 +200,21 @@ func (s *Server) handleCostsModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	models, err := s.costStore.CostByModel()
+	models, err := s.costStore.CoveredCostByModel()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query model costs")
 		return
 	}
 
-	result := make(map[string]float64, len(models))
-	for model, micro := range models {
-		result[model] = microToUSD(micro)
+	legacy := make(map[string]float64, len(models))
+	for _, model := range models {
+		legacy[model.Key] = microToUSD(model.KnownCostMicrodollars)
 	}
-
-	writeJSON(w, http.StatusOK, result)
+	if r.URL.Query().Get("coverage") != "1" {
+		writeJSON(w, http.StatusOK, legacy)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"costs": legacy, "breakdowns": models, "date_basis": "UTC calendar dates", "timezone": "UTC"})
 }
 
 func (s *Server) handleCostsExport(w http.ResponseWriter, r *http.Request) {
@@ -229,23 +270,15 @@ func (s *Server) handleCostsExport(w http.ResponseWriter, r *http.Request) {
 		to = now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
 	}
 
-	dailyCosts, err := s.costStore.TotalByDateRange(from, to)
+	events, err := s.costStore.EventsByDateRange(from, to)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query daily costs")
 		return
 	}
 
-	type dailyEntry struct {
-		Date    string  `json:"date"`
-		CostUSD float64 `json:"cost_usd"`
-	}
-
-	entries := make([]dailyEntry, 0, len(dailyCosts))
-	for _, dc := range dailyCosts {
-		entries = append(entries, dailyEntry{
-			Date:    dc.Date.Format("2006-01-02"),
-			CostUSD: microToUSD(dc.CostMicrodollars),
-		})
+	entries := make([]costExportRow, 0, len(events))
+	for _, event := range events {
+		entries = append(entries, newCostExportRow(event))
 	}
 
 	if format == "csv" {
@@ -254,9 +287,9 @@ func (s *Server) handleCostsExport(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 
 		cw := csv.NewWriter(w)
-		_ = cw.Write([]string{"date", "cost_usd"})
+		_ = cw.Write(costExportCSVHeader)
 		for _, e := range entries {
-			_ = cw.Write([]string{e.Date, fmt.Sprintf("%.6f", e.CostUSD)})
+			_ = cw.Write(e.csvRecord())
 		}
 		cw.Flush()
 		return
@@ -264,6 +297,78 @@ func (s *Server) handleCostsExport(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", "attachment; filename=costs.json")
 	writeJSON(w, http.StatusOK, entries)
+}
+
+type costExportRow struct {
+	Date                      string                     `json:"date"`
+	Timestamp                 string                     `json:"timestamp"`
+	Timezone                  string                     `json:"timezone"`
+	DateBasis                 string                     `json:"date_basis"`
+	Provider                  string                     `json:"provider"`
+	SourceKind                string                     `json:"source_kind"`
+	SourceIdentity            string                     `json:"source_identity"`
+	TranscriptIdentity        string                     `json:"transcript_identity"`
+	SessionID                 string                     `json:"session_id"`
+	ParentSessionID           string                     `json:"parent_session_id"`
+	RunID                     string                     `json:"run_id"`
+	Attribution               string                     `json:"attribution"`
+	Model                     string                     `json:"model"`
+	UncachedInputTokens       int64                      `json:"uncached_input_tokens"`
+	CacheReadInputTokens      int64                      `json:"cache_read_input_tokens"`
+	CacheWriteInputTokens     int64                      `json:"cache_write_input_tokens"`
+	CacheWrite5mInputTokens   int64                      `json:"cache_write_5m_input_tokens"`
+	CacheWrite1hInputTokens   int64                      `json:"cache_write_1h_input_tokens"`
+	CacheWriteDurationUnknown int64                      `json:"cache_write_duration_unknown_input_tokens"`
+	OutputTokens              int64                      `json:"output_tokens"`
+	ReasoningOutputTokens     int64                      `json:"reasoning_output_tokens"`
+	CostUSD                   float64                    `json:"cost_usd"`
+	KnownCostUSD              float64                    `json:"known_cost_usd"`
+	PricingStatus             costs.PricingStatus        `json:"pricing_status"`
+	ReconciliationStatus      costs.ReconciliationStatus `json:"reconciliation_status"`
+}
+
+func newCostExportRow(event costs.CostEvent) costExportRow {
+	knownMicro := int64(0)
+	if event.PricingStatus == costs.PricingKnown || event.PricingStatus == costs.PricingKnownZero {
+		knownMicro = event.CostMicrodollars
+	}
+	residual := event.CacheWriteTokens - event.CacheWrite5mTokens - event.CacheWrite1hTokens
+	if residual < 0 {
+		residual = 0
+	}
+	attribution := "unassigned"
+	if event.SessionID != "" && event.SessionID != costs.UnassignedSessionID {
+		attribution = "session"
+	}
+	return costExportRow{
+		Date: event.Timestamp.UTC().Format("2006-01-02"), Timestamp: event.Timestamp.UTC().Format(time.RFC3339Nano),
+		Timezone: "UTC", DateBasis: "UTC calendar dates", Provider: event.Provider, SourceKind: event.SourceKind,
+		SourceIdentity: event.SourceIdentity, TranscriptIdentity: event.TranscriptIdentity, SessionID: event.SessionID,
+		ParentSessionID: event.ParentSessionID, RunID: event.RunID, Attribution: attribution, Model: event.Model,
+		UncachedInputTokens: event.InputTokens, CacheReadInputTokens: event.CacheReadTokens, CacheWriteInputTokens: event.CacheWriteTokens,
+		CacheWrite5mInputTokens: event.CacheWrite5mTokens, CacheWrite1hInputTokens: event.CacheWrite1hTokens,
+		CacheWriteDurationUnknown: residual, OutputTokens: event.OutputTokens, ReasoningOutputTokens: event.ReasoningTokens,
+		CostUSD: microToUSD(knownMicro), KnownCostUSD: microToUSD(knownMicro), PricingStatus: event.PricingStatus,
+		ReconciliationStatus: event.ReconciliationStatus,
+	}
+}
+
+var costExportCSVHeader = []string{
+	"date", "timestamp", "timezone", "date_basis", "provider", "source_kind", "source_identity", "transcript_identity",
+	"session_id", "parent_session_id", "run_id", "attribution", "model", "uncached_input_tokens", "cache_read_input_tokens",
+	"cache_write_input_tokens", "cache_write_5m_input_tokens", "cache_write_1h_input_tokens", "cache_write_duration_unknown_input_tokens",
+	"output_tokens", "reasoning_output_tokens", "cost_usd", "known_cost_usd", "pricing_status", "reconciliation_status",
+}
+
+func (e costExportRow) csvRecord() []string {
+	return []string{
+		e.Date, e.Timestamp, e.Timezone, e.DateBasis, e.Provider, e.SourceKind, e.SourceIdentity, e.TranscriptIdentity,
+		e.SessionID, e.ParentSessionID, e.RunID, e.Attribution, e.Model, strconv.FormatInt(e.UncachedInputTokens, 10),
+		strconv.FormatInt(e.CacheReadInputTokens, 10), strconv.FormatInt(e.CacheWriteInputTokens, 10),
+		strconv.FormatInt(e.CacheWrite5mInputTokens, 10), strconv.FormatInt(e.CacheWrite1hInputTokens, 10),
+		strconv.FormatInt(e.CacheWriteDurationUnknown, 10), strconv.FormatInt(e.OutputTokens, 10), strconv.FormatInt(e.ReasoningOutputTokens, 10),
+		fmt.Sprintf("%.6f", e.CostUSD), fmt.Sprintf("%.6f", e.KnownCostUSD), string(e.PricingStatus), string(e.ReconciliationStatus),
+	}
 }
 
 var (
@@ -306,6 +411,7 @@ func (s *Server) handleCostsStream(w http.ResponseWriter, r *http.Request) {
 	lastToday := summary.TodayMicro
 	lastWeek := summary.WeekMicro
 	lastMonth := summary.MonthMicro
+	lastCoverage := [3]costs.Coverage{summary.TodayCoverage, summary.WeekCoverage, summary.MonthCoverage}
 
 	if err := writeSSEEvent(w, flusher, "cost_summary", summary); err != nil {
 		return
@@ -325,7 +431,8 @@ func (s *Server) handleCostsStream(w http.ResponseWriter, r *http.Request) {
 				slog.String("error", err.Error()))
 			return nil
 		}
-		if next.TodayMicro == lastToday && next.WeekMicro == lastWeek && next.MonthMicro == lastMonth {
+		nextCoverage := [3]costs.Coverage{next.TodayCoverage, next.WeekCoverage, next.MonthCoverage}
+		if next.TodayMicro == lastToday && next.WeekMicro == lastWeek && next.MonthMicro == lastMonth && nextCoverage == lastCoverage {
 			return nil
 		}
 		if err := writeSSEEvent(w, flusher, "cost_summary", next); err != nil {
@@ -334,6 +441,7 @@ func (s *Server) handleCostsStream(w http.ResponseWriter, r *http.Request) {
 		lastToday = next.TodayMicro
 		lastWeek = next.WeekMicro
 		lastMonth = next.MonthMicro
+		lastCoverage = nextCoverage
 		return nil
 	}
 
@@ -354,34 +462,38 @@ func (s *Server) handleCostsStream(w http.ResponseWriter, r *http.Request) {
 }
 
 type costSummarySSE struct {
-	TodayUSD   float64 `json:"today_usd"`
-	WeekUSD    float64 `json:"week_usd"`
-	MonthUSD   float64 `json:"month_usd"`
-	TodayMicro int64   `json:"-"`
-	WeekMicro  int64   `json:"-"`
-	MonthMicro int64   `json:"-"`
+	TodayUSD      float64        `json:"today_usd"`
+	WeekUSD       float64        `json:"week_usd"`
+	MonthUSD      float64        `json:"month_usd"`
+	TodayMicro    int64          `json:"-"`
+	WeekMicro     int64          `json:"-"`
+	MonthMicro    int64          `json:"-"`
+	TodayCoverage costs.Coverage `json:"today_coverage"`
+	WeekCoverage  costs.Coverage `json:"week_coverage"`
+	MonthCoverage costs.Coverage `json:"month_coverage"`
 }
 
 func (s *Server) buildCostSummary() (*costSummarySSE, error) {
-	today, err := s.costStore.TotalToday()
+	today, err := s.costStore.CoveredTotalToday()
 	if err != nil {
 		return nil, err
 	}
-	week, err := s.costStore.TotalThisWeek()
+	week, err := s.costStore.CoveredTotalThisWeek()
 	if err != nil {
 		return nil, err
 	}
-	month, err := s.costStore.TotalThisMonth()
+	month, err := s.costStore.CoveredTotalThisMonth()
 	if err != nil {
 		return nil, err
 	}
 	return &costSummarySSE{
-		TodayUSD:   microToUSD(today.TotalCostMicrodollars),
-		WeekUSD:    microToUSD(week.TotalCostMicrodollars),
-		MonthUSD:   microToUSD(month.TotalCostMicrodollars),
-		TodayMicro: today.TotalCostMicrodollars,
-		WeekMicro:  week.TotalCostMicrodollars,
-		MonthMicro: month.TotalCostMicrodollars,
+		TodayUSD:      microToUSD(today.TotalCostMicrodollars),
+		WeekUSD:       microToUSD(week.TotalCostMicrodollars),
+		MonthUSD:      microToUSD(month.TotalCostMicrodollars),
+		TodayMicro:    today.TotalCostMicrodollars,
+		WeekMicro:     week.TotalCostMicrodollars,
+		MonthMicro:    month.TotalCostMicrodollars,
+		TodayCoverage: today.Coverage, WeekCoverage: week.Coverage, MonthCoverage: month.Coverage,
 	}, nil
 }
 
@@ -389,13 +501,17 @@ func (s *Server) buildCostSummary() (*costSummarySSE, error) {
 // excluding the internal micro fields.
 func (c costSummarySSE) MarshalJSON() ([]byte, error) {
 	return json.Marshal(struct {
-		TodayUSD float64 `json:"today_usd"`
-		WeekUSD  float64 `json:"week_usd"`
-		MonthUSD float64 `json:"month_usd"`
+		TodayUSD      float64        `json:"today_usd"`
+		WeekUSD       float64        `json:"week_usd"`
+		MonthUSD      float64        `json:"month_usd"`
+		TodayCoverage costs.Coverage `json:"today_coverage"`
+		WeekCoverage  costs.Coverage `json:"week_coverage"`
+		MonthCoverage costs.Coverage `json:"month_coverage"`
 	}{
-		TodayUSD: c.TodayUSD,
-		WeekUSD:  c.WeekUSD,
-		MonthUSD: c.MonthUSD,
+		TodayUSD:      c.TodayUSD,
+		WeekUSD:       c.WeekUSD,
+		MonthUSD:      c.MonthUSD,
+		TodayCoverage: c.TodayCoverage, WeekCoverage: c.WeekCoverage, MonthCoverage: c.MonthCoverage,
 	})
 }
 
@@ -420,25 +536,32 @@ func (s *Server) handleCostsGroups(w http.ResponseWriter, r *http.Request) {
 	}
 
 	type groupEntry struct {
-		Group    string  `json:"group"`
-		CostUSD  float64 `json:"cost_usd"`
-		Events   int     `json:"events"`
-		Sessions int     `json:"sessions"`
+		Group    string         `json:"group"`
+		CostUSD  float64        `json:"cost_usd"`
+		Events   int            `json:"events"`
+		Sessions int            `json:"sessions"`
+		Coverage costs.Coverage `json:"coverage"`
 	}
 
 	groups := make(map[string]*groupEntry)
 	for _, sc := range sessions {
+		covered, queryErr := s.costStore.CoveredTotalBySession(sc.SessionID)
+		if queryErr != nil {
+			continue
+		}
 		g := sc.Group
 		if g == "" {
 			g = "(ungrouped)"
 		}
 		entry, ok := groups[g]
 		if !ok {
-			entry = &groupEntry{Group: g}
+			entry = &groupEntry{Group: g, Coverage: covered.Coverage}
 			groups[g] = entry
+		} else {
+			entry.Coverage = costs.MergeCoverage(entry.Coverage, covered.Coverage)
 		}
-		entry.CostUSD += microToUSD(sc.CostMicrodollars)
-		entry.Events += sc.EventCount
+		entry.CostUSD += microToUSD(covered.TotalCostMicrodollars)
+		entry.Events += covered.EventCount
 		entry.Sessions++
 	}
 
@@ -470,7 +593,7 @@ func (s *Server) handleCostsSessionDetail(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	summary, err := s.costStore.TotalBySession(sessionID)
+	summary, err := s.costStore.CoveredTotalBySession(sessionID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session")
 		return
@@ -480,46 +603,54 @@ func (s *Server) handleCostsSessionDetail(w http.ResponseWriter, r *http.Request
 	now := time.Now().UTC()
 	from := now.AddDate(0, 0, -30).Truncate(24 * time.Hour)
 	to := now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
-	daily, err := s.costStore.DailyBySession(sessionID, from, to)
+	daily, err := s.costStore.CoveredCostByDayForSession(sessionID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session daily costs")
 		return
 	}
 
 	// Get model breakdown for this session
-	models, err := s.costStore.CostByModelForSession(sessionID)
+	models, err := s.costStore.CoveredCostByModelForSession(sessionID)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session model costs")
 		return
 	}
 
 	type dailyEntry struct {
-		Date    string  `json:"date"`
-		CostUSD float64 `json:"cost_usd"`
+		Date     string         `json:"date"`
+		CostUSD  float64        `json:"cost_usd"`
+		Coverage costs.Coverage `json:"coverage"`
 	}
 	dailyResult := make([]dailyEntry, 0, len(daily))
 	for _, dc := range daily {
+		date, parseErr := time.Parse("2006-01-02", dc.Key)
+		if parseErr != nil || date.Before(from) || !date.Before(to) {
+			continue
+		}
 		dailyResult = append(dailyResult, dailyEntry{
-			Date:    dc.Date.Format("2006-01-02"),
-			CostUSD: microToUSD(dc.CostMicrodollars),
+			Date: dc.Key, CostUSD: microToUSD(dc.KnownCostMicrodollars), Coverage: dc.Coverage,
 		})
 	}
 
 	modelResult := make(map[string]float64, len(models))
-	for model, micro := range models {
-		modelResult[model] = microToUSD(micro)
+	for _, model := range models {
+		modelResult[model.Key] = microToUSD(model.KnownCostMicrodollars)
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{
-		"session_id":    sessionID,
-		"cost_usd":      microToUSD(summary.TotalCostMicrodollars),
-		"input_tokens":  summary.TotalInputTokens,
-		"output_tokens": summary.TotalOutputTokens,
-		"cache_read":    summary.TotalCacheReadTokens,
-		"cache_write":   summary.TotalCacheWriteTokens,
-		"events":        summary.EventCount,
-		"daily":         dailyResult,
-		"models":        modelResult,
+		"session_id":       sessionID,
+		"cost_usd":         microToUSD(summary.TotalCostMicrodollars),
+		"input_tokens":     summary.TotalInputTokens,
+		"output_tokens":    summary.TotalOutputTokens,
+		"cache_read":       summary.TotalCacheReadTokens,
+		"cache_write":      summary.TotalCacheWriteTokens,
+		"events":           summary.EventCount,
+		"coverage":         summary.Coverage,
+		"daily":            dailyResult,
+		"models":           modelResult,
+		"model_breakdowns": models,
+		"date_basis":       "UTC calendar dates",
+		"timezone":         "UTC",
 	})
 }
 
@@ -546,18 +677,19 @@ func (s *Server) handleCostsBatchGET(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.costStore == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}, "coverage": map[string]costs.Coverage{}})
 		return
 	}
 
 	rawIDs := r.URL.Query().Get("ids")
 	if rawIDs == "" {
-		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}, "coverage": map[string]costs.Coverage{}})
 		return
 	}
 
 	ids := strings.Split(rawIDs, ",")
-	writeJSON(w, http.StatusOK, map[string]any{"costs": s.computeBatchCosts(ids)})
+	amounts, coverage := s.computeBatchCosts(ids)
+	writeJSON(w, http.StatusOK, map[string]any{"costs": amounts, "coverage": coverage})
 }
 
 // handleCostsBatchPOST is the PERF-I successor to the GET handler. Accepts
@@ -570,7 +702,7 @@ func (s *Server) handleCostsBatchPOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.costStore == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}, "coverage": map[string]costs.Coverage{}})
 		return
 	}
 
@@ -582,30 +714,33 @@ func (s *Server) handleCostsBatchPOST(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.IDs) == 0 {
-		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}})
+		writeJSON(w, http.StatusOK, map[string]any{"costs": map[string]float64{}, "coverage": map[string]costs.Coverage{}})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"costs": s.computeBatchCosts(req.IDs)})
+	amounts, coverage := s.computeBatchCosts(req.IDs)
+	writeJSON(w, http.StatusOK, map[string]any{"costs": amounts, "coverage": coverage})
 }
 
-func (s *Server) computeBatchCosts(ids []string) map[string]float64 {
+func (s *Server) computeBatchCosts(ids []string) (map[string]float64, map[string]costs.Coverage) {
 	const maxBatch = 200
 	if len(ids) > maxBatch {
 		ids = ids[:maxBatch]
 	}
 	sessionCosts := make(map[string]float64, len(ids))
+	coverage := make(map[string]costs.Coverage, len(ids))
 	for _, id := range ids {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		summary, err := s.costStore.TotalBySession(id)
+		summary, err := s.costStore.CoveredTotalBySession(id)
 		if err != nil {
 			continue
 		}
 		sessionCosts[id] = microToUSD(summary.TotalCostMicrodollars)
+		coverage[id] = summary.Coverage
 	}
-	return sessionCosts
+	return sessionCosts, coverage
 }
 
 func microToUSD(microdollars int64) float64 {
