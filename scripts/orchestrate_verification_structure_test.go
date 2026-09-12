@@ -435,8 +435,6 @@ func TestUsageAwareLaunchContract(t *testing.T) {
   --extra-arg --model --extra-arg <model> \
   --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"`,
 		"Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is empty",
-		// The manifest line, verbatim in the design's form.
-		"role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>",
 		// Exhausted pauses the wave and waits on the real reset time.
 		"do not launch that wave",
 		"earliest `resets_at` from `agent-deck usage --all --json`",
@@ -452,9 +450,33 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"`gpt-6-astra`",
 		// Escalations now land on frontier, not on strong.
 		"escalate the reviewer to strong → frontier",
-		// The planner's tier vocabulary, restated in the skill.
+		// The planner's tier vocabulary, restated in the skill. Criterion 9a
+		// names two sites, so both are pinned: a revert of either one alone
+		// leaves the skill contradicting the prompt it describes.
 		"It tags every task `tier: mid | strong | frontier`",
+		"the planner tags `mid`, `strong` or `frontier` for that reason — never below mid",
+		// Criterion 8 requires BOTH escalation bullets to land on frontier;
+		// pinning only the reviewer bullet let the implementer bullet revert.
+		"as a NEW session in the same worktree, escalated strong → frontier",
+		// Escalation is one-way to the tier actually reached, not to strong —
+		// the bullets above end on frontier, so the rule introducing them
+		// must not say the role "stays strong".
+		"once a role escalates, it stays at the escalated tier",
+		// Frontier's two entry points, without claiming every escalation
+		// starts from strong (the reviewer's baseline is mid).
+		"or by an escalation, which reaches it through strong",
+		// The empty-`tool` decision is a decision, and its remedy is on
+		// stderr only — the section's own `>` redirect does not capture it.
+		"An empty `tool` is different",
+		"the remedy reaches **stderr only**",
 	})
+	// Criterion 3: the manifest line is owed at three sites — the code block
+	// and both cross-references. A whole-file Contains passed with BOTH
+	// cross-references deleted, so count instead of testing presence.
+	const manifestLine = "role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>"
+	if got := strings.Count(normalize(skill), manifestLine); got < 3 {
+		t.Errorf("orchestrate skill records the manifest line at %d sites, want >= 3 (the code block plus both cross-references)", got)
+	}
 	// Criterion 6a: the two clauses this change falsifies must not survive.
 	// A document asserting both the old rule and the new one is worse than one
 	// asserting only the old one, so this is checked over the whole file.
@@ -483,6 +505,28 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"`failover`",
 		"[usage.policy.ladder.claude]",
 		"[usage.policy.frontier_window]",
+		// The bare tokens above are all satisfied by the TOML example block
+		// and by cross-references, so each key-table ROW is anchored on text
+		// unique to that row. These also pin the corrections this round made:
+		// an exhausted provider is returned though never preferred; only the
+		// two usage providers may name a ladder; an empty non-frontier rung
+		// yields an empty model rather than falling back to strong; the
+		// default failover order excludes a non-provider `default_tool`; an
+		// empty failover list keeps the default; and a named-but-absent
+		// frontier window does not gate.
+		"| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`.",
+		"An exhausted provider is never *preferred*",
+		"it is still returned when no candidate is eligible, so read `state` on every decision",
+		"| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`:",
+		"| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = \"codex\"` |",
+		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
+		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
+		"| `[usage.policy.ladder.<claude\\|codex>]` | table of strings |",
+		"Only `claude` and `codex` are accepted; any other table name fails config validation with exit 1",
+		"an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged",
+		"| `[usage.policy.frontier_window]` | table of strings | `{ claude = \"fable\" }` |",
+		"a window that is named here but absent from the snapshot the provider actually returned",
+		"`null` when the selected tool has no snapshot",
 		"agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]",
 		"exits 0 for every decision",
 		"Exit 2 is reserved for a bad flag",
@@ -497,8 +541,39 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	if !(orchestrateSection < usagePolicySection && usagePolicySection < logsSection) {
 		t.Errorf("[usage.policy] must sit between [orchestrate] and [logs]: orchestrate=%d usage.policy=%d logs=%d", orchestrateSection, usagePolicySection, logsSection)
 	}
+	// Criterion 11: the TOC entry sits in the SAME position as the section.
+	// Presence alone let the entry be moved anywhere in the list while the
+	// section-body ordering above stayed green.
+	orchestrateTOC := strings.Index(configReference, "- [[orchestrate] Section](#orchestrate-section)")
+	usagePolicyTOC := strings.Index(configReference, "- [[usage.policy] Section](#usagepolicy-section)")
+	logsTOC := strings.Index(configReference, "- [[logs] Section](#logs-section)")
+	if orchestrateTOC < 0 || usagePolicyTOC < 0 || logsTOC < 0 {
+		t.Fatalf("config reference TOC entries: orchestrate=%d usage.policy=%d logs=%d", orchestrateTOC, usagePolicyTOC, logsTOC)
+	}
+	if !(orchestrateTOC < usagePolicyTOC && usagePolicyTOC < logsTOC) {
+		t.Errorf("the [usage.policy] TOC entry must sit between the [orchestrate] and [logs] entries, matching the section order: orchestrate=%d usage.policy=%d logs=%d", orchestrateTOC, usagePolicyTOC, logsTOC)
+	}
 
-	requireAll("agent-deck skill command table", read("skills", "agent-deck", "SKILL.md"), []string{
+	// Criterion 11a: the command row goes IMMEDIATELY after the `usage --all`
+	// row. A plain Contains let it be moved anywhere in the table.
+	agentDeckSkill := read("skills", "agent-deck", "SKILL.md")
+	requireAll("agent-deck skill command table", agentDeckSkill, []string{
 		"| `agent-deck usage recommend --role <role> --tier <tier>` |",
 	})
+	agentDeckLines := strings.Split(agentDeckSkill, "\n")
+	usageAllRow, recommendRow := -1, -1
+	for i, line := range agentDeckLines {
+		switch {
+		case strings.HasPrefix(line, "| `agent-deck usage --all [--json]` |"):
+			usageAllRow = i
+		case strings.HasPrefix(line, "| `agent-deck usage recommend --role <role> --tier <tier>` |"):
+			recommendRow = i
+		}
+	}
+	if usageAllRow < 0 || recommendRow < 0 {
+		t.Fatalf("agent-deck skill command table rows: usage --all=%d usage recommend=%d", usageAllRow, recommendRow)
+	}
+	if recommendRow != usageAllRow+1 {
+		t.Errorf("the `usage recommend` row must sit immediately after the `usage --all` row: usage --all on line %d, usage recommend on line %d", usageAllRow+1, recommendRow+1)
+	}
 }
