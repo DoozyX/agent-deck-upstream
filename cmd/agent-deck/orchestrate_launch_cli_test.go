@@ -138,11 +138,63 @@ claude_model = "haiku"
 		t.Fatalf("parse launch response: id=%q err=%v\nstdout: %s", launched.ID, err, stdout)
 	}
 	receipt := readOrchestrateReceiptFromShow(t, home, launched.ID)
-	if receipt.Model != "claude-sonnet-4-6" || receipt.ModelSource != "group:work/child" {
+	if receipt.Model != "claude-sonnet-4-6" || receipt.ModelSource != "group:work" {
 		t.Fatalf("ancestor group precedence missing from supported launch: %#v", receipt)
 	}
 	if !receipt.ToolLoadout.StrictEmptyMCP {
 		t.Fatalf("non-browser launch did not retain strict empty MCP loadout: %#v", receipt.ToolLoadout)
+	}
+}
+
+func TestOrchestrateExplicitExtraArgs_NormalizesSupportedForms(t *testing.T) {
+	tests := []struct {
+		name       string
+		tool       string
+		args       []string
+		wantModel  string
+		wantEffort string
+	}{
+		{name: "Codex long model", tool: "codex", args: []string{"--model", "gpt-5.5"}, wantModel: "gpt-5.5"},
+		{name: "Codex short model", tool: "codex", args: []string{"-m", "gpt-5.5"}, wantModel: "gpt-5.5"},
+		{name: "Codex short model equals", tool: "codex", args: []string{"-m=gpt-5.5"}, wantModel: "gpt-5.5"},
+		{name: "Codex TOML model", tool: "codex", args: []string{"-c", `model="gpt-5.5"`}, wantModel: "gpt-5.5"},
+		{name: "Codex TOML effort", tool: "codex", args: []string{"-c", `model_reasoning_effort="high"`}, wantEffort: "high"},
+		{name: "Codex long config equals", tool: "codex", args: []string{`--config=model="gpt-5.5"`, `--config=model_reasoning_effort="xhigh"`}, wantModel: "gpt-5.5", wantEffort: "xhigh"},
+		{name: "Claude split effort", tool: "claude", args: []string{"--effort", "high"}, wantEffort: "high"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model, effort, err := orchestrateExplicitExtraArgs(tt.tool, tt.args)
+			if err != nil || model != tt.wantModel || effort != tt.wantEffort {
+				t.Fatalf("orchestrateExplicitExtraArgs() = model=%q effort=%q err=%v; want model=%q effort=%q", model, effort, err, tt.wantModel, tt.wantEffort)
+			}
+		})
+	}
+}
+
+func TestOrchestrateExplicitExtraArgs_RejectsEmptyExplicitValues(t *testing.T) {
+	tests := []struct {
+		name string
+		tool string
+		args []string
+	}{
+		{name: "long model split empty", tool: "codex", args: []string{"--model", "  "}},
+		{name: "long model equals empty", tool: "codex", args: []string{"--model="}},
+		{name: "short model split empty", tool: "codex", args: []string{"-m", ""}},
+		{name: "short model equals empty", tool: "codex", args: []string{"-m="}},
+		{name: "TOML model raw empty", tool: "codex", args: []string{"-c", "model="}},
+		{name: "TOML model quoted empty", tool: "codex", args: []string{"-c", `model=""`}},
+		{name: "TOML effort raw empty", tool: "codex", args: []string{"-c", "model_reasoning_effort="}},
+		{name: "TOML effort quoted empty", tool: "codex", args: []string{"-c", `model_reasoning_effort=""`}},
+		{name: "Claude effort split empty", tool: "claude", args: []string{"--effort", " "}},
+		{name: "Claude effort equals empty", tool: "claude", args: []string{"--effort="}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if model, effort, err := orchestrateExplicitExtraArgs(tt.tool, tt.args); err == nil {
+				t.Fatalf("empty explicit value accepted: model=%q effort=%q", model, effort)
+			}
+		})
 	}
 }
 
