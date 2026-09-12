@@ -7,6 +7,7 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 RUN="$TMP/run"
 mkdir -p "$RUN/bin"
 cp "$ROOT/supervisor.sh" "$RUN/supervisor.sh"
+cp "$ROOT/command-timeout.sh" "$RUN/command-timeout.sh"
 printf 'cond-1\n' > "$RUN/.conductor-id"
 
 cat > "$RUN/bin/agent-deck" <<'FIXTURE'
@@ -14,7 +15,20 @@ cat > "$RUN/bin/agent-deck" <<'FIXTURE'
 set -euo pipefail
 T="${SUPERVISOR_FIXTURE:?}"
 case "$1 $2" in
-  "session children") cat "$T/children.json" ;;
+  "session children")
+    [ ! -e "$T/hang-children" ] || sleep 10
+    cat "$T/children.json"
+    ;;
+  "session show")
+    [ ! -e "$T/hang-show-$3" ] || sleep 10
+    [ -f "$T/show-$3.json" ] && cat "$T/show-$3.json" || printf '{}\n'
+    ;;
+  "session output")
+    [ ! -e "$T/hang-output-$3" ] || sleep 10
+    [ -f "$T/output-$3.json" ] || exit 2
+    cat "$T/output-$3.json"
+    [ ! -f "$T/output-$3.rc" ] || exit "$(cat "$T/output-$3.rc")"
+    ;;
   "session nudge")
     printf '%s|%s\n' "$3" "$4" >> "$T/nudges.log"
     case "$(cat "$T/delivery")" in
@@ -28,6 +42,11 @@ case "$1 $2" in
 esac
 FIXTURE
 chmod +x "$RUN/bin/agent-deck"
+cat > "$RUN/bin/terminal-notifier" <<'FIXTURE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${SUPERVISOR_FIXTURE:?}/notifications.log"
+FIXTURE
+chmod +x "$RUN/bin/terminal-notifier"
 export PATH="$RUN/bin:$PATH" SUPERVISOR_FIXTURE="$RUN"
 
 observe() {
@@ -44,10 +63,30 @@ cat > "$RUN/children.json" <<'JSON'
 JSON
 observe 0
 
+# A coarse waiting status with concrete running/native-agent evidence is not
+# input-needed and must never wake the conductor.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"worker-1","title":"review","status":"waiting","context_tokens":1000}]}
+JSON
+cat > "$RUN/show-worker-1.json" <<'JSON'
+{"substate":"running","pane":"Working / Waiting for agents","native_subagents":[{"status":"running"}]}
+JSON
+observe 45
+if jq -e '.pending | any(.child_id == "worker-1" and .kind == "input-needed")' <<<"$(status)" >/dev/null; then
+  echo 'generic waiting became input-needed' >&2; exit 1
+fi
+
+# Both documented children JSON shapes survive enrichment.
+cat > "$RUN/children.json" <<'JSON'
+[{"id":"worker-1","title":"array child","status":"running","context_tokens":1000}]
+JSON
+observe 46
+jq -e '.observed["worker-1"].status == "running"' <<<"$(status)" >/dev/null
+
 # Sixty minutes of healthy local observations never wake the conductor.
 for minute in 15 30 45 60; do observe "$((minute * 60))"; done
 [ ! -s "$RUN/nudges.log" ]
-[ "$(field '.observation_count')" -eq 5 ]
+[ "$(field '.observation_count')" -eq 7 ]
 
 # A context crossing is retained while busy, follows conductor rotation, and
 # is acknowledged only by a confirmed delivery.
@@ -77,9 +116,21 @@ JSON
 observe 3960
 pending_json="$(status)"
 for kind in completed input-needed failed; do
+  [ "$kind" != input-needed ] || continue
   jq -e --arg kind "$kind" '.pending | any(.kind == $kind)' <<<"$pending_json" >/dev/null || {
     echo "missing actionable event $kind" >&2; exit 1; }
 done
+if jq -e '.pending | any(.child_id == "worker-1" and .kind == "input-needed")' <<<"$pending_json" >/dev/null; then
+  echo 'completed waiting child also emitted input-needed' >&2; exit 1
+fi
+
+# Awaiting-choice is the actionable waiting evidence.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"needs-input","title":"needs input","status":"waiting"}]}
+JSON
+printf '{"substate":"awaiting-choice"}\n' > "$RUN/show-needs-input.json"
+observe 4090
+jq -e '.pending | any(.child_id == "needs-input" and .kind == "input-needed")' <<<"$(status)" >/dev/null
 before="$(field '.pending_count')"; observe 4050; [ "$(field '.pending_count')" -eq "$before" ]
 
 cat > "$RUN/children.json" <<'JSON'
@@ -89,7 +140,7 @@ observe 4140
 jq -e '.pending | any(.kind == "removed")' <<<"$(status)" >/dev/null
 printf '{bad json\n' > "$RUN/children.json"
 observe 4230 || true
-jq -e '.pending | any(.kind == "observer-failure")' <<<"$(status)" >/dev/null
+jq -e '[.pending[],.delivered[]] | any(.kind == "observer-failure")' <<<"$(status)" >/dev/null
 
 # Explicit meaningful stall deadlines notify once, then back off rather than
 # turning ordinary elapsed runtime into a synthetic stall.
@@ -99,14 +150,30 @@ JSON
 observe 4321
 jq -e '.pending | any(.child_id == "stalled" and .kind == "stalled")' <<<"$(status)" >/dev/null
 
-# A stale done sentinel is not completion, and an unknown quota reset parks
-# the event without a retry storm.
+# The installed completion fallback uses supported `session output` data when
+# children JSON lacks done fields. It independently rejects an output timestamp
+# older than the child's newer last_sent_at, even if output says stale=false.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"fallback-fresh","title":"fresh","status":"waiting","last_sent_at":"2026-09-12T09:00:00Z"},{"id":"fallback-stale","title":"stale","status":"waiting","last_sent_at":"2026-09-12T10:00:00Z"}]}
+JSON
+printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-fresh.json"
+printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-fallback-stale.json"
+printf '%s\n' '{"success":true,"stale":false,"timestamp":"2026-09-12T09:01:00Z","content":"done\n===AGENTDECK_DONE=== status=ok summary=fresh output fallback"}' > "$RUN/output-fallback-fresh.json"
+printf '%s\n' '{"success":true,"stale":false,"timestamp":"2026-09-12T09:59:00Z","content":"===AGENTDECK_DONE=== status=ok summary=old pane"}' > "$RUN/output-fallback-stale.json"
+observe 4260
+jq -e '.pending | any(.child_id == "fallback-fresh" and .kind == "completed")' <<<"$(status)" >/dev/null
+if jq -e '.pending | any(.child_id == "fallback-stale" and .kind == "completed")' <<<"$(status)" >/dev/null; then
+  echo 'stale output sentinel became completion' >&2; exit 1
+fi
+
+# A stale done sentinel is not completion. Known quota waits until reset;
+# unknown reset is visibly blocked without any delivery attempt.
 cat > "$RUN/children.json" <<'JSON'
 {"children":[{"id":"quota","title":"quota","status":"error","substate":"usage-limit","done_status":"ok","done_stale":true},{"id":"quota-known","title":"quota-known","status":"error","substate":"usage-limit","reset_at":5000}]}
 JSON
 observe 4320
-jq -e '[.pending[] | select(.child_id == "quota")][0] | .kind == "quota-blocked"' <<<"$(status)" >/dev/null
-jq -e '[.pending[] | select(.child_id == "quota-known")][0] | .kind == "quota-blocked" and .detail == 5000' <<<"$(status)" >/dev/null
+jq -e '[.pending[] | select(.child_id == "quota")][0] | .kind == "quota-blocked" and .blocked == true' <<<"$(status)" >/dev/null
+jq -e '[.pending[] | select(.child_id == "quota-known")][0] | .kind == "quota-blocked" and .detail == 5000 and .backoff_until == 5000' <<<"$(status)" >/dev/null
 if jq -e '.pending | any(.child_id == "quota" and .kind == "completed")' <<<"$(status)" >/dev/null; then
   echo 'stale completion became actionable' >&2; exit 1
 fi
@@ -114,6 +181,78 @@ quota_id="$(jq -r '.pending[] | select(.child_id == "quota" and .kind == "quota-
 [ "$(bash "$RUN/supervisor.sh" ack "$RUN" "$quota_id" | jq -r '.result')" = allowed ]
 duplicate_ack="$(bash "$RUN/supervisor.sh" ack "$RUN" "$quota_id" || true)"
 [ "$(jq -r '.result' <<<"$duplicate_ack")" = already-recorded ]
+
+# Error subtype changes are new incidents; recovery clears the generation so
+# the same later error can deliver again. A hard-to-soft context downshift does
+# not create a threshold event.
+printf 'delivered\n' > "$RUN/delivery"
+while pending_id="$(jq -r '.pending[0].id // empty' <<<"$(status)")" && [ -n "$pending_id" ]; do
+  bash "$RUN/supervisor.sh" ack "$RUN" "$pending_id" >/dev/null
+done
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"recurring","title":"recurring","status":"error","substate":"auth-401","error":"auth","context_tokens":260000}]}
+JSON
+observe 5100
+first_failures="$(jq '[.delivered[] | select(.child_id == "recurring" and .kind == "failed")] | length' <<<"$(status)")"
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"recurring","title":"recurring","status":"running","substate":"running","context_tokens":210000}]}
+JSON
+observe 5190
+downshift_thresholds="$(jq '[.pending[],.delivered[] | select(.child_id == "recurring" and .kind == "context-threshold")] | length' <<<"$(status)")"
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"recurring","title":"recurring","status":"error","substate":"auth-401","error":"auth","context_tokens":210000}]}
+JSON
+observe 5280
+[ "$(jq '[.pending[],.delivered[] | select(.child_id == "recurring" and .kind == "failed")] | length' <<<"$(status)")" -eq $((first_failures + 1)) ]
+[ "$(jq '[.pending[],.delivered[] | select(.child_id == "recurring" and .kind == "context-threshold")] | length' <<<"$(status)")" -eq "$downshift_thresholds" ]
+
+# A recovered stall begins a new incident with a new event identity instead of
+# inheriting the delivered ID/backoff from an older stall.
+while pending_id="$(jq -r '.pending[0].id // empty' <<<"$(status)")" && [ -n "$pending_id" ]; do
+  bash "$RUN/supervisor.sh" ack "$RUN" "$pending_id" >/dev/null
+done
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"restall","title":"restall","status":"running","stall_deadline":5300}]}
+JSON
+observe 5310
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"restall","title":"restall","status":"running"}]}
+JSON
+observe 5320
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"restall","title":"restall","status":"running","stall_deadline":5330}]}
+JSON
+observe 5340
+[ "$(jq '[.pending[],.delivered[] | select(.child_id == "restall" and .kind == "stalled")] | length' <<<"$(status)")" -eq 2 ]
+
+# Conductor choices notify the human without typing into the choice. Concrete
+# conductor stalls may wake an optional watchdog once; no watchdog is mandatory.
+: > "$RUN/notifications.log"
+printf '{"substate":"awaiting-choice"}\n' > "$RUN/show-cond-2.json"
+SUPERVISOR_CHOICE_ESCALATE=0 observe 5370
+[ "$(wc -l < "$RUN/notifications.log" | tr -d ' ')" -eq 1 ]
+printf 'watchdog-1\n' > "$RUN/.watchdog-id"
+printf '{"substate":"stalled"}\n' > "$RUN/show-cond-2.json"
+observe 5460
+grep -q '^watchdog-1|' "$RUN/nudges.log"
+
+# Truly unreachable delivery stops after the configured bound, remains visible
+# as blocked operator attention, and does not keep waking models.
+while pending_id="$(jq -r '.pending[0].id // empty' <<<"$(status)")" && [ -n "$pending_id" ]; do
+  bash "$RUN/supervisor.sh" ack "$RUN" "$pending_id" >/dev/null
+done
+printf 'uncertain\n' > "$RUN/delivery"
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"unreachable","title":"unreachable","status":"error","substate":"auth-401","error":"auth"}]}
+JSON
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5500
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5501
+unreachable_state="$(status)"
+jq -e '.pending | any(.child_id == "unreachable" and .blocked == true and .operator_attention == true and .attempts == 2)' <<<"$unreachable_state" >/dev/null
+unreachable_nudges="$(grep -c 'failed — unreachable' "$RUN/nudges.log")"
+SUPERVISOR_MAX_DELIVERY_MISSES=2 observe 5590
+[ "$(grep -c 'failed — unreachable' "$RUN/nudges.log")" -eq "$unreachable_nudges" ]
+printf 'delivered\n' > "$RUN/delivery"
 
 # Replay wake count: the legacy 15-minute loop wakes 4 times/hour; this
 # unchanged 60-minute replay woke zero. The actionable crossing delivered in
@@ -130,7 +269,17 @@ if SUPERVISOR_MAX_TICKS=1 bash "$RUN/supervisor.sh" run "$RUN" >/dev/null 2>&1; 
 fi
 touch "$RUN/.heartbeat-stop"
 wait "$owner_pid" || true
-[ ! -d "$RUN/.supervisor.lock" ]
+[ ! -e "$RUN/.supervisor.lock" ]
+
+# Acquisition remains exclusive even when owner publication is deliberately
+# delayed. This exercises the old mkdir-before-owner race window.
+rm -f "$RUN/.heartbeat-stop"
+SUPERVISOR_TEST_OWNER_DELAY=1 SUPERVISOR_MAX_TICKS=1 SUPERVISOR_DETECT_INTERVAL=0 bash "$RUN/supervisor.sh" run "$RUN" >/dev/null & race1=$!
+sleep 0.1
+if SUPERVISOR_MAX_TICKS=1 SUPERVISOR_DETECT_INTERVAL=0 bash "$RUN/supervisor.sh" run "$RUN" >/dev/null 2>&1; then
+  echo 'second supervisor acquired before owner publication' >&2; wait "$race1" || true; exit 1
+fi
+wait "$race1"
 
 # A reused/live PID alone is not ownership: the recorded process-start token
 # must also match before takeover is refused.
@@ -138,7 +287,7 @@ rm -f "$RUN/.heartbeat-stop"
 mkdir "$RUN/.supervisor.lock"
 printf '{"pid":%s,"process_start":"wrong start token","run_dir":"%s"}\n' "$$" "$RUN" > "$RUN/.supervisor.lock/owner.json"
 SUPERVISOR_MAX_TICKS=1 SUPERVISOR_DETECT_INTERVAL=0 bash "$RUN/supervisor.sh" run "$RUN" >/dev/null
-[ ! -d "$RUN/.supervisor.lock" ]
+[ ! -e "$RUN/.supervisor.lock" ]
 
 # The detached command reports its real owner; stop terminates it and releases
 # ownership without leaving a legacy heartbeat/watchdog process.
@@ -148,6 +297,27 @@ if bash "$RUN/supervisor.sh" start "$RUN" >/dev/null 2>&1; then
   echo 'duplicate detached start reported success' >&2; exit 1
 fi
 bash "$RUN/supervisor.sh" stop "$RUN" >/dev/null
-[ ! -d "$RUN/.supervisor.lock" ]
+[ ! -e "$RUN/.supervisor.lock" ]
 
-printf '%s\n' 'supervisor replay, delivery, rotation, quota, stale, removal, observer, terminal and lock fixtures: ok'
+# Every external observation has a portable timeout. A wedged children command
+# becomes a durable observer failure and the one-tick run returns promptly.
+rm -f "$RUN/.heartbeat-stop"
+touch "$RUN/hang-children"
+started="$(date +%s)"
+SUPERVISOR_COMMAND_TIMEOUT=1 observe 5600
+elapsed=$(( $(date +%s) - started ))
+[ "$elapsed" -lt 5 ]
+jq -e '[.pending[],.delivered[]] | any(.kind == "observer-failure")' <<<"$(status)" >/dev/null
+rm -f "$RUN/hang-children"
+
+# Default cadence is part of persisted observability, not only an overridable
+# test constant. Corrupt state is reported and never replaced with defaults.
+SUPERVISOR_MAX_TICKS=1 bash "$RUN/supervisor.sh" run "$RUN" >/dev/null
+jq -e '.config.detect_interval == 90 and .config.health_interval == 900' <<<"$(status)" >/dev/null
+printf '{broken state\n' > "$RUN/.supervisor-state.json"
+if bash "$RUN/supervisor.sh" status "$RUN" >/dev/null 2>&1; then
+  echo 'invalid supervisor state was silently accepted' >&2; exit 1
+fi
+grep -q 'broken state' "$RUN/.supervisor-state.json"
+
+printf '%s\n' 'supervisor completion fallback, transitions, escalation, timeout and atomic lock fixtures: ok'
