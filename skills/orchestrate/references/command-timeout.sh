@@ -13,7 +13,32 @@ import sys
 
 seconds = float(sys.argv[1])
 command = sys.argv[2:]
+watched = {signal.SIGINT, signal.SIGTERM}
+signal.pthread_sigmask(signal.SIG_BLOCK, watched)
 proc = subprocess.Popen(command, start_new_session=True)
+
+def terminate_group(signum, _frame):
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        proc.wait()
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    raise SystemExit(128 + signum)
+
+signal.signal(signal.SIGINT, terminate_group)
+signal.signal(signal.SIGTERM, terminate_group)
+signal.pthread_sigmask(signal.SIG_UNBLOCK, watched)
 try:
     returncode = proc.wait(timeout=seconds)
 except subprocess.TimeoutExpired:

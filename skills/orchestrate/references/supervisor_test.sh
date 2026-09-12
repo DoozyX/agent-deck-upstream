@@ -8,6 +8,7 @@ RUN="$TMP/run"
 mkdir -p "$RUN/bin"
 cp "$ROOT/supervisor.sh" "$RUN/supervisor.sh"
 cp "$ROOT/command-timeout.sh" "$RUN/command-timeout.sh"
+cp "$ROOT/supervisor-observe.py" "$RUN/supervisor-observe.py"
 printf 'cond-1\n' > "$RUN/.conductor-id"
 
 cat > "$RUN/bin/agent-deck" <<'FIXTURE'
@@ -22,6 +23,7 @@ case "$1 $2" in
   "session show")
     if [ -e "$T/hang-show-$3" ]; then
       touch "$T/began-show-$3"
+      printf '%s\n' "$$" > "$T/pid-show-$3"
       trap 'touch "$T/terminated-show-$3"; exit 143' TERM INT
       sleep 30
     fi
@@ -30,6 +32,7 @@ case "$1 $2" in
   "session output")
     if [ -e "$T/hang-output-$3" ]; then
       touch "$T/began-output-$3"
+      printf '%s\n' "$$" > "$T/pid-output-$3"
       trap 'touch "$T/terminated-output-$3"; exit 143' TERM INT
       sleep 30
     fi
@@ -373,6 +376,51 @@ elapsed=$(( $(date +%s) - started ))
 [ "$elapsed" -lt 5 ]
 jq -e '[.pending[],.delivered[]] | any(.kind == "observer-failure")' <<<"$(status)" >/dev/null
 rm -f "$RUN/hang-children"
+
+# Per-child detail and completion probes share one aggregate deadline. Three
+# fully slow children finish near one timeout window, and every owned process
+# group is reaped before the tick returns.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"slow-a","status":"running"},{"id":"slow-b","status":"running"},{"id":"slow-c","status":"running"}]}
+JSON
+for slow in slow-a slow-b slow-c; do touch "$RUN/hang-show-$slow" "$RUN/hang-output-$slow"; done
+started="$(date +%s)"
+SUPERVISOR_COMMAND_TIMEOUT=1 observe 5610
+elapsed=$(( $(date +%s) - started ))
+[ "$elapsed" -lt 4 ] || { echo "aggregate observation exceeded deadline: ${elapsed}s" >&2; exit 1; }
+for slow in slow-a slow-b slow-c; do
+  [ -e "$RUN/terminated-show-$slow" ] && [ -e "$RUN/terminated-output-$slow" ]
+  for kind in show output; do
+    slow_pid="$(cat "$RUN/pid-$kind-$slow")"
+    if kill -0 "$slow_pid" 2>/dev/null; then
+      echo "aggregate observation left $kind $slow alive" >&2; exit 1
+    fi
+  done
+done
+
+# Prompt stop interrupts the aggregate owner, which terminates and reaps all
+# outstanding probes before supervisor ownership is released.
+rm -f "$RUN/.heartbeat-stop"
+for slow in slow-a slow-b slow-c; do
+  rm -f "$RUN/began-show-$slow" "$RUN/began-output-$slow" "$RUN/terminated-show-$slow" "$RUN/terminated-output-$slow" "$RUN/pid-show-$slow" "$RUN/pid-output-$slow"
+done
+SUPERVISOR_COMMAND_TIMEOUT=30 SUPERVISOR_DETECT_INTERVAL=30 bash "$RUN/supervisor.sh" start "$RUN" >/dev/null
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ ! -e "$RUN/began-output-slow-c" ] || break; sleep 0.1; done
+stop_started="$(date +%s)"
+stop_rc=0; bash "$RUN/supervisor.sh" stop "$RUN" >/dev/null 2>&1 || stop_rc=$?
+stop_elapsed=$(( $(date +%s) - stop_started ))
+leaked=0
+for slow in slow-a slow-b slow-c; do
+  for kind in show output; do
+    slow_pid="$(cat "$RUN/pid-$kind-$slow" 2>/dev/null || true)"
+    [ -z "$slow_pid" ] || ! kill -0 "$slow_pid" 2>/dev/null || leaked=1
+    [ "$leaked" -eq 0 ] || kill -KILL -- "-$slow_pid" 2>/dev/null || kill -KILL "$slow_pid" 2>/dev/null || true
+  done
+done
+[ "$stop_rc" -eq 0 ] && [ "$stop_elapsed" -lt 5 ] && [ "$leaked" -eq 0 ] || {
+  echo "prompt stop failed rc=$stop_rc elapsed=${stop_elapsed}s leaked=$leaked" >&2; exit 1; }
+for slow in slow-a slow-b slow-c; do rm -f "$RUN/hang-show-$slow" "$RUN/hang-output-$slow"; done
+rm -f "$RUN/.heartbeat-stop"
 
 # Default cadence is part of persisted observability, not only an overridable
 # test constant. Corrupt state is reported and never replaced with defaults.

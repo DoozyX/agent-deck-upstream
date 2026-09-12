@@ -26,6 +26,7 @@ START_TIMEOUT="${SUPERVISOR_START_TIMEOUT:-3}"
 MAX_MISSES="${SUPERVISOR_MAX_DELIVERY_MISSES:-4}"
 CHOICE_ESCALATE="${SUPERVISOR_CHOICE_ESCALATE:-300}"
 TIMEOUT_HELPER="$(cd "$(dirname "$SCRIPT")" && pwd -P)/command-timeout.sh"
+OBSERVE_HELPER="$(cd "$(dirname "$SCRIPT")" && pwd -P)/supervisor-observe.py"
 
 json_error() {
   printf '{"result":"error","reason":"%s"}\n' "$1"
@@ -328,37 +329,6 @@ dfd=os.open(os.path.dirname(p),os.O_RDONLY); os.fsync(dfd); os.close(dfd)
 PY
 }
 
-enrich_completion_from_output() {
-  local input="$1" child_id="$2" output="$3" result="$4"
-  INPUT_JSON="$input" CHILD_ID="$child_id" OUTPUT_JSON="$output" RESULT_JSON="$result" python3 - <<'PY'
-import datetime as dt,json,os,re,sys
-with open(os.environ["INPUT_JSON"],encoding="utf-8") as fh:data=json.load(fh)
-with open(os.environ["OUTPUT_JSON"],encoding="utf-8") as fh:out=json.load(fh)
-if not isinstance(out,dict) or out.get("stale") or not out.get("success",False):sys.exit(1)
-rows=data if isinstance(data,list) else data.get("children",[])
-row=next((r for r in rows if str(r.get("id",""))==os.environ["CHILD_ID"]),None)
-if row is None or (row.get("done_status") and not row.get("done_stale")):sys.exit(1)
-def parse_time(value):
-    if not isinstance(value,str) or not value:return None
-    try:return dt.datetime.fromisoformat(value.replace("Z","+00:00"))
-    except ValueError:return None
-sent_at=parse_time(row.get("last_sent_at"));output_at=parse_time(out.get("timestamp"))
-source="response-timestamp"
-if output_at is not None:
-    if sent_at is not None and output_at < sent_at + dt.timedelta(seconds=1):sys.exit(1)
-else:
-    output_sent=parse_time(out.get("last_sent_at"))
-    if out.get("role")!="assistant" or sent_at is None or output_sent is None or output_sent!=sent_at:sys.exit(1)
-    source="require-fresh-last-sent"
-signal=re.search(r'(?:^|\n)===AGENTDECK_DONE===\s+status=(ok|fail)\s+summary=([^\r\n]*)\r?\n?\Z',str(out.get("content") or ""))
-if not signal:sys.exit(1)
-row.update({"done_status":signal.group(1),"done_summary":signal.group(2).strip(),
-            "done_at":out.get("timestamp") or None,"done_stale":False,
-            "done_source":"session-output","done_freshness_source":source})
-with open(os.environ["RESULT_JSON"],"w",encoding="utf-8") as fh:json.dump(data,fh,separators=(",",":"));fh.write("\n")
-PY
-}
-
 notify_user() {
   command -v terminal-notifier >/dev/null 2>&1 || return 0
   "$TIMEOUT_HELPER" "$COMMAND_TIMEOUT" terminal-notifier -title 'agent-deck orchestrate' -message "$1" >/dev/null 2>&1 || true
@@ -403,14 +373,15 @@ PY
 run_loop() {
   [ -s "$ID_FILE" ] || { json_error conductor-id-missing; return 2; }
   [ -x "$TIMEOUT_HELPER" ] || { json_error command-timeout-helper-missing; return 2; }
+  [ -x "$OBSERVE_HELPER" ] || { json_error supervisor-observe-helper-missing; return 2; }
   acquire || return 1
-  local sleep_pid=""
+  local sleep_pid="" observation_pid=""
   trap 'release' EXIT
-  trap '[ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null || true; release; exit 0' INT TERM
+  trap '[ -z "$observation_pid" ] || kill -TERM "$observation_pid" 2>/dev/null || true; [ -z "$observation_pid" ] || wait "$observation_pid" 2>/dev/null || true; [ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null || true; release; exit 0' INT TERM
   local ticks=0 max_ticks="${SUPERVISOR_MAX_TICKS:-0}"
   while :; do
     [ -e "$STOP" ] && return 0
-    local now cid obs ok due event_id kind title msg out rc outcome enriched show next output conductor_show conductor_substate child_id
+    local now cid obs ok due event_id kind title msg out rc outcome enriched conductor_show conductor_substate blocked
     now="${SUPERVISOR_NOW:-$(date +%s)}"
     cid="$(sed -n '1p' "$ID_FILE" 2>/dev/null)"
     [ -n "$cid" ] || { json_error conductor-id-missing; return 2; }
@@ -420,30 +391,9 @@ run_loop() {
     if [ "$ok" -eq 1 ] && ! python3 -m json.tool "$obs" >/dev/null 2>&1; then ok=0; fi
     if [ "$ok" -eq 1 ]; then
       enriched="$(mktemp "$RUN_DIR/.supervisor-enriched.XXXXXX")"
-      cp "$obs" "$enriched" || ok=0
-      while IFS= read -r child_id; do
-        [ -n "$child_id" ] || continue
-        show="$(mktemp "$RUN_DIR/.supervisor-show.XXXXXX")"
-        if "$TIMEOUT_HELPER" "$COMMAND_TIMEOUT" agent-deck session show "$child_id" --json >"$show" 2>/dev/null && python3 -m json.tool "$show" >/dev/null 2>&1; then
-          next="$(mktemp "$RUN_DIR/.supervisor-next.XXXXXX")"
-          if jq --slurpfile detail "$show" --arg id "$child_id" '
-            def enrich:
-              if .id == $id then
-                . + {substate: ($detail[0].substate // .substate),
-                     reset_at: ($detail[0].reset_at // $detail[0].usage_limit.reset_at // .reset_at),
-                     error: ($detail[0].error // .error)}
-              else . end;
-            if type == "array" then map(enrich) else .children |= map(enrich) end' "$enriched" >"$next"; then mv "$next" "$enriched"; else rm -f "$next"; ok=0; fi
-        fi
-        rm -f "$show"
-        output="$(mktemp "$RUN_DIR/.supervisor-output.XXXXXX")"
-        if "$TIMEOUT_HELPER" "$COMMAND_TIMEOUT" agent-deck session output "$child_id" --json --require-fresh >"$output" 2>/dev/null && python3 -m json.tool "$output" >/dev/null 2>&1; then
-          next="$(mktemp "$RUN_DIR/.supervisor-next.XXXXXX")"
-          if enrich_completion_from_output "$enriched" "$child_id" "$output" "$next"; then mv "$next" "$enriched"; else rm -f "$next"; fi
-        fi
-        rm -f "$output"
-      done < <(jq -r 'if type=="array" then .[]?.id else .children[]?.id end // empty' "$enriched")
-      cp "$enriched" "$obs" || ok=0
+      "$OBSERVE_HELPER" "$obs" "$enriched" "$COMMAND_TIMEOUT" & observation_pid=$!
+      if wait "$observation_pid"; then cp "$enriched" "$obs" || ok=0; else ok=0; fi
+      observation_pid=""
       rm -f "$enriched"
     fi
     due="$(observe "$now" "$obs" "$ok")"

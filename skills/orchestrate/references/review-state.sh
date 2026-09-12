@@ -38,8 +38,8 @@ def parser_for(action):
     p.add_argument("--changed-requirement")
     return p
 
-if len(sys.argv) < 2 or sys.argv[1] not in {"check", "record-review", "record-fix", "override"}:
-    sys.exit("usage: review-state.sh check|record-review|record-fix|override --run-dir DIR --task-id ID --attempt-id ID ...")
+if len(sys.argv) < 2 or sys.argv[1] not in {"check", "record-review", "record-fix", "cancel", "override"}:
+    sys.exit("usage: review-state.sh check|record-review|record-fix|cancel|override --run-dir DIR --task-id ID --attempt-id ID ...")
 action = sys.argv[1]
 args = parser_for(action).parse_args(sys.argv[2:])
 run_dir = os.path.realpath(args.run_dir)
@@ -88,6 +88,22 @@ def load_state():
                          and a.get("reviewed_head") == state.get("clean_head")
                          and a.get("spec_id") == state.get("clean_spec_id")), None)
     state.setdefault("clean_base_head", clean_review.get("base_head") if clean_review else None)
+    for attempt in state.get("attempts", {}).values():
+        if "prior_review_attempt" in attempt or attempt.get("kind") not in REVIEW_KINDS | {"fix"}:
+            continue
+        if attempt.get("kind") == "fix":
+            attempt["prior_review_attempt"] = attempt.get("originating_attempt")
+            continue
+        reserved_at = attempt.get("reserved_at", "")
+        prior = [
+            (candidate.get("recorded_at", ""), candidate_id)
+            for candidate_id, candidate in state.get("attempts", {}).items()
+            if candidate.get("epoch") == attempt.get("epoch")
+            and candidate.get("kind") in REVIEW_KINDS
+            and candidate.get("status") == "completed"
+            and candidate.get("recorded_at", "") <= reserved_at
+        ]
+        attempt["prior_review_attempt"] = max(prior, default=("", None))[1]
     return state
 
 def save_state(state):
@@ -125,23 +141,30 @@ def require(*names):
     if missing:
         raise SystemExit("review-state.sh: missing required options: " + ", ".join("--" + n.replace("_", "-") for n in missing))
 
-def parse_findings(lines):
+def parse_findings(lines, source_file):
     findings = []
-    for line in lines:
+    for source_line, line in lines:
         pipe = line.split("|", 2)
         if len(pipe) == 3 and pipe[0] in {"critical", "major", "minor"} and pipe[1] in {"patch", "decision-needed", "defer"}:
-            findings.append({"severity": pipe[0], "disposition": pipe[1], "text": pipe[2]})
+            findings.append({
+                "location": None, "severity": pipe[0], "disposition": pipe[1],
+                "provenance": None, "text": pipe[2],
+                "source_file": source_file, "source_line": source_line,
+            })
             continue
         # Shared review output is: [number.] path:line — severity —
-        # [disposition] — provenance — text. Keep provenance out of durable
-        # finding text; it is review process metadata, not the defect.
+        # [disposition] — provenance — text. Preserve each component so later
+        # fixes can identify the exact finding without reparsing prose.
         parts = [part.strip() for part in line.split(" — ")]
         if len(parts) >= 5 and parts[1] in {"critical", "major", "minor"}:
             match = re.fullmatch(r"\[(patch|decision-needed|defer)\]", parts[2])
             if match:
                 findings.append({
+                    "location": re.sub(r"^\d+\.\s*", "", parts[0]),
                     "severity": parts[1], "disposition": match.group(1),
+                    "provenance": parts[3],
                     "text": " — ".join(parts[4:]),
+                    "source_file": source_file, "source_line": source_line,
                 })
                 continue
         raise SystemExit("review-state.sh: malformed merged finding: " + line)
@@ -151,7 +174,8 @@ def read_findings(path):
     if not path:
         return []
     with open(path, encoding="utf-8") as fh:
-        return parse_findings([line.rstrip("\n") for line in fh if line.strip()])
+        lines = [(number, line.rstrip("\n")) for number, line in enumerate(fh, 1) if line.strip()]
+    return parse_findings(lines, os.path.realpath(path))
 
 def read_verdict_file(path):
     with open(path, encoding="utf-8") as fh:
@@ -165,13 +189,14 @@ def read_verdict_file(path):
         raise SystemExit("review-state.sh: unsupported VERDICT line: " + terminal)
     try: start = lines.index("## Merged findings") + 1
     except ValueError: start = 0
-    finding_lines = [line for line in lines[start:] if line and not line.startswith(("Seen:", "Scored:", "Checked:", "VERDICT:"))]
-    findings = parse_findings(finding_lines)
+    finding_lines = [(number, line) for number, line in enumerate(lines[start:], start + 1)
+                     if line and not line.startswith(("Seen:", "Scored:", "Checked:", "VERDICT:"))]
+    findings = parse_findings(finding_lines, os.path.realpath(path))
     counts = {name: sum(1 for f in findings if f["disposition"] == name)
               for name in ("patch", "decision-needed", "defer")}
     if verdict == "clean":
-        if findings:
-            raise SystemExit("review-state.sh: clean verdict contains merged findings")
+        if any(f["disposition"] != "defer" for f in findings):
+            raise SystemExit("review-state.sh: clean verdict contains blocking merged findings")
     else:
         match = re.fullmatch(r"VERDICT: fix-needed patch=(\d+) decision-needed=(\d+) defer=(\d+)", terminal)
         if not match:
@@ -180,6 +205,13 @@ def read_verdict_file(path):
         if declared != counts:
             raise SystemExit(f"review-state.sh: verdict counts {declared} do not match merged findings {counts}")
     return verdict, findings
+
+def validate_verdict(verdict, findings):
+    blocking = [f for f in findings if f["disposition"] in {"patch", "decision-needed"}]
+    if verdict == "clean" and blocking:
+        raise SystemExit("review-state.sh: clean verdict contains blocking merged findings")
+    if verdict == "fix-needed" and not blocking:
+        raise SystemExit("review-state.sh: fix-needed verdict has no blocking merged findings")
 
 def epoch_count(state, kind):
     epoch = state["epoch"]
@@ -207,14 +239,23 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
                 reply(state, "needs-attention", "attempt-identity-mismatch")
                 sys.exit(1)
             status = prior["status"]
-            if status == "transport-failure":
+            if status not in {"transport-failure", "quota", "cancelled"}:
+                reply(state, "already-recorded", "attempt-id-exists")
+                sys.exit(1)
+            if prior.get("epoch") != state["epoch"]:
+                reply(state, "needs-attention", "stale-attempt-epoch")
+                sys.exit(1)
+            if prior.get("prior_review_attempt") != state.get("current_review_attempt"):
+                reply(state, "needs-attention", "stale-attempt-state")
+                sys.exit(1)
+            if status in {"transport-failure", "cancelled"}:
                 if prior.get("startup_retries", 0) > 2:
                     reply(state, "needs-attention", "startup-retry-budget-exhausted")
                     sys.exit(1)
                 prior["status"] = "reserved"
                 prior["reserved_at"] = now_text()
                 save_state(state)
-                reply(state, "allowed", "startup-retry")
+                reply(state, "allowed", "cancelled-retry" if status == "cancelled" else "startup-retry")
                 sys.exit(0)
             if status == "quota":
                 reset = prior.get("reset_at")
@@ -229,8 +270,6 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
                 save_state(state)
                 reply(state, "allowed", "quota-reset-reached")
                 sys.exit(0)
-            reply(state, "already-recorded", "attempt-id-exists")
-            sys.exit(1)
 
         # One active reservation per task makes the check itself the atomic
         # launch boundary; two conductors cannot both spend the final slot.
@@ -252,9 +291,13 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
                     and state["clean_head"] == args.reviewed_head and state["clean_spec_id"] == args.spec_id):
                 reply(state, "needs-attention", "integration-boundary-unchanged")
                 sys.exit(1)
-            if (state.get("clean_base_head") == args.base_head and state["clean_head"] == args.reviewed_head
+            if (state["clean_head"] == args.reviewed_head
                     and state["clean_spec_id"] == args.spec_id and args.kind != "integration"):
                 reply(state, "needs-attention", "clean-unchanged")
+                sys.exit(1)
+            if (args.kind != "integration" and epoch_count(state, "review") > 0
+                    and state.get("current_base_head") not in (None, args.base_head)):
+                reply(state, "needs-attention", "integration-kind-required")
                 sys.exit(1)
             limit = 4 if args.kind == "integration" else 3
             if epoch_count(state, "review") >= limit:
@@ -296,6 +339,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             "spec_id": args.spec_id, "originating_attempt": args.originating_attempt,
             "originating_verdict": origin.get("verdict") if args.kind == "fix" else None,
             "material_reason": args.material_reason, "startup_retries": 0,
+            "prior_review_attempt": state.get("current_review_attempt"),
             "reserved_at": now_text(),
         }
         if state["current_head"] is None:
@@ -316,6 +360,10 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             sys.exit(1)
         if attempt.get("kind") not in REVIEW_KINDS:
             reply(state, "needs-attention", "reserved-kind-mismatch")
+            sys.exit(1)
+        if (attempt.get("epoch") != state["epoch"]
+                or attempt.get("prior_review_attempt") != state.get("current_review_attempt")):
+            reply(state, "needs-attention", "stale-result")
             sys.exit(1)
         if attempt.get("status") != "reserved":
             reply(state, "needs-attention", "attempt-not-reserved")
@@ -343,6 +391,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             verdict, findings = args.verdict, read_findings(args.findings)
         if verdict not in {"clean", "fix-needed"}:
             raise SystemExit("review-state.sh: --verdict must be clean or fix-needed")
+        validate_verdict(verdict, findings)
         identity = (attempt["base_head"], attempt["reviewed_head"], attempt["spec_id"])
         reported = (args.base_head, args.reviewed_head, args.spec_id)
         if identity != reported:
@@ -361,7 +410,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
         state["current_head"] = args.reviewed_head
         state["current_spec_id"] = args.spec_id
         state["current_review_attempt"] = args.attempt_id
-        state["unresolved_findings"] = attempt["findings"] if verdict == "fix-needed" else []
+        state["unresolved_findings"] = attempt["findings"]
         if verdict == "clean":
             state["clean_base_head"] = args.base_head
             state["clean_head"] = args.reviewed_head
@@ -381,11 +430,21 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
         if attempt.get("kind") != "fix":
             reply(state, "needs-attention", "reserved-kind-mismatch")
             sys.exit(1)
-        if attempt.get("status") != "reserved":
-            reply(state, "needs-attention", "attempt-not-reserved")
-            sys.exit(1)
         if attempt.get("originating_attempt") != args.originating_attempt:
             reply(state, "needs-attention", "originating-verdict-mismatch")
+            sys.exit(1)
+        origin = attempts.get(args.originating_attempt)
+        current_identity = (state.get("current_base_head"), state.get("current_head"), state.get("current_spec_id"))
+        reserved_identity = (attempt.get("base_head"), attempt.get("reviewed_head"), attempt.get("spec_id"))
+        if (attempt.get("epoch") != state["epoch"] or not origin
+                or origin.get("epoch") != state["epoch"]
+                or state.get("current_review_attempt") != args.originating_attempt
+                or origin.get("verdict") != "fix-needed"
+                or current_identity != reserved_identity):
+            reply(state, "needs-attention", "stale-fix-result")
+            sys.exit(1)
+        if attempt.get("status") != "reserved":
+            reply(state, "needs-attention", "attempt-not-reserved")
             sys.exit(1)
         if args.outcome == "transport-failure":
             attempt["status"] = "transport-failure"
@@ -403,16 +462,6 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             reply(state, "needs-attention", reason, reset_at=args.reset_at)
             sys.exit(1)
         require("resulting_revision", "unresolved_findings")
-        origin = attempts.get(args.originating_attempt)
-        current_identity = (state.get("current_base_head"), state.get("current_head"), state.get("current_spec_id"))
-        reserved_identity = (attempt.get("base_head"), attempt.get("reviewed_head"), attempt.get("spec_id"))
-        if (attempt.get("epoch") != state["epoch"] or not origin
-                or origin.get("epoch") != state["epoch"]
-                or state.get("current_review_attempt") != args.originating_attempt
-                or origin.get("verdict") != "fix-needed"
-                or current_identity != reserved_identity):
-            reply(state, "needs-attention", "stale-fix-result")
-            sys.exit(1)
         if args.resulting_revision == state.get("current_head"):
             reply(state, "needs-attention", "resulting-revision-unchanged")
             sys.exit(1)
@@ -437,6 +486,25 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             sys.exit(1)
         save_state(state)
         reply(state, "allowed", "fix-recorded")
+
+    elif action == "cancel":
+        attempt = attempts.get(args.attempt_id)
+        if not attempt:
+            reply(state, "needs-attention", "attempt-not-reserved")
+            sys.exit(1)
+        if attempt.get("epoch") != state["epoch"]:
+            reply(state, "needs-attention", "stale-result")
+            sys.exit(1)
+        if attempt.get("status") == "cancelled":
+            reply(state, "already-recorded", "attempt-already-cancelled")
+            sys.exit(1)
+        if attempt.get("status") != "reserved":
+            reply(state, "needs-attention", "attempt-not-reserved")
+            sys.exit(1)
+        attempt["status"] = "cancelled"
+        attempt["recorded_at"] = now_text()
+        save_state(state)
+        reply(state, "allowed", "attempt-cancelled")
 
     else:
         require("changed_requirement", "spec_id")
