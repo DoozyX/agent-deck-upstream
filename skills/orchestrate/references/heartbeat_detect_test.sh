@@ -4,8 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT INT TERM
-cp "$ROOT/heartbeat.sh" "$ROOT/supervisor.sh" "$ROOT/command-timeout.sh" "$TMP/"
-chmod +x "$TMP/heartbeat.sh" "$TMP/supervisor.sh" "$TMP/command-timeout.sh"
+cp "$ROOT/heartbeat.sh" "$ROOT/supervisor.sh" "$ROOT/supervisor-observe.py" "$ROOT/command-timeout.sh" "$TMP/"
+chmod +x "$TMP/heartbeat.sh" "$TMP/supervisor.sh" "$TMP/supervisor-observe.py" "$TMP/command-timeout.sh"
 mkdir -p "$TMP/bin"
 printf 'cond-1\n' > "$TMP/.conductor-id"
 printf '{"children":[]}\n' > "$TMP/children.json"

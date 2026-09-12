@@ -32,7 +32,7 @@ printf '%s\n' 'major|patch|bug one' > "$TMP/findings-1"
 
 # A stale result cannot advance review counters.
 [ "$(check_review stale incremental head-2 | result)" = allowed ]
-stale_out="$(record_review stale reviewer-stale head-1 clean "$TMP/findings-1" || true)"
+stale_out="$(record_review stale reviewer-stale head-1 fix-needed "$TMP/findings-1" || true)"
 [ "$(jq -r '.result' <<<"$stale_out")" = needs-attention ]
 [ "$(jq -r '.reason' <<<"$stale_out")" = stale-result ]
 
@@ -120,11 +120,13 @@ raw layer text
 ## Merged findings
 file.go:1 — minor — [defer] — adversarial — adjacent issue
 Checked: tests focused cmd=true exit=0 duration=0s
-VERDICT: fix-needed patch=0 decision-needed=0 defer=1
+VERDICT: clean
 VERDICT
-vout="$("$RS" record-review --run-dir "$RUN4" --task-id verdict-task --attempt-id vr1 --reviewer rv --base-head b --reviewed-head h --spec-id s --verdict-file "$TMP/verdict.md")"
-jq -e '.state.unresolved_findings[0] == {severity:"minor",disposition:"defer",text:"adjacent issue"}' <<<"$vout" >/dev/null
-jq -e '.state.attempts.vr1 | .reviewer == "rv" and .base_head == "b" and .reviewed_head == "h" and .spec_id == "s" and .verdict == "fix-needed"' <<<"$vout" >/dev/null
+vout="$("$RS" record-review --run-dir "$RUN4" --task-id verdict-task --attempt-id vr1 --reviewer rv --base-head b --reviewed-head h --spec-id s --verdict-file "$TMP/verdict.md")" || {
+  echo 'clean verdict with defer-only findings was rejected' >&2; exit 1; }
+jq -e '.state.attempts.vr1.findings[0] | .location == "file.go:1" and .severity == "minor" and .disposition == "defer" and .provenance == "adversarial" and .text == "adjacent issue" and (.source_file | endswith("/verdict.md")) and .source_line == 3' <<<"$vout" >/dev/null
+jq -e '.state.unresolved_findings[0].disposition == "defer"' <<<"$vout" >/dev/null
+jq -e '.state.attempts.vr1 | .reviewer == "rv" and .base_head == "b" and .reviewed_head == "h" and .spec_id == "s" and .verdict == "clean"' <<<"$vout" >/dev/null
 
 # A missing run marker fails closed and does not create either the requested
 # directory or fresh review counters. Canonical aliases share one state.
@@ -157,6 +159,41 @@ unknown_quota="$("$RS" check --run-dir "$RUN5" --task-id transitions --attempt-i
 active_override="$("$RS" override --run-dir "$RUN5" --task-id transitions --attempt-id ov-active --changed-requirement changed --spec-id s2 || true)"
 [ "$(jq -r '.reason' <<<"$active_override")" = attempt-in-flight ]
 
+# An old transport/quota reservation cannot be retried or recorded after an
+# override opens a new epoch. Neither path may restore the old HEAD/spec.
+STALE="$TMP/stale-epoch"; mkdir -p "$STALE"; printf 'conductor\n' > "$STALE/.conductor-id"
+old=(--run-dir "$STALE" --task-id stale-task --attempt-id old-r --kind full --base-head old-base --reviewed-head old-head --spec-id old-spec)
+"$RS" check "${old[@]}" >/dev/null
+"$RS" record-review "${old[@]}" --outcome transport-failure >/dev/null
+"$RS" override --run-dir "$STALE" --task-id stale-task --attempt-id override --changed-requirement changed --spec-id new-spec >/dev/null
+old_retry="$("$RS" check "${old[@]}" || true)"
+[ "$(jq -r '.result' <<<"$old_retry")" = needs-attention ]
+[ "$(jq -r '.reason' <<<"$old_retry")" = stale-attempt-epoch ]
+old_record="$("$RS" record-review "${old[@]}" --outcome transport-failure || true)"
+[ "$(jq -r '.reason' <<<"$old_record")" = stale-result ]
+jq -e '.state | .epoch == 2 and .current_spec_id == "new-spec" and .current_head == "old-head"' <<<"$old_record" >/dev/null
+old_quota=(--run-dir "$STALE" --task-id stale-task --attempt-id old-quota --kind full --base-head new-base --reviewed-head old-head --spec-id new-spec)
+"$RS" check "${old_quota[@]}" >/dev/null
+"$RS" record-review "${old_quota[@]}" --outcome quota --reset-at 1 >/dev/null 2>&1 || true
+"$RS" override --run-dir "$STALE" --task-id stale-task --attempt-id override-2 --changed-requirement changed-again --spec-id new-spec-2 >/dev/null
+quota_retry="$("$RS" check "${old_quota[@]}" || true)"
+[ "$(jq -r '.reason' <<<"$quota_retry")" = stale-attempt-epoch ]
+
+# Direct verdict input uses the same semantic rule as a verdict file: clean
+# permits defer-only evidence, while fix-needed requires blocking work.
+DIRECT="$TMP/direct-verdict"; mkdir -p "$DIRECT"; printf 'conductor\n' > "$DIRECT/.conductor-id"
+printf '%s\n' 'major|patch|blocking bug' > "$TMP/blocking-findings"
+printf '%s\n' 'minor|defer|adjacent work' > "$TMP/direct-defer"
+"$RS" check --run-dir "$DIRECT" --task-id direct --attempt-id direct-clean-bad --kind full --base-head b --reviewed-head h --spec-id s >/dev/null
+if "$RS" record-review --run-dir "$DIRECT" --task-id direct --attempt-id direct-clean-bad --reviewer rv --base-head b --reviewed-head h --spec-id s --verdict clean --findings "$TMP/blocking-findings" >/dev/null 2>&1; then
+  echo 'direct clean verdict accepted a blocking finding' >&2; exit 1
+fi
+"$RS" cancel --run-dir "$DIRECT" --task-id direct --attempt-id direct-clean-bad >/dev/null
+"$RS" check --run-dir "$DIRECT" --task-id direct --attempt-id direct-fix-bad --kind full --base-head b --reviewed-head h --spec-id s >/dev/null
+if "$RS" record-review --run-dir "$DIRECT" --task-id direct --attempt-id direct-fix-bad --reviewer rv --base-head b --reviewed-head h --spec-id s --verdict fix-needed --findings "$TMP/direct-defer" >/dev/null 2>&1; then
+  echo 'direct fix-needed verdict accepted only deferred findings' >&2; exit 1
+fi
+
 # Verdict evidence must contain exactly one terminal verdict and counts must
 # equal the parsed merged findings. Malformed evidence stays unconsumed.
 RUN6="$TMP/malformed"; mkdir -p "$RUN6"; printf 'conductor\n' > "$RUN6/.conductor-id"
@@ -185,12 +222,14 @@ done
 [ "$(jq -r '.result' <<<"$defer_result")" = allowed ]
 [ "$(jq -r '.state.needs_attention' <<<"$defer_result")" = false ]
 
-# A changed integration base is a changed stable identity even when reviewed
-# HEAD and spec are unchanged; it must not be denied as clean-unchanged.
+# A changed base does not bypass the HEAD/spec clean stopping rule for an
+# ordinary review. Material integration changes use the integration kind.
 RUN8="$TMP/base-identity"; mkdir -p "$RUN8"; printf 'conductor\n' > "$RUN8/.conductor-id"
 "$RS" check --run-dir "$RUN8" --task-id base-task --attempt-id base-r1 --kind full --base-head base-1 --reviewed-head h --spec-id s >/dev/null
 "$RS" record-review --run-dir "$RUN8" --task-id base-task --attempt-id base-r1 --reviewer rv --base-head base-1 --reviewed-head h --spec-id s --verdict clean --findings "$TMP/no-findings" >/dev/null
-changed_base="$("$RS" check --run-dir "$RUN8" --task-id base-task --attempt-id base-r2 --kind incremental --base-head base-2 --reviewed-head h --spec-id s)"
-[ "$(jq -r '.result' <<<"$changed_base")" = allowed ]
+changed_base="$("$RS" check --run-dir "$RUN8" --task-id base-task --attempt-id base-r2 --kind incremental --base-head base-2 --reviewed-head h --spec-id s || true)"
+[ "$(jq -r '.reason' <<<"$changed_base")" = clean-unchanged ]
+changed_boundary="$("$RS" check --run-dir "$RUN8" --task-id base-task --attempt-id base-r3 --kind incremental --base-head base-2 --reviewed-head h2 --spec-id s || true)"
+[ "$(jq -r '.reason' <<<"$changed_boundary")" = integration-kind-required ]
 
 printf '%s\n' 'review identity, transition, evidence, retry, quota, override and fifth-launch refusal fixtures: ok'
