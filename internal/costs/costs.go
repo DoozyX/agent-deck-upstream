@@ -66,26 +66,53 @@ func FormatUSD(microdollars int64) string {
 // and folds the totals into the local cost-line totals so the status bar
 // reflects spend across every host.
 type RemoteCostSummary struct {
-	CostTodayMicrodollars     int64 `json:"cost_today_microdollars"`
-	CostYesterdayMicrodollars int64 `json:"cost_yesterday_microdollars"`
-	CostThisWeekMicrodollars  int64 `json:"cost_this_week_microdollars"`
-	CostLastWeekMicrodollars  int64 `json:"cost_last_week_microdollars"`
-	CostThisMonthMicrodollars int64 `json:"cost_this_month_microdollars"`
-	CostLastMonthMicrodollars int64 `json:"cost_last_month_microdollars"`
-	CostProjectedMicrodollars int64 `json:"cost_projected_microdollars"`
-	EventsToday               int   `json:"events_today"`
-	EventsThisWeek            int   `json:"events_this_week"`
-	EventsThisMonth           int   `json:"events_this_month"`
+	CostTodayMicrodollars     int64    `json:"cost_today_microdollars"`
+	CostYesterdayMicrodollars int64    `json:"cost_yesterday_microdollars"`
+	CostThisWeekMicrodollars  int64    `json:"cost_this_week_microdollars"`
+	CostLastWeekMicrodollars  int64    `json:"cost_last_week_microdollars"`
+	CostThisMonthMicrodollars int64    `json:"cost_this_month_microdollars"`
+	CostLastMonthMicrodollars int64    `json:"cost_last_month_microdollars"`
+	CostProjectedMicrodollars int64    `json:"cost_projected_microdollars"`
+	EventsToday               int      `json:"events_today"`
+	EventsThisWeek            int      `json:"events_this_week"`
+	EventsThisMonth           int      `json:"events_this_month"`
+	CoverageKnown             bool     `json:"coverage_known"`
+	CoverageComplete          bool     `json:"coverage_complete"`
+	ProjectionComplete        bool     `json:"projection_complete"`
+	TodayCoverage             Coverage `json:"today_coverage"`
+	YesterdayCoverage         Coverage `json:"yesterday_coverage"`
+	ThisWeekCoverage          Coverage `json:"this_week_coverage"`
+	LastWeekCoverage          Coverage `json:"last_week_coverage"`
+	ThisMonthCoverage         Coverage `json:"this_month_coverage"`
+	LastMonthCoverage         Coverage `json:"last_month_coverage"`
+	ProjectionCoverage        Coverage `json:"projection_coverage"`
+	DateBasis                 string   `json:"date_basis,omitempty"`
+	Timezone                  string   `json:"timezone,omitempty"`
 }
 
 // MergeRemoteCostSummaries sums per-remote summaries into a single aggregate.
 // Used by the TUI to display a combined "local + all remotes" cost line.
 func MergeRemoteCostSummaries(summaries map[string]*RemoteCostSummary) RemoteCostSummary {
 	var out RemoteCostSummary
+	seen := false
+	coverageKnown := true
+	coverageComplete := true
+	projectionComplete := true
 	for _, s := range summaries {
 		if s == nil {
+			coverageKnown = false
+			coverageComplete = false
+			projectionComplete = false
 			continue
 		}
+		first := !seen
+		seen = true
+		coverageKnown = coverageKnown && s.CoverageKnown
+		coverageComplete = coverageComplete && s.CoverageComplete
+		projectionComplete = projectionComplete && s.ProjectionComplete
+		todayCoverage := legacyRemoteCoverage(s.TodayCoverage, s.EventsToday, s.CoverageKnown)
+		weekCoverage := legacyRemoteCoverage(s.ThisWeekCoverage, s.EventsThisWeek, s.CoverageKnown)
+		monthCoverage := legacyRemoteCoverage(s.ThisMonthCoverage, s.EventsThisMonth, s.CoverageKnown)
 		out.CostTodayMicrodollars += s.CostTodayMicrodollars
 		out.CostYesterdayMicrodollars += s.CostYesterdayMicrodollars
 		out.CostThisWeekMicrodollars += s.CostThisWeekMicrodollars
@@ -96,6 +123,39 @@ func MergeRemoteCostSummaries(summaries map[string]*RemoteCostSummary) RemoteCos
 		out.EventsToday += s.EventsToday
 		out.EventsThisWeek += s.EventsThisWeek
 		out.EventsThisMonth += s.EventsThisMonth
+		if first {
+			out.TodayCoverage = todayCoverage
+			out.YesterdayCoverage = s.YesterdayCoverage
+			out.ThisWeekCoverage = weekCoverage
+			out.LastWeekCoverage = s.LastWeekCoverage
+			out.ThisMonthCoverage = monthCoverage
+			out.LastMonthCoverage = s.LastMonthCoverage
+			out.ProjectionCoverage = s.ProjectionCoverage
+		} else {
+			out.TodayCoverage = MergeCoverage(out.TodayCoverage, todayCoverage)
+			out.YesterdayCoverage = MergeCoverage(out.YesterdayCoverage, s.YesterdayCoverage)
+			out.ThisWeekCoverage = MergeCoverage(out.ThisWeekCoverage, weekCoverage)
+			out.LastWeekCoverage = MergeCoverage(out.LastWeekCoverage, s.LastWeekCoverage)
+			out.ThisMonthCoverage = MergeCoverage(out.ThisMonthCoverage, monthCoverage)
+			out.LastMonthCoverage = MergeCoverage(out.LastMonthCoverage, s.LastMonthCoverage)
+			out.ProjectionCoverage = MergeCoverage(out.ProjectionCoverage, s.ProjectionCoverage)
+		}
+	}
+	out.CoverageKnown = seen && coverageKnown
+	out.CoverageComplete = seen && coverageKnown && coverageComplete
+	out.ProjectionComplete = seen && coverageKnown && projectionComplete
+	if len(summaries) > 0 {
+		out.DateBasis = "UTC calendar dates"
+		out.Timezone = "UTC"
 	}
 	return out
+}
+
+func legacyRemoteCoverage(coverage Coverage, events int, known bool) Coverage {
+	if !known && coverage.EventCount == 0 {
+		coverage.EventCount = events
+		coverage.CoverageKnown = false
+		coverage.Complete = false
+	}
+	return coverage
 }

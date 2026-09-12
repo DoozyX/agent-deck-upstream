@@ -10,15 +10,16 @@ import (
 )
 
 type costDashboard struct {
-	store     *costs.Store
-	width     int
-	height    int
-	today     costs.CostSummary
-	week      costs.CostSummary
-	month     costs.CostSummary
-	top       []costs.SessionCost
-	byModel   map[string]int64
-	projected int64
+	store              *costs.Store
+	width              int
+	height             int
+	today              costs.CoveredSummary
+	week               costs.CoveredSummary
+	month              costs.CoveredSummary
+	top                []costs.SessionCost
+	byModel            map[string]int64
+	projected          int64
+	projectionCoverage costs.Coverage
 }
 
 func newCostDashboard(store *costs.Store, width, height int) costDashboard {
@@ -31,12 +32,12 @@ func (d *costDashboard) refresh() {
 	if d.store == nil {
 		return
 	}
-	d.today, _ = d.store.TotalToday()
-	d.week, _ = d.store.TotalThisWeek()
-	d.month, _ = d.store.TotalThisMonth()
+	d.today, _ = d.store.CoveredTotalToday()
+	d.week, _ = d.store.CoveredTotalThisWeek()
+	d.month, _ = d.store.CoveredTotalThisMonth()
 	d.top, _ = d.store.TopSessionsByCost(5)
 	d.byModel, _ = d.store.CostByModel()
-	d.projected, _ = d.store.ProjectedMonthly()
+	d.projected, d.projectionCoverage, _ = d.store.CoveredProjectedMonthly()
 }
 
 func (d costDashboard) View() string {
@@ -51,11 +52,14 @@ func (d costDashboard) View() string {
 	valueStyle := lipgloss.NewStyle().Foreground(ColorCyan).Bold(true)
 
 	b.WriteString(fmt.Sprintf("  %s %s    %s %s    %s %s    %s %s\n\n",
-		labelStyle.Render("Today:"), valueStyle.Render(costs.FormatUSD(d.today.TotalCostMicrodollars)),
-		labelStyle.Render("Week:"), valueStyle.Render(costs.FormatUSD(d.week.TotalCostMicrodollars)),
-		labelStyle.Render("Month:"), valueStyle.Render(costs.FormatUSD(d.month.TotalCostMicrodollars)),
-		labelStyle.Render("Projected:"), valueStyle.Render(costs.FormatUSD(d.projected)+"/mo"),
+		labelStyle.Render("Today:"), valueStyle.Render(formatCoveredSummary(d.today)),
+		labelStyle.Render("Week:"), valueStyle.Render(formatCoveredSummary(d.week)),
+		labelStyle.Render("Month:"), valueStyle.Render(formatCoveredSummary(d.month)),
+		labelStyle.Render("Projected:"), valueStyle.Render(formatCoveredProjection(d.projected, d.projectionCoverage)),
 	))
+	if detail := costs.CoverageDetail(d.today.Coverage); detail != "" {
+		b.WriteString("  " + detail + " · incomplete\n\n")
+	}
 
 	// Token totals
 	tokenStyle := lipgloss.NewStyle().Foreground(ColorComment)
@@ -103,6 +107,32 @@ func (d costDashboard) View() string {
 	b.WriteString("  " + helpStyle.Render("Press q or $ to return"))
 
 	return b.String()
+}
+
+func formatCoveredSummary(summary costs.CoveredSummary) string {
+	status := costs.CostCoverageStatus(summary)
+	if status == "price unknown" || status == "coverage unknown" {
+		return status
+	}
+	if status == "complete" {
+		return costs.FormatUSD(summary.TotalCostMicrodollars)
+	}
+	return costs.FormatUSD(summary.TotalCostMicrodollars) + " " + status
+}
+
+func formatCoveredProjection(value int64, coverage costs.Coverage) string {
+	summary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: value}, Coverage: coverage}
+	status := costs.CostCoverageStatus(summary)
+	if status == "price unknown" || status == "coverage unknown" {
+		return status + " (incomplete)"
+	}
+	if coverage.Complete {
+		if status == "verified" {
+			return costs.FormatUSD(value) + "/mo verified"
+		}
+		return costs.FormatUSD(value) + "/mo"
+	}
+	return costs.FormatUSD(value) + " known subtotal/mo (incomplete)"
 }
 
 func formatTokens(n int64) string {

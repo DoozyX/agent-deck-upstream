@@ -197,57 +197,102 @@ func handleCostsSummary(profile string, args []string) {
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
 
-	today, _ := costStore.TotalToday()
-	yesterday, _ := costStore.TotalYesterday()
-	week, _ := costStore.TotalThisWeek()
-	lastWeek, _ := costStore.TotalLastWeek()
-	month, _ := costStore.TotalThisMonth()
-	lastMonth, _ := costStore.TotalLastMonth()
-	projected, _ := costStore.ProjectedMonthly()
+	today, _ := costStore.CoveredTotalToday()
+	yesterday, _ := costStore.CoveredTotalYesterday()
+	week, _ := costStore.CoveredTotalThisWeek()
+	lastWeek, _ := costStore.CoveredTotalLastWeek()
+	month, _ := costStore.CoveredTotalThisMonth()
+	lastMonth, _ := costStore.CoveredTotalLastMonth()
+	projected, projectionCoverage, _ := costStore.CoveredProjectedMonthly()
+	days, _ := costStore.CoveredCostByDay()
+	providers, _ := costStore.CoveredCostByProvider()
+	models, _ := costStore.CoveredCostByModel()
+	sessions, _ := costStore.CoveredCostBySession()
+	runs, _ := costStore.CoveredCostByRun()
+	allCoverage := costs.MergeCoverage(today.Coverage, yesterday.Coverage, week.Coverage, lastWeek.Coverage, month.Coverage, lastMonth.Coverage)
 
 	if *jsonOutput {
 		// Wire shape mirrors costs.RemoteCostSummary so SSHRunner can json.Unmarshal directly.
-		payload := map[string]interface{}{
-			"cost_today_microdollars":      today.TotalCostMicrodollars,
-			"cost_yesterday_microdollars":  yesterday.TotalCostMicrodollars,
-			"cost_this_week_microdollars":  week.TotalCostMicrodollars,
-			"cost_last_week_microdollars":  lastWeek.TotalCostMicrodollars,
-			"cost_this_month_microdollars": month.TotalCostMicrodollars,
-			"cost_last_month_microdollars": lastMonth.TotalCostMicrodollars,
-			"cost_projected_microdollars":  projected,
-			"events_today":                 today.EventCount,
-			"events_this_week":             week.EventCount,
-			"events_this_month":            month.EventCount,
+		remote := costs.RemoteCostSummary{
+			CostTodayMicrodollars: today.TotalCostMicrodollars, CostYesterdayMicrodollars: yesterday.TotalCostMicrodollars,
+			CostThisWeekMicrodollars: week.TotalCostMicrodollars, CostLastWeekMicrodollars: lastWeek.TotalCostMicrodollars,
+			CostThisMonthMicrodollars: month.TotalCostMicrodollars, CostLastMonthMicrodollars: lastMonth.TotalCostMicrodollars,
+			CostProjectedMicrodollars: projected, EventsToday: today.EventCount, EventsThisWeek: week.EventCount, EventsThisMonth: month.EventCount,
+			CoverageKnown: allCoverage.CoverageKnown, CoverageComplete: allCoverage.Complete,
+			ProjectionComplete: projectionCoverage.CoverageKnown && projectionCoverage.Complete,
+			TodayCoverage:      today.Coverage, YesterdayCoverage: yesterday.Coverage, ThisWeekCoverage: week.Coverage,
+			LastWeekCoverage: lastWeek.Coverage, ThisMonthCoverage: month.Coverage, LastMonthCoverage: lastMonth.Coverage,
+			ProjectionCoverage: projectionCoverage, DateBasis: "UTC calendar dates", Timezone: "UTC",
 		}
+		payload := struct {
+			costs.RemoteCostSummary
+			Days      []costs.CostBreakdown `json:"days"`
+			Providers []costs.CostBreakdown `json:"providers"`
+			Models    []costs.CostBreakdown `json:"models"`
+			Sessions  []costs.CostBreakdown `json:"sessions"`
+			Runs      []costs.CostBreakdown `json:"runs"`
+		}{remote, days, providers, models, sessions, runs}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(payload)
 		return
 	}
 
-	fmt.Printf("Cost Summary:\n")
-	fmt.Printf("  Today:      %s (%d events)\n", costs.FormatUSD(today.TotalCostMicrodollars), today.EventCount)
-	fmt.Printf("  This week:  %s (%d events)\n", costs.FormatUSD(week.TotalCostMicrodollars), week.EventCount)
-	fmt.Printf("  This month: %s (%d events)\n", costs.FormatUSD(month.TotalCostMicrodollars), month.EventCount)
-	fmt.Printf("  Projected:  %s/mo\n", costs.FormatUSD(projected))
-
-	top, _ := costStore.TopSessionsByCost(5)
-	if len(top) > 0 {
-		fmt.Printf("\nTop Sessions:\n")
-		for i, sc := range top {
-			title := sc.SessionTitle
-			if title == "" {
-				title = sc.SessionID
-			}
-			fmt.Printf("  %d. %-30s %s (%d events)\n", i+1, title, costs.FormatUSD(sc.CostMicrodollars), sc.EventCount)
-		}
+	fmt.Printf("Cost Summary (UTC calendar dates):\n")
+	printCoveredSummary("Today", today)
+	printCoveredSummary("This week", week)
+	printCoveredSummary("This month", month)
+	projectionSummary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: projected}, Coverage: projectionCoverage}
+	projectionStatus := costs.CostCoverageStatus(projectionSummary)
+	if projectionStatus == "price unknown" || projectionStatus == "coverage unknown" {
+		fmt.Printf("  Projected:  %s (incomplete)\n", projectionStatus)
+	} else if projectionCoverage.Complete {
+		fmt.Printf("  Projected:  %s/mo (%s)\n", costs.FormatUSD(projected), projectionStatus)
+	} else {
+		fmt.Printf("  Projected:  %s known subtotal/mo (incomplete)\n", costs.FormatUSD(projected))
 	}
 
-	byModel, _ := costStore.CostByModel()
-	if len(byModel) > 0 {
-		fmt.Printf("\nCost by Model:\n")
-		for model, cost := range byModel {
-			fmt.Printf("  %-30s %s\n", model, costs.FormatUSD(cost))
+	printCostBreakdowns("By day", days)
+	printCostBreakdowns("By provider", providers)
+	printCostBreakdowns("By model", models)
+	printCostBreakdowns("By session", sessions)
+	printCostBreakdowns("By run", runs)
+}
+
+func printCoveredSummary(label string, summary costs.CoveredSummary) {
+	status := costs.CostCoverageStatus(summary)
+	value := costs.FormatUSD(summary.TotalCostMicrodollars)
+	if status == "price unknown" || status == "coverage unknown" {
+		value = status
+	} else if status != "complete" {
+		value += " (" + status + ")"
+	}
+	fmt.Printf("  %-10s %s (%d events)\n", label+":", value, summary.EventCount)
+	if detail := costs.CoverageDetail(summary.Coverage); detail != "" {
+		fmt.Printf("               %s\n", detail)
+	}
+}
+
+func printCostBreakdowns(title string, items []costs.CostBreakdown) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Printf("\n%s:\n", title)
+	for _, item := range items {
+		summary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: item.KnownCostMicrodollars, EventCount: item.Coverage.EventCount}, Coverage: item.Coverage}
+		status := costs.CostCoverageStatus(summary)
+		amount := costs.FormatUSD(item.KnownCostMicrodollars)
+		if status == "price unknown" || status == "coverage unknown" {
+			amount = status
+		} else if status != "complete" {
+			amount += " " + status
 		}
+		fmt.Printf("  %-24s %s | input %d cache-read %d cache-write %d (5m %d, 1h %d) output %d (reasoning subset %d)",
+			item.Key, amount, item.UncachedInputTokens, item.CacheReadInputTokens, item.CacheWriteInputTokens,
+			item.CacheWrite5mInputTokens, item.CacheWrite1hInputTokens, item.OutputTokens, item.ReasoningOutputTokens)
+		if detail := costs.CoverageDetail(item.Coverage); detail != "" {
+			fmt.Printf(" | %s", detail)
+		}
+		fmt.Println()
 	}
 }
 
