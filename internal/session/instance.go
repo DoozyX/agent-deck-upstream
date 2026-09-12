@@ -1903,22 +1903,13 @@ func ValidateClaudeExtraArgToken(token string) error {
 // (or "--model=..." form) token. When present we must NOT also inject
 // [claude].default_model, or the launch command would carry two --model flags.
 func extraArgsSupplyModel(extraArgs []string) bool {
-	for _, tok := range extraArgs {
-		if tok == "--model" || strings.HasPrefix(tok, "--model=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("claude", extraArgs)
+	return selected.ModelSet
 }
 
 func extraArgsSupplyClaudeEffort(extraArgs []string) bool {
-	for _, tok := range extraArgs {
-		tok = strings.TrimSpace(tok)
-		if tok == "--effort" || strings.HasPrefix(tok, "--effort=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("claude", extraArgs)
+	return selected.EffortSet
 }
 
 // buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
@@ -2348,13 +2339,8 @@ func (i *Instance) resolveCodexModelFlag() string {
 }
 
 func hasCodexExtraArgModel(args []string) bool {
-	for _, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("codex", args)
+	return selected.ModelSet
 }
 
 func (i *Instance) resolveCodexReasoningEffortFlag() string {
@@ -2382,16 +2368,8 @@ func (i *Instance) resolveCodexReasoningEffortFlag() string {
 }
 
 func hasCodexExtraArgReasoningEffort(args []string) bool {
-	for idx, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if (arg == "--config" || arg == "-c") && idx+1 < len(args) && strings.HasPrefix(strings.TrimSpace(args[idx+1]), "model_reasoning_effort=") {
-			return true
-		}
-		if strings.HasPrefix(arg, "--config=model_reasoning_effort=") || strings.HasPrefix(arg, "-c=model_reasoning_effort=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("codex", args)
+	return selected.EffortSet
 }
 
 func (i *Instance) resolveCodexExtraArgsFlag() string {

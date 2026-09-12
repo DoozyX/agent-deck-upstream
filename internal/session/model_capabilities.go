@@ -2,8 +2,24 @@ package session
 
 import "slices"
 
-// KnownModelIDsForTool is the shared connector model catalog used by both
-// launch UI suggestions and orchestrated launch validation.
+// codexOrchestrateEffortsByModel mirrors the bundled model capabilities in
+// codex-cli 0.153.4. Keep validation model-specific: the connector does not
+// support one common effort range across all models.
+var codexOrchestrateEffortsByModel = map[string][]string{
+	"gpt-6-astra":       {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-sol":       {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-terra":     {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-luna":      {"low", "medium", "high", "xhigh", "max"},
+	"gpt-5.5":           {"low", "medium", "high", "xhigh"},
+	"gpt-5.4":           {"low", "medium", "high", "xhigh"},
+	"gpt-5.4-mini":      {"low", "medium", "high", "xhigh"},
+	"gpt-5.2":           {"low", "medium", "high", "xhigh"},
+	"codex-auto-review": {"low", "medium", "high", "xhigh", "max"},
+}
+
+// KnownModelIDsForTool is the visible connector model catalog used by launch
+// UI suggestions. Orchestrated Codex validation also accepts installed hidden
+// models through codexOrchestrateEffortsByModel.
 func KnownModelIDsForTool(tool string) []string {
 	var models []string
 	switch {
@@ -56,33 +72,30 @@ func KnownModelIDsForTool(tool string) []string {
 			"gpt-5.6-luna",
 			"gpt-6-astra",
 			"gpt-5.5",
-			"gpt-5.5-pro",
-			"gpt-5.4",
-			"gpt-5.4-pro",
-			"gpt-5.4-mini",
-			"gpt-5.4-nano",
-			"gpt-5.3-codex",
 			"gpt-5.2",
-			"gpt-5.2-pro",
-			"gpt-5.1",
-			"gpt-5-pro",
-			"gpt-5",
-			"gpt-5-mini",
-			"gpt-5-nano",
-			"gpt-4.1",
-			"gpt-4.1-mini",
-			"gpt-4o",
-			"gpt-4o-mini",
-			"o3-pro",
-			"o3",
 		}
 	}
 	return append([]string(nil), models...)
 }
 
 func isKnownOrchestrateModel(provider, model string) bool {
-	if provider == "claude" && (model == "opus" || model == "sonnet" || model == "haiku") {
-		return true
+	if provider == "codex" {
+		_, ok := codexOrchestrateEffortsByModel[model]
+		return ok
 	}
-	return slices.Contains(KnownModelIDsForTool(provider), model)
+	if provider == "claude" {
+		if model == "opus" || model == "sonnet" || model == "haiku" || model == "fable" {
+			return true
+		}
+		return slices.Contains(KnownModelIDsForTool(provider), model)
+	}
+	return false
+}
+
+func supportsOrchestrateModelEffort(provider, model, effort string) bool {
+	if provider == "codex" {
+		efforts, ok := codexOrchestrateEffortsByModel[model]
+		return ok && slices.Contains(efforts, effort)
+	}
+	return isKnownOrchestrateModel(provider, model) && ValidateLaunchReasoningEffort(provider, effort) == nil
 }
