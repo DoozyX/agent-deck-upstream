@@ -7,15 +7,27 @@ import (
 
 // CostEvent represents a single token usage and cost record.
 type CostEvent struct {
-	ID               string
-	SessionID        string
-	Timestamp        time.Time
-	Model            string
-	InputTokens      int64
-	OutputTokens     int64
-	CacheReadTokens  int64
-	CacheWriteTokens int64
-	CostMicrodollars int64 // 1 USD = 1,000,000 microdollars
+	ID                   string
+	SessionID            string
+	ParentSessionID      string
+	RunID                string
+	Timestamp            time.Time
+	Provider             string
+	SourceKind           string
+	SourceIdentity       string
+	TranscriptIdentity   string
+	Model                string
+	InputTokens          int64
+	OutputTokens         int64
+	CacheReadTokens      int64
+	CacheWriteTokens     int64
+	CacheWrite5mTokens   int64
+	CacheWrite1hTokens   int64
+	ReasoningTokens      int64
+	ProviderInputTokens  *int64
+	CostMicrodollars     int64 // 1 USD = 1,000,000 microdollars
+	PricingStatus        PricingStatus
+	ReconciliationStatus ReconciliationStatus
 }
 
 // CostSummary aggregates cost data.

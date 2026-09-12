@@ -147,6 +147,10 @@ func TestCollector(t *testing.T) {
 	assert.Equal(t, "claude-sonnet-4-6", ev.Model)
 	assert.NotEmpty(t, ev.ID)
 	assert.Greater(t, ev.CostMicrodollars, int64(0))
+	assert.Equal(t, "claude", ev.Provider)
+	assert.Equal(t, "hook", ev.SourceKind)
+	assert.Equal(t, PricingKnown, ev.PricingStatus)
+	assert.Equal(t, ReconciliationLegacyUnreconciled, ev.ReconciliationStatus)
 }
 
 func TestCollectorMiniMax(t *testing.T) {

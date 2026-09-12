@@ -49,8 +49,8 @@ func TestStore_WriteThenRead(t *testing.T) {
 	if summary.TotalCostMicrodollars != 41193 {
 		t.Errorf("cost = %d, want 41193", summary.TotalCostMicrodollars)
 	}
-	if summary.TotalInputTokens != 4231 {
-		t.Errorf("input = %d, want 4231", summary.TotalInputTokens)
+	if summary.TotalInputTokens != 7731 {
+		t.Errorf("input = %d, want 7731 (uncached + cache read + cache write)", summary.TotalInputTokens)
 	}
 	if summary.EventCount != 1 {
 		t.Errorf("count = %d, want 1", summary.EventCount)
