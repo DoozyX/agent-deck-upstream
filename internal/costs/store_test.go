@@ -131,6 +131,30 @@ func TestStore_TopSessionsByCost(t *testing.T) {
 	}
 }
 
+func TestStore_CoveredTopSessionsByCostRanksKnownSubtotal(t *testing.T) {
+	s := testStore(t)
+	now := time.Now()
+
+	events := []costs.CostEvent{
+		{ID: "known", SessionID: "known-session", Timestamp: now, Model: "m", CostMicrodollars: 100, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "unknown", SessionID: "unknown-session", Timestamp: now, Model: "m", CostMicrodollars: 1_000_000, PricingStatus: costs.PricingLegacyUnresolved, ReconciliationStatus: costs.ReconciliationLegacyUnreconciled},
+		{ID: "superseded", SessionID: "superseded-session", Timestamp: now, Model: "m", CostMicrodollars: 2_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationLegacySuperseded},
+	}
+	for _, event := range events {
+		if err := s.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	top, err := s.CoveredTopSessionsByCost(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(top) != 1 || top[0].SessionID != "known-session" || top[0].CostMicrodollars != 100 {
+		t.Fatalf("top = %#v, want known-session with known subtotal 100", top)
+	}
+}
+
 func TestStore_Retention(t *testing.T) {
 	s := testStore(t)
 	old := time.Now().AddDate(0, 0, -100)

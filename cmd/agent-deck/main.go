@@ -852,20 +852,9 @@ func main() {
 		if cacheErr != nil {
 			cacheDir = ""
 		}
-		pricerCfg := costs.PricerConfig{}
+		pricerCfg := pricerConfigFromUserConfig(userCfg)
 		if cacheDir != "" {
 			pricerCfg.CachePath = cacheDir
-		}
-		if userCfg != nil && len(userCfg.Costs.Pricing.Overrides) > 0 {
-			pricerCfg.Overrides = make(map[string]costs.PriceOverride)
-			for model, ov := range userCfg.Costs.Pricing.Overrides {
-				pricerCfg.Overrides[model] = costs.PriceOverride{
-					InputPerMtok:      ov.InputPerMtok,
-					OutputPerMtok:     ov.OutputPerMtok,
-					CacheReadPerMtok:  ov.CacheReadPerMtok,
-					CacheWritePerMtok: ov.CacheWritePerMtok,
-				}
-			}
 		}
 		pricer := costs.NewPricer(pricerCfg)
 		if cacheDir != "" {

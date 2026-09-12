@@ -735,6 +735,38 @@ func (s *Store) TopSessionsByCost(limit int) ([]SessionCost, error) {
 	return result, rows.Err()
 }
 
+// CoveredTopSessionsByCost returns the top N sessions ranked by their
+// known-price subtotal. Unknown and unreconciled events remain in the event
+// count so callers can report their coverage; superseded events are excluded.
+func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
+	rows, err := s.db.Query(`
+		SELECT ce.session_id, COALESCE(i.title, ce.session_id), COALESCE(i.group_path, ''),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
+			COUNT(*)
+		FROM cost_events ce
+		LEFT JOIN instances i ON ce.session_id = i.id
+		WHERE ce.reconciliation_status <> ?
+		GROUP BY ce.session_id
+		ORDER BY COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0) DESC,
+			ce.session_id
+		LIMIT ?`, PricingKnown, PricingKnownZero, ReconciliationLegacySuperseded,
+		PricingKnown, PricingKnownZero, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []SessionCost
+	for rows.Next() {
+		var sc SessionCost
+		if err := rows.Scan(&sc.SessionID, &sc.SessionTitle, &sc.Group, &sc.CostMicrodollars, &sc.EventCount); err != nil {
+			return nil, err
+		}
+		result = append(result, sc)
+	}
+	return result, rows.Err()
+}
+
 // CostByModel returns total cost per model.
 func (s *Store) CostByModel() (map[string]int64, error) {
 	rows, err := s.db.Query(`

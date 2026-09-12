@@ -827,14 +827,14 @@ Hide tools you don't use from the new-session picker with `[ui].hidden_tools` (a
 
 Track token usage and costs across all your AI agent sessions in real-time.
 
-- **Automatic collection** — Claude Code hook integration reads transcript files on each turn. Gemini/Codex/MiniMax support via output parsing (untested)
-- **15 models priced** — Claude Opus 4.6/4.7, Sonnet 4.6, Haiku 4.5, Gemini Pro/Flash, GPT-4o/4.1, o3, o4-mini, MiniMax M3/M2.7/M2.7-highspeed/M2.5/M2.5-highspeed with daily price refresh
+- **Canonical collection** — Claude transcripts and Codex rollout records use stable provider identities, checkpoints, and one normalized ledger. Hook ingestion shares those identities. Terminal text parsing is retained only as an explicit `terminal_limited`/unreconciled fallback; it is excluded when a complete authoritative transcript range supersedes it.
+- **Truthful pricing** — verified built-in rates and configured overrides produce known-price subtotals. Unknown models keep their token usage visible as `price unknown`; a known zero rate remains a verified zero.
 - **TUI dashboard** — press `$` to view today/week/month costs, top sessions, model breakdown
 - **Web dashboard** — `/costs` page with Chart.js charts, group drill-down, session detail views, SSE live updates
 - **Budget limits** — configurable daily/weekly/monthly/per-group/per-session limits with 80% warning and 100% hard stop (untested)
-- **Historical sync** — `agent-deck costs sync` backfills cost data from existing Claude transcript files
-- **Recompute costs** — `agent-deck costs recompute` recalculates `cost_microdollars` for every cost event using current pricing data. Useful after a pricing-data update to retroactively price events that landed at $0 because the model was missing from the pricer. Pass `--dry-run` to preview.
-- **Export** — CSV/JSON export from web dashboard
+- **Historical sync** — `agent-deck costs sync` incrementally imports discoverable Claude and Codex transcripts; unchanged replay imports zero events.
+- **Recompute costs** — `agent-deck costs recompute` requotes every event using the same catalog without changing token identity. Unknown prices remain unknown and visible. Pass `--dry-run` to preview.
+- **Export** — CSV/JSON rows include source identity, attribution, UTC date basis, exclusive token categories, cache-write duration subsets, reasoning subset, pricing status, and reconciliation status—never conversation text.
 
 ```toml
 # Optional config ($XDG_CONFIG_HOME/agent-deck/config.toml;
@@ -852,17 +852,20 @@ weekly_limit = 200.00
 
 #### Customizing the status-line cost segment
 
-The home status bar shows a brief cost line drawn from the seven windows below. The default renders `$X.XX today`; configure `cost_line_template` to surface different windows or a per-profile layout. Variables substitute as `$X.XX`; unknown placeholders pass through literally so typos surface in the output.
+The home status bar shows a brief cost line drawn from the seven UTC windows below. The default renders the known-price subtotal plus its coverage state; configure `cost_line_template` to surface different windows or a per-profile layout. Cost variables remain numeric dollar values. Coverage placeholders expose incomplete pricing/reconciliation without treating unknown usage as zero.
 
 | Variable | Window |
 |---|---|
-| `{cost_today}` | Today (00:00 local) |
+| `{cost_today}` | Today (00:00 UTC) |
 | `{cost_yesterday}` | Prior day |
 | `{cost_this_week}` | Monday-start of this week |
 | `{cost_last_week}` | Prior Monday to Sunday |
 | `{cost_this_month}` | First of this month |
 | `{cost_last_month}` | Prior calendar month |
 | `{cost_projected}` | Rolling 7-day average times 30 |
+| `{coverage_status}` | `complete`, `verified`, `known subtotal`, `price unknown`, or `coverage unknown` |
+| `{unpriced_events}` / `{unpriced_tokens}` | Unknown-price event and token volume |
+| `{unreconciled_events}` / `{unreconciled_tokens}` | Legacy-unreconciled event and token volume |
 
 ```toml
 [costs]

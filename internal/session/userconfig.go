@@ -5454,10 +5454,12 @@ type PricingSettings struct {
 }
 
 type PricingOverride struct {
-	InputPerMtok      float64 `toml:"input_per_mtok,omitzero"`
-	OutputPerMtok     float64 `toml:"output_per_mtok,omitzero"`
-	CacheReadPerMtok  float64 `toml:"cache_read_per_mtok,omitzero"`
-	CacheWritePerMtok float64 `toml:"cache_write_per_mtok,omitzero"`
+	InputPerMtok        float64 `toml:"input_per_mtok,omitzero"`
+	OutputPerMtok       float64 `toml:"output_per_mtok,omitzero"`
+	CacheReadPerMtok    float64 `toml:"cache_read_per_mtok,omitzero"`
+	CacheWritePerMtok   float64 `toml:"cache_write_per_mtok,omitzero"`
+	CacheWrite5mPerMtok float64 `toml:"cache_write_5m_per_mtok,omitzero"`
+	CacheWrite1hPerMtok float64 `toml:"cache_write_1h_per_mtok,omitzero"`
 }
 
 func (c CostsSettings) GetRetentionDays() int {

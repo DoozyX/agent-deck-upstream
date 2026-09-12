@@ -17,7 +17,8 @@ type costDashboard struct {
 	week               costs.CoveredSummary
 	month              costs.CoveredSummary
 	top                []costs.SessionCost
-	byModel            map[string]int64
+	topCoverage        map[string]costs.Coverage
+	byModel            []costs.CostBreakdown
 	projected          int64
 	projectionCoverage costs.Coverage
 }
@@ -35,8 +36,18 @@ func (d *costDashboard) refresh() {
 	d.today, _ = d.store.CoveredTotalToday()
 	d.week, _ = d.store.CoveredTotalThisWeek()
 	d.month, _ = d.store.CoveredTotalThisMonth()
-	d.top, _ = d.store.TopSessionsByCost(5)
-	d.byModel, _ = d.store.CostByModel()
+	d.top, _ = d.store.CoveredTopSessionsByCost(5)
+	d.topCoverage = make(map[string]costs.Coverage, len(d.top))
+	for i := range d.top {
+		covered, err := d.store.CoveredTotalBySession(d.top[i].SessionID)
+		if err != nil {
+			continue
+		}
+		d.top[i].CostMicrodollars = covered.TotalCostMicrodollars
+		d.top[i].EventCount = covered.EventCount
+		d.topCoverage[d.top[i].SessionID] = covered.Coverage
+	}
+	d.byModel, _ = d.store.CoveredCostByModel()
 	d.projected, d.projectionCoverage, _ = d.store.CoveredProjectedMonthly()
 }
 
@@ -85,9 +96,10 @@ func (d costDashboard) View() string {
 		if len(title) > 35 {
 			title = title[:32] + "..."
 		}
+		summary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: sc.CostMicrodollars, EventCount: sc.EventCount}, Coverage: d.topCoverage[sc.SessionID]}
 		b.WriteString(fmt.Sprintf("  %d. %-35s %s  (%d events)\n",
 			i+1, title,
-			valueStyle.Render(costs.FormatUSD(sc.CostMicrodollars)),
+			valueStyle.Render(formatCoveredSummary(summary)),
 			sc.EventCount))
 	}
 	b.WriteString("\n")
@@ -97,8 +109,9 @@ func (d costDashboard) View() string {
 	if len(d.byModel) == 0 {
 		b.WriteString("  " + lipgloss.NewStyle().Foreground(ColorComment).Render("(no cost data yet)") + "\n")
 	}
-	for model, cost := range d.byModel {
-		b.WriteString(fmt.Sprintf("  %-35s %s\n", model, valueStyle.Render(costs.FormatUSD(cost))))
+	for _, model := range d.byModel {
+		summary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: model.KnownCostMicrodollars, EventCount: model.Coverage.EventCount}, Coverage: model.Coverage}
+		b.WriteString(fmt.Sprintf("  %-35s %s\n", model.Key, valueStyle.Render(formatCoveredSummary(summary))))
 	}
 	b.WriteString("\n")
 

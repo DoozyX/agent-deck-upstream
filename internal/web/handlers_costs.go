@@ -152,7 +152,7 @@ func (s *Server) handleCostsSessions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions, err := s.costStore.TopSessionsByCost(100)
+	sessions, err := s.costStore.CoveredTopSessionsByCost(100)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session costs")
 		return
@@ -529,7 +529,7 @@ func (s *Server) handleCostsGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions, err := s.costStore.TopSessionsByCost(1000)
+	sessions, err := s.costStore.CoveredTopSessionsByCost(1000)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query costs")
 		return
