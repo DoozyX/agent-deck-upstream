@@ -40,7 +40,7 @@ esac
 
 mkdir -p "$(dirname "$OUT")"
 TPL="$TPL" OUT="$OUT" DIR="$DIR" python3 - "$@" <<'PY'
-import os, re, sys
+import os, re, sys, tempfile
 
 tpl_path, out_path, inc_dir = os.environ["TPL"], os.environ["OUT"], os.environ["DIR"]
 
@@ -80,8 +80,17 @@ if leftover:
     # improvises around it, and the run finds out one review round later.
     sys.exit("render.sh: unfilled placeholders: " + ", ".join(leftover))
 
-with open(out_path, "w", encoding="utf-8") as fh:
-    fh.write(text if text.endswith("\n") else text + "\n")
+os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(out_path) + ".", suffix=".tmp", dir=os.path.dirname(os.path.abspath(out_path)))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, out_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
 print(f"rendered {out_path} ({len(text)} chars)")
 
 # A child prompt this large is almost always a spec or findings list pasted in
@@ -96,52 +105,3 @@ if len(text) > 8000:
         "instead of KEY@=path inlining, unless the child truly needs the body.\n"
     )
 PY
-
-# Review and fix prompts are the supported launch seam. Reserve their stable
-# attempt identity only after a valid prompt was rendered, and remove the
-# output again if the atomic budget guard refuses the launch.
-case "$(basename "$TPL" .md)" in
-  review-full|review-round|fix)
-    run_dir="" task_id="" attempt_id="" base_head="" reviewed_head="" spec_id=""
-    originating_attempt="" material_reason="" review_kind=""
-    for arg in "$@"; do
-      key="${arg%%=*}"; value="${arg#*=}"
-      case "$key" in
-        RUN_DIR) run_dir="$value" ;;
-        TASK_ID) task_id="$value" ;;
-        ATTEMPT_ID) attempt_id="$value" ;;
-        BASE_HEAD) base_head="$value" ;;
-        REVIEWED_HEAD) reviewed_head="$value" ;;
-        SPEC_ID) spec_id="$value" ;;
-        ORIGINATING_ATTEMPT) originating_attempt="$value" ;;
-        MATERIAL_REASON) material_reason="$value" ;;
-        REVIEW_KIND) review_kind="$value" ;;
-      esac
-    done
-    missing=""
-    for pair in "RUN_DIR:$run_dir" "TASK_ID:$task_id" "ATTEMPT_ID:$attempt_id" \
-                "BASE_HEAD:$base_head" "REVIEWED_HEAD:$reviewed_head" "SPEC_ID:$spec_id"; do
-      [ -n "${pair#*:}" ] || missing="$missing ${pair%%:*}"
-    done
-    if [ -n "$missing" ]; then
-      rm -f "$OUT"
-      echo "render.sh: review guard missing:$missing" >&2
-      exit 2
-    fi
-    helper="$DIR/../review-state.sh"
-    [ -x "$helper" ] || { rm -f "$OUT"; echo "render.sh: missing executable review guard: $helper" >&2; exit 2; }
-    name="$(basename "$TPL" .md)"
-    case "$name" in
-      review-full) kind="${review_kind:-full}" ;;
-      review-round) kind="${review_kind:-incremental}" ;;
-      fix) kind="fix" ;;
-    esac
-    guard=(check --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id"
-      --kind "$kind" --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id")
-    [ -n "$originating_attempt" ] && guard+=(--originating-attempt "$originating_attempt")
-    [ -n "$material_reason" ] && guard+=(--material-reason "$material_reason")
-    guard_out="$("$helper" "${guard[@]}")" || {
-      rc=$?; rm -f "$OUT"; printf '%s\n' "$guard_out" >&2; exit "$rc"; }
-    printf '%s\n' "$guard_out"
-    ;;
-esac
