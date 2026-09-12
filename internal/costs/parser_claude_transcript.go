@@ -79,7 +79,7 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 		return ParseResult{}, fmt.Errorf("stat claude transcript: %w", err)
 	}
 
-	result := ParseResult{Checkpoint: checkpoint}
+	result := ParseResult{Checkpoint: checkpoint, Complete: true}
 	result.Checkpoint.Provider = ProviderClaude
 	result.Checkpoint.SourceKind = source.Kind
 	result.Checkpoint.SourceIdentity = source.Identity
@@ -124,6 +124,7 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 			result.Warnings = append(result.Warnings, warning)
 		}
 		if malformed {
+			result.Complete = false
 			break
 		}
 		consumed += lineLength
@@ -141,6 +142,7 @@ func (p *ClaudeTranscriptParser) Parse(ctx context.Context, source TranscriptSou
 		}
 	}
 	if len(bytes.TrimSpace(data)) > 0 {
+		result.Complete = false
 		result.Warnings = append(result.Warnings, fmt.Sprintf("partial claude transcript record at byte %d", start+consumed))
 	}
 	for _, identity := range order {

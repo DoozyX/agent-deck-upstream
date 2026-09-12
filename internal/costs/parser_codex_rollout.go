@@ -95,7 +95,7 @@ func (p *CodexRolloutParser) Parse(ctx context.Context, source TranscriptSource,
 		return ParseResult{}, fmt.Errorf("stat codex rollout: %w", err)
 	}
 
-	result := ParseResult{Checkpoint: checkpoint}
+	result := ParseResult{Checkpoint: checkpoint, Complete: true}
 	result.Checkpoint.Provider = ProviderCodex
 	result.Checkpoint.SourceKind = SourceKindCodexRollout
 	result.Checkpoint.SourceIdentity = source.Identity
@@ -142,6 +142,9 @@ func (p *CodexRolloutParser) Parse(ctx context.Context, source TranscriptSource,
 		if warning := p.parseRecord(line, recordOffset, source, &state, &result); warning != "" {
 			result.Warnings = append(result.Warnings, warning)
 		}
+	}
+	if len(bytes.TrimSpace(data)) > 0 {
+		result.Complete = false
 	}
 	fingerprint, err := json.Marshal(state)
 	if err != nil {

@@ -44,7 +44,7 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	completeSources := make(map[string]bool, len(checkpoints))
 	for _, checkpoint := range checkpoints {
 		if checkpoint.Complete {
-			completeSources[checkpointKey(checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity)] = true
+			completeSources[checkpointKey(checkpoint.Provider, checkpoint.SourceIdentity)] = true
 		}
 	}
 
@@ -59,7 +59,7 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 			result.Inserted++
 		}
 
-		canReconcile := completeSources[checkpointKey(event.Provider, event.SourceKind, event.TranscriptIdentity)]
+		canReconcile := completeSources[checkpointKey(event.Provider, event.TranscriptIdentity)]
 		if !canReconcile || len(event.SupersedesEventIDs) == 0 {
 			continue
 		}
@@ -113,8 +113,8 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	return result, nil
 }
 
-func checkpointKey(provider, sourceKind, sourceIdentity string) string {
-	return provider + "\x00" + sourceKind + "\x00" + sourceIdentity
+func checkpointKey(provider, sourceIdentity string) string {
+	return provider + "\x00" + sourceIdentity
 }
 
 func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, error) {
