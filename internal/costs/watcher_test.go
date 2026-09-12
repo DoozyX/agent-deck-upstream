@@ -48,6 +48,16 @@ func TestCostEventWatcher(t *testing.T) {
 		if ev.InputTokens != 1000 {
 			t.Errorf("input = %d, want 1000", ev.InputTokens)
 		}
+		time.Sleep(100 * time.Millisecond)
+		if _, err := os.Stat(finalPath); err != nil {
+			t.Fatalf("durable queue file removed before persistence acknowledgment: %v", err)
+		}
+		if err := ev.Ack(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+			t.Fatalf("acknowledged queue file still exists: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for cost event")
 	}

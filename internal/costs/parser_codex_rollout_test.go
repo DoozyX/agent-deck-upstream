@@ -191,3 +191,23 @@ func TestCodexRolloutSingleCounterRegressionDoesNotRebillUnaffectedCounters(t *t
 		t.Fatalf("ambiguous regression must leave a visible coverage gap: complete=%v warnings=%v", result.Complete, result.Warnings)
 	}
 }
+
+func TestCodexRolloutInputOutputOnlyResetStartsNewSegment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	body := `{"timestamp":"2026-09-01T12:00:00Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}` + "\n" +
+		`{"timestamp":"2026-09-01T12:00:01Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"output_tokens":20}}}}` + "\n" +
+		`{"timestamp":"2026-09-01T12:00:02Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":2}}}}` + "\n"
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	result, err := (&costs.CodexRolloutParser{}).Parse(context.Background(), codexSource(path, "codex:sparse-reset"), costs.ScanCheckpoint{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Events) != 2 || result.Events[1].Usage.InputTokens != 10 || result.Events[1].Usage.OutputTokens != 2 {
+		t.Fatalf("events=%+v warnings=%v complete=%v; want reset event input=10 output=2", result.Events, result.Warnings, result.Complete)
+	}
+	if !result.Complete || len(result.Warnings) != 0 {
+		t.Fatalf("coordinated sparse reset must remain complete: complete=%v warnings=%v", result.Complete, result.Warnings)
+	}
+}

@@ -39,8 +39,8 @@ func TestRecompute_EmptyStore(t *testing.T) {
 
 func TestRecompute_BackfillsZeroCostRows(t *testing.T) {
 	s := testStore(t)
-	// 1M input + 1M output on Opus 4.7 should cost $5 + $25 = $30 = 30,000,000 microdollars.
-	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
+	// 1M input + 1M output on Opus 5 costs $5 + $25 = $30.
+	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 0)
 
 	updated, skipped, err := costs.Recompute(context.Background(), s, costs.NewPricer(costs.PricerConfig{}), false)
 	if err != nil {
@@ -61,8 +61,8 @@ func TestRecompute_BackfillsZeroCostRows(t *testing.T) {
 
 func TestRecompute_SkipsAlreadyCorrectRows(t *testing.T) {
 	s := testStore(t)
-	// 1M input + 1M output on Sonnet 4.6 = $3 + $15 = $18 = 18,000,000.
-	seedEvent(t, s, "evt-1", "sess-1", "claude-sonnet-4-6", 1_000_000, 1_000_000, 0, 0, 18_000_000)
+	// 1M input + 1M output on Sonnet 5 = $2 + $10 = $12.
+	seedEvent(t, s, "evt-1", "sess-1", "claude-sonnet-5", 1_000_000, 1_000_000, 0, 0, 12_000_000)
 	if _, err := s.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'evt-1'`, costs.PricingKnown); err != nil {
 		t.Fatal(err)
 	}
@@ -99,9 +99,33 @@ func TestRecompute_LeavesUnknownModelRowsUntouched(t *testing.T) {
 	}
 }
 
+func TestRecomputeDemotesStaleKnownUnknownModelWithoutErasingCost(t *testing.T) {
+	s := testStore(t)
+	if err := s.WriteCostEvent(costs.CostEvent{
+		ID: "stale-known", SessionID: "session", Timestamp: time.Now(),
+		Provider: "test", SourceKind: "test", SourceIdentity: "stale-known",
+		Model: "not-in-catalog", InputTokens: 1, CostMicrodollars: 42,
+		PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, skipped, err := costs.Recompute(context.Background(), s, costs.NewPricer(costs.PricerConfig{}), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cost int64
+	var status string
+	if err := s.DB().QueryRow(`SELECT cost_microdollars, pricing_status FROM cost_events WHERE id = 'stale-known'`).Scan(&cost, &status); err != nil {
+		t.Fatal(err)
+	}
+	if updated != 1 || skipped != 0 || cost != 42 || status != string(costs.PricingUnknown) {
+		t.Fatalf("updated=%d skipped=%d cost=%d status=%q", updated, skipped, cost, status)
+	}
+}
+
 func TestRecompute_DryRunDoesNotMutate(t *testing.T) {
 	s := testStore(t)
-	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
+	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 0)
 
 	updated, skipped, err := costs.Recompute(context.Background(), s, costs.NewPricer(costs.PricerConfig{}), true)
 	if err != nil {
@@ -122,7 +146,7 @@ func TestRecompute_DryRunDoesNotMutate(t *testing.T) {
 
 func TestRecompute_Idempotent(t *testing.T) {
 	s := testStore(t)
-	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
+	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 0)
 	pricer := costs.NewPricer(costs.PricerConfig{})
 
 	// First run: backfills 1 row.
@@ -141,15 +165,15 @@ func TestRecompute_Idempotent(t *testing.T) {
 
 func TestRecompute_MixedRows(t *testing.T) {
 	s := testStore(t)
-	// Zero-cost Opus 4.7 row: needs backfill to $30M.
-	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
-	// Already-correct Sonnet 4.6 row.
-	seedEvent(t, s, "evt-2", "sess-1", "claude-sonnet-4-6", 1_000_000, 1_000_000, 0, 0, 18_000_000)
+	// Zero-cost Opus 5 row: needs backfill to $30M.
+	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 0)
+	// Already-correct Sonnet 5 row.
+	seedEvent(t, s, "evt-2", "sess-1", "claude-sonnet-5", 1_000_000, 1_000_000, 0, 0, 12_000_000)
 	if _, err := s.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'evt-2'`, costs.PricingKnown); err != nil {
 		t.Fatal(err)
 	}
-	// Stale Opus 4.6 row at the old (3x too high) rate of $90M -- should be corrected to $30M.
-	seedEvent(t, s, "evt-3", "sess-1", "claude-opus-4-6", 1_000_000, 1_000_000, 0, 0, 90_000_000)
+	// Stale Opus 5 row at $90M should be corrected to $30M.
+	seedEvent(t, s, "evt-3", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 90_000_000)
 	// Unknown model with non-zero cost: leave alone.
 	seedEvent(t, s, "evt-4", "sess-1", "totally-made-up-model", 1_000, 0, 0, 0, 1_234)
 
@@ -165,8 +189,8 @@ func TestRecompute_MixedRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TotalBySession: %v", err)
 	}
-	// $30M (opus-4-7 backfilled) + $18M (sonnet-4-6 unchanged) + $30M (opus-4-6 corrected) + $1234 (unknown, untouched)
-	want := int64(30_000_000 + 18_000_000 + 30_000_000 + 1_234)
+	// $30M (Opus backfilled) + $12M (Sonnet unchanged) + $30M (Opus corrected) + $1234 (unknown, untouched).
+	want := int64(30_000_000 + 12_000_000 + 30_000_000 + 1_234)
 	if got.TotalCostMicrodollars != want {
 		t.Errorf("total cost = %d, want %d", got.TotalCostMicrodollars, want)
 	}
@@ -189,7 +213,7 @@ func TestRecompute_NilPricer(t *testing.T) {
 
 func TestRecompute_CancelledContext(t *testing.T) {
 	s := testStore(t)
-	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-4-7", 1_000_000, 1_000_000, 0, 0, 0)
+	seedEvent(t, s, "evt-1", "sess-1", "claude-opus-5", 1_000_000, 1_000_000, 0, 0, 0)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, _, err := costs.Recompute(ctx, s, costs.NewPricer(costs.PricerConfig{}), false)

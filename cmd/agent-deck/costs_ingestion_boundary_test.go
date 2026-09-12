@@ -63,6 +63,113 @@ func TestStopHookCostEventCarriesCanonicalClaudeIdentity(t *testing.T) {
 	}
 }
 
+func TestStopHookAcceptsExplicitClaudeProviderHome(t *testing.T) {
+	home := t.TempDir()
+	customHome := filepath.Join(home, "claude-account")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", customHome)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	transcriptPath := filepath.Join(customHome, "projects", "project", "custom-home.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(`{"type":"assistant","requestId":"custom-home","timestamp":"2026-09-01T16:00:02Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1}}}`)
+	if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"hook_event_name": "Stop", "transcript_path": transcriptPath})
+	writeCostEvent("instance-custom-home", payload)
+	entries, err := os.ReadDir(getCostEventsDir())
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("cost event files=%d err=%v, want 1 for explicit Claude home", len(entries), err)
+	}
+}
+
+func TestStopHookAcceptsRetainedInstanceClaudeAccountHome(t *testing.T) {
+	home := t.TempDir()
+	accountHome := filepath.Join(home, "claude-account")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("AGENTDECK_PROFILE", "work")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	writeCostsConfig(t, home, fmt.Sprintf("[profiles.account-a.claude]\nconfig_dir = %q\n", accountHome))
+	session.ClearUserConfigCache()
+	storage, err := session.NewStorageWithProfile("work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	instance := &session.Instance{
+		ID: "instance-account-home", Title: "account-home", ProjectPath: home,
+		Command: "claude", Tool: "claude", Status: session.StatusIdle,
+		Account: "account-a", CreatedAt: time.Now(),
+	}
+	if err := storage.Save([]*session.Instance{instance}); err != nil {
+		storage.Close()
+		t.Fatal(err)
+	}
+	if err := storage.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	transcriptPath := filepath.Join(accountHome, "projects", "project", "account-home.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(`{"type":"assistant","requestId":"account-home","timestamp":"2026-09-01T16:00:02Z","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1}}}`)
+	if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"hook_event_name": "Stop", "transcript_path": transcriptPath})
+	writeCostEvent(instance.ID, payload)
+	entries, err := os.ReadDir(getCostEventsDir())
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("cost event files=%d err=%v, want 1 for retained instance account home", len(entries), err)
+	}
+}
+
+func TestStopHookRetainsCacheOnlyUsage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	transcriptPath := filepath.Join(home, ".claude", "projects", "project", "cache-only.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(`{"type":"assistant","requestId":"cache-only","timestamp":"2026-09-01T16:00:02Z","message":{"model":"claude-sonnet-5","usage":{"cache_read_input_tokens":7,"cache_creation_input_tokens":5,"cache_creation":{"ephemeral_5m_input_tokens":5}}}}`)
+	if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"hook_event_name": "Stop", "transcript_path": transcriptPath})
+	writeCostEvent("instance-cache-only", payload)
+	entries, err := os.ReadDir(getCostEventsDir())
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("cost event files=%d err=%v, want 1 for cache-only usage", len(entries), err)
+	}
+}
+
+func TestStopHookDoesNotFabricateMissingTimestamp(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	transcriptPath := filepath.Join(home, ".claude", "projects", "project", "missing-time.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(`{"type":"assistant","requestId":"missing-time","message":{"model":"claude-sonnet-5","usage":{"input_tokens":1}}}`)
+	if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"hook_event_name": "Stop", "transcript_path": transcriptPath})
+	writeCostEvent("instance-missing-time", payload)
+	entries, err := os.ReadDir(getCostEventsDir())
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("missing timestamp produced %d billable event file(s), want 0", len(entries))
+	}
+}
+
 func TestCostsSyncRejectsMalformedConfigWithoutLeakingContents(t *testing.T) {
 	home := t.TempDir()
 	writeCostsConfig(t, home, "[profiles.work.codex\nconfig_dir = \"super-secret-transcript-home\"\n")
@@ -72,6 +179,18 @@ func TestCostsSyncRejectsMalformedConfigWithoutLeakingContents(t *testing.T) {
 	}
 	if !strings.Contains(out, "Error: failed to load user config") || strings.Contains(out, "super-secret-transcript-home") {
 		t.Fatalf("config diagnostic was absent or unsanitized:\n%s", out)
+	}
+}
+
+func TestCostsRecomputeRejectsMalformedPricingConfig(t *testing.T) {
+	home := t.TempDir()
+	writeCostsConfig(t, home, "[costs.pricing.overrides.bad\ninput_per_mtok = 99\n")
+	out, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "costs", "recompute", "--dry-run")
+	if err == nil {
+		t.Fatalf("recompute accepted malformed pricing config:\n%s", out)
+	}
+	if !strings.Contains(out, "Error: failed to load user config") || strings.Contains(out, "input_per_mtok") {
+		t.Fatalf("recompute diagnostic was absent or unsanitized:\n%s", out)
 	}
 }
 
@@ -150,6 +269,14 @@ func TestCostsSyncPrintsAndPersistsBlockedResetReceipt(t *testing.T) {
 	}
 	if !strings.Contains(out, "provider usage is blocked (primary); resets at 2026-09-02T00:00:00Z") {
 		t.Fatalf("blocked reset missing from CLI:\n%s", out)
+	}
+	unchangedOut, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "costs", "sync")
+	if err != nil {
+		t.Fatalf("unchanged blocked receipt sync failed: %v\n%s", err, unchangedOut)
+	}
+	if !strings.Contains(unchangedOut, "Sources changed:  0") ||
+		!strings.Contains(unchangedOut, "provider usage is blocked (primary); resets at 2026-09-02T00:00:00Z") {
+		t.Fatalf("unchanged sync lost durable blocked receipt:\n%s", unchangedOut)
 	}
 	db := openCostsCLIState(t, home, "work")
 	var status, blockedUntil string
@@ -360,5 +487,78 @@ func TestHookWriterDeduplicatesBeforeAndAfterAuthoritativeSync(t *testing.T) {
 				t.Fatalf("visible overlapping rows=%d, want 1", visibleRows)
 			}
 		})
+	}
+}
+
+func TestCostEventDeliveryRetriesUntilPersistenceThenAcknowledges(t *testing.T) {
+	dir := t.TempDir()
+	watcher, err := costs.NewCostEventWatcher(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(watcher.Stop)
+	go watcher.Start()
+
+	db, err := statedb.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	store := costs.NewStore(db.DB())
+	if _, err := store.DB().Exec(`CREATE TRIGGER fail_hook_queue BEFORE INSERT ON cost_events BEGIN SELECT RAISE(FAIL, 'forced hook persistence failure'); END`); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := costs.RawCostEvent{
+		InstanceID: "instance-retry", Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeHook,
+		SourceIdentity: "claude:msg:retry", TranscriptIdentity: "claude:retry",
+		Model: "claude-sonnet-5", InputTokens: 1, Timestamp: time.Now().UnixNano(),
+	}
+	data, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queuePath := filepath.Join(dir, "retry.json")
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	delivery := waitForCostDelivery(t, watcher)
+	if err := persistCostEventDelivery(delivery, store, costs.NewPricer(costs.PricerConfig{})); err == nil {
+		t.Fatal("forced persistence failure returned nil")
+	}
+	if _, err := os.Stat(queuePath); err != nil {
+		t.Fatalf("failed delivery lost durable queue file: %v", err)
+	}
+	if _, err := store.DB().Exec(`DROP TRIGGER fail_hook_queue`); err != nil {
+		t.Fatal(err)
+	}
+	delivery = waitForCostDelivery(t, watcher)
+	if err := persistCostEventDelivery(delivery, store, costs.NewPricer(costs.PricerConfig{})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(queuePath); !os.IsNotExist(err) {
+		t.Fatalf("successfully persisted delivery was not acknowledged: %v", err)
+	}
+	var rows int
+	if err := store.DB().QueryRow(`SELECT COUNT(*) FROM cost_events WHERE source_identity = 'claude:msg:retry'`).Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 1 {
+		t.Fatalf("persisted rows=%d, want 1", rows)
+	}
+}
+
+func waitForCostDelivery(t *testing.T, watcher *costs.CostEventWatcher) *costs.CostEventDelivery {
+	t.Helper()
+	select {
+	case delivery := <-watcher.EventCh():
+		return delivery
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for durable cost delivery")
+		return nil
 	}
 }

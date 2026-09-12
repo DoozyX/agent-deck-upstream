@@ -163,3 +163,41 @@ func TestWriteCostEventUsesCanonicalCompatibilityAdapter(t *testing.T) {
 			provider, sourceKind, sourceIdentity, parent, run, pricing, reconciliation, reasoning, write5m, write1h, storedProviderInput)
 	}
 }
+
+func TestIngestCorrectionPriceMatchesFinalMergedDurationUsage(t *testing.T) {
+	store := testStore(t)
+	pricer := costs.NewPricer(costs.PricerConfig{})
+	firstUsage := costs.TokenUsage{
+		OutputTokens: 1_000_000, CacheWriteTokens: 3_000_000,
+		CacheWrite5mTokens: 1_000_000, CacheWrite1hTokens: 1_000_000,
+	}
+	firstQuote := pricer.Quote("claude-opus-5", firstUsage)
+	first := costs.UsageEvent{
+		ID: "claude:msg:merged-price", Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeHook,
+		SourceIdentity: "claude:msg:merged-price", TranscriptIdentity: "claude:merged-price", SessionID: "session",
+		Timestamp: time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC), Model: "claude-opus-5", Usage: firstUsage,
+		CostMicrodollars: firstQuote.CostMicrodollars, PricingStatus: firstQuote.Status,
+		ReconciliationStatus: costs.ReconciliationAuthoritative,
+	}
+	if _, err := store.Ingest(context.Background(), []costs.UsageEvent{first}, nil); err != nil {
+		t.Fatal(err)
+	}
+	secondUsage := costs.TokenUsage{OutputTokens: 2_000_000, CacheWriteTokens: 3_000_000}
+	secondQuote := pricer.Quote("claude-opus-5", secondUsage)
+	second := first
+	second.Usage, second.CostMicrodollars, second.PricingStatus = secondUsage, secondQuote.CostMicrodollars, secondQuote.Status
+	if _, err := store.Ingest(context.Background(), []costs.UsageEvent{second}, nil); err != nil {
+		t.Fatal(err)
+	}
+	var cost, write5m, write1h int64
+	if err := store.DB().QueryRow(`SELECT cost_microdollars, cache_write_5m_tokens, cache_write_1h_tokens FROM cost_events WHERE id = ?`, first.ID).Scan(&cost, &write5m, &write1h); err != nil {
+		t.Fatal(err)
+	}
+	mergedQuote := pricer.Quote("claude-opus-5", costs.TokenUsage{
+		OutputTokens: 2_000_000, CacheWriteTokens: 3_000_000,
+		CacheWrite5mTokens: write5m, CacheWrite1hTokens: write1h,
+	})
+	if cost != mergedQuote.CostMicrodollars {
+		t.Fatalf("stored cost=%d merged-usage cost=%d write5m=%d write1h=%d", cost, mergedQuote.CostMicrodollars, write5m, write1h)
+	}
+}

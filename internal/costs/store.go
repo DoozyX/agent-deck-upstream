@@ -25,6 +25,16 @@ type IngestResult struct {
 // Ingest atomically persists canonical events, reconciliation, and complete
 // checkpoints.
 func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint) (result IngestResult, err error) {
+	return s.ingest(ctx, events, checkpoints, nil)
+}
+
+// IngestPriced atomically ingests events and requotes any merged correction
+// against the final stored usage.
+func (s *Store) IngestPriced(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint, pricer *Pricer) (result IngestResult, err error) {
+	return s.ingest(ctx, events, checkpoints, pricer)
+}
+
+func (s *Store) ingest(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint, pricer *Pricer) (result IngestResult, err error) {
 	for i := range events {
 		if err := events[i].Usage.Validate(); err != nil {
 			return result, fmt.Errorf("validate usage event %q: %w", events[i].ID, err)
@@ -51,7 +61,7 @@ func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []S
 	}
 
 	for _, event := range events {
-		inserted, updated, err := insertUsageEventTx(tx, event)
+		inserted, updated, err := insertUsageEventTx(tx, event, pricer)
 		if err != nil {
 			return IngestResult{}, fmt.Errorf("insert usage event %q: %w", event.ID, err)
 		}
@@ -253,13 +263,13 @@ func checkpointKey(provider, sourceIdentity string) string {
 	return provider + "\x00" + sourceIdentity
 }
 
-func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, bool, error) {
+func insertUsageEventTx(tx *sql.Tx, event UsageEvent, pricer *Pricer) (bool, bool, error) {
 	existingID, existingSource, found, err := findUsageEventByAliases(tx, event)
 	if err != nil {
 		return false, false, err
 	}
 	if found {
-		updated, err := updateUsageEventCorrection(tx, existingID, event)
+		updated, err := updateUsageEventCorrection(tx, existingID, event, pricer)
 		if err != nil {
 			return false, false, err
 		}
@@ -329,7 +339,7 @@ func findUsageEventByAliases(tx *sql.Tx, event UsageEvent) (id, sourceIdentity s
 	return "", "", false, nil
 }
 
-func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEvent) (bool, error) {
+func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEvent, pricer *Pricer) (bool, error) {
 	var current TokenUsage
 	var providerInput sql.NullInt64
 	var reconciliation string
@@ -356,6 +366,7 @@ func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEve
 	if !changed {
 		return false, nil
 	}
+	cost, status := correctionPrice(incoming, merged, pricer)
 	providerInputValue := any(nil)
 	if merged.ProviderInputTokens != nil {
 		providerInputValue = *merged.ProviderInputTokens
@@ -373,9 +384,27 @@ func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEve
 		incoming.TranscriptIdentity, incoming.Model,
 		merged.InputTokens, merged.OutputTokens, merged.CacheReadTokens,
 		merged.CacheWriteTokens, merged.CacheWrite5mTokens, merged.CacheWrite1hTokens,
-		merged.ReasoningTokens, providerInputValue, incoming.CostMicrodollars,
-		incoming.PricingStatus, existingID)
+		merged.ReasoningTokens, providerInputValue, cost, status, existingID)
 	return err == nil, err
+}
+
+func correctionPrice(incoming UsageEvent, merged TokenUsage, pricer *Pricer) (int64, PricingStatus) {
+	if pricer != nil {
+		quote := pricer.Quote(incoming.Model, merged)
+		if quote.Valid {
+			return quote.CostMicrodollars, quote.Status
+		}
+		return incoming.CostMicrodollars, PricingUnknown
+	}
+	if incoming.PricingStatus == PricingKnown || incoming.PricingStatus == PricingKnownZero {
+		builtIn := NewPricer(PricerConfig{})
+		incomingQuote := builtIn.Quote(incoming.Model, incoming.Usage)
+		if incomingQuote.Valid && incomingQuote.Status == incoming.PricingStatus && incomingQuote.CostMicrodollars == incoming.CostMicrodollars {
+			mergedQuote := builtIn.Quote(incoming.Model, merged)
+			return mergedQuote.CostMicrodollars, mergedQuote.Status
+		}
+	}
+	return incoming.CostMicrodollars, incoming.PricingStatus
 }
 
 func mergeMonotoneUsage(current, incoming TokenUsage) (TokenUsage, bool) {

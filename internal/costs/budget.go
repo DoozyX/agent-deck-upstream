@@ -59,9 +59,7 @@ func (b *BudgetChecker) CheckTx(tx *sql.Tx, sessionID, groupName string, groupSe
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget query failed"}, err
 		}
 		r := evaluate(total, limit, "session lifetime limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		coverage, err := budgetCoverageTx(tx, `session_id = ?`, sessionID)
 		if err != nil {
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget coverage query failed"}, err
@@ -76,9 +74,7 @@ func (b *BudgetChecker) CheckTx(tx *sql.Tx, sessionID, groupName string, groupSe
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget query failed"}, err
 		}
 		r := evaluate(total, b.cfg.DailyLimit, "daily global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		coverage, err := budgetCoverageTx(tx, `timestamp >= ?`, startOfDay(tz).UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget coverage query failed"}, err
@@ -93,9 +89,7 @@ func (b *BudgetChecker) CheckTx(tx *sql.Tx, sessionID, groupName string, groupSe
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget query failed"}, err
 		}
 		r := evaluate(total, b.cfg.WeeklyLimit, "weekly global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		coverage, err := budgetCoverageTx(tx, `timestamp >= ?`, startOfWeek(tz).UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget coverage query failed"}, err
@@ -110,9 +104,7 @@ func (b *BudgetChecker) CheckTx(tx *sql.Tx, sessionID, groupName string, groupSe
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget query failed"}, err
 		}
 		r := evaluate(total, b.cfg.MonthlyLimit, "monthly global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		coverage, err := budgetCoverageTx(tx, `timestamp >= ?`, startOfMonth(tz).UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget coverage query failed"}, err
@@ -127,9 +119,7 @@ func (b *BudgetChecker) CheckTx(tx *sql.Tx, sessionID, groupName string, groupSe
 			return BudgetResult{Action: BudgetActionStop, Reason: "budget query failed"}, err
 		}
 		r := evaluate(total, limit, "group daily limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		placeholders := "?" + repeatArg(len(groupSessionIDs)-1)
 		where := "session_id IN (" + placeholders + ") AND timestamp >= ?"
 		args := make([]any, 0, len(groupSessionIDs)+1)
@@ -154,27 +144,21 @@ func (b *BudgetChecker) Check(sessionID, groupName string) BudgetResult {
 	if b.cfg.DailyLimit > 0 {
 		summary, _ := b.store.CoveredTotalToday()
 		r := evaluate(summary.TotalCostMicrodollars, b.cfg.DailyLimit, "daily global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		worst = applyBudgetCoverage(worst, summary.Coverage, summary.TotalCostMicrodollars, b.cfg.DailyLimit)
 	}
 
 	if b.cfg.WeeklyLimit > 0 {
 		summary, _ := b.store.CoveredTotalThisWeek()
 		r := evaluate(summary.TotalCostMicrodollars, b.cfg.WeeklyLimit, "weekly global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		worst = applyBudgetCoverage(worst, summary.Coverage, summary.TotalCostMicrodollars, b.cfg.WeeklyLimit)
 	}
 
 	if b.cfg.MonthlyLimit > 0 {
 		summary, _ := b.store.CoveredTotalThisMonth()
 		r := evaluate(summary.TotalCostMicrodollars, b.cfg.MonthlyLimit, "monthly global limit exceeded")
-		if r.Action > worst.Action {
-			worst = r
-		}
+		worst = mergeBudgetAction(worst, r)
 		worst = applyBudgetCoverage(worst, summary.Coverage, summary.TotalCostMicrodollars, b.cfg.MonthlyLimit)
 	}
 
@@ -193,6 +177,16 @@ func evaluate(used, limit int64, reason string) BudgetResult {
 		return BudgetResult{Action: BudgetActionWarn, Reason: reason, UsedMicro: used, LimitMicro: limit, Percentage: pct * 100}
 	}
 	return BudgetResult{Action: BudgetActionNone, UsedMicro: used, LimitMicro: limit, Percentage: pct * 100}
+}
+
+func mergeBudgetAction(current, candidate BudgetResult) BudgetResult {
+	if candidate.Action <= current.Action {
+		return current
+	}
+	candidate.CoverageIncomplete = current.CoverageIncomplete
+	candidate.UnknownPriceTokens = current.UnknownPriceTokens
+	candidate.UnreconciledTokens = current.UnreconciledTokens
+	return candidate
 }
 
 func applyBudgetCoverage(result BudgetResult, coverage Coverage, used, limit int64) BudgetResult {

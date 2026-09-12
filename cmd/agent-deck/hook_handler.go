@@ -269,7 +269,7 @@ func handleHookHandlerArgs(args []string) {
 	}
 
 	if isStopHookEvent(payload.HookEventName) {
-		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data))
+		writeHookStatusWithScan(instanceID, status, sessionID, payload.HookEventName, payload.Cwd, detectDoneSentinel(data, instanceID))
 	} else {
 		writeHookStatus(instanceID, status, sessionID, payload.HookEventName, payload.Cwd)
 	}
@@ -946,7 +946,7 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 	// containment guard (same check the done-sentinel reader uses) so a crafted
 	// payload can't coax this reader into opening an arbitrary file. Claude
 	// stores transcripts under ~/.claude/projects/{hash}/{session}.jsonl.
-	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	cleanPath, ok := validateHookTranscriptPath(instanceID, stop.TranscriptPath)
 	if !ok {
 		logCostDebug("rejected transcript_path outside ~/.claude or traversal: %s", stop.TranscriptPath)
 		return
@@ -971,8 +971,21 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 	}
 
 	usage := msg.Message.Usage
-	if usage.InputTokens == 0 && usage.OutputTokens == 0 {
+	canonicalUsage := costs.TokenUsage{
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens,
+		CacheReadTokens: usage.CacheReadInputTokens, CacheWriteTokens: usage.CacheCreationInputTokens,
+		CacheWrite5mTokens: usage.CacheCreation.FiveMinute, CacheWrite1hTokens: usage.CacheCreation.OneHour,
+		ReasoningTokens: usage.OutputDetails.Thinking,
+	}
+	if canonicalUsage.TotalTokens() == 0 {
 		logCostDebug("no token usage in transcript")
+		return
+	}
+	if err := canonicalUsage.Validate(); err != nil {
+		hookHandlerLog.Warn("cost_event_usage_invalid",
+			slog.String("instance", instanceID),
+			slog.String("error", err.Error()),
+		)
 		return
 	}
 
@@ -997,7 +1010,11 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 	)
 	eventTime, err := time.Parse(time.RFC3339Nano, msg.Timestamp)
 	if err != nil {
-		eventTime = time.Now()
+		hookHandlerLog.Warn("cost_event_timestamp_invalid",
+			slog.String("instance", instanceID),
+			slog.String("error", "provider timestamp is missing or invalid"),
+		)
+		return
 	}
 	ts := eventTime.UnixNano()
 	cf := costEventFile{
@@ -1008,13 +1025,13 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 		SourceAliases:      sourceAliases,
 		TranscriptIdentity: transcriptIdentity,
 		Model:              msg.Message.Model,
-		InputTokens:        usage.InputTokens,
-		OutputTokens:       usage.OutputTokens,
-		CacheReadTokens:    usage.CacheReadInputTokens,
-		CacheWriteTokens:   usage.CacheCreationInputTokens,
-		CacheWrite5mTokens: usage.CacheCreation.FiveMinute,
-		CacheWrite1hTokens: usage.CacheCreation.OneHour,
-		ReasoningTokens:    usage.OutputDetails.Thinking,
+		InputTokens:        canonicalUsage.InputTokens,
+		OutputTokens:       canonicalUsage.OutputTokens,
+		CacheReadTokens:    canonicalUsage.CacheReadTokens,
+		CacheWriteTokens:   canonicalUsage.CacheWriteTokens,
+		CacheWrite5mTokens: canonicalUsage.CacheWrite5mTokens,
+		CacheWrite1hTokens: canonicalUsage.CacheWrite1hTokens,
+		ReasoningTokens:    canonicalUsage.ReasoningTokens,
 		Timestamp:          ts,
 	}
 
@@ -1071,12 +1088,15 @@ type doneScanResult struct {
 // cost path so a crafted payload can't read arbitrary files. The scan itself
 // lives in internal/session, shared with the transition daemon's flush-race
 // rescan.
-func detectDoneSentinel(rawPayload []byte) doneScanResult {
+func detectDoneSentinel(rawPayload []byte, instanceIDs ...string) doneScanResult {
 	var stop stopHookPayload
 	if err := json.Unmarshal(rawPayload, &stop); err != nil {
 		return doneScanResult{}
 	}
 	cleanPath, ok := session.ValidateTranscriptPath(stop.TranscriptPath)
+	if len(instanceIDs) > 0 {
+		cleanPath, ok = validateHookTranscriptPath(instanceIDs[0], stop.TranscriptPath)
+	}
 	if !ok {
 		return doneScanResult{}
 	}
@@ -1089,6 +1109,27 @@ func detectDoneSentinel(rawPayload []byte) doneScanResult {
 	default:
 		return doneScanResult{}
 	}
+}
+
+func validateHookTranscriptPath(instanceID, path string) (string, bool) {
+	if cleanPath, ok := session.ValidateTranscriptPath(path); ok {
+		return cleanPath, true
+	}
+	storage, err := session.NewReadOnlyStorageWithProfile("")
+	if err != nil {
+		return "", false
+	}
+	defer storage.Close()
+	instances, err := storage.Load()
+	if err != nil {
+		return "", false
+	}
+	for _, inst := range instances {
+		if inst != nil && inst.ID == instanceID {
+			return session.ValidateTranscriptPathForInstance(path, inst)
+		}
+	}
+	return "", false
 }
 
 // readLastLine reads the last non-empty line from a file.

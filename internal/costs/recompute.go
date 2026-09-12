@@ -53,7 +53,12 @@ func Recompute(ctx context.Context, store *Store, pricer *Pricer, dryRun bool) (
 				return updated, skipped, fmt.Errorf("quote event %s: %s", ev.ID, quote.Error)
 			}
 			if quote.Status == PricingUnknown {
-				skipped++
+				if ev.PricingStatus == PricingKnown || ev.PricingStatus == PricingKnownZero {
+					batchUpdates[ev.ID] = PricingUpdate{CostMicrodollars: ev.CostMicrodollars, Status: PricingUnknown}
+					updated++
+				} else {
+					skipped++
+				}
 				continue
 			}
 			if quote.CostMicrodollars == ev.CostMicrodollars && quote.Status == ev.PricingStatus {

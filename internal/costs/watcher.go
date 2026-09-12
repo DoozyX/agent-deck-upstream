@@ -34,11 +34,46 @@ type RawCostEvent struct {
 
 // CostEventWatcher watches a directory for new cost event JSON files.
 type CostEventWatcher struct {
-	dir     string
-	watcher *fsnotify.Watcher
-	eventCh chan RawCostEvent
-	ctx     context.Context
-	cancel  context.CancelFunc
+	dir      string
+	watcher  *fsnotify.Watcher
+	eventCh  chan *CostEventDelivery
+	retryCh  chan string
+	ctx      context.Context
+	cancel   context.CancelFunc
+	mu       sync.Mutex
+	inFlight map[string]bool
+}
+
+// CostEventDelivery remains backed by its durable queue file until Ack.
+type CostEventDelivery struct {
+	RawCostEvent
+	watcher *CostEventWatcher
+	path    string
+	once    sync.Once
+}
+
+// Ack removes a queue file only after its event has been persisted.
+func (d *CostEventDelivery) Ack() error {
+	var err error
+	d.once.Do(func() {
+		err = os.Remove(d.path)
+		if os.IsNotExist(err) {
+			err = nil
+		}
+		d.watcher.release(d.path)
+		if err != nil {
+			d.watcher.retry(d.path)
+		}
+	})
+	return err
+}
+
+// Retry releases a failed delivery and schedules the durable file again.
+func (d *CostEventDelivery) Retry() {
+	d.once.Do(func() {
+		d.watcher.release(d.path)
+		d.watcher.retry(d.path)
+	})
 }
 
 // NewCostEventWatcher creates a watcher for the given directory.
@@ -59,16 +94,18 @@ func NewCostEventWatcher(dir string) (*CostEventWatcher, error) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	return &CostEventWatcher{
-		dir:     dir,
-		watcher: w,
-		eventCh: make(chan RawCostEvent, 64),
-		ctx:     ctx,
-		cancel:  cancel,
+		dir:      dir,
+		watcher:  w,
+		eventCh:  make(chan *CostEventDelivery, 64),
+		retryCh:  make(chan string, 64),
+		ctx:      ctx,
+		cancel:   cancel,
+		inFlight: make(map[string]bool),
 	}, nil
 }
 
 // EventCh returns the channel that emits parsed cost events.
-func (w *CostEventWatcher) EventCh() <-chan RawCostEvent {
+func (w *CostEventWatcher) EventCh() <-chan *CostEventDelivery {
 	return w.eventCh
 }
 
@@ -78,6 +115,13 @@ func (w *CostEventWatcher) Start() {
 	var mu sync.Mutex
 	pending := make(map[string]struct{})
 	var timer *time.Timer
+	var timerCh <-chan time.Time
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	w.scanExisting()
 
 	processPending := func() {
 		mu.Lock()
@@ -97,6 +141,11 @@ func (w *CostEventWatcher) Start() {
 		select {
 		case <-w.ctx.Done():
 			return
+		case path := <-w.retryCh:
+			w.processFile(path)
+		case <-timerCh:
+			processPending()
+			timerCh = nil
 		case event, ok := <-w.watcher.Events:
 			if !ok {
 				return
@@ -111,10 +160,18 @@ func (w *CostEventWatcher) Start() {
 			pending[event.Name] = struct{}{}
 			mu.Unlock()
 
-			if timer != nil {
-				timer.Stop()
+			if timer == nil {
+				timer = time.NewTimer(100 * time.Millisecond)
+			} else {
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				timer.Reset(100 * time.Millisecond)
 			}
-			timer = time.AfterFunc(100*time.Millisecond, processPending)
+			timerCh = timer.C
 		case <-w.watcher.Errors:
 			// continue
 		}
@@ -128,21 +185,65 @@ func (w *CostEventWatcher) Stop() {
 }
 
 func (w *CostEventWatcher) processFile(path string) {
+	if !w.claim(path) {
+		return
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
+		w.release(path)
 		return
 	}
 	var ev RawCostEvent
 	if err := json.Unmarshal(data, &ev); err != nil {
-		os.Remove(path) // malformed, remove
+		_ = os.Remove(path) // malformed queue payloads cannot be retried
+		w.release(path)
 		return
 	}
 
 	select {
-	case w.eventCh <- ev:
-		os.Remove(path) // only delete after successful send
+	case w.eventCh <- &CostEventDelivery{RawCostEvent: ev, watcher: w, path: path}:
 	default:
-		// channel full, leave file for retry on next fsnotify event
+		w.release(path)
+		w.retry(path)
+	}
+}
+
+func (w *CostEventWatcher) claim(path string) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.inFlight[path] {
+		return false
+	}
+	w.inFlight[path] = true
+	return true
+}
+
+func (w *CostEventWatcher) release(path string) {
+	w.mu.Lock()
+	delete(w.inFlight, path)
+	w.mu.Unlock()
+}
+
+func (w *CostEventWatcher) retry(path string) {
+	time.AfterFunc(time.Second, func() {
+		select {
+		case <-w.ctx.Done():
+			return
+		case w.retryCh <- path:
+		}
+	})
+}
+
+func (w *CostEventWatcher) scanExisting() {
+	entries, err := os.ReadDir(w.dir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" || strings.HasSuffix(entry.Name(), ".tmp") {
+			continue
+		}
+		w.processFile(filepath.Join(w.dir, entry.Name()))
 	}
 }
 
@@ -166,7 +267,7 @@ func (s *Store) WriteRawCostEvent(raw RawCostEvent, pricer *Pricer) error {
 		if pricer != nil {
 			applyEventPrice(&event, pricer)
 		}
-		_, err := s.Ingest(context.Background(), []UsageEvent{event}, nil)
+		_, err := s.IngestPriced(context.Background(), []UsageEvent{event}, nil, pricer)
 		return err
 	}
 	event := CostEvent{
