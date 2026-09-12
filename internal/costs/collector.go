@@ -46,8 +46,21 @@ func (c *Collector) Collect(toolType, sessionID, input string) ([]CostEvent, err
 		for i := range events {
 			events[i].SessionID = sessionID
 			events[i].Timestamp = now
+			events[i].Provider = p.Name()
+			events[i].SourceKind = "terminal"
+			if p.Name() == "claude" {
+				events[i].SourceKind = "hook"
+			}
+			events[i].ReconciliationStatus = ReconciliationLegacyUnreconciled
 			if events[i].ID == "" {
 				events[i].ID = uuid.New().String()
+			}
+			if price, ok := c.pricer.GetPrice(events[i].Model); !ok {
+				events[i].PricingStatus = PricingUnknown
+			} else if price.InputPerMtokMicro == 0 && price.OutputPerMtokMicro == 0 && price.CacheReadPerMtokMicro == 0 && price.CacheWritePerMtokMicro == 0 {
+				events[i].PricingStatus = PricingKnownZero
+			} else {
+				events[i].PricingStatus = PricingKnown
 			}
 			if events[i].CostMicrodollars == 0 {
 				events[i].CostMicrodollars = c.pricer.ComputeCost(

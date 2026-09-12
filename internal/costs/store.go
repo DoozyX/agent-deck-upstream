@@ -13,6 +13,138 @@ type Store struct {
 	now func() time.Time
 }
 
+type IngestResult struct {
+	Inserted            int
+	Duplicates          int
+	Superseded          int
+	CheckpointsAdvanced int
+}
+
+// Ingest atomically persists canonical events, reconciliation, and complete
+// checkpoints.
+func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint) (result IngestResult, err error) {
+	for i := range events {
+		if err := events[i].Usage.Validate(); err != nil {
+			return result, fmt.Errorf("validate usage event %q: %w", events[i].ID, err)
+		}
+		if events[i].ID == "" {
+			return result, fmt.Errorf("usage event id is required")
+		}
+		if events[i].SourceIdentity != "" && (events[i].Provider == "" || events[i].SourceKind == "") {
+			return result, fmt.Errorf("usage event %q source identity requires provider and source kind", events[i].ID)
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("begin usage ingest: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	completeSources := make(map[string]bool, len(checkpoints))
+	for _, checkpoint := range checkpoints {
+		if checkpoint.Complete {
+			completeSources[checkpointKey(checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity)] = true
+		}
+	}
+
+	for _, event := range events {
+		inserted, err := insertUsageEventTx(tx, event)
+		if err != nil {
+			return IngestResult{}, fmt.Errorf("insert usage event %q: %w", event.ID, err)
+		}
+		if !inserted {
+			result.Duplicates++
+		} else {
+			result.Inserted++
+		}
+
+		canReconcile := completeSources[checkpointKey(event.Provider, event.SourceKind, event.TranscriptIdentity)]
+		if !canReconcile || len(event.SupersedesEventIDs) == 0 {
+			continue
+		}
+		for _, legacyID := range event.SupersedesEventIDs {
+			update, err := tx.ExecContext(ctx, `
+				UPDATE cost_events
+				SET reconciliation_status = ?
+				WHERE id = ? AND reconciliation_status = ?`,
+				ReconciliationLegacySuperseded, legacyID, ReconciliationLegacyUnreconciled)
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("supersede legacy event %q: %w", legacyID, err)
+			}
+			count, err := update.RowsAffected()
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("count superseded legacy event %q: %w", legacyID, err)
+			}
+			result.Superseded += int(count)
+		}
+	}
+
+	for _, checkpoint := range checkpoints {
+		if !checkpoint.Complete {
+			continue
+		}
+		if checkpoint.Provider == "" || checkpoint.SourceKind == "" || checkpoint.SourceIdentity == "" {
+			return IngestResult{}, fmt.Errorf("complete checkpoint requires provider, source kind, and source identity")
+		}
+		updatedAt := checkpoint.UpdatedAt
+		if updatedAt.IsZero() {
+			return IngestResult{}, fmt.Errorf("complete checkpoint %q requires updated timestamp", checkpoint.SourceIdentity)
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO usage_scan_checkpoints (
+				provider, source_kind, source_identity, offset, fingerprint, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+				offset = excluded.offset,
+				fingerprint = excluded.fingerprint,
+				updated_at = excluded.updated_at`,
+			checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity,
+			checkpoint.Offset, checkpoint.Fingerprint, updatedAt.UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return IngestResult{}, fmt.Errorf("advance checkpoint %q: %w", checkpoint.SourceIdentity, err)
+		}
+		result.CheckpointsAdvanced++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return IngestResult{}, fmt.Errorf("commit usage ingest: %w", err)
+	}
+	return result, nil
+}
+
+func checkpointKey(provider, sourceKind, sourceIdentity string) string {
+	return provider + "\x00" + sourceKind + "\x00" + sourceIdentity
+}
+
+func insertUsageEventTx(tx *sql.Tx, event UsageEvent) (bool, error) {
+	providerInput := any(nil)
+	if event.Usage.ProviderInputTokens != nil {
+		providerInput = *event.Usage.ProviderInputTokens
+	}
+	result, err := tx.Exec(`
+		INSERT OR IGNORE INTO cost_events (
+			id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.SessionID, event.ParentSessionID, event.RunID,
+		event.Timestamp.UTC().Format(time.RFC3339Nano), event.Provider, event.SourceKind,
+		event.SourceIdentity, event.TranscriptIdentity, event.Model,
+		event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens,
+		event.Usage.CacheWriteTokens, event.Usage.CacheWrite5mTokens,
+		event.Usage.CacheWrite1hTokens, event.Usage.ReasoningTokens, providerInput,
+		event.CostMicrodollars, event.PricingStatus, event.ReconciliationStatus)
+	if err != nil {
+		return false, err
+	}
+	count, err := result.RowsAffected()
+	return count == 1, err
+}
+
 // NewStore creates a Store using an existing database connection.
 func NewStore(db *sql.DB) *Store {
 	return &Store{db: db, now: time.Now}
@@ -31,28 +163,49 @@ func (s *Store) DB() *sql.DB {
 
 // WriteCostEvent inserts a cost event.
 func (s *Store) WriteCostEvent(ev CostEvent) error {
-	_, err := s.db.Exec(`
-		INSERT INTO cost_events (id, session_id, timestamp, model, input_tokens, output_tokens,
-			cache_read_tokens, cache_write_tokens, cost_microdollars)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.SessionID, ev.Timestamp.UTC().Format(time.RFC3339), ev.Model,
-		ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens,
-		ev.CostMicrodollars,
-	)
+	event := UsageEventFromCostEvent(ev)
+	if err := event.Usage.Validate(); err != nil {
+		return fmt.Errorf("validate cost event %q: %w", event.ID, err)
+	}
+	_, err := insertCanonicalEvent(s.db, event)
 	return err
 }
 
 // WriteCostEventTx inserts a cost event within a transaction.
 func (s *Store) WriteCostEventTx(tx *sql.Tx, ev CostEvent) error {
-	_, err := tx.Exec(`
-		INSERT INTO cost_events (id, session_id, timestamp, model, input_tokens, output_tokens,
-			cache_read_tokens, cache_write_tokens, cost_microdollars)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.SessionID, ev.Timestamp.UTC().Format(time.RFC3339), ev.Model,
-		ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens,
-		ev.CostMicrodollars,
-	)
+	event := UsageEventFromCostEvent(ev)
+	if err := event.Usage.Validate(); err != nil {
+		return fmt.Errorf("validate cost event %q: %w", event.ID, err)
+	}
+	_, err := insertCanonicalEvent(tx, event)
 	return err
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func insertCanonicalEvent(exec sqlExecer, event UsageEvent) (sql.Result, error) {
+	providerInput := any(nil)
+	if event.Usage.ProviderInputTokens != nil {
+		providerInput = *event.Usage.ProviderInputTokens
+	}
+	return exec.Exec(`
+		INSERT INTO cost_events (
+			id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.SessionID, event.ParentSessionID, event.RunID,
+		event.Timestamp.UTC().Format(time.RFC3339Nano), event.Provider, event.SourceKind,
+		event.SourceIdentity, event.TranscriptIdentity, event.Model,
+		event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens,
+		event.Usage.CacheWriteTokens, event.Usage.CacheWrite5mTokens,
+		event.Usage.CacheWrite1hTokens, event.Usage.ReasoningTokens, providerInput,
+		event.CostMicrodollars, event.PricingStatus, event.ReconciliationStatus)
 }
 
 // TotalBySession returns aggregated costs for a session.
@@ -263,12 +416,12 @@ func (s *Store) querySum(where string, args ...any) (CostSummary, error) {
 	var cs CostSummary
 	err := s.db.QueryRow(`
 		SELECT COALESCE(SUM(cost_microdollars), 0),
-			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens), 0),
 			COALESCE(SUM(output_tokens), 0),
 			COALESCE(SUM(cache_read_tokens), 0),
 			COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(*)
-		FROM cost_events `+where, args...).Scan(
+		FROM cost_events `+where+` AND reconciliation_status <> ?`, append(args, ReconciliationLegacySuperseded)...).Scan(
 		&cs.TotalCostMicrodollars,
 		&cs.TotalInputTokens,
 		&cs.TotalOutputTokens,

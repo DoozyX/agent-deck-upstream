@@ -99,7 +99,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 17
+const SchemaVersion = 18
 
 type LifecycleIntent struct {
 	InstanceID        string
@@ -285,16 +285,28 @@ type WatcherEventRow struct {
 // internal/costs, but we keep this minimal struct here so the statedb package
 // can read/write rows without a circular import.
 type CostEventRow struct {
-	ID                  string
-	SessionID           string
-	Timestamp           string // RFC3339; preserve verbatim — cost_events stores TEXT
-	Model               string
-	InputTokens         int64
-	OutputTokens        int64
-	CacheReadTokens     int64
-	CacheWriteTokens    int64
-	CostMicrodollars    int64
-	BudgetStopTriggered bool
+	ID                   string
+	SessionID            string
+	ParentSessionID      string
+	RunID                string
+	Timestamp            string // RFC3339; preserve verbatim — cost_events stores TEXT
+	Provider             string
+	SourceKind           string
+	SourceIdentity       string
+	TranscriptIdentity   string
+	Model                string
+	InputTokens          int64
+	OutputTokens         int64
+	CacheReadTokens      int64
+	CacheWriteTokens     int64
+	CacheWrite5mTokens   int64
+	CacheWrite1hTokens   int64
+	ReasoningTokens      int64
+	ProviderInputTokens  *int64
+	CostMicrodollars     int64
+	PricingStatus        string
+	ReconciliationStatus string
+	BudgetStopTriggered  bool
 }
 
 // GroupRow represents a group row in the database.
@@ -566,13 +578,25 @@ func (s *StateDB) Migrate() error {
 		CREATE TABLE IF NOT EXISTS cost_events (
 			id TEXT PRIMARY KEY,
 			session_id TEXT NOT NULL,
+			parent_session_id TEXT NOT NULL DEFAULT '',
+			run_id TEXT NOT NULL DEFAULT '',
 			timestamp DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			provider TEXT NOT NULL DEFAULT 'unknown',
+			source_kind TEXT NOT NULL DEFAULT 'legacy',
+			source_identity TEXT NOT NULL DEFAULT '',
+			transcript_identity TEXT NOT NULL DEFAULT '',
 			model TEXT NOT NULL,
 			input_tokens INTEGER NOT NULL DEFAULT 0,
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0,
+			cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
+			reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+			provider_input_tokens INTEGER,
 			cost_microdollars INTEGER NOT NULL DEFAULT 0,
+			pricing_status TEXT NOT NULL DEFAULT 'legacy_unresolved',
+			reconciliation_status TEXT NOT NULL DEFAULT 'legacy_unreconciled',
 			budget_stop_triggered INTEGER NOT NULL DEFAULT 0
 		)
 	`); err != nil {
@@ -584,6 +608,19 @@ func (s *StateDB) Migrate() error {
 	}
 	if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_cost_events_timestamp ON cost_events(timestamp)`); err != nil {
 		return fmt.Errorf("statedb: create cost_events timestamp index: %w", err)
+	}
+	if _, err := tx.Exec(`
+		CREATE TABLE IF NOT EXISTS usage_scan_checkpoints (
+			provider TEXT NOT NULL,
+			source_kind TEXT NOT NULL,
+			source_identity TEXT NOT NULL,
+			offset INTEGER NOT NULL DEFAULT 0,
+			fingerprint TEXT NOT NULL DEFAULT '',
+			updated_at TEXT NOT NULL,
+			PRIMARY KEY (provider, source_kind, source_identity)
+		)
+	`); err != nil {
+		return fmt.Errorf("statedb: create usage scan checkpoints: %w", err)
 	}
 
 	// watchers table (v5)
@@ -649,6 +686,18 @@ func (s *StateDB) Migrate() error {
 	// Each migration is idempotent: errors from "duplicate column" are silently ignored.
 	// See CLAUDE.md "Schema Migration Safety": every new column MUST have a corresponding ALTER TABLE.
 	alterMigrations := []string{
+		"ALTER TABLE cost_events ADD COLUMN parent_session_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE cost_events ADD COLUMN run_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE cost_events ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown'",
+		"ALTER TABLE cost_events ADD COLUMN source_kind TEXT NOT NULL DEFAULT 'legacy'",
+		"ALTER TABLE cost_events ADD COLUMN source_identity TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE cost_events ADD COLUMN transcript_identity TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE cost_events ADD COLUMN cache_write_5m_tokens INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE cost_events ADD COLUMN cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE cost_events ADD COLUMN reasoning_tokens INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE cost_events ADD COLUMN provider_input_tokens INTEGER",
+		"ALTER TABLE cost_events ADD COLUMN pricing_status TEXT NOT NULL DEFAULT 'legacy_unresolved'",
+		"ALTER TABLE cost_events ADD COLUMN reconciliation_status TEXT NOT NULL DEFAULT 'legacy_unreconciled'",
 		"ALTER TABLE lifecycle_intents ADD COLUMN phase TEXT NOT NULL DEFAULT 'prepared'",
 		"ALTER TABLE lifecycle_intents ADD COLUMN token TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE lifecycle_intents ADD COLUMN generation INTEGER NOT NULL DEFAULT 1",
@@ -701,6 +750,13 @@ func (s *StateDB) Migrate() error {
 				return fmt.Errorf("statedb: alter migration: %w", err)
 			}
 		}
+	}
+	if _, err := tx.Exec(`
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_cost_events_source_identity
+		ON cost_events(provider, source_kind, source_identity)
+		WHERE source_identity <> ''
+	`); err != nil {
+		return fmt.Errorf("statedb: create cost event source identity index: %w", err)
 	}
 
 	// Set schema version only when missing or changed.
