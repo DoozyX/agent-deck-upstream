@@ -1,5 +1,7 @@
 Review round {{ROUND}} found issues on your branch — fix them:
 
+Stable fix identity: run={{RUN_DIR}} task={{TASK_ID}} attempt={{ATTEMPT_ID}} originating-review={{ORIGINATING_ATTEMPT}} base={{BASE_HEAD}} reviewed={{REVIEWED_HEAD}} spec={{SPEC_ID}}. This consumes one automatic fix cycle even if the session title or model changes.
+
 {{FINDINGS}}
 
 This message carries only what changed since your last round: the findings.
