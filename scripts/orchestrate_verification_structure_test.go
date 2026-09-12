@@ -423,7 +423,12 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	skill := read("skills", "orchestrate", "SKILL.md")
 	requireAll("orchestrate skill", skill, []string{
 		// One call per distinct role+tier per wave, saved under $RUN_DIR.
-		"once per distinct role+tier",
+		// The pin is the WHOLE clause, not just the "once per distinct
+		// role+tier" fragment: that fragment alone left criterion 1's timing
+		// half unasserted, and a mutant rewriting the trigger to "Whenever it
+		// seems useful" — destroying both "Before each launch wave" and "in
+		// that wave" — stayed green.
+		"Before each launch wave, run `agent-deck usage recommend` **once per distinct role+tier** in that wave and save its JSON under `$RUN_DIR/usage/`:",
 		"$RUN_DIR/usage/<wave>-<role>-<tier>.json",
 		// The re-run rule, including the null-fetched_at case the CLI really
 		// emits: the SELECTED tool has no available snapshot, which happens even
@@ -439,15 +444,31 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		`agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --json \
   > "$RUN_DIR/usage/<wave>-<role>-<tier>.json"`,
 		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag (a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional).",
+		// Exit 1 was enumerated nowhere in the skill, though this section's own
+		// recipe redirects stdout into a file the shell creates either way — a
+		// conductor with no reason to check the code saves a zero-byte "decision".
+		"Exit 1 means the configuration could not be loaded or validated — check the exit code before reading the saved file, because the `>` redirect creates that file even when nothing was written to it.",
 		// Criterion 4 and criterion 5, second halves: the exhausted pause owes a
 		// recorded, reported decision and the yield owes a recorded override.
 		// Both were deletable without turning this test red.
 		"record the decision, report it through the run's existing path",
 		"Record the override on that launch's manifest line.",
 		// Criterion 5's input: the yield rule scores a non-selected provider by
-		// re-running with --prefer, because `alternatives` is empty under the
-		// default tool strategy.
-		"re-running the call with `--prefer <that provider>`",
+		// re-running with --prefer. Where that provider's state then LANDS is
+		// strategy-dependent, and the round-2 wording ("makes it the selected
+		// tool ... do not look for it in `alternatives[]`") was false under
+		// `tool_strategy = "auto"`, where --prefer only ORDERS the candidates
+		// and a healthier tool still wins. Both halves are pinned, so neither
+		// can revert to the unqualified claim.
+		"Score that provider by re-running the call with `--prefer <that provider>`, then read its state from wherever the strategy in force puts it.",
+		"Under the default `tool_strategy` that provider is the only candidate, so the top-level `state` is its own and `alternatives[]` is empty.",
+		"Under `tool_strategy = \"auto\"` `--prefer` only puts it FIRST among the candidates: a healthier tool can still be selected, and that provider's own state is then its entry in `alternatives[]` — read it there, because the top-level `state` belongs to the other tool.",
+		// Finding 8: the probe is a SECOND recommend call for the same
+		// role+tier, so it must not overwrite the wave's one saved decision.
+		"The probe is diagnostic: do not save it over the wave's `$RUN_DIR/usage/<wave>-<role>-<tier>.json`",
+		// Finding 9: the manifest format criterion 3 fixes has no override
+		// field, so the override has to name where it actually goes.
+		"The format above has no override field, so it goes in `reason=`.",
 		// The launch shape the decision produces, and the empty-model rule.
 		`agent-deck launch <worktree-path> -c <tool> \
   -t "impl-<task-slug>" \
@@ -465,8 +486,13 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// the rule that it is never a baseline.
 		"| Implementer of a plan task tagged `tier: frontier` | frontier |",
 		"frontier is never a baseline",
-		"`fable`",
-		"`gpt-6-astra`",
+		// Criterion 7 requires these two to be the FRONTIER entries. The bare
+		// tokens "`fable`" and "`gpt-6-astra`" pinned presence, not rung:
+		// moving `fable` to the cheap rung, and swapping the codex frontier
+		// rung for `gpt-5.6-nova` while leaving the token in prose, both
+		// stayed green. Each string below contains the bare token it replaces.
+		"Claude: `haiku` / `sonnet` / `opus` / `fable`",
+		"`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` / `gpt-6-astra`",
 		// Escalations now land on frontier, not on strong.
 		"escalate the reviewer to strong → frontier",
 		// The planner's tier vocabulary, restated in the skill. Criterion 9a
@@ -496,11 +522,49 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	if got := strings.Count(normalize(skill), manifestLine); got < 3 {
 		t.Errorf("orchestrate skill records the manifest line at %d sites, want >= 3 (the code block plus both cross-references)", got)
 	}
+	// The count alone fixes the QUANTITY of citations, not where they are:
+	// a mutant that replaced the "Then record per task:" citation with
+	// "(see the launch line above)" and added one inside the usage section
+	// kept the total at exactly 3 and stayed green. Criterion 3 names both
+	// cross-reference sites, so each is anchored to its own heading line.
+	skillLines := strings.Split(skill, "\n")
+	citedWithin := func(anchor string, window int) bool {
+		for i, line := range skillLines {
+			if !strings.Contains(line, anchor) {
+				continue
+			}
+			for j := i; j < len(skillLines) && j <= i+window; j++ {
+				if strings.Contains(normalize(skillLines[j]), manifestLine) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, site := range []struct{ anchor string }{
+		{"Then record per task:"},
+		{"Record every session's connector + model in the manifest"},
+	} {
+		if !citedWithin(site.anchor, 6) {
+			t.Errorf("criterion 3's manifest line must be cited within 6 lines of %q; it is not", site.anchor)
+		}
+	}
 	// Criterion 6a: the two clauses this change falsifies must not survive.
 	// A document asserting both the old rule and the new one is worse than one
 	// asserting only the old one, so this is checked over the whole file.
+	//
+	// fold is deliberately LOCAL to this negative loop rather than folded into
+	// normalize: normalize backs every positive pin above, and making those
+	// case-insensitive and emphasis-blind would weaken ~60 assertions to
+	// strengthen one. The loop needs it because the criterion's whole content
+	// is a removal, and the bare Contains was case-sensitive and markup-blind
+	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
+	// an explicit tool choice: never." all survived it.
+	fold := func(s string) string {
+		return strings.NewReplacer("*", "", "_", "").Replace(strings.ToLower(normalize(s)))
+	}
 	for _, dead := range []string{"never blocks a launch", "overrides an explicit tool"} {
-		if strings.Contains(normalize(skill), dead) {
+		if strings.Contains(fold(skill), fold(dead)) {
 			t.Errorf("orchestrate skill still asserts the now-false clause %q", dead)
 		}
 	}
@@ -515,9 +579,15 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"Frontier is never a baseline: tag it deliberately or not at all.",
 	})
 
+	// Criterion 10's pointer, pinned as a SENTENCE. As two independent bare
+	// tokens ("agent-deck usage recommend", "skills/orchestrate/SKILL.md")
+	// nothing forced them into a pointer at all: a mutant reading "**Not
+	// fleet's business.** `agent-deck usage recommend` has nothing to do with
+	// fleet children; see `skills/orchestrate/SKILL.md` for teardown ordering."
+	// asserted the OPPOSITE of the criterion and stayed green. The string
+	// below contains both retired tokens.
 	requireAll("fleet skill", read("skills", "fleet", "SKILL.md"), []string{
-		"agent-deck usage recommend",
-		"skills/orchestrate/SKILL.md",
+		"`agent-deck usage recommend --role <role> --tier <tier>` returns a read-only, advisory tool/model choice from live quota; `skills/orchestrate/SKILL.md` carries the full contract for using it.",
 	})
 
 	configReference := read("skills", "agent-deck", "references", "config-reference.md")
@@ -545,6 +615,21 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = \"codex\"` |",
 		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
 		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
+		// The failover row was entirely rewritten and gained ZERO pins: the
+		// three above are context lines that rewrite never touched, so the
+		// "auto"-only scoping, the silent-drop behaviour and both verbatim
+		// reason strings could all be reverted while this test stayed green.
+		// Each corrected claim is now held, and each was driven against a
+		// built binary rather than read off the source.
+		"The ORDER is consulted **only** under `[orchestrate] tool_strategy = \"auto\"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool",
+		"there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy \"\"`",
+		"Under `\"auto\"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order",
+		"a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed",
+		"the decision then carries the `--prefer` tool, or the first entry when `--prefer` was omitted, as its `tool`, with `state: unknown` and the reason `no candidate tools for tool strategy \"auto\"`",
+		// Driven discriminator: an uninstalled name that IS a usage provider
+		// keeps a non-empty `provider` and a model here, so the round-2 "with an
+		// empty `provider`, no model" clause was false and is not re-pinned.
+		"`provider` and `model` come back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way",
 		"| `[usage.policy.ladder.<claude\\|codex>]` | table of strings |",
 		"Only `claude` and `codex` are accepted, and the rejection is not a startup error",
 		"`usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1",
@@ -552,13 +637,23 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"| `[usage.policy.frontier_window]` | table of strings | `{ claude = \"fable\" }` |",
 		"a window that is named here but absent from the snapshot the provider actually returned",
 		"`null` whenever the selected tool has no available snapshot",
-		"a tool whose own query failed — that second case still reports a non-empty `account` alongside the `null`",
+		// The round-2 wording closed an enumeration that is not closed and
+		// attached a guarantee a third case falsifies: `--profile` naming a
+		// label with no snapshot is queried, succeeds, and still yields
+		// `fetched_at: null` with an EMPTY `account`. The sibling pin above
+		// ("`null` whenever the selected tool has no available snapshot") is
+		// true and is kept.
+		"because it was never queried at all, because its own query failed, or because `--profile` named no snapshot for it; among those, only the failed-query case still reports a non-empty `account` alongside the `null`",
 		"agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]",
 		// Criterion 12: all ten JSON keys, named in order. Nine of them had no
 		// assertion at all — only the `fetched_at` sub-clause was anchored.
 		"`--json` prints the decision as ten snake_case keys: `tool`, `provider`, `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`, `alternatives` (each entry `tool` / `state` / `remaining_percent`), and `fetched_at`",
 		"exits 0 for every decision",
 		"Exit 2 is reserved for a bad flag",
+		// ...and the whole exit contract as one sentence. The two fragments
+		// above are kept, but neither held the exit-1 clause, so the config
+		// reference could drop it while the skill side stayed pinned.
+		"It exits 0 for every decision — including `exhausted`, `unknown`, and the case where no candidate tool could be chosen at all (the decision then carries an empty `tool`, and a remedy hint goes to stderr) — so a caller reads `state`, not the exit code. Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, or a stray positional argument. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
 	})
 	// The section is placed where its table-of-contents entry says it is.
 	orchestrateSection := strings.Index(configReference, "\n## [orchestrate] Section")

@@ -30,7 +30,10 @@ agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --js
 The command is read-only and advisory. It exits 0 for every decision — including
 `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag
 (a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
-positional). A machine with no `openusage` binary gets `state: unknown` and the
+positional). Exit 1 means the configuration could not be loaded or validated —
+check the exit code before reading the saved file, because the `>` redirect
+creates that file even when nothing was written to it. A machine with no
+`openusage` binary gets `state: unknown` and the
 preferred tool when one resolves, which is an answer, not a failure; continue
 unchanged there.
 
@@ -77,11 +80,17 @@ retrying.
 **Explicit workflow tool choices** — the cross-provider Codex reviewer in
 "Model & connector tiering" is the standing one — yield to the recommendation
 **only** when that provider's state is `exhausted`. Score that provider by
-re-running the call with `--prefer <that provider>`, which makes it the selected
-tool so the decision's `state` is its own. Do not look for it in
-`alternatives[]`: that lists non-selected candidates, and under the default
-`tool_strategy` there is at most one candidate, so it is always empty. Record
-the override on that launch's manifest line.
+re-running the call with `--prefer <that provider>`, then read its state from
+wherever the strategy in force puts it. Under the default `tool_strategy` that
+provider is the only candidate, so the top-level `state` is its own and
+`alternatives[]` is empty. Under `tool_strategy = "auto"` `--prefer` only puts
+it FIRST among the candidates: a healthier tool can still be selected, and that
+provider's own state is then its entry in `alternatives[]` — read it there,
+because the top-level `state` belongs to the other tool. The probe is
+diagnostic: do not save it over the wave's
+`$RUN_DIR/usage/<wave>-<role>-<tier>.json`, which the re-run rule reuses for the
+rest of the wave. Record the override on that launch's manifest line. The
+format above has no override field, so it goes in `reason=`.
 
 The recommendation chooses a connector and a model and nothing else: it never
 switches an account automatically, and it never overrides an explicit account or
