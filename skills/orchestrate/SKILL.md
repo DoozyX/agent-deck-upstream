@@ -84,10 +84,14 @@ re-running the call with `--prefer <that provider>`, then read its state from
 wherever the strategy in force puts it. Under the default `tool_strategy` that
 provider is the only candidate, so the top-level `state` is its own and
 `alternatives[]` is empty. Under `tool_strategy = "auto"` `--prefer` only puts
-it FIRST among the candidates: a healthier tool can still be selected, and that
-provider's own state is then its entry in `alternatives[]` — read it there,
-because the top-level `state` belongs to the other tool. The probe is
-diagnostic: do not save it over the wave's
+it FIRST among the candidates: a healthier tool can still be selected, so that
+provider's state lands in one of three places — the top-level `state` when
+`tool` names it, its entry in `alternatives[]` when a different tool was
+selected, and neither when it was never a candidate at all. `alternatives[]`
+lists the non-selected candidates, so a provider filtered out before it was
+ever scored — hidden by `[ui] hidden_tools`, say, or dropped from the failover
+order by a miscased entry — is absent from both, and that absence is the only
+signal you get. The probe is diagnostic: do not save it over the wave's
 `$RUN_DIR/usage/<wave>-<role>-<tier>.json`, which the re-run rule reuses for the
 rest of the wave. Record the override on that launch's manifest line. The
 format above has no override field, so it goes in `reason=`.
@@ -230,9 +234,10 @@ AVAILABLE_TOOLS=$(jq -r '.available_tools | join(", ")' "$RUN_DIR/tool-policy.js
   record that fallback.
 - An explicit workflow choice (for example the cross-provider Codex reviewer)
   overrides the policy.
-- Before launching, append `role=<role> tool=<tool> reason=<one line>` to
-  `$RUN_DIR/manifest.md`. Automatic selection that is not recorded is not a
-  selection; it is hidden drift.
+- Before launching, append the full manifest line defined under "Record every
+  launch" above — `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`,
+  all six fields — to `$RUN_DIR/manifest.md`. Automatic selection that is not
+  recorded is not a selection; it is hidden drift.
 - Connector flags move with the connector. `LEAN` is Claude-only. Build a
   role-specific argument array for another connector rather than passing
   Claude flags to it. Set the recipe's role variable (`PLANNER_TOOL`,
