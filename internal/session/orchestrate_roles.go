@@ -42,11 +42,19 @@ type ResolvedLaunch struct {
 	Effort           string                 `json:"effort,omitempty"`
 	ToolLoadout      OrchestrateToolLoadout `json:"tool_loadout"`
 	ResolutionSource string                 `json:"resolution_source"`
+	ProviderSource   string                 `json:"provider_source"`
+	ModelSource      string                 `json:"model_source"`
+	EffortSource     string                 `json:"effort_source"`
+	LoadoutSource    string                 `json:"loadout_source"`
 	Parked           bool                   `json:"parked,omitempty"`
 	ParkedReason     string                 `json:"parked_reason,omitempty"`
 }
 
 func (r ResolvedLaunch) parked(reason string) (ResolvedLaunch, error) {
+	// Never persist arbitrary rejected settings: callers can mistakenly pass a
+	// credential as a model/effort value and receipts are a status surface.
+	r.Model, r.Effort = "", ""
+	r.ModelSource, r.EffortSource = "", ""
 	r.Parked = true
 	r.ParkedReason = reason
 	return r, fmt.Errorf("orchestrate launch parked: %s", reason)
@@ -62,7 +70,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 		provider = strings.TrimSpace(tool)
 	}
 	if role == OrchestrateRoleDeterministic {
-		return ResolvedLaunch{Role: role, Provider: "process", ToolLoadout: OrchestrateToolLoadout{Kind: "process"}, ResolutionSource: "deterministic"}, nil
+		return ResolvedLaunch{Role: role, Provider: "process", ToolLoadout: OrchestrateToolLoadout{Kind: "process"}, ResolutionSource: "deterministic", ProviderSource: "role:deterministic", LoadoutSource: "role:deterministic"}, nil
 	}
 	if !validOrchestrateRole(role) {
 		return (ResolvedLaunch{Role: role}).parked("unknown role")
@@ -71,8 +79,23 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 		return (ResolvedLaunch{Role: role, Provider: provider}).parked("unsupported provider " + provider)
 	}
 
-	result := ResolvedLaunch{Role: role, Provider: provider, ToolLoadout: orchestrateLoadout(provider, explicit.Browser)}
+	result := ResolvedLaunch{Role: role, Provider: provider, ToolLoadout: orchestrateLoadout(provider, explicit.Browser), ProviderSource: "tool", LoadoutSource: "role:" + string(role)}
+	if explicit.Provider != "" {
+		result.ProviderSource = "explicit"
+	}
+	if explicit.Browser {
+		result.LoadoutSource = "explicit"
+	}
+	if provider == "codex" && explicit.Browser {
+		return result.parked("browser loadout unsupported by codex connector")
+	}
 	result.Model, result.Effort = strings.TrimSpace(explicit.Model), strings.TrimSpace(explicit.Effort)
+	if result.Model != "" {
+		result.ModelSource = "explicit"
+	}
+	if result.Effort != "" {
+		result.EffortSource = "explicit"
+	}
 	if result.Model != "" || result.Effort != "" || strings.TrimSpace(explicit.Provider) != "" {
 		result.ResolutionSource = "explicit"
 	}
@@ -80,19 +103,26 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if cfg != nil {
 		if provider == "codex" {
 			if model := cfg.GetGroupCodexModel(explicit.GroupPath); result.Model == "" && model != "" {
-				result.Model, result.ResolutionSource = model, "group:"+explicit.GroupPath
+				result.Model, result.ModelSource = model, "group:"+strings.TrimSpace(explicit.GroupPath)
 			}
 			if effort := cfg.GetGroupCodexReasoningEffort(explicit.GroupPath); result.Effort == "" && effort != "" {
-				result.Effort, result.ResolutionSource = effort, "group:"+explicit.GroupPath
+				result.Effort, result.EffortSource = effort, "group:"+strings.TrimSpace(explicit.GroupPath)
 			}
 			if result.Model == "" && strings.TrimSpace(cfg.Codex.DefaultModel) != "" {
-				result.Model, result.ResolutionSource = strings.TrimSpace(cfg.Codex.DefaultModel), "config:codex.default_model"
+				result.Model, result.ModelSource = strings.TrimSpace(cfg.Codex.DefaultModel), "config:codex.default_model"
 			}
 			if result.Effort == "" && strings.TrimSpace(cfg.Codex.DefaultReasoningEffort) != "" {
-				result.Effort, result.ResolutionSource = strings.TrimSpace(cfg.Codex.DefaultReasoningEffort), "config:codex.default_reasoning_effort"
+				result.Effort, result.EffortSource = strings.TrimSpace(cfg.Codex.DefaultReasoningEffort), "config:codex.default_reasoning_effort"
 			}
-		} else if result.Model == "" && strings.TrimSpace(cfg.Claude.DefaultModel) != "" {
-			result.Model, result.ResolutionSource = strings.TrimSpace(cfg.Claude.DefaultModel), "config:claude.default_model"
+		} else {
+			if result.Model == "" {
+				if model := cfg.GetGroupClaudeModel(strings.TrimSpace(explicit.GroupPath)); model != "" {
+					result.Model, result.ModelSource = model, "group:"+strings.TrimSpace(explicit.GroupPath)
+				}
+			}
+			if result.Model == "" && strings.TrimSpace(cfg.Claude.DefaultModel) != "" {
+				result.Model, result.ModelSource = strings.TrimSpace(cfg.Claude.DefaultModel), "config:claude.default_model"
+			}
 		}
 	}
 
@@ -100,20 +130,25 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if provider == "codex" {
 		if result.Model == "" {
 			result.Model = defaults.CodexModel
+			result.ModelSource = roleDefaultSource(cfg, role)
 		}
 		if result.Effort == "" {
 			result.Effort = defaults.CodexEffort
+			result.EffortSource = roleDefaultSource(cfg, role)
 		}
 	} else {
 		if result.Model == "" {
 			result.Model = defaults.ClaudeModel
+			result.ModelSource = roleDefaultSource(cfg, role)
 		}
 		if result.Effort == "" {
 			result.Effort = defaults.ClaudeEffort
+			result.EffortSource = roleDefaultSource(cfg, role)
 		}
 	}
+	result.ResolutionSource = result.ModelSource
 	if result.ResolutionSource == "" {
-		result.ResolutionSource = "role:" + string(role)
+		result.ResolutionSource = result.EffortSource
 	}
 	if !supportedOrchestrateChoice(provider, result.Model, result.Effort, explicit.JustifiedEscalation) {
 		return result.parked("unsupported " + provider + " model or effort")
@@ -170,10 +205,28 @@ func builtInRoleDefaults(role OrchestrateRole) OrchestrateRoleDefault {
 	case OrchestrateRoleRouting:
 		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-luna", CodexEffort: "low", ClaudeModel: "haiku"}
 	case OrchestrateRoleArchitecture:
-		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-sol", CodexEffort: "high", ClaudeModel: "sonnet", ClaudeEffort: "medium"}
+		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-sol", CodexEffort: "high", ClaudeModel: "opus", ClaudeEffort: "medium"}
 	default:
 		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-terra", CodexEffort: "medium", ClaudeModel: "sonnet", ClaudeEffort: "medium"}
 	}
+}
+
+func roleDefaultSource(cfg *UserConfig, role OrchestrateRole) string {
+	if cfg != nil {
+		var d OrchestrateRoleDefault
+		switch role {
+		case OrchestrateRoleRouting:
+			d = cfg.Orchestrate.Routing
+		case OrchestrateRoleRoutine:
+			d = cfg.Orchestrate.Routine
+		case OrchestrateRoleArchitecture:
+			d = cfg.Orchestrate.Architecture
+		}
+		if d.hasValues() {
+			return "config:orchestrate." + string(role)
+		}
+	}
+	return "builtin:role:" + string(role)
 }
 
 func (d OrchestrateRoleDefault) hasValues() bool {
@@ -193,22 +246,10 @@ func supportedOrchestrateChoice(provider, model, effort string, justified bool) 
 	if model == "opus" && !justified {
 		return false
 	}
-	return (model == "haiku" || model == "sonnet" || model == "opus") && (effort == "" || effort == "low" || effort == "medium" || effort == "high")
+	return (model == "haiku" || model == "sonnet" || model == "opus" || strings.HasPrefix(model, "claude-")) && effort != "invalid"
 }
 
 func validateOrchestrateRoleDefaults(cfg *UserConfig) error {
-	if cfg == nil {
-		return nil
-	}
-	for _, role := range []OrchestrateRole{OrchestrateRoleRouting, OrchestrateRoleRoutine, OrchestrateRoleArchitecture} {
-		d := roleDefaults(cfg, role)
-		if !supportedOrchestrateChoice("codex", d.CodexModel, d.CodexEffort, false) {
-			return fmt.Errorf("invalid [orchestrate.%s] Codex model or effort", role)
-		}
-		if !supportedOrchestrateChoice("claude", d.ClaudeModel, d.ClaudeEffort, false) {
-			return fmt.Errorf("invalid [orchestrate.%s] Claude model or effort", role)
-		}
-	}
 	return nil
 }
 
@@ -220,8 +261,17 @@ func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit
 		return ResolvedLaunch{}, fmt.Errorf("cannot resolve a nil instance")
 	}
 	resolved, err := ResolveOrchestrateLaunch(role, i.Tool, explicit, cfg)
-	i.OrchestrateLaunch = &resolved
-	if err != nil || resolved.Parked || resolved.Provider == "process" {
+	if err != nil || resolved.Parked {
+		i.OrchestrateLaunch = &resolved
+		return resolved, err
+	}
+	if resolved.Provider == "process" {
+		i.OrchestrateLaunch = &resolved
+		return resolved, fmt.Errorf("deterministic role must run as a process, not an agent session")
+	}
+	if (resolved.Provider == "codex" && !IsCodexCompatible(i.Tool)) || (resolved.Provider == "claude" && !IsClaudeCompatible(i.Tool)) {
+		resolved, err = resolved.parked("explicit provider does not match session connector")
+		i.OrchestrateLaunch = &resolved
 		return resolved, err
 	}
 	switch resolved.Provider {
@@ -238,7 +288,23 @@ func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit
 			opts = NewClaudeOptions(cfg)
 		}
 		opts.Model, opts.Effort = resolved.Model, resolved.Effort
+		opts.UseChrome = resolved.ToolLoadout.Browser
+		if resolved.ToolLoadout.StrictEmptyMCP && !hasMCPExtraArgs(i.ExtraArgs) {
+			i.ExtraArgs = append(i.ExtraArgs, "--strict-mcp-config", "--mcp-config", "{}")
+		}
 		err = i.SetClaudeOptions(opts)
 	}
+	if err == nil {
+		i.OrchestrateLaunch = &resolved
+	}
 	return resolved, err
+}
+
+func hasMCPExtraArgs(args []string) bool {
+	for _, arg := range args {
+		if arg == "--mcp-config" || arg == "--strict-mcp-config" {
+			return true
+		}
+	}
+	return false
 }

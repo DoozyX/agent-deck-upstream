@@ -37,16 +37,17 @@ type StorageData struct {
 
 // InstanceData represents the serializable session data
 type InstanceData struct {
-	PersistenceGeneration int64  `json:"persistence_generation,omitempty"`
-	ID                    string `json:"id"`
-	Title                 string `json:"title"`
-	ProjectPath           string `json:"project_path"`
-	GroupPath             string `json:"group_path"`
-	Order                 int    `json:"order"`
-	ParentSessionID       string `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
-	IsConductor           bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
-	NoTransitionNotify    bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
-	TitleLocked           bool   `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
+	OrchestrateLaunch     *ResolvedLaunch `json:"orchestrate_launch,omitempty"`
+	PersistenceGeneration int64           `json:"persistence_generation,omitempty"`
+	ID                    string          `json:"id"`
+	Title                 string          `json:"title"`
+	ProjectPath           string          `json:"project_path"`
+	GroupPath             string          `json:"group_path"`
+	Order                 int             `json:"order"`
+	ParentSessionID       string          `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
+	IsConductor           bool            `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
+	NoTransitionNotify    bool            `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
+	TitleLocked           bool            `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
 	// SubcommandPassthrough mirrors Instance.SubcommandPassthrough (#1821).
 	// Persisted via the tool_data extras zone (see
 	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
@@ -1160,6 +1161,7 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// zone. For a one-shot the task IS the invocation, so a row that forgets it
 	// can only ever be "restarted" into dsh's usage error.
 	toolData = WriteDeepSeekTaskToToolData(toolData, inst.DeepSeekTask)
+	toolData = WriteOrchestrateLaunchToToolData(toolData, inst.OrchestrateLaunch)
 
 	return &statedb.InstanceRow{
 		PersistenceGeneration: inst.PersistenceGeneration,
@@ -1352,6 +1354,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
+			OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
 		}
 	}
 
@@ -1472,6 +1475,7 @@ func instanceDataFromRow(r *statedb.InstanceRow) *InstanceData {
 		MultiRepoWorktrees: mrWorktrees, Channels: channels, ExtraArgs: extraArgs, Plugins: plugins,
 		PluginChannelLinkDisabled: pluginChannelLinkDisabled, AutoLinkedChannels: autoLinkedChannels,
 		Color: color, IdleTimeoutSecs: ReadIdleTimeoutSecsFromToolData(r.ToolData),
+		OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
 		SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
 		ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 		LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
@@ -1938,6 +1942,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AutoLinkedChannels:           instData.AutoLinkedChannels,
 			Color:                        instData.Color,
 			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
+			OrchestrateLaunch:            instData.OrchestrateLaunch,
 			DeepSeekTask:                 instData.DeepSeekTask,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
 			LastStartedAt:                instData.LastStartedAt,
