@@ -33,6 +33,7 @@ type ScanCheckpoint struct {
 type ParseResult struct {
 	Events            []UsageEvent
 	Checkpoint        ScanCheckpoint
+	Complete          bool
 	Warnings          []string
 	BlockedStatus     string
 	BlockedUntil      time.Time

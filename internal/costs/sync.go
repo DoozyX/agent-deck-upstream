@@ -2,6 +2,8 @@ package costs
 
 import (
 	"bufio"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -48,10 +50,157 @@ type progressData struct {
 
 // SyncResult holds the result of a historical sync operation.
 type SyncResult struct {
-	SessionsScanned int
-	EventsImported  int
-	EventsSkipped   int
-	Errors          []string
+	SessionsScanned  int
+	SourcesScanned   int
+	SourcesChanged   int
+	EventsImported   int
+	EventsSkipped    int
+	EventsReconciled int
+	Warnings         []CoverageWarning
+	Errors           []string
+}
+
+// Sync incrementally imports authoritative provider transcripts.
+func Sync(ctx context.Context, store *Store, pricer *Pricer, sources []TranscriptSource) SyncResult {
+	var result SyncResult
+	if store == nil {
+		result.Errors = append(result.Errors, "sync: store is nil")
+		return result
+	}
+	if pricer == nil {
+		result.Errors = append(result.Errors, "sync: pricer is nil")
+		return result
+	}
+	parsers := map[string]TranscriptParser{
+		ProviderClaude: &ClaudeTranscriptParser{},
+		ProviderCodex:  &CodexRolloutParser{},
+	}
+	for _, source := range sources {
+		result.SourcesScanned++
+		parser := parsers[source.Provider]
+		if parser == nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: unsupported provider %q", source.Identity, source.Provider))
+			continue
+		}
+		fileInfo, err := os.Stat(source.Path)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: read source: %v", source.Identity, err))
+			continue
+		}
+		checkpoint, found, err := loadScanCheckpoint(ctx, store, source)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: load checkpoint: %v", source.Identity, err))
+			continue
+		}
+		if found && checkpoint.Offset == fileInfo.Size() && !fileInfo.ModTime().After(checkpoint.UpdatedAt) {
+			continue
+		}
+		if found && checkpoint.Offset == fileInfo.Size() && fileInfo.ModTime().After(checkpoint.UpdatedAt) {
+			checkpoint = ScanCheckpoint{}
+		}
+		parsed, err := parser.Parse(ctx, source, checkpoint)
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: parse: %v", source.Identity, err))
+			continue
+		}
+		result.SourcesChanged++
+		for _, warning := range parsed.Warnings {
+			result.Warnings = append(result.Warnings, CoverageWarning{
+				Provider: source.Provider, Source: source.Identity, Kind: "parse", Message: warning,
+			})
+		}
+		for i := range parsed.Events {
+			applyEventPrice(&parsed.Events[i], pricer)
+		}
+		if parsed.Complete && len(parsed.Events) > 0 && source.SessionID != "" && source.SessionID != UnassignedSessionID {
+			legacyIDs, err := overlappingLegacyEventIDs(ctx, store, source.SessionID, parsed.Events)
+			if err != nil {
+				result.Errors = append(result.Errors, fmt.Sprintf("sync %s: find legacy overlap: %v", source.Identity, err))
+				continue
+			}
+			parsed.Events[0].SupersedesEventIDs = legacyIDs
+		}
+		ingested, err := store.Ingest(ctx, parsed.Events, []ScanCheckpoint{parsed.Checkpoint})
+		if err != nil {
+			result.Errors = append(result.Errors, fmt.Sprintf("sync %s: ingest: %v", source.Identity, err))
+			continue
+		}
+		result.EventsImported += ingested.Inserted
+		result.EventsSkipped += ingested.Duplicates
+		result.EventsReconciled += ingested.Superseded
+	}
+	return result
+}
+
+func loadScanCheckpoint(ctx context.Context, store *Store, source TranscriptSource) (ScanCheckpoint, bool, error) {
+	var checkpoint ScanCheckpoint
+	var updatedAt string
+	err := store.db.QueryRowContext(ctx, `
+		SELECT provider, source_kind, source_identity, offset, fingerprint, updated_at
+		FROM usage_scan_checkpoints
+		WHERE provider = ? AND source_kind = ? AND source_identity = ?`,
+		source.Provider, source.Kind, source.Identity).Scan(
+		&checkpoint.Provider, &checkpoint.SourceKind, &checkpoint.SourceIdentity,
+		&checkpoint.Offset, &checkpoint.Fingerprint, &updatedAt)
+	if err == sql.ErrNoRows {
+		return ScanCheckpoint{}, false, nil
+	}
+	if err != nil {
+		return ScanCheckpoint{}, false, err
+	}
+	checkpoint.UpdatedAt, err = time.Parse(time.RFC3339Nano, updatedAt)
+	if err != nil {
+		return ScanCheckpoint{}, false, fmt.Errorf("invalid checkpoint timestamp: %w", err)
+	}
+	checkpoint.Complete = true
+	return checkpoint, true, nil
+}
+
+func applyEventPrice(event *UsageEvent, pricer *Pricer) {
+	price, known := pricer.GetPrice(event.Model)
+	if !known {
+		event.PricingStatus = PricingUnknown
+		event.CostMicrodollars = 0
+		return
+	}
+	if price.InputPerMtokMicro == 0 && price.OutputPerMtokMicro == 0 && price.CacheReadPerMtokMicro == 0 && price.CacheWritePerMtokMicro == 0 {
+		event.PricingStatus = PricingKnownZero
+	} else {
+		event.PricingStatus = PricingKnown
+	}
+	event.CostMicrodollars = pricer.ComputeCost(event.Model, event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens, event.Usage.CacheWriteTokens)
+}
+
+func overlappingLegacyEventIDs(ctx context.Context, store *Store, sessionID string, events []UsageEvent) ([]string, error) {
+	from := events[0].Timestamp
+	to := events[0].Timestamp
+	for _, event := range events[1:] {
+		if event.Timestamp.Before(from) {
+			from = event.Timestamp
+		}
+		if event.Timestamp.After(to) {
+			to = event.Timestamp
+		}
+	}
+	rows, err := store.db.QueryContext(ctx, `
+		SELECT id FROM cost_events
+		WHERE session_id = ? AND timestamp >= ? AND timestamp <= ?
+			AND reconciliation_status = ?`,
+		sessionID, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano),
+		ReconciliationLegacyUnreconciled)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // SyncSession holds the info needed to locate a session's transcript.

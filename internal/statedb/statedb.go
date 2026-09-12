@@ -99,7 +99,7 @@ func withBusyRetry(op func() error) error {
 
 // SchemaVersion tracks the current database schema version.
 // Bump this when adding migrations.
-const SchemaVersion = 18
+const SchemaVersion = 19
 
 type LifecycleIntent struct {
 	InstanceID        string
@@ -752,8 +752,8 @@ func (s *StateDB) Migrate() error {
 		}
 	}
 	if _, err := tx.Exec(`
-		CREATE UNIQUE INDEX IF NOT EXISTS idx_cost_events_source_identity
-		ON cost_events(provider, source_kind, source_identity)
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_cost_events_provider_identity
+		ON cost_events(provider, source_identity)
 		WHERE source_identity <> ''
 	`); err != nil {
 		return fmt.Errorf("statedb: create cost event source identity index: %w", err)

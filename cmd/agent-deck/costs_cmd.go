@@ -89,36 +89,90 @@ func handleCostsSync(profile string) {
 		os.Exit(1)
 	}
 
-	var syncSessions []costs.SyncSession
-	for _, inst := range instances {
-		if inst.Tool != "claude" || inst.ClaudeSessionID == "" {
-			continue
-		}
-		syncSessions = append(syncSessions, costs.SyncSession{
-			InstanceID:      inst.ID,
-			ClaudeSessionID: inst.ClaudeSessionID,
-			ProjectPath:     inst.ProjectPath,
-			Tool:            inst.Tool,
-		})
+	userConfig, _ := session.LoadUserConfig()
+	discoveryConfig := buildCostDiscoveryConfig(profile, userConfig, instances)
+	sources, warnings, err := costs.DiscoverTranscriptSources(discoveryConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to discover usage transcripts: %v\n", err)
+		os.Exit(1)
 	}
-
-	if len(syncSessions) == 0 {
-		fmt.Println("No Claude sessions found to sync.")
+	if len(sources) == 0 {
+		fmt.Println("No Claude or Codex transcripts found to sync.")
+		printCostSyncWarnings(warnings)
 		return
 	}
 
-	fmt.Printf("Syncing cost data for %d Claude session(s)...\n", len(syncSessions))
-	result := costs.SyncFromTranscripts(costStore, pricer, syncSessions)
+	fmt.Printf("Syncing cost data from %d Claude/Codex transcript source(s)...\n", len(sources))
+	result := costs.Sync(context.Background(), costStore, pricer, sources)
+	result.Warnings = append(warnings, result.Warnings...)
 
 	fmt.Printf("\nResults:\n")
-	fmt.Printf("  Sessions scanned: %d\n", result.SessionsScanned)
+	fmt.Printf("  Sources scanned:  %d\n", result.SourcesScanned)
+	fmt.Printf("  Sources changed:  %d\n", result.SourcesChanged)
 	fmt.Printf("  Events imported:  %d\n", result.EventsImported)
 	fmt.Printf("  Events skipped:   %d (already tracked)\n", result.EventsSkipped)
+	fmt.Printf("  Events reconciled:%d\n", result.EventsReconciled)
+	printCostSyncWarnings(result.Warnings)
 	if len(result.Errors) > 0 {
 		fmt.Printf("  Errors:           %d\n", len(result.Errors))
 		for _, e := range result.Errors {
 			fmt.Printf("    - %s\n", e)
 		}
+		os.Exit(1)
+	}
+}
+
+func buildCostDiscoveryConfig(profile string, cfg *session.UserConfig, instances []*session.Instance) costs.DiscoveryConfig {
+	var config costs.DiscoveryConfig
+	addHome := func(provider, path, account string) {
+		if path == "" {
+			return
+		}
+		config.Homes = append(config.Homes, costs.ProviderHome{Provider: provider, Path: path, Account: account})
+	}
+	addHome(costs.ProviderClaude, session.GetClaudeConfigDir(), profile)
+	addHome(costs.ProviderCodex, session.GetCodexConfigDir(), profile)
+	if cfg != nil {
+		for name := range cfg.Profiles {
+			addHome(costs.ProviderClaude, cfg.GetProfileClaudeConfigDir(name), name)
+			addHome(costs.ProviderCodex, cfg.GetProfileCodexConfigDir(name), name)
+		}
+	}
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		switch inst.Tool {
+		case "claude":
+			home := session.GetClaudeConfigDirForInstance(inst)
+			addHome(costs.ProviderClaude, home, inst.Account)
+			if inst.ClaudeSessionID != "" {
+				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
+					Provider: costs.ProviderClaude, Home: home, NativeSessionID: inst.ClaudeSessionID,
+					SessionID: inst.ID, ParentSessionID: inst.ParentSessionID, Archived: !inst.ArchivedAt.IsZero(),
+				})
+			}
+		case "codex":
+			home := session.GetCodexConfigDirForInstance(inst)
+			addHome(costs.ProviderCodex, home, inst.Account)
+			if inst.CodexSessionID != "" {
+				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
+					Provider: costs.ProviderCodex, Home: home, NativeSessionID: inst.CodexSessionID,
+					SessionID: inst.ID, ParentSessionID: inst.ParentSessionID, Archived: !inst.ArchivedAt.IsZero(),
+				})
+			}
+		}
+	}
+	return config
+}
+
+func printCostSyncWarnings(warnings []costs.CoverageWarning) {
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Printf("  Warnings:         %d\n", len(warnings))
+	for _, warning := range warnings {
+		fmt.Printf("    - %s %s: %s\n", warning.Provider, warning.Source, warning.Message)
 	}
 }
 
