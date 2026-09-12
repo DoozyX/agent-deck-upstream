@@ -6,15 +6,17 @@ import "slices"
 // codex-cli 0.153.4. Keep validation model-specific: the connector does not
 // support one common effort range across all models.
 var codexOrchestrateEffortsByModel = map[string][]string{
-	"gpt-6-astra":       {"low", "medium", "high", "xhigh", "max", "ultra"},
-	"gpt-5.6-sol":       {"low", "medium", "high", "xhigh", "max", "ultra"},
-	"gpt-5.6-terra":     {"low", "medium", "high", "xhigh", "max", "ultra"},
-	"gpt-5.6-luna":      {"low", "medium", "high", "xhigh", "max"},
-	"gpt-5.5":           {"low", "medium", "high", "xhigh"},
-	"gpt-5.4":           {"low", "medium", "high", "xhigh"},
-	"gpt-5.4-mini":      {"low", "medium", "high", "xhigh"},
-	"gpt-5.2":           {"low", "medium", "high", "xhigh"},
-	"codex-auto-review": {"low", "medium", "high", "xhigh", "max"},
+	"gpt-6-astra":              {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-sol":              {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-terra":            {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-5.6-luna":             {"low", "medium", "high", "xhigh", "max"},
+	"gpt-5.5":                  {"low", "medium", "high", "xhigh"},
+	"gpt-5.4":                  {"low", "medium", "high", "xhigh"},
+	"gpt-5.4-mini":             {"low", "medium", "high", "xhigh"},
+	"gpt-5.2":                  {"low", "medium", "high", "xhigh"},
+	"codex-auto-review":        {"low", "medium", "high", "xhigh", "max"},
+	"gpt-daybreak-blue-latest": {"low", "medium", "high", "xhigh", "max", "ultra"},
+	"gpt-daybreak-red-latest":  {"low", "medium", "high", "xhigh", "max", "ultra"},
 }
 
 // KnownModelIDsForTool is the visible connector model catalog used by launch
