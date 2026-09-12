@@ -246,6 +246,24 @@ agent-deck group codex sync work
 agent-deck group show work --resolved --json
 ```
 
+To share one login across these separate group homes, opt in globally:
+
+```toml
+[codex]
+shared_auth_source = "~/.codex/auth.json"
+```
+
+Agent Deck links each configured group home's `auth.json` to this source on
+session create/start/restart and `group codex sync`. Token refreshes at the
+source are immediately visible to every linked home. The source must exist;
+use Codex file credential storage (the default, or
+`cli_auth_credentials_store = "file"`). Other storage backends are reported
+as incompatible. Existing credential files or links to another source are
+preserved and reported; back them up and move them aside before syncing.
+Explicit session account slots are excluded. Leaving this setting empty
+disables provisioning; it does not remove links already created. Logging out
+of the main home logs out every home sharing that login.
+
 #### Per-conductor Claude config (v1.5.4)
 
 Conductors are first-class agent-deck entities (see `agent-deck conductor setup`). Each conductor can carry its own Claude `config_dir` and `env_file` via a top-level `[conductors.<name>.claude]` block:

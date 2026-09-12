@@ -102,6 +102,11 @@ func ApplyConfiguredLoadout(inst *Instance) []string {
 		if err != nil {
 			warn("Codex managed settings: %v", err)
 		} else {
+			if inst.Account == "" && config.GetGroupCodexConfigDir(inst.GroupPath) != "" {
+				if err := applyCodexSharedAuth(codexHome, config.Codex.SharedAuthSource); err != nil {
+					warn("Codex shared login: %v", err)
+				}
+			}
 			model := config.GetGroupCodexModel(inst.GroupPath)
 			if strings.TrimSpace(model) == "" {
 				model = config.Codex.DefaultModel
