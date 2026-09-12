@@ -58,8 +58,10 @@ just the `>` redirect. Re-run the call with `--prefer <tool>`, or set
 `recommend` again only after a child reports the existing `usage-limit`
 substate, or before a later wave when the saved decision's `fetched_at` is
 older than five minutes. A saved decision whose `fetched_at` is `null` — what
-the command emits when no snapshot could be fetched — counts as stale. Do not
-query it during ordinary polling, focused single tasks, or every-turn hooks.
+the command emits whenever the *selected* tool has no available snapshot, which
+happens even when snapshots were fetched for other candidates — counts as
+stale. Do not query it during ordinary polling, focused single tasks, or
+every-turn hooks.
 
 **Record every launch** on one manifest line:
 
@@ -74,8 +76,12 @@ retrying.
 
 **Explicit workflow tool choices** — the cross-provider Codex reviewer in
 "Model & connector tiering" is the standing one — yield to the recommendation
-**only** when that provider's state is `exhausted`. Record the override on that
-launch's manifest line.
+**only** when that provider's state is `exhausted`. Score that provider by
+re-running the call with `--prefer <that provider>`, which makes it the selected
+tool so the decision's `state` is its own. Do not look for it in
+`alternatives[]`: that lists non-selected candidates, and under the default
+`tool_strategy` there is at most one candidate, so it is always empty. Record
+the override on that launch's manifest line.
 
 The recommendation chooses a connector and a model and nothing else: it never
 switches an account automatically, and it never overrides an explicit account or

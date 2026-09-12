@@ -426,9 +426,28 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"once per distinct role+tier",
 		"$RUN_DIR/usage/<wave>-<role>-<tier>.json",
 		// The re-run rule, including the null-fetched_at case the CLI really
-		// emits when no snapshot was fetched.
+		// emits: the SELECTED tool has no available snapshot, which happens even
+		// when snapshots were fetched for other candidates.
 		"`usage-limit` substate",
 		"older than five minutes",
+		"the command emits whenever the *selected* tool has no available snapshot, which happens even when snapshots were fetched for other candidates",
+		// Criterion 12: the CLI surface must match in the orchestrate skill too,
+		// not only in the config reference — this is the copy a conductor runs.
+		// The flag string and the exit-code sentence are pinned verbatim; a
+		// `--tier <tier>` collapse or an "exits 0 normally and 2 on error"
+		// paraphrase both used to survive here.
+		`agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --json \
+  > "$RUN_DIR/usage/<wave>-<role>-<tier>.json"`,
+		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag (a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional).",
+		// Criterion 4 and criterion 5, second halves: the exhausted pause owes a
+		// recorded, reported decision and the yield owes a recorded override.
+		// Both were deletable without turning this test red.
+		"record the decision, report it through the run's existing path",
+		"Record the override on that launch's manifest line.",
+		// Criterion 5's input: the yield rule scores a non-selected provider by
+		// re-running with --prefer, because `alternatives` is empty under the
+		// default tool strategy.
+		"re-running the call with `--prefer <that provider>`",
 		// The launch shape the decision produces, and the empty-model rule.
 		`agent-deck launch <worktree-path> -c <tool> \
   -t "impl-<task-slug>" \
@@ -489,6 +508,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	requireAll("plan prompt", read("skills", "orchestrate", "references", "prompts", "plan.md"), []string{
 		"`tier: mid | strong | frontier`",
 		"There is no tier below mid",
+		// Criterion 9's SECOND clause: the one-line frontier definition and the
+		// rule that it is never a baseline. The vocabulary and the floor sentence
+		// above both stayed green with the definition deleted.
+		"frontier only for a task no strong session should be asked to carry alone",
+		"Frontier is never a baseline: tag it deliberately or not at all.",
 	})
 
 	requireAll("fleet skill", read("skills", "fleet", "SKILL.md"), []string{
@@ -522,12 +546,17 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
 		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
 		"| `[usage.policy.ladder.<claude\\|codex>]` | table of strings |",
-		"Only `claude` and `codex` are accepted; any other table name fails config validation with exit 1",
+		"Only `claude` and `codex` are accepted, and the rejection is not a startup error",
+		"`usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1",
 		"an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged",
 		"| `[usage.policy.frontier_window]` | table of strings | `{ claude = \"fable\" }` |",
 		"a window that is named here but absent from the snapshot the provider actually returned",
-		"`null` when the selected tool has no snapshot",
+		"`null` whenever the selected tool has no available snapshot",
+		"a tool whose own query failed — that second case still reports a non-empty `account` alongside the `null`",
 		"agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]",
+		// Criterion 12: all ten JSON keys, named in order. Nine of them had no
+		// assertion at all — only the `fetched_at` sub-clause was anchored.
+		"`--json` prints the decision as ten snake_case keys: `tool`, `provider`, `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`, `alternatives` (each entry `tool` / `state` / `remaining_percent`), and `fetched_at`",
 		"exits 0 for every decision",
 		"Exit 2 is reserved for a bad flag",
 	})
@@ -558,7 +587,10 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// row. A plain Contains let it be moved anywhere in the table.
 	agentDeckSkill := read("skills", "agent-deck", "SKILL.md")
 	requireAll("agent-deck skill command table", agentDeckSkill, []string{
-		"| `agent-deck usage recommend --role <role> --tier <tier>` |",
+		// The whole row, not just its command cell: criterion 11a owes the
+		// read-only, advisory purpose too, and dropping those two words left
+		// both the command-cell pin and the adjacency check below green.
+		"| `agent-deck usage recommend --role <role> --tier <tier>` | Read-only, advisory connector + model pick for that role and tier from live quota; add `--json` for the decision object |",
 	})
 	agentDeckLines := strings.Split(agentDeckSkill, "\n")
 	usageAllRow, recommendRow := -1, -1
