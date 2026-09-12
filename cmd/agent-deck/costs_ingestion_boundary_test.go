@@ -149,6 +149,27 @@ func TestStopHookRetainsCacheOnlyUsage(t *testing.T) {
 	}
 }
 
+func TestStopHookRejectsInvalidProviderUsage(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	transcriptPath := filepath.Join(home, ".claude", "projects", "project", "invalid-usage.jsonl")
+	if err := os.MkdirAll(filepath.Dir(transcriptPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	line := []byte(`{"type":"assistant","requestId":"invalid-usage","timestamp":"2026-09-01T16:00:02Z","message":{"model":"claude-sonnet-5","usage":{"cache_creation_input_tokens":1,"cache_creation":{"ephemeral_5m_input_tokens":2}}}}`)
+	if err := os.WriteFile(transcriptPath, append(line, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"hook_event_name": "Stop", "transcript_path": transcriptPath})
+	writeCostEvent("instance-invalid-usage", payload)
+	entries, err := os.ReadDir(getCostEventsDir())
+	if err == nil && len(entries) != 0 {
+		t.Fatalf("invalid provider usage produced %d queue file(s), want 0", len(entries))
+	}
+}
+
 func TestStopHookDoesNotFabricateMissingTimestamp(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

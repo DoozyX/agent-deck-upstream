@@ -305,7 +305,10 @@ func countersRegressed(current, previous codexCounters) int {
 }
 
 func wholeCountersReset(current, previous codexCounters) bool {
-	return current.Input < previous.Input && current.Output < previous.Output
+	return current.Input < previous.Input && current.Output < previous.Output &&
+		(previous.CacheRead == 0 || current.CacheRead < previous.CacheRead) &&
+		(previous.CacheWrite == 0 || current.CacheWrite < previous.CacheWrite) &&
+		(previous.Reasoning == 0 || current.Reasoning < previous.Reasoning)
 }
 
 func subtractCounters(current, previous codexCounters) codexCounters {

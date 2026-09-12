@@ -342,16 +342,17 @@ func findUsageEventByAliases(tx *sql.Tx, event UsageEvent) (id, sourceIdentity s
 func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEvent, pricer *Pricer) (bool, error) {
 	var current TokenUsage
 	var providerInput sql.NullInt64
+	var currentCost int64
 	var reconciliation string
 	err := tx.QueryRow(`
 		SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
 			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
-			provider_input_tokens, reconciliation_status
+			provider_input_tokens, cost_microdollars, reconciliation_status
 		FROM cost_events WHERE id = ?`, existingID).Scan(
 		&current.InputTokens, &current.OutputTokens, &current.CacheReadTokens,
 		&current.CacheWriteTokens, &current.CacheWrite5mTokens,
 		&current.CacheWrite1hTokens, &current.ReasoningTokens,
-		&providerInput, &reconciliation)
+		&providerInput, &currentCost, &reconciliation)
 	if err != nil {
 		return false, err
 	}
@@ -366,7 +367,7 @@ func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEve
 	if !changed {
 		return false, nil
 	}
-	cost, status := correctionPrice(incoming, merged, pricer)
+	cost, status := correctionPrice(incoming, merged, currentCost, pricer)
 	providerInputValue := any(nil)
 	if merged.ProviderInputTokens != nil {
 		providerInputValue = *merged.ProviderInputTokens
@@ -388,13 +389,16 @@ func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEve
 	return err == nil, err
 }
 
-func correctionPrice(incoming UsageEvent, merged TokenUsage, pricer *Pricer) (int64, PricingStatus) {
+func correctionPrice(incoming UsageEvent, merged TokenUsage, currentCost int64, pricer *Pricer) (int64, PricingStatus) {
 	if pricer != nil {
 		quote := pricer.Quote(incoming.Model, merged)
 		if quote.Valid {
+			if quote.Status == PricingUnknown {
+				return currentCost, PricingUnknown
+			}
 			return quote.CostMicrodollars, quote.Status
 		}
-		return incoming.CostMicrodollars, PricingUnknown
+		return currentCost, PricingUnknown
 	}
 	if incoming.PricingStatus == PricingKnown || incoming.PricingStatus == PricingKnownZero {
 		builtIn := NewPricer(PricerConfig{})
@@ -403,6 +407,9 @@ func correctionPrice(incoming UsageEvent, merged TokenUsage, pricer *Pricer) (in
 			mergedQuote := builtIn.Quote(incoming.Model, merged)
 			return mergedQuote.CostMicrodollars, mergedQuote.Status
 		}
+	}
+	if incoming.PricingStatus == PricingUnknown {
+		return currentCost, PricingUnknown
 	}
 	return incoming.CostMicrodollars, incoming.PricingStatus
 }
