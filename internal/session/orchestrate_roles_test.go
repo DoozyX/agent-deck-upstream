@@ -49,8 +49,8 @@ func TestResolveOrchestrateLaunch_PrecedenceAndRoleDefaults(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got != tt.want {
-				t.Fatalf("ResolveOrchestrateLaunch() = %#v, want %#v", got, tt.want)
+			if got.Role != tt.want.Role || got.Provider != tt.want.Provider || got.Model != tt.want.Model || got.Effort != tt.want.Effort || got.ToolLoadout != tt.want.ToolLoadout {
+				t.Fatalf("ResolveOrchestrateLaunch() = %#v, want core %#v", got, tt.want)
 			}
 		})
 	}
@@ -74,7 +74,7 @@ func TestResolveOrchestrateLaunch_UsesConfiguredRoleDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Model != "gpt-5.6-sol" || got.Effort != "high" || got.ResolutionSource != "role:routine" {
+	if got.Model != "gpt-5.6-sol" || got.Effort != "high" || got.ResolutionSource != "config:orchestrate.routine" {
 		t.Fatalf("configured role default = %#v", got)
 	}
 }

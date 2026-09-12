@@ -96,7 +96,7 @@ func TestLoadUserConfig_RejectsInvalidOrchestrateToolStrategy(t *testing.T) {
 	}
 }
 
-func TestLoadUserConfig_RejectsUnsupportedOrchestrateRoleDefault(t *testing.T) {
+func TestLoadUserConfig_PreservesUnsupportedOrchestrateRoleDefaultForParking(t *testing.T) {
 	configDir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", configDir)
 	ClearUserConfigCache()
@@ -109,7 +109,12 @@ func TestLoadUserConfig_RejectsUnsupportedOrchestrateRoleDefault(t *testing.T) {
 	if err := os.WriteFile(path, []byte("[orchestrate.routine]\ncodex_model = \"not-a-model\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := LoadUserConfig(); err == nil {
-		t.Fatal("LoadUserConfig() error = nil, want unsupported role default")
+	cfg, err := LoadUserConfig()
+	if err != nil {
+		t.Fatalf("LoadUserConfig() error = %v, want preserved config", err)
+	}
+	got, err := ResolveOrchestrateLaunch(OrchestrateRoleRoutine, "codex", OrchestrateLaunchExplicit{}, cfg)
+	if err == nil || !got.Parked {
+		t.Fatalf("unsupported configured default = %#v, %v; want parked", got, err)
 	}
 }
