@@ -182,8 +182,8 @@ func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 		failed:   map[string]bool{"b": true},
 	})
 	h = model.(*Home)
-	if _, ok := h.remoteCosts["a"]; ok {
-		t.Fatalf("a remote whose cost fetch failed must contribute zero; got %+v", h.remoteCosts)
+	if summary, ok := h.remoteCosts["a"]; !ok || summary != nil {
+		t.Fatalf("a remote whose cost fetch failed must contribute zero with unknown coverage; got %+v", h.remoteCosts)
 	}
 	if h.remoteCosts["b"] == nil {
 		t.Fatalf("a remote still marked failed must keep its last-good figure; got %+v", h.remoteCosts)

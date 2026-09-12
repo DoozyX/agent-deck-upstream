@@ -1,6 +1,9 @@
 package costs
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // RenderCostLine substitutes {name} placeholders in template with values
 // drawn from vars and formatted as USD via FormatUSD. Recognized
@@ -15,6 +18,34 @@ import "strings"
 // The walker is left-to-right and never iterates the vars map, so output
 // is deterministic regardless of map iteration order.
 func RenderCostLine(template string, vars map[string]int64, hideWhenZero bool) string {
+	return renderCostLine(template, vars, nil, hideWhenZero)
+}
+
+// RenderCoveredCostLine keeps all legacy cost variables numeric while adding
+// coverage/status placeholders for templates that want to explain subtotals.
+func RenderCoveredCostLine(template string, vars map[string]int64, coverage Coverage, hideWhenZero bool) string {
+	status := "coverage unknown"
+	if coverage.CoverageKnown {
+		switch {
+		case coverage.EventCount > 0 && coverage.KnownPriceEventCount == 0 && (coverage.UnknownPriceEventCount > 0 || coverage.UnreconciledEventCount > 0):
+			status = "price unknown"
+		case coverage.Complete:
+			status = "complete"
+		default:
+			status = "known subtotal"
+		}
+	}
+	text := map[string]string{
+		"coverage_status":     status,
+		"unpriced_events":     strconv.Itoa(coverage.UnknownPriceEventCount),
+		"unpriced_tokens":     strconv.FormatInt(coverage.UnknownPriceTokens, 10),
+		"unreconciled_events": strconv.Itoa(coverage.UnreconciledEventCount),
+		"unreconciled_tokens": strconv.FormatInt(coverage.UnreconciledTokens, 10),
+	}
+	return renderCostLine(template, vars, text, hideWhenZero)
+}
+
+func renderCostLine(template string, vars map[string]int64, text map[string]string, hideWhenZero bool) string {
 	var b strings.Builder
 	b.Grow(len(template))
 
@@ -39,6 +70,11 @@ func RenderCostLine(template string, vars map[string]int64, hideWhenZero bool) s
 		if val, ok := vars[name]; ok {
 			b.WriteString(FormatUSD(val))
 			if val != 0 {
+				hasNonZero = true
+			}
+		} else if val, ok := text[name]; ok {
+			b.WriteString(val)
+			if val != "" && val != "0" {
 				hasNonZero = true
 			}
 		} else {

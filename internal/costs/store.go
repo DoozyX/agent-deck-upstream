@@ -553,12 +553,105 @@ func (s *Store) CoveredTotalToday() (CoveredSummary, error) {
 	return s.queryCovered(`WHERE timestamp >= date('now', 'start of day')`)
 }
 
+func (s *Store) CoveredTotalYesterday() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of day', '-1 day') AND timestamp < date('now', 'start of day')`)
+}
+
 func (s *Store) CoveredTotalThisWeek() (CoveredSummary, error) {
 	return s.queryCovered(`WHERE timestamp >= date('now', 'weekday 1', '-7 days')`)
 }
 
+func (s *Store) CoveredTotalLastWeek() (CoveredSummary, error) {
+	now := s.now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(today.Weekday()) + 6) % 7
+	thisMonday := today.AddDate(0, 0, -daysSinceMonday)
+	lastMonday := thisMonday.AddDate(0, 0, -7)
+	return s.queryCovered(`WHERE timestamp >= ? AND timestamp < ?`, lastMonday.Format(time.RFC3339), thisMonday.Format(time.RFC3339))
+}
+
 func (s *Store) CoveredTotalThisMonth() (CoveredSummary, error) {
 	return s.queryCovered(`WHERE timestamp >= date('now', 'start of month')`)
+}
+
+func (s *Store) CoveredTotalLastMonth() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of month', '-1 month') AND timestamp < date('now', 'start of month')`)
+}
+
+// CoveredProjectedMonthly returns the rolling-seven-day known-price subtotal
+// projected to 30 days and the exact coverage behind that projection.
+func (s *Store) CoveredProjectedMonthly() (int64, Coverage, error) {
+	summary, err := s.queryCovered(`WHERE timestamp >= datetime('now', '-7 days')`)
+	if err != nil {
+		return 0, Coverage{}, err
+	}
+	return (summary.TotalCostMicrodollars / 7) * 30, summary.Coverage, nil
+}
+
+func (s *Store) CoveredCostByDay() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)")
+}
+
+func (s *Store) CoveredCostByProvider() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("provider")
+}
+
+func (s *Store) CoveredCostByModel() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("model")
+}
+
+func (s *Store) CoveredCostBySession() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("session_id")
+}
+
+func (s *Store) CoveredCostByRun() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("run_id")
+}
+
+func (s *Store) coveredBreakdown(expression string) ([]CostBreakdown, error) {
+	allowed := map[string]bool{"date(timestamp)": true, "provider": true, "model": true, "session_id": true, "run_id": true}
+	if !allowed[expression] {
+		return nil, fmt.Errorf("unsupported cost breakdown %q", expression)
+	}
+	// #nosec G201 -- expression is selected from the fixed allowlist above.
+	rows, err := s.db.Query(`SELECT DISTINCT `+expression+` FROM cost_events WHERE reconciliation_status <> ? ORDER BY 1`, ReconciliationLegacySuperseded)
+	if err != nil {
+		return nil, err
+	}
+	var keys []string
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+
+	result := make([]CostBreakdown, 0, len(keys))
+	for _, key := range keys {
+		where := `WHERE ` + expression + ` = ?`
+		summary, err := s.queryCovered(where, key)
+		if err != nil {
+			return nil, err
+		}
+		var item CostBreakdown
+		item.Key = key
+		item.KnownCostMicrodollars = summary.TotalCostMicrodollars
+		item.Coverage = summary.Coverage
+		// #nosec G201 -- expression is selected from the fixed allowlist above.
+		err = s.db.QueryRow(`SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(cache_write_5m_tokens),0), COALESCE(SUM(cache_write_1h_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0) FROM cost_events `+where+` AND reconciliation_status <> ?`, key, ReconciliationLegacySuperseded).Scan(
+			&item.UncachedInputTokens, &item.CacheReadInputTokens, &item.CacheWriteInputTokens,
+			&item.CacheWrite5mInputTokens, &item.CacheWrite1hInputTokens, &item.OutputTokens, &item.ReasoningOutputTokens)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	return result, nil
 }
 
 // TotalToday returns today's total costs.

@@ -802,6 +802,8 @@ type Home struct {
 	costThisMonth        atomic.Int64 // microdollars
 	costLastMonth        atomic.Int64 // microdollars
 	costProjected        atomic.Int64 // microdollars
+	costCoverageMu       sync.RWMutex
+	costTodayCoverage    costs.Coverage
 	costRefreshTime      time.Time
 	costLineTemplate     string // resolved at construction; see session.ResolveCostLineTemplate
 	costLineHideWhenZero bool
@@ -2753,13 +2755,13 @@ func (h *Home) refreshCostTotals() {
 		return
 	}
 	h.costRefreshTime = time.Now()
-	today, _ := h.costStore.TotalToday()
-	yesterday, _ := h.costStore.TotalYesterday()
-	week, _ := h.costStore.TotalThisWeek()
-	lastWeek, _ := h.costStore.TotalLastWeek()
-	thisMonth, _ := h.costStore.TotalThisMonth()
-	lastMonth, _ := h.costStore.TotalLastMonth()
-	projected, _ := h.costStore.ProjectedMonthly()
+	today, _ := h.costStore.CoveredTotalToday()
+	yesterday, _ := h.costStore.CoveredTotalYesterday()
+	week, _ := h.costStore.CoveredTotalThisWeek()
+	lastWeek, _ := h.costStore.CoveredTotalLastWeek()
+	thisMonth, _ := h.costStore.CoveredTotalThisMonth()
+	lastMonth, _ := h.costStore.CoveredTotalLastMonth()
+	projected, _, _ := h.costStore.CoveredProjectedMonthly()
 	h.costToday.Store(today.TotalCostMicrodollars)
 	h.costYesterday.Store(yesterday.TotalCostMicrodollars)
 	h.costWeek.Store(week.TotalCostMicrodollars)
@@ -2767,6 +2769,9 @@ func (h *Home) refreshCostTotals() {
 	h.costThisMonth.Store(thisMonth.TotalCostMicrodollars)
 	h.costLastMonth.Store(lastMonth.TotalCostMicrodollars)
 	h.costProjected.Store(projected)
+	h.costCoverageMu.Lock()
+	h.costTodayCoverage = today.Coverage
+	h.costCoverageMu.Unlock()
 }
 
 func (h *Home) publishWebMenuSnapshot() {
@@ -4381,6 +4386,13 @@ func mergeRemoteCosts(prev map[string]*costs.RemoteCostSummary, msg remoteSessio
 	}
 	for name, summary := range msg.costs {
 		merged[name] = summary
+	}
+	for name := range msg.sessions {
+		if _, ok := msg.costs[name]; !ok {
+			// A reachable remote whose cost endpoint is old, failed, or empty
+			// contributes no amount but must retain explicit unknown coverage.
+			merged[name] = nil
+		}
 	}
 	return merged
 }
@@ -18198,6 +18210,7 @@ func (h *Home) renderFrame() string {
 	// fetch failed contribute zero — the local figures still render.
 	h.remoteCostsMu.RLock()
 	remoteAgg := costs.MergeRemoteCostSummaries(h.remoteCosts)
+	hasRemotes := len(h.remoteCosts) > 0
 	h.remoteCostsMu.RUnlock()
 	costVars := map[string]int64{
 		"cost_today":      h.costToday.Load() + remoteAgg.CostTodayMicrodollars,
@@ -18208,7 +18221,21 @@ func (h *Home) renderFrame() string {
 		"cost_last_month": h.costLastMonth.Load() + remoteAgg.CostLastMonthMicrodollars,
 		"cost_projected":  h.costProjected.Load() + remoteAgg.CostProjectedMicrodollars,
 	}
-	if rendered := costs.RenderCostLine(h.costLineTemplate, costVars, h.costLineHideWhenZero); rendered != "" {
+	h.costCoverageMu.RLock()
+	lineCoverage := h.costTodayCoverage
+	h.costCoverageMu.RUnlock()
+	if hasRemotes {
+		lineCoverage = costs.MergeCoverage(lineCoverage, remoteAgg.TodayCoverage)
+		if !remoteAgg.CoverageKnown {
+			lineCoverage.CoverageKnown = false
+			lineCoverage.Complete = false
+		}
+	}
+	template := h.costLineTemplate
+	if lineCoverage.EventCount > 0 || hasRemotes {
+		template += " ({coverage_status})"
+	}
+	if rendered := costs.RenderCoveredCostLine(template, costVars, lineCoverage, h.costLineHideWhenZero); rendered != "" {
 		costStyle := lipgloss.NewStyle().Foreground(ColorCyan)
 		stats += statsSep + costStyle.Render(rendered)
 	}

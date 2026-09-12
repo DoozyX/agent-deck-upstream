@@ -215,6 +215,106 @@ func TestCostsRecomputeRejectsMalformedPricingConfig(t *testing.T) {
 	}
 }
 
+func TestCostsSummaryReportsPricingCoverageWithoutChangingNumericJSON(t *testing.T) {
+	cases := []struct {
+		name       string
+		events     []costs.CostEvent
+		wantText   []string
+		forbidText string
+	}{
+		{
+			name: "known zero",
+			events: []costs.CostEvent{{
+				ID: "zero", SessionID: "zero-session", Timestamp: time.Now(), Provider: costs.ProviderClaude,
+				SourceKind: costs.SourceKindClaudeDirect, SourceIdentity: "zero", Model: "free-model",
+				InputTokens: 3, PricingStatus: costs.PricingKnownZero, ReconciliationStatus: costs.ReconciliationAuthoritative,
+			}},
+			wantText:   []string{"Today:", "$0.00 (verified)", "Projected:  $0.00/mo (verified)"},
+			forbidText: "price unknown",
+		},
+		{
+			name: "all unpriced",
+			events: []costs.CostEvent{{
+				ID: "unknown", SessionID: "unknown-session", Timestamp: time.Now(), Provider: costs.ProviderCodex,
+				SourceKind: costs.SourceKindCodexRollout, SourceIdentity: "unknown", Model: "future-model",
+				InputTokens: 4, OutputTokens: 2, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative,
+			}},
+			wantText: []string{"Today:", "price unknown", "1 unpriced event / 6 tokens", "Projected:  price unknown (incomplete)", "future-model", "input 4 cache-read 0"},
+		},
+		{
+			name: "mixed and legacy unresolved",
+			events: []costs.CostEvent{
+				{ID: "known", SessionID: "mixed", Timestamp: time.Now(), Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeDirect, SourceIdentity: "known", Model: "known", InputTokens: 2, CostMicrodollars: 1_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+				{ID: "unknown", SessionID: "mixed", Timestamp: time.Now(), Provider: costs.ProviderCodex, SourceKind: costs.SourceKindCodexRollout, SourceIdentity: "unknown", Model: "future", CacheReadTokens: 7, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+				{ID: "legacy", SessionID: "mixed", Timestamp: time.Now(), Model: "legacy", InputTokens: 9, CostMicrodollars: 9_000_000},
+			},
+			wantText: []string{"Today:", "$1.00 (known subtotal)", "1 unpriced event / 7 tokens", "1 unreconciled event / 9 tokens", "Projected:  $4.29 known subtotal/mo (incomplete)", "legacy", "price unknown"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			writeCostsSummaryFixture(t, home, tc.events)
+			textOut, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "costs", "summary")
+			if err != nil {
+				t.Fatalf("text summary: %v\n%s", err, textOut)
+			}
+			for _, want := range tc.wantText {
+				if !strings.Contains(textOut, want) {
+					t.Fatalf("summary missing %q:\n%s", want, textOut)
+				}
+			}
+			if tc.forbidText != "" && strings.Contains(textOut, tc.forbidText) {
+				t.Fatalf("summary unexpectedly contains %q:\n%s", tc.forbidText, textOut)
+			}
+
+			jsonOut, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "costs", "summary", "--json")
+			if err != nil {
+				t.Fatalf("json summary: %v\n%s", err, jsonOut)
+			}
+			var payload map[string]any
+			if err := json.NewDecoder(strings.NewReader(jsonOut)).Decode(&payload); err != nil {
+				t.Fatalf("decode json: %v\n%s", err, jsonOut)
+			}
+			for _, key := range []string{"cost_today_microdollars", "cost_projected_microdollars", "events_today"} {
+				if _, ok := payload[key].(float64); !ok {
+					t.Fatalf("legacy JSON field %q changed from number: %#v", key, payload[key])
+				}
+			}
+			if _, ok := payload["today_coverage"].(map[string]any); !ok {
+				t.Fatalf("today_coverage missing: %s", jsonOut)
+			}
+			if _, ok := payload["coverage_known"].(bool); !ok {
+				t.Fatalf("coverage_known missing: %s", jsonOut)
+			}
+		})
+	}
+}
+
+func writeCostsSummaryFixture(t *testing.T, home string, events []costs.CostEvent) {
+	t.Helper()
+	path := filepath.Join(home, ".local", "share", "agent-deck", "profiles", "work", "state.db")
+	db, err := statedb.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	store := costs.NewStore(db.DB())
+	for _, event := range events {
+		if err := store.WriteCostEvent(event); err != nil {
+			_ = db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestCostsSyncRejectsExplicitMissingProviderHome(t *testing.T) {
 	home := t.TempDir()
 	missing := filepath.Join(home, "private-account-home")
