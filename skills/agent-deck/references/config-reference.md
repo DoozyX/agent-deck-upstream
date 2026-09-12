@@ -689,10 +689,16 @@ agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--p
 The command is read-only: it queries usage and prints a decision, and writes no
 configuration, session or account. It exits 0 for every decision — including
 `exhausted`, `unknown`, and the case where no candidate tool could be chosen at
-all (the decision then carries an empty `tool`, and a remedy hint goes to
-stderr) — so a caller reads `state`, not the exit code. Exit 2 is reserved for a
-bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool,
-or a stray positional argument. Exit 1 means the configuration could not be
+all — so a caller reads `state`, not the exit code. That last case is not always
+an empty `tool`: it always carries a `reason` beginning `no candidate tools for
+tool strategy`, but only when the strategy resolved no name either does `tool`
+come back empty with a remedy hint on stderr; when a name survives, as the
+`failover` row above describes, `tool` is that name, `provider` and `model` are
+filled in whenever it maps to a usage provider, and stderr stays silent. Read
+the `reason`, not the emptiness of `tool`. Exit 2 is reserved for a bad flag: a
+missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
+positional argument, or anything else `flag.Parse` rejects — an undefined flag,
+or a defined flag given no value. Exit 1 means the configuration could not be
 loaded or validated, or the JSON could not be encoded.
 
 `--json` prints the decision as ten snake_case keys: `tool`, `provider`,
