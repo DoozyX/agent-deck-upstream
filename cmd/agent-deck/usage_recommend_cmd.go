@@ -86,7 +86,13 @@ func usageRecommendRemaining(alt usage.Alternative) string {
 // verbatim — rewording it here would mean matching on the recommender's reason
 // strings, which is the drift the CLI is built to avoid.
 func renderUsageRecommendText(out io.Writer, decision usage.Decision) {
-	headline := []string{decision.Tool}
+	headline := []string{}
+	// An empty tool is a real answer too ("no candidate tool for this
+	// invocation"), and printing it would put a stray empty field at the head
+	// of the line, so it is omitted the same way an empty model is.
+	if decision.Tool != "" {
+		headline = append(headline, decision.Tool)
+	}
 	// An empty model is a real answer ("no model configured for the applied
 	// tier"), so the field is omitted rather than printed empty.
 	if decision.Model != "" {
@@ -143,9 +149,11 @@ func usageRecommendSnapshots(req usage.Request, config *session.UserConfig, tool
 }
 
 // handleUsageRecommend implements `agent-deck usage recommend`. Exit codes are
-// advisory: every decision the recommender can render exits 0, including the
-// exhausted and unknown states and a completely missing openusage binary. Exit
-// 2 is reserved for an invocation this command cannot answer.
+// advisory: every decision the recommender reaches exits 0, including the
+// exhausted and unknown states, a completely missing openusage binary, and a
+// decision that names no tool at all. Exit 2 is reserved for a flag the
+// command cannot act on: a missing --role, an unknown --tier, an unknown
+// --prefer tool, and flag.Parse's own rejections.
 func handleUsageRecommend(args []string) {
 	fs := flag.NewFlagSet("usage recommend", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
@@ -213,12 +221,12 @@ func handleUsageRecommend(args []string) {
 
 	// The recommender names no tool when the invocation named none either:
 	// under a "default" or empty tool strategy with neither --prefer nor
-	// [default_tool] there is no candidate to score. That is a decision with
-	// nothing to render, not an answer, so it exits 2 with the remedy rather
-	// than printing an empty tool and an empty model.
+	// [default_tool] there is no candidate to score. That is still a decision
+	// — no flag was wrong — so it renders on stdout like any other and exits
+	// 0; the remedy goes to stderr, written before stdout is touched so a
+	// terminal cannot interleave it into the decision.
 	if decision.Tool == "" {
 		fmt.Fprintf(os.Stderr, "usage recommend: no candidate tool (%s); pass --prefer <tool> or set default_tool in config.toml\n", decision.Reason)
-		os.Exit(2)
 	}
 
 	if *jsonOut {

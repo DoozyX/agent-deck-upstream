@@ -237,6 +237,11 @@ func TestUsageRecommendWithoutOpenUsageReportsUnknown(t *testing.T) {
 	if got, want := firstLine(stdout), "claude sonnet tier=mid state=unknown"; got != want {
 		t.Fatalf("headline = %q, want %q", got, want)
 	}
+	// One candidate means no alternatives, and no alternatives means no
+	// table — not a bare header with no rows under it.
+	if got := strings.Split(strings.TrimRight(stdout, "\n"), "\n"); len(got) != 2 {
+		t.Fatalf("stdout = %q, want exactly a headline and a reason line, got %d lines", stdout, len(got))
+	}
 }
 
 // TestUsageRecommendFrontierReasonIsPassedThrough pins what the second line
@@ -376,22 +381,140 @@ func TestUsageRecommendInvalidUsagePolicyIsFatal(t *testing.T) {
 	}
 }
 
-// TestUsageRecommendWithoutCandidateToolNamesTheRemedy covers a stock install:
+// TestUsageRecommendWithoutCandidateToolStillDecides covers a stock install:
 // no config file, so no default_tool and no tool strategy, and no --prefer.
-// The recommender answers with an empty tool and an empty model, which is not
-// renderable.
-func TestUsageRecommendWithoutCandidateToolNamesTheRemedy(t *testing.T) {
-	stdout, stderr, code := runUsageRecommendHelper(t, nil, "--role", "implementer", "--tier", "mid")
-	if code != 2 {
-		t.Fatalf("exit = %d, want 2 (stdout=%q stderr=%q)", code, stdout, stderr)
-	}
-	if stdout != "" {
-		t.Fatalf("stdout = %q, want empty", stdout)
-	}
-	for _, remedy := range []string{"--prefer", "default_tool"} {
-		if !strings.Contains(stderr, remedy) {
-			t.Fatalf("stderr = %q, want it to name %q", stderr, remedy)
+// The recommender answers with an empty tool and an empty model, and no flag
+// was wrong, so that is a decision: exit 0, the whole decision on stdout, the
+// remedy on stderr. Exit 2 here would hand a --json consumer an empty stdout
+// where the contract promises a decision.
+func TestUsageRecommendWithoutCandidateToolStillDecides(t *testing.T) {
+	assertRemedy := func(t *testing.T, stderr string) {
+		t.Helper()
+		for _, remedy := range []string{"no candidate tool", "--prefer", "default_tool"} {
+			if !strings.Contains(stderr, remedy) {
+				t.Fatalf("stderr = %q, want it to name %q", stderr, remedy)
+			}
 		}
+	}
+
+	t.Run("text", func(t *testing.T) {
+		stdout, stderr, code := runUsageRecommendHelper(t, nil, "--role", "implementer", "--tier", "mid")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		// stdout carries the decision and nothing else: the remedy belongs on
+		// stderr, so it cannot be interleaved into the two lines below.
+		lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+		if len(lines) != 2 {
+			t.Fatalf("stdout = %q, want exactly a headline and a reason line, got %d lines", stdout, len(lines))
+		}
+		// The empty tool is omitted from the headline the way an empty model
+		// is: the line starts at "tier=", with no leading empty field.
+		if got, want := lines[0], "tier=mid state=unknown"; got != want {
+			t.Fatalf("headline = %q, want %q", got, want)
+		}
+		if got, want := lines[1], `no candidate tools for tool strategy ""`; got != want {
+			t.Fatalf("reason line = %q, want the recommender's own reason text %q", got, want)
+		}
+		assertRemedy(t, stderr)
+	})
+
+	t.Run("json", func(t *testing.T) {
+		stdout, stderr, code := runUsageRecommendHelper(t, nil, "--role", "implementer", "--tier", "mid", "--json")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		// Unmarshal over the WHOLE of stdout, so a remedy printed there too
+		// would fail to decode rather than be skipped past.
+		var decoded map[string]any
+		if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+			t.Fatalf("decode stdout %q: %v", stdout, err)
+		}
+		want := []string{"account", "alternatives", "fetched_at", "model", "provider", "reason", "state", "tier_applied", "tier_requested", "tool"}
+		if got := sortedJSONKeys(decoded); !reflect.DeepEqual(got, want) {
+			t.Fatalf("keys = %v, want %v", got, want)
+		}
+		if decoded["tool"] != "" || decoded["tier_applied"] != "mid" || decoded["state"] != usage.StateUnknown {
+			t.Fatalf("decision = %v, want an empty tool at tier mid in the unknown state", decoded)
+		}
+		assertRemedy(t, stderr)
+	})
+}
+
+// TestUsageRecommendJSONCarriesAlternativeElements pins the alternatives array
+// at the JSON boundary, which is the surface the orchestrate skill consumes.
+// TestUsageRecommendJSONShape runs on a single-candidate config, so the array
+// it sees is empty; only the auto fixture populates it.
+func TestUsageRecommendJSONCarriesAlternativeElements(t *testing.T) {
+	env := &usageRecommendEnv{
+		config:    usageRecommendConfigAuto,
+		openusage: usageRecommendFakeOpenUsage,
+		tools:     []string{"claude", "codex", "gemini"},
+	}
+	stdout, stderr, code := runUsageRecommendHelper(t, env, "--role", "implementer", "--tier", "mid", "--json")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	var decoded struct {
+		Alternatives []map[string]any `json:"alternatives"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("decode stdout %q: %v", stdout, err)
+	}
+	// codex reported -1 and gemini has no usage provider at all: the same
+	// remaining_percent for two different states, which is exactly why the
+	// consumer needs `state` alongside the number.
+	want := []map[string]any{
+		{"tool": "codex", "state": usage.StateExhausted, "remaining_percent": float64(-1)},
+		{"tool": "gemini", "state": usage.StateUnknown, "remaining_percent": float64(-1)},
+	}
+	if len(decoded.Alternatives) != len(want) {
+		t.Fatalf("alternatives = %v, want %d elements (stdout=%q)", decoded.Alternatives, len(want), stdout)
+	}
+	for i, wantElem := range want {
+		got := decoded.Alternatives[i]
+		if !reflect.DeepEqual(got, wantElem) {
+			t.Fatalf("alternatives[%d] = %v, want %v (stdout=%q)", i, got, wantElem, stdout)
+		}
+	}
+}
+
+// TestUsageRecommendProfileReachesTheRecommender pins --profile as more than a
+// parsed flag: the recommender matches snapshots by account label, and a
+// profile no snapshot carries earns its own clause in the reason. A --profile
+// that never reached usage.Request would lose that clause silently.
+func TestUsageRecommendProfileReachesTheRecommender(t *testing.T) {
+	stdout, stderr, code := runUsageRecommendHelper(t,
+		&usageRecommendEnv{config: usageRecommendConfigDefaultTool},
+		"--role", "implementer", "--tier", "mid", "--profile", "Codex")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	if want := `no snapshot for profile "Codex"`; !strings.Contains(stdout, want) {
+		t.Fatalf("stdout = %q, want the reason to contain %q", stdout, want)
+	}
+}
+
+// TestUsageRecommendFailedQueryKeepsTheAccount pins usageRecommendSnapshots'
+// documented behaviour: a query that fails becomes an unavailable snapshot
+// rather than being dropped. The difference is visible in `account` — the
+// snapshot is what the recommender scored, so dropping it would leave the
+// decision naming no account at all, and would take the profile clause
+// TestUsageRecommendProfileReachesTheRecommender relies on with it.
+func TestUsageRecommendFailedQueryKeepsTheAccount(t *testing.T) {
+	// No openusage anywhere on the child's PATH, so every query fails.
+	stdout, stderr, code := runUsageRecommendHelper(t,
+		&usageRecommendEnv{config: usageRecommendConfigDefaultTool},
+		"--role", "implementer", "--tier", "mid", "--json")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(stdout), &decoded); err != nil {
+		t.Fatalf("decode stdout %q: %v", stdout, err)
+	}
+	if got, want := decoded["account"], "Claude"; got != want {
+		t.Fatalf("account = %v, want %q — the failed query's snapshot is what carries it (stdout=%q)", got, want, stdout)
 	}
 }
 
