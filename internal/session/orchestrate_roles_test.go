@@ -2,6 +2,7 @@ package session
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -169,6 +170,8 @@ func TestCodexOrchestrateModelEffortCapabilities_MatchInstalledBoundaries(t *tes
 		{model: "gpt-5.4-mini", acceptedEffort: "xhigh", rejectedEffort: "max"},
 		{model: "gpt-5.2", acceptedEffort: "xhigh", rejectedEffort: "max"},
 		{model: "codex-auto-review", acceptedEffort: "max", rejectedEffort: "ultra"},
+		{model: "gpt-daybreak-blue-latest", acceptedEffort: "ultra", rejectedEffort: "minimal"},
+		{model: "gpt-daybreak-red-latest", acceptedEffort: "ultra", rejectedEffort: "minimal"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.model, func(t *testing.T) {
@@ -179,6 +182,12 @@ func TestCodexOrchestrateModelEffortCapabilities_MatchInstalledBoundaries(t *tes
 				t.Fatalf("unsupported neighbor %s/%s accepted", tt.model, tt.rejectedEffort)
 			}
 		})
+	}
+	visible := KnownModelIDsForTool("codex")
+	for _, hidden := range []string{"gpt-daybreak-blue-latest", "gpt-daybreak-red-latest"} {
+		if slices.Contains(visible, hidden) {
+			t.Fatalf("hidden installed model %q exposed as a UI suggestion", hidden)
+		}
 	}
 }
 
