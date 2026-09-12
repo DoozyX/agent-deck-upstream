@@ -34,6 +34,12 @@ const (
 	// because 90 inverts against the default constrained_below of 35.
 	usageRecommendConfigBadPolicy = "default_tool = \"claude\"\n\n" +
 		"[usage.policy]\nexhausted_below = 90\n"
+
+	// usageRecommendConfigUnparseable does not parse at all: line 2 is a bare
+	// word with no '='. session.LoadUserConfig fails on it, so it reaches the
+	// FIRST of the three os.Exit(1) paths, before the policy merge that
+	// usageRecommendConfigBadPolicy reaches.
+	usageRecommendConfigUnparseable = "default_tool = \"claude\"\ninvalid\n"
 )
 
 // usageRecommendFakeOpenUsage logs the provider argument it was called with and
@@ -595,6 +601,132 @@ func TestUsageRecommendPayloadKeepsRealFetchTime(t *testing.T) {
 	payload := usageRecommendPayload(usage.Decision{FetchedAt: fetched})
 	if payload.FetchedAt == nil || !payload.FetchedAt.Equal(fetched) {
 		t.Fatalf("fetched_at = %v, want %v", payload.FetchedAt, fetched)
+	}
+}
+
+// TestUsageRecommendRoleReachesTheTierFloor pins --role end to end together
+// with the tier the headline reports. The recommender's tier floor
+// (internal/usage/recommend.go's applyTierFloor: the implementer and reviewer
+// roles asking for cheap are raised to mid) is what makes both observable from
+// the CLI. It changes the MODEL — the claude ladder's cheap rung is haiku and
+// its mid rung is sonnet — so a --role that never reached usage.Request would
+// silently ship a different model than the decision names.
+//
+// No other test in this file can see either. They pass --tier mid, where the
+// floor returns early, or --tier frontier, where the OTHER rule that can make
+// TierApplied differ from TierRequested — the frontier gate, which falls back
+// to the strong rung when it fires — reports "the gate did not apply" on a
+// machine with no snapshot and leaves tier=frontier.
+func TestUsageRecommendRoleReachesTheTierFloor(t *testing.T) {
+	t.Run("implementer asking for cheap is raised to mid", func(t *testing.T) {
+		stdout, stderr, code := runUsageRecommendHelper(t,
+			&usageRecommendEnv{config: usageRecommendConfigDefaultTool},
+			"--role", "implementer", "--tier", "cheap")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		// sonnet, not haiku, and tier=mid, not tier=cheap: the applied tier
+		// picks the model, and the headline reports the APPLIED tier rather
+		// than the one the invocation asked for.
+		if got, want := firstLine(stdout), "claude sonnet tier=mid state=unknown"; got != want {
+			t.Fatalf("headline = %q, want %q", got, want)
+		}
+		if want := `tier floor: role "implementer" raised the cheap tier to mid`; !strings.Contains(stdout, want) {
+			t.Fatalf("stdout = %q, want the reason to carry %q", stdout, want)
+		}
+	})
+
+	t.Run("a role the floor does not name keeps cheap", func(t *testing.T) {
+		// The contrast case. The floor is keyed on the ROLE, so this is what
+		// separates "--role reached the request" from "cheap is always
+		// rewritten to mid" and from a role wired to a constant implementer.
+		stdout, stderr, code := runUsageRecommendHelper(t,
+			&usageRecommendEnv{config: usageRecommendConfigDefaultTool},
+			"--role", "architect", "--tier", "cheap")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+		}
+		if got, want := firstLine(stdout), "claude haiku tier=cheap state=unknown"; got != want {
+			t.Fatalf("headline = %q, want %q", got, want)
+		}
+		if strings.Contains(stdout, "tier floor") {
+			t.Fatalf("stdout = %q, want no tier-floor clause for a role the floor does not name", stdout)
+		}
+	})
+}
+
+// TestUsageRecommendUnloadableConfigIsFatal covers the config-load os.Exit(1)
+// path. TestUsageRecommendInvalidUsagePolicyIsFatal covers the policy-merge
+// one and asserts stderr does NOT say "load config"; this is its mirror. Every
+// flag here is valid, so the exit code is what keeps "my machinery failed" (1)
+// distinct from "your invocation is wrong" (2).
+func TestUsageRecommendUnloadableConfigIsFatal(t *testing.T) {
+	stdout, stderr, code := runUsageRecommendHelper(t,
+		&usageRecommendEnv{config: usageRecommendConfigUnparseable},
+		"--role", "implementer", "--tier", "mid")
+	if code != 1 {
+		t.Fatalf("exit = %d, want 1 (stdout=%q stderr=%q)", code, stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("stdout = %q, want empty", stdout)
+	}
+	if !strings.Contains(stderr, "load config") {
+		t.Fatalf("stderr = %q, want it to name the config load that failed", stderr)
+	}
+}
+
+// TestUsageRecommendHelpExitsZero pins the one flag.Parse rejection that is not
+// an invocation error: flag.ContinueOnError returns flag.ErrHelp for -h and
+// --help after running fs.Usage, and handleUsageRecommend returns on it instead
+// of exiting 2. Asking what the flags are is not getting them wrong.
+func TestUsageRecommendHelpExitsZero(t *testing.T) {
+	for _, arg := range []string{"-h", "--help"} {
+		t.Run(arg, func(t *testing.T) {
+			stdout, stderr, code := runUsageRecommendHelper(t, nil, arg)
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+			}
+			// fs.SetOutput(os.Stderr): the usage line is a diagnostic, so
+			// stdout stays empty for a consumer piping the decision.
+			if stdout != "" {
+				t.Fatalf("stdout = %q, want empty", stdout)
+			}
+			if !strings.Contains(stderr, usageRecommendUsageLine) {
+				t.Fatalf("stderr = %q, want the usage line", stderr)
+			}
+		})
+	}
+}
+
+// TestUsageRecommendTrimsFlagValues pins the TrimSpace on --tier and --prefer.
+// TestUsageRecommendRejectsBadFlags already pins --role's, in its "role empty"
+// case, but every case in that table asserts exit 2, so a padded VALID value
+// has nowhere to land there: dropping either trim turns a working invocation
+// into a flag error, and only a success-path assertion can see that.
+//
+// --profile is deliberately absent. usage.Recommend re-trims Request.Profile
+// at internal/usage/recommend.go:472, which is that field's only consumer, so
+// dropping the CLI's own trim changes nothing observable in stdout, stderr or
+// the exit code.
+func TestUsageRecommendTrimsFlagValues(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{name: "tier", args: []string{"--role", "implementer", "--tier", "  mid  "}},
+		{name: "prefer", args: []string{"--role", "implementer", "--tier", "mid", "--prefer", "  claude  "}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stdout, stderr, code := runUsageRecommendHelper(t,
+				&usageRecommendEnv{config: usageRecommendConfigDefaultTool}, tc.args...)
+			if code != 0 {
+				t.Fatalf("exit = %d, want 0 (stdout=%q stderr=%q)", code, stdout, stderr)
+			}
+			if got, want := firstLine(stdout), "claude sonnet tier=mid state=unknown"; got != want {
+				t.Fatalf("headline = %q, want %q — the padded value must resolve like the bare one", got, want)
+			}
+		})
 	}
 }
 
