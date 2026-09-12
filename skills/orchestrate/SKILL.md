@@ -16,15 +16,63 @@ independent review loop until clean, a PR, and CI babysat to green. The user
 gets one final report, and that report is the only place screenshots are ever
 referenced.
 
-## Advisory usage context
+## Usage-aware launch
 
-Before a multi-child launch wave, optionally run `agent-deck usage --all --json`
-once when OpenUsage is available. Re-check only after a child reports the
-existing `usage-limit` substate or before a later wave after that snapshot has
-expired. This information may inform a recommendation, but never blocks a
-launch, switches an account automatically, or overrides an explicit tool or
-account choice. Do not query it during ordinary polling, focused single tasks,
-or every-turn hooks; continue unchanged when it is unavailable.
+Before each launch wave, run `agent-deck usage recommend` **once per distinct
+role+tier** in that wave and save its JSON under `$RUN_DIR/usage/`:
+
+```bash
+mkdir -p "$RUN_DIR/usage"
+agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --json \
+  > "$RUN_DIR/usage/<wave>-<role>-<tier>.json"
+```
+
+The command is read-only and advisory. It exits 0 for every decision — including
+`state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag
+(a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
+positional). A machine with no `openusage` binary gets `state: unknown` and the
+preferred tool, which is an answer, not a failure; continue unchanged there.
+
+Launch with the decision's `tool`, and with its `model` when that field is
+non-empty:
+
+```bash
+agent-deck launch <worktree-path> -c <tool> \
+  -t "impl-<task-slug>" \
+  --extra-arg --model --extra-arg <model> \
+  --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"
+```
+
+Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is
+empty — an empty model is the decision telling you to run the connector's own
+default.
+
+**Re-run rule.** Reuse the saved decision for the rest of its wave. Call
+`recommend` again only after a child reports the existing `usage-limit`
+substate, or before a later wave when the saved decision's `fetched_at` is
+older than five minutes. A saved decision whose `fetched_at` is `null` — what
+the command emits when no snapshot could be fetched — counts as stale. Do not
+query it during ordinary polling, focused single tasks, or every-turn hooks.
+
+**Record every launch** on one manifest line:
+
+```text
+role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>
+```
+
+**A decision whose `state` is `exhausted` pauses the wave**: do not launch that
+wave, record the decision, report it through the run's existing path, and wait
+for the earliest `resets_at` from `agent-deck usage --all --json` before
+retrying.
+
+**Explicit workflow tool choices** — the cross-provider Codex reviewer in
+"Model & connector tiering" is the standing one — yield to the recommendation
+**only** when that provider's state is `exhausted`. Record the override on that
+launch's manifest line.
+
+The recommendation chooses a connector and a model and nothing else: it never
+switches an account automatically, and it never overrides an explicit account or
+profile choice. Accounts stay exactly as configured.
 
 **Requires:** everything `fleet` requires. Delivery/PR entrances additionally
 require an authenticated `gh` for the target repo; verification-only work does
@@ -397,7 +445,9 @@ silently replace the shared contract.
 
 Then record per task: slug, base ref and resolved base sha, branch, worktree
 path, verified launch HEAD and merge base, session ids with each session's
-connector + model (and any escalation), current stage, review round, the HEAD
+connector + model (and any escalation), the per-launch usage decision line
+`role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>`
+from "Usage-aware launch", current stage, review round, the HEAD
 sha each review round saw, per review round `launched=<unix> done=<unix>
 span=<s>` (from `session children --json`, so the next run can be compared
 against this one's round times), the `AB_SUMMARY:` line of each blind A/B
@@ -713,8 +763,9 @@ and any safety/rollback steps. It does not embed production code, duplicate
 the approved design, or predict unobserved output. Short signatures, schemas,
 and pseudocode are allowed only when they are the shared interface the plan
 exists to settle. Each task file carries an `## Interfaces` block and an empty
-`## Record (append-only)` section. It tags every task `tier: mid | strong` and
-sizes it to fit one fresh session. It implements nothing, and it commits
+`## Record (append-only)` section. It tags every task
+`tier: mid | strong | frontier` and sizes it to fit one fresh session. It
+implements nothing, and it commits
 nothing — the plan is scaffolding under `$PLAN_ROOT`, not a change to the branch.
 Verify that after it finishes:
 
@@ -814,10 +865,13 @@ Passing a model is per-connector: `-c claude` and `-c codex` both accept
 `--extra-arg --model --extra-arg <model>`; a connector with no known model
 flag runs its default (tier by connector choice alone). Omit the flag to
 use the user's default. Each provider maps its own ladder onto
-cheap/mid/strong — Claude: `haiku` / `sonnet` / `opus` (aliases
-self-update to the latest release, so pass them bare; `fable` sits above
-opus for the very hardest work); Codex (GPT-5.6): `gpt-5.6-luna` /
-`gpt-5.6-terra` / `gpt-5.6-sol` (generation-prefixed, so these do drift).
+cheap/mid/strong/frontier — Claude: `haiku` / `sonnet` / `opus` / `fable`
+(the first three are aliases that self-update to the latest release, so pass
+them bare); Codex (GPT-5.6): `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` /
+`gpt-6-astra` (generation-prefixed, so these do drift). The top rung is
+special: frontier is never a baseline the conductor picks on its own. It is
+reached only by a planner `tier: frontier` tag — which is why the baseline
+table's frontier row names that tag — or by an escalation off strong.
 Trust the user's config/defaults over any example here. Connector-specific mechanics move with the role:
 read-only enforcement for a **Codex** reviewer is
 `--extra-arg --sandbox --extra-arg read-only` (not `--disallowedTools`,
@@ -842,6 +896,7 @@ Baseline tier per session:
 | --- | --- |
 | Planner, plan reviewer, merge-conflict, integration check | strong (e.g. opus) |
 | Implementer of a reviewed plan task | the plan task's `tier:` tag — never below mid |
+| Implementer of a plan task tagged `tier: frontier` | frontier |
 | Implementer, clear spec but no plan | mid (e.g. sonnet) |
 | Implementer, freeform — designs its own approach | strong |
 | Reviewer, default | mid (e.g. sonnet) |
@@ -850,9 +905,9 @@ Baseline tier per session:
 
 For planned tasks the planner's `tier:` tags (see the planner prompt) are
 authoritative — the planner read the codebase; you'd be guessing from
-titles. Mid is the floor for any implementer, though, and the planner only
-tags `mid` or `strong` for that reason: an implementer never merely
-transcribes the plan. It also edits real files, runs the verification
+titles. Mid is the floor for any implementer, though, and the planner tags
+`mid`, `strong` or `frontier` for that reason — never below mid: an
+implementer never merely transcribes the plan. It also edits real files, runs the verification
 commands, diagnoses a failure the plan did not predict, commits, and emits
 the sentinel — and a cheap-tier session that drops one of those does not
 fail cheaply. The miss lands in the reviewer's findings, costs a fix round,
@@ -893,16 +948,18 @@ rest of that task:
 
 - **Reviewer oscillates** — a round reports new findings in code an earlier
   round already passed, meaning the reviewer is missing things → escalate
-  the reviewer to strong.
+  the reviewer to strong → frontier.
 - **Downgraded implementer fails round 2** — round 2 still reports `patch`
   or `decision-needed` findings → don't send a third round to the same
   session; launch the fix
-  as a NEW strong-model session in the same worktree (tell it to read
-  `git log` and the diff first). Caps the worst case at roughly
-  strong-model cost.
+  as a NEW session in the same worktree, escalated strong → frontier (tell it
+  to read `git log` and the diff first). Caps the worst case at roughly
+  one frontier-model session.
 
 Record every session's connector + model in the manifest, escalations
-included — the final report surfaces them, and that record is the only way
+included, on the launch line from "Usage-aware launch"
+(`role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>`)
+— the final report surfaces them, and that record is the only way
 to tell whether tiering saved cost or just bought extra rounds.
 
 ## Deployed-system verification

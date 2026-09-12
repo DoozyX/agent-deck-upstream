@@ -32,9 +32,11 @@ old shape and depends on every migrate task. Carry the design's
 section instead of inventing a test strategy per task. If the design names
 ADR files under its `design/adr/` directory, the first task copies them to
 `docs/adr/` and commits them with its change. Tag every task
-with `tier: mid | strong` — mid when it needs only local judgment within a
-clear spec, strong when it settles a technical contract or makes a remaining
-implementation decision. There is no tier below mid: every executor still has
+with `tier: mid | strong | frontier` — mid when it needs only local judgment
+within a clear spec, strong when it settles a technical contract or makes a
+remaining implementation decision, frontier only for a task no strong session
+should be asked to carry alone. Frontier is never a baseline: tag it
+deliberately or not at all. There is no tier below mid: every executor still has
 to run verification and diagnose what the plan did not predict.
 
 This is a coordination plan, not a shadow implementation. Do not embed production code,
