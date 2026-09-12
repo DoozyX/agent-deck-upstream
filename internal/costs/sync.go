@@ -157,18 +157,9 @@ func loadScanCheckpoint(ctx context.Context, store *Store, source TranscriptSour
 }
 
 func applyEventPrice(event *UsageEvent, pricer *Pricer) {
-	price, known := pricer.GetPrice(event.Model)
-	if !known {
-		event.PricingStatus = PricingUnknown
-		event.CostMicrodollars = 0
-		return
-	}
-	if price.InputPerMtokMicro == 0 && price.OutputPerMtokMicro == 0 && price.CacheReadPerMtokMicro == 0 && price.CacheWritePerMtokMicro == 0 {
-		event.PricingStatus = PricingKnownZero
-	} else {
-		event.PricingStatus = PricingKnown
-	}
-	event.CostMicrodollars = pricer.ComputeCost(event.Model, event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens, event.Usage.CacheWriteTokens)
+	quote := pricer.Quote(event.Model, event.Usage)
+	event.PricingStatus = quote.Status
+	event.CostMicrodollars = quote.CostMicrodollars
 }
 
 func overlappingLegacyEventIDs(ctx context.Context, store *Store, sessionID string, events []UsageEvent) ([]string, error) {
