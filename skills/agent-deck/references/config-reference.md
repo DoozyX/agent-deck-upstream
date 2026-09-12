@@ -671,11 +671,11 @@ claude = "fable"
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted` and is never selected. Must be `<= constrained_below`. |
+| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`. An exhausted provider is never *preferred* — unlike a constrained one it does not win the `strong` and `frontier` tiers — but it is still returned when no candidate is eligible, so read `state` on every decision. Must be `<= constrained_below`. |
 | `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`: avoided while a healthy candidate exists, but a constrained *preferred* tool still wins for the `strong` and `frontier` tiers. |
-| `failover` | array of strings | `[default_tool, then the other usage provider]` | Tool-name order tried after the requested `--prefer` tool. Entries are validated by shape only and are never matched against the set of known tools, so a misspelled or miscased entry is carried through verbatim and can come back as the decision's `tool` with an empty `provider` and no model. |
-| `[usage.policy.ladder.<tool>]` | table of strings | Claude `haiku`/`sonnet`/`opus`/`fable`; Codex `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol`/`gpt-6-astra` | Model per tier (`cheap`, `mid`, `strong`, `frontier`) for that tool. An explicitly empty rung marks that tier unavailable on that provider and the recommendation falls back to `strong`; an absent rung keeps the default. |
-| `[usage.policy.frontier_window]` | table of strings | `{ claude = "fable" }` | Per-provider name of the separate OpenUsage consumption window that gates the `frontier` tier. When that window is below `constrained_below`, `frontier` is applied as `strong`. Unset means no gate. |
+| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = "codex"` | Tool-name order tried after the requested `--prefer` tool. A `default_tool` that is not itself a usage provider does not enter the order at all. An explicitly empty list is treated exactly like an omitted key and keeps the default order — it does not switch cross-provider failover off. Entries are validated by shape only and are never matched against the set of known tools, so a misspelled or miscased entry is carried through verbatim and can come back as the decision's `tool` with an empty `provider` and no model. |
+| `[usage.policy.ladder.<claude\|codex>]` | table of strings | Claude `haiku`/`sonnet`/`opus`/`fable`; Codex `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol`/`gpt-6-astra` | Model per tier (`cheap`, `mid`, `strong`, `frontier`) for that provider. Only `claude` and `codex` are accepted; any other table name fails config validation with exit 1, so a ladder named for a non-usage tool breaks every `recommend` call rather than being ignored. An explicitly empty `frontier` rung marks that tier unavailable and the recommendation falls back to `strong`; an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged, which tells the caller to launch the connector's own default; an absent rung keeps the default. |
+| `[usage.policy.frontier_window]` | table of strings | `{ claude = "fable" }` | Per-provider name of the separate OpenUsage consumption window that gates the `frontier` tier. When that window is present in the snapshot and below `constrained_below`, `frontier` is applied as `strong`. A window that is unset gates nothing — and so does a window that is named here but absent from the snapshot the provider actually returned, which leaves `frontier` applied in full. |
 
 Read the current decision for a role and tier:
 
@@ -695,7 +695,8 @@ loaded or validated, or the JSON could not be encoded.
 `--json` prints the decision as ten snake_case keys: `tool`, `provider`,
 `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`,
 `alternatives` (each entry `tool` / `state` / `remaining_percent`), and
-`fetched_at` (`null` when no snapshot was fetched, an RFC 3339 timestamp
+`fetched_at` (`null` when the selected tool has no snapshot — which happens
+even when snapshots were fetched for other candidates — an RFC 3339 timestamp
 otherwise). A `remaining_percent` of `-1` covers both a reading that was not
 available and a provider that genuinely reported a negative remaining; read
 `state` to tell those apart. `tier_requested` and `tier_applied` differ whenever

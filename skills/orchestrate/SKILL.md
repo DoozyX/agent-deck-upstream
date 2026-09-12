@@ -31,7 +31,8 @@ The command is read-only and advisory. It exits 0 for every decision — includi
 `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag
 (a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
 positional). A machine with no `openusage` binary gets `state: unknown` and the
-preferred tool, which is an answer, not a failure; continue unchanged there.
+preferred tool when one resolves, which is an answer, not a failure; continue
+unchanged there.
 
 Launch with the decision's `tool`, and with its `model` when that field is
 non-empty:
@@ -46,6 +47,12 @@ agent-deck launch <worktree-path> -c <tool> \
 Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is
 empty — an empty model is the decision telling you to run the connector's own
 default.
+
+An empty `tool` is different: there is no `-c <tool>` to pass and the launch
+above cannot be built. It means no candidate tool resolved at all — the exit
+code is still 0 and the remedy reaches **stderr only**, so capture stderr, not
+just the `>` redirect. Re-run the call with `--prefer <tool>`, or set
+`default_tool` in `config.toml`, before launching anything for that wave.
 
 **Re-run rule.** Reuse the saved decision for the rest of its wave. Call
 `recommend` again only after a child reports the existing `usage-limit`
@@ -871,7 +878,8 @@ them bare); Codex (GPT-5.6): `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` /
 `gpt-6-astra` (generation-prefixed, so these do drift). The top rung is
 special: frontier is never a baseline the conductor picks on its own. It is
 reached only by a planner `tier: frontier` tag — which is why the baseline
-table's frontier row names that tag — or by an escalation off strong.
+table's frontier row names that tag — or by an escalation, which reaches it
+through strong whatever tier the role started at.
 Trust the user's config/defaults over any example here. Connector-specific mechanics move with the role:
 read-only enforcement for a **Codex** reviewer is
 `--extra-arg --sandbox --extra-arg read-only` (not `--disallowedTools`,
@@ -943,8 +951,8 @@ that gets it wrong costs you one re-read; doing it yourself costs you the
 context permanently. Cheap does not extend to implementing or reviewing —
 those have their own floor above.
 
-Escalations are one-way — once a role escalates, it stays strong for the
-rest of that task:
+Escalations are one-way — once a role escalates, it stays at the escalated
+tier for the rest of that task:
 
 - **Reviewer oscillates** — a round reports new findings in code an earlier
   round already passed, meaning the reviewer is missing things → escalate
