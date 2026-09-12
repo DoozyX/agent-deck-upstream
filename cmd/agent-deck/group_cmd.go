@@ -561,6 +561,10 @@ func handleGroupCodex(profile string, args []string) {
 		fmt.Printf("group '%s' not found\n", name)
 		os.Exit(2)
 	}
+	if err := session.SyncGroupCodexAuth(groupPath); err != nil {
+		fmt.Printf("failed to sync Codex shared login for %s: %v\n", groupPath, err)
+		os.Exit(1)
+	}
 	if err := session.SyncGroupCodexPlugins(groupPath); err != nil {
 		fmt.Printf("failed to sync Codex plugins for %s: %v\n", groupPath, err)
 		os.Exit(1)

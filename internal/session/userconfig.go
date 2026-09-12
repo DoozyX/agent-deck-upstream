@@ -2229,6 +2229,10 @@ type OpenCodeSettings struct {
 
 // CodexSettings defines Codex CLI configuration
 type CodexSettings struct {
+	// SharedAuthSource opts group homes into one file-backed login. Empty keeps
+	// credentials isolated. Named account slots are never opted in implicitly.
+	SharedAuthSource string `toml:"shared_auth_source,omitempty"`
+
 	// Command is the Codex CLI command or alias to use (e.g., "codex", "codex-v2")
 	// Default: "codex"
 	Command string `toml:"command,omitempty"`
