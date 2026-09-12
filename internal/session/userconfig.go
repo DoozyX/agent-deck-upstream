@@ -279,7 +279,19 @@ type UserConfig struct {
 // OrchestrateSettings controls how the orchestrate workflow chooses tools for
 // child sessions. An empty strategy preserves the workflow's legacy defaults.
 type OrchestrateSettings struct {
-	ToolStrategy string `toml:"tool_strategy,omitempty"`
+	ToolStrategy string                 `toml:"tool_strategy,omitempty"`
+	Routing      OrchestrateRoleDefault `toml:"routing,omitempty"`
+	Routine      OrchestrateRoleDefault `toml:"routine,omitempty"`
+	Architecture OrchestrateRoleDefault `toml:"architecture,omitempty"`
+}
+
+// OrchestrateRoleDefault selectively overrides the built-in economical role
+// defaults. Empty values deliberately inherit the built-in value.
+type OrchestrateRoleDefault struct {
+	CodexModel   string `toml:"codex_model,omitempty"`
+	CodexEffort  string `toml:"codex_effort,omitempty"`
+	ClaudeModel  string `toml:"claude_model,omitempty"`
+	ClaudeEffort string `toml:"claude_effort,omitempty"`
 }
 
 // SelfHealSettings controls the self-heal supervision policy (SELF-HEAL-DESIGN.md
@@ -3593,6 +3605,14 @@ func LoadUserConfig() (*UserConfig, error) {
 		userConfigCacheMtime = currentMtime
 		SetGroupSortMode(fresh.GetGroupSort())
 		userConfigCacheErr = fmt.Errorf("invalid [orchestrate].tool_strategy %q: must be \"default\" or \"auto\"", strategy)
+		return userConfigCache, userConfigCacheErr
+	}
+	if err := validateOrchestrateRoleDefaults(&config); err != nil {
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
+		userConfigCacheMtime = currentMtime
+		SetGroupSortMode(fresh.GetGroupSort())
+		userConfigCacheErr = err
 		return userConfigCache, userConfigCacheErr
 	}
 	if alternate := strings.TrimSpace(config.QuickCreate.AlternateTool); alternate != "" {

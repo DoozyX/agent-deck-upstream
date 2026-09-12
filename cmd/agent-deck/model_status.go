@@ -27,6 +27,14 @@ func addModelInfoJSON(target map[string]interface{}, info session.ModelInfo) {
 	}
 }
 
+// addOrchestrateLaunchJSON exposes the persisted, credential-free role receipt
+// on existing JSON status surfaces without changing their model fields.
+func addOrchestrateLaunchJSON(target map[string]interface{}, inst *session.Instance) {
+	if inst != nil && inst.OrchestrateLaunch != nil {
+		target["orchestrate_launch"] = inst.OrchestrateLaunch
+	}
+}
+
 // addAutoNameJSON surfaces a session's auto-name state on `session show --json`
 // so consumers (notably the notification hook) can show the meaningful task
 // description instead of the machine-generated handle in Title. auto_name is

@@ -546,6 +546,11 @@ type Instance struct {
 	// JSON structure: {"tool": "claude", "options": {...}}
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
+	// OrchestrateLaunch is the sanitized role/model/loadout receipt for a
+	// child created through the role resolver. It is nil for existing sessions
+	// and contains no credentials or prompt content.
+	OrchestrateLaunch *ResolvedLaunch `json:"orchestrate_launch,omitempty"`
+
 	tmuxSession *tmux.Session // Internal tmux session
 
 	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus

@@ -624,11 +624,18 @@ default_tool = "codex"
 
 [orchestrate]
 tool_strategy = "auto"
+
+[orchestrate.routine]
+codex_model = "gpt-5.6-terra"
+codex_effort = "medium"
+claude_model = "sonnet"
+claude_effort = "medium"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `tool_strategy` | string | `""` (legacy) | `"default"` uses the top-level `default_tool` for every non-explicit orchestrated launch. `"auto"` lets the conductor mix locally installed, non-hidden tools by role and task, falling back to `default_tool` when no connector is clearly better. An omitted value preserves the workflow's historical explicit choices. |
+| `routing.*`, `routine.*`, `architecture.*` | strings | built-in role defaults | Optional role-default tables. Supported keys are `codex_model`, `codex_effort`, `claude_model`, and `claude_effort`. They fill only missing launch settings after explicit session/provider choices, group settings, and root provider defaults. Unsupported values make the launch visibly parked; they never upgrade to a stronger model. |
 
 Inspect the policy and the locally available auto-selection candidates:
 
