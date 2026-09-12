@@ -433,6 +433,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// The re-run rule, including the null-fetched_at case the CLI really
 		// emits: the SELECTED tool has no available snapshot, which happens even
 		// when snapshots were fetched for other candidates.
+		// Round-4 finding 4: the two pins below are both true of "Never reuse a
+		// saved decision; make a fresh call before every single launch", which
+		// is the exact OPPOSITE of criterion 1's re-run rule and stayed green.
+		// The opener carries the rule; pin it.
+		"**Re-run rule.** Reuse the saved decision for the rest of its wave.",
 		"`usage-limit` substate",
 		"older than five minutes",
 		"the command emits whenever the *selected* tool has no available snapshot, which happens even when snapshots were fetched for other candidates",
@@ -462,10 +467,28 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// can revert to the unqualified claim.
 		"Score that provider by re-running the call with `--prefer <that provider>`, then read its state from wherever the strategy in force puts it.",
 		"Under the default `tool_strategy` that provider is the only candidate, so the top-level `state` is its own and `alternatives[]` is empty.",
-		"Under `tool_strategy = \"auto\"` `--prefer` only puts it FIRST among the candidates: a healthier tool can still be selected, and that provider's own state is then its entry in `alternatives[]` — read it there, because the top-level `state` belongs to the other tool.",
+		// Round-4 finding 1: the round-3 wording named ONE "auto" sub-case and
+		// then generalised from it. Driven, `--prefer codex` under "auto" with
+		// both providers at 5% selects codex itself — top-level `state` is its
+		// own and it is NOT in `alternatives[]` — and with codex hidden via
+		// `[ui] hidden_tools` the decision is claude/healthy with `alternatives`
+		// EMPTY, so codex appears in NEITHER place. `alternatives` is built by
+		// skipping the selected tool over the EVALUATED candidates only
+		// (internal/usage/recommend.go:569-572), so a provider filtered out
+		// before evaluation has no entry. Both halves of the three-way rule are
+		// pinned, and so is the membership rule that makes the third case
+		// readable: neither can revert to the two-way claim. The two triggers named
+		// are the two that were DRIVEN here (hidden via `[ui] hidden_tools`, and a
+		// miscased failover entry, both yielding `alternatives: []`); the
+		// not-installed path could not be driven on this machine, so the clause
+		// gives examples rather than closing the set.
+		"Under `tool_strategy = \"auto\"` `--prefer` only puts it FIRST among the candidates: a healthier tool can still be selected, so that provider's state lands in one of three places — the top-level `state` when `tool` names it, its entry in `alternatives[]` when a different tool was selected, and neither when it was never a candidate at all.",
+		"`alternatives[]` lists the non-selected candidates, so a provider filtered out before it was ever scored — hidden by `[ui] hidden_tools`, say, or dropped from the failover order by a miscased entry — is absent from both, and that absence is the only signal you get.",
 		// Finding 8: the probe is a SECOND recommend call for the same
 		// role+tier, so it must not overwrite the wave's one saved decision.
-		"The probe is diagnostic: do not save it over the wave's `$RUN_DIR/usage/<wave>-<role>-<tier>.json`",
+		// Round-4 finding 7: the trailing clause was deletable while green.
+		// Strict superset of the string it replaces.
+		"The probe is diagnostic: do not save it over the wave's `$RUN_DIR/usage/<wave>-<role>-<tier>.json`, which the re-run rule reuses for the rest of the wave.",
 		// Finding 9: the manifest format criterion 3 fixes has no override
 		// field, so the override has to name where it actually goes.
 		"The format above has no override field, so it goes in `reason=`.",
@@ -514,6 +537,10 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// stderr only — the section's own `>` redirect does not capture it.
 		"An empty `tool` is different",
 		"the remedy reaches **stderr only**",
+		// Round-4 finding 7: the two pins above hold the surrounding sentences
+		// but not the remedy itself, which survived replacement by "Launch
+		// without `-c` and let the connector default apply."
+		"Re-run the call with `--prefer <tool>`, or set `default_tool` in `config.toml`, before launching anything for that wave.",
 	})
 	// Criterion 3: the manifest line is owed at three sites — the code block
 	// and both cross-references. A whole-file Contains passed with BOTH
@@ -549,6 +576,22 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 			t.Errorf("criterion 3's manifest line must be cited within 6 lines of %q; it is not", site.anchor)
 		}
 	}
+	// Round-4 finding 5: the third per-launch instruction carried the
+	// pre-existing THREE-field form while the code block and both
+	// cross-references mandate the six-field one, so the document gave two
+	// formats for one artifact and the short one omitted `model=`, `tier=` and
+	// `state=` — the field the exhausted pause and the final report both read.
+	// The count above uses the six-field string, so this site contributes
+	// nothing to it and a pointer added here would otherwise be
+	// revertible-green. Pin the pointer itself.
+	requireAll("orchestrate skill third manifest site", skill, []string{
+		"append the full manifest line defined under \"Record every launch\" above — `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`, all six fields — to `$RUN_DIR/manifest.md`",
+	})
+	// ...and the short form it replaced must not come back alongside it.
+	if strings.Contains(normalize(skill), "`role=<role> tool=<tool> reason=<one line>`") {
+		t.Errorf("orchestrate skill still gives the three-field manifest form; the six-field form at \"Record every launch\" is the only one")
+	}
+
 	// Criterion 6a: the two clauses this change falsifies must not survive.
 	// A document asserting both the old rule and the new one is worse than one
 	// asserting only the old one, so this is checked over the whole file.
@@ -560,8 +603,12 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// is a removal, and the bare Contains was case-sensitive and markup-blind
 	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
 	// an explicit tool choice: never." all survived it.
+	// Backticks are stripped for the same reason as `*` and `_`: this document
+	// backticks `tool` everywhere, so "It overrides an explicit `tool` choice."
+	// and "It never `blocks a launch`." both revert the dead clauses while
+	// reading as ordinary prose, and both survived the emphasis-only fold.
 	fold := func(s string) string {
-		return strings.NewReplacer("*", "", "_", "").Replace(strings.ToLower(normalize(s)))
+		return strings.NewReplacer("*", "", "_", "", "`", "").Replace(strings.ToLower(normalize(s)))
 	}
 	for _, dead := range []string{"never blocks a launch", "overrides an explicit tool"} {
 		if strings.Contains(fold(skill), fold(dead)) {
@@ -614,6 +661,12 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`:",
 		"| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = \"codex\"` |",
 		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
+		// Round-4 finding 7: round 3 added this block to the TOML example
+		// because round-2 finding 2 asked for it, and criterion 11 owes "a TOML
+		// example matching the design's block" — yet the block survived
+		// deletion. Pinned with its trailing blank line so it also holds its
+		// position immediately ahead of `[usage.policy]`.
+		"[orchestrate]\ntool_strategy = \"auto\"\n\n[usage.policy]",
 		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
 		// The failover row was entirely rewritten and gained ZERO pins: the
 		// three above are context lines that rewrite never touched, so the
@@ -621,7 +674,14 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// reason strings could all be reverted while this test stayed green.
 		// Each corrected claim is now held, and each was driven against a
 		// built binary rather than read off the source.
-		"The ORDER is consulted **only** under `[orchestrate] tool_strategy = \"auto\"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool",
+		// Round-4 finding 3: three clauses written in cd175e91 carried no pin
+		// and were invertible while green. All three are true today, each
+		// driven against a built binary. The first string below is a strict
+		// superset of the one it replaces — it adds the "no other tool it could
+		// change to" clause; the two after it are new.
+		"The ORDER is consulted **only** under `[orchestrate] tool_strategy = \"auto\"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool — that strategy has at most one candidate to choose from, so there is no other tool it could change to.",
+		"Either way cross-provider failover does not happen there: no second provider is queried and `alternatives` comes back empty.",
+		"`--prefer` is checked against the tool registry rather than the installed set, so a registry name that is not installed passes the flag check and is then dropped here like any other entry.",
 		"there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy \"\"`",
 		"Under `\"auto\"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order",
 		"a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed",
