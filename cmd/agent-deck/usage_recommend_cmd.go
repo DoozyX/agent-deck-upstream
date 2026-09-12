@@ -151,9 +151,15 @@ func usageRecommendSnapshots(req usage.Request, config *session.UserConfig, tool
 // handleUsageRecommend implements `agent-deck usage recommend`. Exit codes are
 // advisory: every decision the recommender reaches exits 0, including the
 // exhausted and unknown states, a completely missing openusage binary, and a
-// decision that names no tool at all. Exit 2 is reserved for a flag the
-// command cannot act on: a missing --role, an unknown --tier, an unknown
-// --prefer tool, and flag.Parse's own rejections.
+// decision that names no tool at all. Exit 2 is reserved for an invocation
+// this command cannot act on, which is wider than a bad flag value: a missing
+// --role, an unknown --tier, an unknown --prefer tool, flag.Parse's own
+// rejections, and a stray positional argument — which is not a flag at all,
+// since flag.Parse accepts it and leaves it in NArg(). All five are driven by
+// TestUsageRecommendRejectsBadFlags' table. Exit 1 is a third case and not an
+// invocation error at all: it reports this command's own machinery failing,
+// on the three os.Exit(1) paths below (config load, policy merge, JSON
+// encode).
 func handleUsageRecommend(args []string) {
 	fs := flag.NewFlagSet("usage recommend", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)

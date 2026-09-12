@@ -242,6 +242,15 @@ func TestUsageRecommendWithoutOpenUsageReportsUnknown(t *testing.T) {
 	if got := strings.Split(strings.TrimRight(stdout, "\n"), "\n"); len(got) != 2 {
 		t.Fatalf("stdout = %q, want exactly a headline and a reason line, got %d lines", stdout, len(got))
 	}
+	// This run NAMES a tool, so the empty-tool remedy must not fire. The
+	// guard's body is covered by TestUsageRecommendWithoutCandidateToolStillDecides;
+	// this negative is what covers the guard's CONDITION, which is otherwise
+	// unobservable now that the empty-tool branch exits 0 like every other
+	// decision. Without it, dropping the `if` and keeping the body prints a
+	// false remedy on every healthy run and no test notices.
+	if strings.Contains(stderr, "no candidate tool") {
+		t.Fatalf("stderr = %q, want no remedy on a decision that names a tool", stderr)
+	}
 }
 
 // TestUsageRecommendFrontierReasonIsPassedThrough pins what the second line
@@ -441,6 +450,51 @@ func TestUsageRecommendWithoutCandidateToolStillDecides(t *testing.T) {
 	})
 }
 
+// TestUsageRecommendRemedyPrecedesTheDecisionOnOneStream pins the ordering
+// half of the empty-tool guard's comment: the remedy is written before stdout
+// is touched, so a terminal cannot interleave it into the decision.
+//
+// runUsageRecommendHelper cannot see this. It gives cmd.Stdout and cmd.Stderr
+// two SEPARATE buffers, so the relative order of a write to one and a write to
+// the other is simply not recorded anywhere. Pointing both at one buffer is
+// what a terminal does, and os/exec hands the child a single pipe when the two
+// writers are the same value — so the buffer records the child's own write
+// order.
+func TestUsageRecommendRemedyPrecedesTheDecisionOnOneStream(t *testing.T) {
+	home := t.TempDir()
+	binDir := t.TempDir()
+
+	// No config file and no openusage: the stock install of
+	// TestUsageRecommendWithoutCandidateToolStillDecides, which is the only
+	// case that writes to both streams.
+	cmd := exec.Command(os.Args[0], "-test.run=TestUsageRecommendHelperProcess", "--",
+		"recommend", "--role", "implementer", "--tier", "mid")
+	cmd.Env = append(os.Environ(),
+		"AGENT_DECK_USAGE_RECOMMEND_HELPER=1",
+		"HOME="+home,
+		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
+		"PATH="+binDir,
+	)
+	var merged bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &merged, &merged
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("run helper: %v (output=%q)", err, merged.String())
+	}
+	out := merged.String()
+
+	// Both anchors are unique to their own stream: the remedy says "tool ("
+	// singular with a parenthesis, while the reason line on stdout says
+	// "tools for tool strategy" plural with none.
+	remedy := strings.Index(out, "no candidate tool (")
+	headline := strings.Index(out, "tier=mid state=unknown")
+	if remedy < 0 || headline < 0 {
+		t.Fatalf("output = %q, want it to carry both the stderr remedy and the stdout headline", out)
+	}
+	if remedy > headline {
+		t.Fatalf("output = %q, want the stderr remedy at %d to precede the stdout headline at %d", out, remedy, headline)
+	}
+}
+
 // TestUsageRecommendJSONCarriesAlternativeElements pins the alternatives array
 // at the JSON boundary, which is the surface the orchestrate skill consumes.
 // TestUsageRecommendJSONShape runs on a single-candidate config, so the array
@@ -499,8 +553,10 @@ func TestUsageRecommendProfileReachesTheRecommender(t *testing.T) {
 // documented behaviour: a query that fails becomes an unavailable snapshot
 // rather than being dropped. The difference is visible in `account` — the
 // snapshot is what the recommender scored, so dropping it would leave the
-// decision naming no account at all, and would take the profile clause
-// TestUsageRecommendProfileReachesTheRecommender relies on with it.
+// decision naming no account at all. That is the whole of what this test
+// pins: run under a mutant that drops the failed snapshot,
+// TestUsageRecommendProfileReachesTheRecommender still PASSES, because its
+// `no snapshot for profile "Codex"` clause survives with zero snapshots.
 func TestUsageRecommendFailedQueryKeepsTheAccount(t *testing.T) {
 	// No openusage anywhere on the child's PATH, so every query fails.
 	stdout, stderr, code := runUsageRecommendHelper(t,
