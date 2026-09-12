@@ -1,0 +1,1 @@
+{"type":"assistant","uuid":"native-child","requestId":"req-child","timestamp":"2026-09-01T16:00:02Z","message":{"id":"msg-child","model":"claude-child","usage":{"input_tokens":1,"cache_read_input_tokens":4,"cache_creation_input_tokens":0,"output_tokens":3}}}

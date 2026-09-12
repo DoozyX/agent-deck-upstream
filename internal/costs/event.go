@@ -80,6 +80,12 @@ func (u TokenUsage) TotalTokens() int64 {
 	return u.TotalInputTokens() + u.OutputTokens
 }
 
+// CacheWriteUnknownTokens returns the aggregate cache-write residual for which
+// the provider did not report a 5-minute or 1-hour duration.
+func (u TokenUsage) CacheWriteUnknownTokens() int64 {
+	return u.CacheWriteTokens - u.CacheWrite5mTokens - u.CacheWrite1hTokens
+}
+
 // UsageEvent is the canonical, provider-aware ledger event. SourceIdentity is
 // provider-native and deliberately independent of mutable Agent Deck session
 // titles and instance IDs.
