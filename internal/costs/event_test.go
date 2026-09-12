@@ -23,6 +23,7 @@ func TestTokenUsageValidate(t *testing.T) {
 		{name: "negative cache write 1h", usage: costs.TokenUsage{CacheWrite1hTokens: -1}, wantErr: "cache_write_1h_tokens"},
 		{name: "negative reasoning", usage: costs.TokenUsage{ReasoningTokens: -1}, wantErr: "reasoning_tokens"},
 		{name: "reasoning exceeds output", usage: costs.TokenUsage{OutputTokens: 2, ReasoningTokens: 3}, wantErr: "reasoning_tokens"},
+		{name: "cache duration subsets exceed aggregate", usage: costs.TokenUsage{CacheWriteTokens: 10, CacheWrite5mTokens: 6, CacheWrite1hTokens: 5}, wantErr: "cache write duration subsets"},
 		{name: "provider inclusive input below cache subsets", usage: costs.TokenUsage{CacheReadTokens: 7, CacheWriteTokens: 3, ProviderInputTokens: int64Ptr(9)}, wantErr: "provider_input_tokens"},
 	}
 

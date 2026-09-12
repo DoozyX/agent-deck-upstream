@@ -16,6 +16,7 @@ type ProviderHome struct {
 	Provider string
 	Path     string
 	Account  string
+	Required bool
 }
 
 type TranscriptAttribution struct {
@@ -47,6 +48,9 @@ func DiscoverTranscriptSources(config DiscoveryConfig) ([]TranscriptSource, []Co
 	for _, attribution := range config.Attributions {
 		home, err := canonicalPath(attribution.Home)
 		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
 			return nil, nil, fmt.Errorf("canonicalize %s attribution home: %w", attribution.Provider, err)
 		}
 		attribution.Home = home
@@ -61,6 +65,9 @@ func DiscoverTranscriptSources(config DiscoveryConfig) ([]TranscriptSource, []Co
 		home, err := canonicalPath(configuredHome.Path)
 		if err != nil {
 			if os.IsNotExist(err) {
+				if configuredHome.Required {
+					return nil, warnings, fmt.Errorf("configured %s home for account %q does not exist", configuredHome.Provider, configuredHome.Account)
+				}
 				warnings = append(warnings, CoverageWarning{Provider: configuredHome.Provider, Source: configuredHome.Path, Kind: "home_missing", Message: "configured provider home does not exist"})
 				continue
 			}

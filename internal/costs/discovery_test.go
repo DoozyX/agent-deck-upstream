@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -16,6 +17,27 @@ func writeFixtureFile(t *testing.T, path string) {
 	}
 	if err := os.WriteFile(path, []byte("{}\n"), 0o600); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDiscoverTranscriptSourcesRequiredMissingAttributedHomeSanitizesError(t *testing.T) {
+	missingHome := filepath.Join(t.TempDir(), "private-account-name")
+	_, _, err := costs.DiscoverTranscriptSources(costs.DiscoveryConfig{
+		Homes: []costs.ProviderHome{
+			{Provider: costs.ProviderCodex, Path: missingHome, Account: "work", Required: true},
+		},
+		Attributions: []costs.TranscriptAttribution{
+			{Provider: costs.ProviderCodex, Home: missingHome, NativeSessionID: "11111111-1111-1111-1111-111111111111"},
+		},
+	})
+	if err == nil {
+		t.Fatal("expected missing required home error")
+	}
+	if strings.Contains(err.Error(), missingHome) {
+		t.Fatalf("error leaks configured home path: %v", err)
+	}
+	if got, want := err.Error(), `configured codex home for account "work" does not exist`; got != want {
+		t.Fatalf("error=%q want %q", got, want)
 	}
 }
 

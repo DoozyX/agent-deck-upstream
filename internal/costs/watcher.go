@@ -3,6 +3,7 @@ package costs
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,13 +15,21 @@ import (
 
 // RawCostEvent is the JSON structure written by hook_handler.
 type RawCostEvent struct {
-	InstanceID       string `json:"instance_id"`
-	Model            string `json:"model"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-	Timestamp        int64  `json:"ts"`
+	InstanceID         string   `json:"instance_id"`
+	Provider           string   `json:"provider"`
+	SourceKind         string   `json:"source_kind"`
+	SourceIdentity     string   `json:"source_identity"`
+	SourceAliases      []string `json:"source_aliases,omitempty"`
+	TranscriptIdentity string   `json:"transcript_identity"`
+	Model              string   `json:"model"`
+	InputTokens        int64    `json:"input_tokens"`
+	OutputTokens       int64    `json:"output_tokens"`
+	CacheReadTokens    int64    `json:"cache_read_tokens"`
+	CacheWriteTokens   int64    `json:"cache_write_tokens"`
+	CacheWrite5mTokens int64    `json:"cache_write_5m_tokens"`
+	CacheWrite1hTokens int64    `json:"cache_write_1h_tokens"`
+	ReasoningTokens    int64    `json:"reasoning_tokens"`
+	Timestamp          int64    `json:"ts"`
 }
 
 // CostEventWatcher watches a directory for new cost event JSON files.
@@ -135,4 +144,43 @@ func (w *CostEventWatcher) processFile(path string) {
 	default:
 		// channel full, leave file for retry on next fsnotify event
 	}
+}
+
+// WriteRawCostEvent persists one event emitted by the supported hook watcher.
+func (s *Store) WriteRawCostEvent(raw RawCostEvent, pricer *Pricer) error {
+	if raw.Provider != "" && raw.SourceIdentity != "" {
+		usage := TokenUsage{
+			InputTokens: raw.InputTokens, OutputTokens: raw.OutputTokens,
+			CacheReadTokens: raw.CacheReadTokens, CacheWriteTokens: raw.CacheWriteTokens,
+			CacheWrite5mTokens: raw.CacheWrite5mTokens, CacheWrite1hTokens: raw.CacheWrite1hTokens,
+			ReasoningTokens: raw.ReasoningTokens,
+		}
+		event := UsageEvent{
+			ID:       raw.InstanceID + "_" + fmt.Sprintf("%d", raw.Timestamp),
+			Provider: raw.Provider, SourceKind: raw.SourceKind,
+			SourceIdentity: raw.SourceIdentity, SourceAliases: raw.SourceAliases,
+			TranscriptIdentity: raw.TranscriptIdentity, SessionID: raw.InstanceID,
+			Timestamp: time.Unix(0, raw.Timestamp).UTC(), Model: raw.Model, Usage: usage,
+			PricingStatus: PricingUnknown, ReconciliationStatus: ReconciliationAuthoritative,
+		}
+		if pricer != nil {
+			applyEventPrice(&event, pricer)
+		}
+		_, err := s.Ingest(context.Background(), []UsageEvent{event}, nil)
+		return err
+	}
+	event := CostEvent{
+		ID:               raw.InstanceID + "_" + fmt.Sprintf("%d", raw.Timestamp),
+		SessionID:        raw.InstanceID,
+		Timestamp:        time.Unix(0, raw.Timestamp),
+		Model:            raw.Model,
+		InputTokens:      raw.InputTokens,
+		OutputTokens:     raw.OutputTokens,
+		CacheReadTokens:  raw.CacheReadTokens,
+		CacheWriteTokens: raw.CacheWriteTokens,
+	}
+	if pricer != nil {
+		event.CostMicrodollars = pricer.ComputeCost(raw.Model, raw.InputTokens, raw.OutputTokens, raw.CacheReadTokens, raw.CacheWriteTokens)
+	}
+	return s.WriteCostEvent(event)
 }

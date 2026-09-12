@@ -9,11 +9,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 )
 
 const (
 	ProviderClaude              = "claude"
+	SourceKindClaudeHook        = "hook"
 	SourceKindClaudeDirect      = "claude_direct"
 	SourceKindClaudeProgress    = "claude_progress"
 	SourceKindClaudeNativeChild = "claude_native_child"
@@ -224,20 +227,39 @@ func parseClaudeRecord(line []byte, offset int64, source TranscriptSource) (*cla
 }
 
 func claudeMessageIdentities(record claudeTranscriptRecord, message claudeMessage, transcriptIdentity string) (string, []string) {
+	return ClaudeMessageIdentities(message.ID, record.RequestID, record.UUID, transcriptIdentity, message.Model, message.Content)
+}
+
+// ClaudeMessageIdentities returns the canonical provider-native identity and
+// every stable alias emitted for one Claude assistant observation.
+func ClaudeMessageIdentities(messageID, requestID, recordUUID, transcriptIdentity, model string, content json.RawMessage) (string, []string) {
 	var aliases []string
-	if message.ID != "" {
-		aliases = append(aliases, "claude:msg:"+message.ID)
+	if messageID != "" {
+		aliases = append(aliases, "claude:msg:"+messageID)
 	}
-	if record.RequestID != "" {
-		aliases = append(aliases, "claude:req:"+record.RequestID)
+	if requestID != "" {
+		aliases = append(aliases, "claude:req:"+requestID)
 	}
-	if record.UUID != "" {
-		aliases = append(aliases, "claude:uuid:"+record.UUID)
+	if recordUUID != "" {
+		aliases = append(aliases, "claude:uuid:"+recordUUID)
 	}
 	if len(aliases) == 0 {
-		value := transcriptIdentity + "\x00" + message.Model + "\x00" + string(message.Content)
+		value := transcriptIdentity + "\x00" + model + "\x00" + string(content)
 		sum := sha256.Sum256([]byte(value))
 		aliases = append(aliases, "claude:content:"+hex.EncodeToString(sum[:16]))
 	}
 	return aliases[0], aliases
+}
+
+// ClaudeTranscriptIdentity derives the same stable identity used by discovery
+// from a validated Claude transcript path.
+func ClaudeTranscriptIdentity(path string) string {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	parts := strings.Split(filepath.ToSlash(filepath.Clean(path)), "/")
+	for i, part := range parts {
+		if part == "subagents" && i > 0 {
+			return "claude:" + parts[i-1] + "/subagents/" + base
+		}
+	}
+	return "claude:" + base
 }
