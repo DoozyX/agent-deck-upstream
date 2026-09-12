@@ -95,3 +95,21 @@ func TestLoadUserConfig_RejectsInvalidOrchestrateToolStrategy(t *testing.T) {
 		t.Fatalf("LoadUserConfig() error = %q", got)
 	}
 }
+
+func TestLoadUserConfig_RejectsUnsupportedOrchestrateRoleDefault(t *testing.T) {
+	configDir := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", configDir)
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
+	path := filepath.Join(configDir, "agent-deck", UserConfigFileName)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("[orchestrate.routine]\ncodex_model = \"not-a-model\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadUserConfig(); err == nil {
+		t.Fatal("LoadUserConfig() error = nil, want unsupported role default")
+	}
+}
