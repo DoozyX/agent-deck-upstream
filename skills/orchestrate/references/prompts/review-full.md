@@ -2,6 +2,8 @@
 
 {{SPEC_BLOCK}}
 
+Stable review identity: run={{RUN_DIR}} task={{TASK_ID}} attempt={{ATTEMPT_ID}} base={{BASE_HEAD}} reviewed={{REVIEWED_HEAD}} spec={{SPEC_ID}}. This identity and its reserved budget survive session title/model/context rotation; do not launch or rename another attempt to replace it.
+
 Start the full suite FIRST, detached, before you read anything: the
 full-suite command from the verification contract in the block above (or
 the repo's documented suite command if the block has none), output to
