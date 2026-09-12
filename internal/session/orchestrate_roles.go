@@ -23,15 +23,18 @@ type OrchestrateLaunchExplicit struct {
 	Effort              string
 	GroupPath           string
 	Browser             bool
+	MCPs                []string
+	MCPConfig           bool
 	JustifiedEscalation bool
 }
 
 // OrchestrateToolLoadout is connector-neutral launch data. Claude's strict
 // empty MCP mode is deliberately never emitted for Codex.
 type OrchestrateToolLoadout struct {
-	Kind           string `json:"kind"`
-	Browser        bool   `json:"browser,omitempty"`
-	StrictEmptyMCP bool   `json:"strict_empty_mcp,omitempty"`
+	Kind           string   `json:"kind"`
+	Browser        bool     `json:"browser,omitempty"`
+	StrictEmptyMCP bool     `json:"strict_empty_mcp,omitempty"`
+	MCPs           []string `json:"mcps,omitempty"`
 }
 
 // ResolvedLaunch is a sanitized, durable receipt of a role resolution.
@@ -79,11 +82,11 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 		return (ResolvedLaunch{Role: role, Provider: provider}).parked("unsupported provider " + provider)
 	}
 
-	result := ResolvedLaunch{Role: role, Provider: provider, ToolLoadout: orchestrateLoadout(provider, explicit.Browser), ProviderSource: "tool", LoadoutSource: "role:" + string(role)}
+	result := ResolvedLaunch{Role: role, Provider: provider, ToolLoadout: orchestrateLoadout(provider, explicit), ProviderSource: "tool", LoadoutSource: "role:" + string(role)}
 	if explicit.Provider != "" {
 		result.ProviderSource = "explicit"
 	}
-	if explicit.Browser {
+	if explicit.Browser || explicit.MCPConfig || len(explicit.MCPs) > 0 {
 		result.LoadoutSource = "explicit"
 	}
 	if provider == "codex" && explicit.Browser {
@@ -130,20 +133,20 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if provider == "codex" {
 		if result.Model == "" {
 			result.Model = defaults.CodexModel
-			result.ModelSource = roleDefaultSource(cfg, role)
+			result.ModelSource = roleDefaultSource(cfg, role, provider, "model")
 		}
 		if result.Effort == "" {
 			result.Effort = defaults.CodexEffort
-			result.EffortSource = roleDefaultSource(cfg, role)
+			result.EffortSource = roleDefaultSource(cfg, role, provider, "effort")
 		}
 	} else {
 		if result.Model == "" {
 			result.Model = defaults.ClaudeModel
-			result.ModelSource = roleDefaultSource(cfg, role)
+			result.ModelSource = roleDefaultSource(cfg, role, provider, "model")
 		}
 		if result.Effort == "" {
 			result.Effort = defaults.ClaudeEffort
-			result.EffortSource = roleDefaultSource(cfg, role)
+			result.EffortSource = roleDefaultSource(cfg, role, provider, "effort")
 		}
 	}
 	result.ResolutionSource = result.ModelSource
@@ -160,14 +163,18 @@ func validOrchestrateRole(role OrchestrateRole) bool {
 	return role == OrchestrateRoleRouting || role == OrchestrateRoleRoutine || role == OrchestrateRoleArchitecture
 }
 
-func orchestrateLoadout(provider string, browser bool) OrchestrateToolLoadout {
+func orchestrateLoadout(provider string, explicit OrchestrateLaunchExplicit) OrchestrateToolLoadout {
+	mcps := append([]string(nil), explicit.MCPs...)
 	if provider == "claude" {
-		if browser {
-			return OrchestrateToolLoadout{Kind: "claude-browser", Browser: true}
+		if explicit.Browser {
+			return OrchestrateToolLoadout{Kind: "claude-browser", Browser: true, MCPs: mcps}
+		}
+		if explicit.MCPConfig || len(mcps) > 0 {
+			return OrchestrateToolLoadout{Kind: "claude-task-mcp", MCPs: mcps}
 		}
 		return OrchestrateToolLoadout{Kind: "claude-strict-empty-mcp", StrictEmptyMCP: true}
 	}
-	return OrchestrateToolLoadout{Kind: "codex"}
+	return OrchestrateToolLoadout{Kind: "codex", MCPs: mcps}
 }
 
 func roleDefaults(cfg *UserConfig, role OrchestrateRole) OrchestrateRoleDefault {
@@ -211,7 +218,7 @@ func builtInRoleDefaults(role OrchestrateRole) OrchestrateRoleDefault {
 	}
 }
 
-func roleDefaultSource(cfg *UserConfig, role OrchestrateRole) string {
+func roleDefaultSource(cfg *UserConfig, role OrchestrateRole, provider, field string) string {
 	if cfg != nil {
 		var d OrchestrateRoleDefault
 		switch role {
@@ -222,7 +229,18 @@ func roleDefaultSource(cfg *UserConfig, role OrchestrateRole) string {
 		case OrchestrateRoleArchitecture:
 			d = cfg.Orchestrate.Architecture
 		}
-		if d.hasValues() {
+		configured := false
+		switch provider + ":" + field {
+		case "codex:model":
+			configured = strings.TrimSpace(d.CodexModel) != ""
+		case "codex:effort":
+			configured = strings.TrimSpace(d.CodexEffort) != ""
+		case "claude:model":
+			configured = strings.TrimSpace(d.ClaudeModel) != ""
+		case "claude:effort":
+			configured = strings.TrimSpace(d.ClaudeEffort) != ""
+		}
+		if configured {
 			return "config:orchestrate." + string(role)
 		}
 	}
@@ -234,19 +252,16 @@ func (d OrchestrateRoleDefault) hasValues() bool {
 }
 
 func supportedOrchestrateChoice(provider, model, effort string, justified bool) bool {
-	if provider == "codex" {
-		if model == "gpt-6-astra" && !justified {
-			return false
-		}
-		if model != "gpt-5.6-luna" && model != "gpt-5.6-terra" && model != "gpt-5.6-sol" && model != "gpt-6-astra" {
-			return false
-		}
-		return effort == "low" || effort == "medium" || effort == "high" || effort == "xhigh"
-	}
-	if model == "opus" && !justified {
+	if !isKnownOrchestrateModel(provider, model) {
 		return false
 	}
-	return (model == "haiku" || model == "sonnet" || model == "opus" || strings.HasPrefix(model, "claude-")) && effort != "invalid"
+	if provider == "codex" && model == "gpt-6-astra" && !justified {
+		return false
+	}
+	if provider == "claude" && (model == "opus" || strings.HasPrefix(model, "claude-opus-")) && !justified {
+		return false
+	}
+	return ValidateLaunchReasoningEffort(provider, effort) == nil
 }
 
 func validateOrchestrateRoleDefaults(cfg *UserConfig) error {
@@ -259,6 +274,9 @@ func validateOrchestrateRoleDefaults(cfg *UserConfig) error {
 func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit OrchestrateLaunchExplicit, cfg *UserConfig) (ResolvedLaunch, error) {
 	if i == nil {
 		return ResolvedLaunch{}, fmt.Errorf("cannot resolve a nil instance")
+	}
+	if hasMCPExtraArgs(i.ExtraArgs) {
+		explicit.MCPConfig = true
 	}
 	resolved, err := ResolveOrchestrateLaunch(role, i.Tool, explicit, cfg)
 	if err != nil || resolved.Parked {
@@ -302,7 +320,7 @@ func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit
 
 func hasMCPExtraArgs(args []string) bool {
 	for _, arg := range args {
-		if arg == "--mcp-config" || arg == "--strict-mcp-config" {
+		if arg == "--mcp-config" || strings.HasPrefix(arg, "--mcp-config=") || arg == "--strict-mcp-config" {
 			return true
 		}
 	}

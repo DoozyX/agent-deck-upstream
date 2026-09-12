@@ -1911,6 +1911,16 @@ func extraArgsSupplyModel(extraArgs []string) bool {
 	return false
 }
 
+func extraArgsSupplyClaudeEffort(extraArgs []string) bool {
+	for _, tok := range extraArgs {
+		tok = strings.TrimSpace(tok)
+		if tok == "--effort" || strings.HasPrefix(tok, "--effort=") {
+			return true
+		}
+	}
+	return false
+}
+
 // buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
 // Also handles instance-level flags like --add-dir for subagent access
 func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
@@ -2022,7 +2032,7 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 		}
 	}
 
-	if opts != nil && strings.TrimSpace(opts.Effort) != "" {
+	if opts != nil && strings.TrimSpace(opts.Effort) != "" && !extraArgsSupplyClaudeEffort(i.ExtraArgs) {
 		flags = append(flags, "--effort "+shellescape.Quote(strings.TrimSpace(opts.Effort)))
 	}
 
@@ -2348,6 +2358,9 @@ func hasCodexExtraArgModel(args []string) bool {
 }
 
 func (i *Instance) resolveCodexReasoningEffortFlag() string {
+	if hasCodexExtraArgReasoningEffort(i.ExtraArgs) {
+		return ""
+	}
 	opts := i.GetCodexOptions()
 	effort := ""
 	if opts != nil {
@@ -2366,6 +2379,19 @@ func (i *Instance) resolveCodexReasoningEffortFlag() string {
 		return " --config " + shellescape.Quote(value)
 	}
 	return ""
+}
+
+func hasCodexExtraArgReasoningEffort(args []string) bool {
+	for idx, arg := range args {
+		arg = strings.TrimSpace(arg)
+		if (arg == "--config" || arg == "-c") && idx+1 < len(args) && strings.HasPrefix(strings.TrimSpace(args[idx+1]), "model_reasoning_effort=") {
+			return true
+		}
+		if strings.HasPrefix(arg, "--config=model_reasoning_effort=") || strings.HasPrefix(arg, "-c=model_reasoning_effort=") {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Instance) resolveCodexExtraArgsFlag() string {
