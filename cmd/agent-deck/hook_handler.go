@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/agentpaths"
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/logging"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 )
@@ -888,16 +889,8 @@ func handleHooksStatus() {
 	fmt.Printf("Total hook files: %d\n", len(entries))
 }
 
-// costEventFile is the JSON written to ~/.agent-deck/cost-events/{instance}_{ts}.json
-type costEventFile struct {
-	InstanceID       string `json:"instance_id"`
-	Model            string `json:"model"`
-	InputTokens      int64  `json:"input_tokens"`
-	OutputTokens     int64  `json:"output_tokens"`
-	CacheReadTokens  int64  `json:"cache_read_tokens"`
-	CacheWriteTokens int64  `json:"cache_write_tokens"`
-	Timestamp        int64  `json:"ts"`
-}
+// costEventFile is the JSON written to ~/.agent-deck/cost-events/{instance}_{ts}.json.
+type costEventFile = costs.RawCostEvent
 
 // stopHookPayload extracts transcript_path from the Stop hook payload.
 type stopHookPayload struct {
@@ -907,14 +900,26 @@ type stopHookPayload struct {
 
 // transcriptMessage is the last line of the transcript JSONL file (assistant turn).
 type transcriptMessage struct {
-	Type    string `json:"type"`
-	Message struct {
-		Model string `json:"model"`
-		Usage struct {
+	Type      string `json:"type"`
+	UUID      string `json:"uuid"`
+	RequestID string `json:"requestId"`
+	Timestamp string `json:"timestamp"`
+	Message   struct {
+		ID      string          `json:"id"`
+		Model   string          `json:"model"`
+		Content json.RawMessage `json:"content"`
+		Usage   struct {
 			InputTokens              int64 `json:"input_tokens"`
 			OutputTokens             int64 `json:"output_tokens"`
 			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreation            struct {
+				FiveMinute int64 `json:"ephemeral_5m_input_tokens"`
+				OneHour    int64 `json:"ephemeral_1h_input_tokens"`
+			} `json:"cache_creation"`
+			OutputDetails struct {
+				Thinking int64 `json:"thinking_tokens"`
+			} `json:"output_tokens_details"`
 		} `json:"usage"`
 	} `json:"message"`
 }
@@ -985,15 +990,32 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 		return
 	}
 
-	ts := time.Now().UnixNano()
+	transcriptIdentity := costs.ClaudeTranscriptIdentity(cleanPath)
+	sourceIdentity, sourceAliases := costs.ClaudeMessageIdentities(
+		msg.Message.ID, msg.RequestID, msg.UUID, transcriptIdentity,
+		msg.Message.Model, msg.Message.Content,
+	)
+	eventTime, err := time.Parse(time.RFC3339Nano, msg.Timestamp)
+	if err != nil {
+		eventTime = time.Now()
+	}
+	ts := eventTime.UnixNano()
 	cf := costEventFile{
-		InstanceID:       instanceID,
-		Model:            msg.Message.Model,
-		InputTokens:      usage.InputTokens,
-		OutputTokens:     usage.OutputTokens,
-		CacheReadTokens:  usage.CacheReadInputTokens,
-		CacheWriteTokens: usage.CacheCreationInputTokens,
-		Timestamp:        ts,
+		InstanceID:         instanceID,
+		Provider:           costs.ProviderClaude,
+		SourceKind:         costs.SourceKindClaudeHook,
+		SourceIdentity:     sourceIdentity,
+		SourceAliases:      sourceAliases,
+		TranscriptIdentity: transcriptIdentity,
+		Model:              msg.Message.Model,
+		InputTokens:        usage.InputTokens,
+		OutputTokens:       usage.OutputTokens,
+		CacheReadTokens:    usage.CacheReadInputTokens,
+		CacheWriteTokens:   usage.CacheCreationInputTokens,
+		CacheWrite5mTokens: usage.CacheCreation.FiveMinute,
+		CacheWrite1hTokens: usage.CacheCreation.OneHour,
+		ReasoningTokens:    usage.OutputDetails.Thinking,
+		Timestamp:          ts,
 	}
 
 	jsonData, err := json.Marshal(cf)
@@ -1005,7 +1027,7 @@ func writeCostEvent(instanceID string, rawPayload []byte) {
 		return
 	}
 
-	filename := fmt.Sprintf("%s_%d.json", instanceID, ts)
+	filename := fmt.Sprintf("%s_%d.json", instanceID, time.Now().UnixNano())
 	tmpPath := filepath.Join(costDir, filename+".tmp")
 	finalPath := filepath.Join(costDir, filename)
 

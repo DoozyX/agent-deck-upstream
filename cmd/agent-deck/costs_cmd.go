@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -63,6 +64,10 @@ func openCostStore(profile string) (*costs.Store, *session.Storage) {
 // newPricerFromConfig creates a Pricer using the user's config overrides.
 func newPricerFromConfig() *costs.Pricer {
 	cfg, _ := session.LoadUserConfig()
+	return newPricerFromUserConfig(cfg)
+}
+
+func newPricerFromUserConfig(cfg *session.UserConfig) *costs.Pricer {
 	pricerCfg := costs.PricerConfig{}
 	if cfg != nil && len(cfg.Costs.Pricing.Overrides) > 0 {
 		pricerCfg.Overrides = make(map[string]costs.PriceOverride)
@@ -79,9 +84,14 @@ func newPricerFromConfig() *costs.Pricer {
 }
 
 func handleCostsSync(profile string) {
+	userConfig, err := session.LoadUserConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+		os.Exit(1)
+	}
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
-	pricer := newPricerFromConfig()
+	pricer := newPricerFromUserConfig(userConfig)
 
 	instances, err := storage.Load()
 	if err != nil {
@@ -89,8 +99,7 @@ func handleCostsSync(profile string) {
 		os.Exit(1)
 	}
 
-	userConfig, _ := session.LoadUserConfig()
-	discoveryConfig := buildCostDiscoveryConfig(profile, userConfig, instances)
+	discoveryConfig := buildCostDiscoveryConfig(storage.Profile(), userConfig, instances)
 	sources, warnings, err := costs.DiscoverTranscriptSources(discoveryConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to discover usage transcripts: %v\n", err)
@@ -124,20 +133,20 @@ func handleCostsSync(profile string) {
 
 func buildCostDiscoveryConfig(profile string, cfg *session.UserConfig, instances []*session.Instance) costs.DiscoveryConfig {
 	var config costs.DiscoveryConfig
-	addHome := func(provider, path, account string) {
+	addHome := func(provider, path, account string, required bool) {
 		if path == "" {
 			return
 		}
-		config.Homes = append(config.Homes, costs.ProviderHome{Provider: provider, Path: path, Account: account})
+		config.Homes = append(config.Homes, costs.ProviderHome{Provider: provider, Path: path, Account: account, Required: required})
 	}
-	addHome(costs.ProviderClaude, session.GetClaudeConfigDir(), profile)
-	addHome(costs.ProviderCodex, session.GetCodexConfigDir(), profile)
+	selectedCodexRequired := strings.TrimSpace(os.Getenv("CODEX_HOME")) != ""
 	if cfg != nil {
-		for name := range cfg.Profiles {
-			addHome(costs.ProviderClaude, cfg.GetProfileClaudeConfigDir(name), name)
-			addHome(costs.ProviderCodex, cfg.GetProfileCodexConfigDir(name), name)
-		}
+		selectedCodexRequired = selectedCodexRequired || cfg.GetProfileCodexConfigDir(profile) != "" || strings.TrimSpace(cfg.Codex.ConfigDir) != ""
 	}
+	selectedClaudeHome := session.GetClaudeConfigDir()
+	selectedCodexHome := session.GetCodexConfigDir()
+	addHome(costs.ProviderClaude, selectedClaudeHome, profile, session.IsClaudeConfigDirExplicit())
+	addHome(costs.ProviderCodex, selectedCodexHome, profile, selectedCodexRequired)
 	for _, inst := range instances {
 		if inst == nil {
 			continue
@@ -145,7 +154,7 @@ func buildCostDiscoveryConfig(profile string, cfg *session.UserConfig, instances
 		switch inst.Tool {
 		case "claude":
 			home := session.GetClaudeConfigDirForInstance(inst)
-			addHome(costs.ProviderClaude, home, inst.Account)
+			addHome(costs.ProviderClaude, home, inst.Account, session.IsClaudeConfigDirExplicitForInstance(inst))
 			if inst.ClaudeSessionID != "" {
 				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
 					Provider: costs.ProviderClaude, Home: home, NativeSessionID: inst.ClaudeSessionID,
@@ -154,7 +163,7 @@ func buildCostDiscoveryConfig(profile string, cfg *session.UserConfig, instances
 			}
 		case "codex":
 			home := session.GetCodexConfigDirForInstance(inst)
-			addHome(costs.ProviderCodex, home, inst.Account)
+			addHome(costs.ProviderCodex, home, inst.Account, selectedCodexRequired || home != selectedCodexHome)
 			if inst.CodexSessionID != "" {
 				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
 					Provider: costs.ProviderCodex, Home: home, NativeSessionID: inst.CodexSessionID,

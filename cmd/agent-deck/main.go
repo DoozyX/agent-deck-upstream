@@ -909,18 +909,7 @@ func main() {
 			// Process incoming cost events from hooks
 			go func() {
 				for raw := range costWatcher.EventCh() {
-					ev := costs.CostEvent{
-						ID:               fmt.Sprintf("%s_%d", raw.InstanceID, raw.Timestamp),
-						SessionID:        raw.InstanceID,
-						Timestamp:        time.Unix(0, raw.Timestamp),
-						Model:            raw.Model,
-						InputTokens:      raw.InputTokens,
-						OutputTokens:     raw.OutputTokens,
-						CacheReadTokens:  raw.CacheReadTokens,
-						CacheWriteTokens: raw.CacheWriteTokens,
-						CostMicrodollars: pricer.ComputeCost(raw.Model, raw.InputTokens, raw.OutputTokens, raw.CacheReadTokens, raw.CacheWriteTokens),
-					}
-					_ = costStore.WriteCostEvent(ev)
+					_ = costStore.WriteRawCostEvent(raw, pricer)
 				}
 			}()
 		}

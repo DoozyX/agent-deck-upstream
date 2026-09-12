@@ -60,8 +60,9 @@ func TestUsageLedgerMigrationPreservesLegacyRowsAndAddsCanonicalColumns(t *testi
 
 	wantColumns := map[string]bool{
 		"provider": false, "source_kind": false, "source_identity": false,
-		"parent_session_id": false, "run_id": false,
-		"reasoning_tokens": false, "pricing_status": false,
+		"transcript_identity": false, "parent_session_id": false, "run_id": false,
+		"cache_write_5m_tokens": false, "cache_write_1h_tokens": false,
+		"reasoning_tokens": false, "provider_input_tokens": false, "pricing_status": false,
 		"reconciliation_status": false,
 	}
 	rows, err := db.DB().Query(`PRAGMA table_info(cost_events)`)
@@ -85,6 +86,36 @@ func TestUsageLedgerMigrationPreservesLegacyRowsAndAddsCanonicalColumns(t *testi
 		if !found {
 			t.Errorf("cost_events column %q missing", name)
 		}
+	}
+
+	var id, sessionID, timestamp, model, provider, sourceKind, sourceIdentity, transcriptIdentity string
+	var parentSessionID, runID, pricingStatus, reconciliationStatus string
+	var input, output, cacheRead, cacheWrite, cacheWrite5m, cacheWrite1h, reasoning, cost int64
+	var providerInput sql.NullInt64
+	if err := db.DB().QueryRow(`
+		SELECT id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status, reconciliation_status
+		FROM cost_events WHERE id = 'legacy-1'`).Scan(
+		&id, &sessionID, &parentSessionID, &runID, &timestamp,
+		&provider, &sourceKind, &sourceIdentity, &transcriptIdentity, &model,
+		&input, &output, &cacheRead, &cacheWrite, &cacheWrite5m, &cacheWrite1h,
+		&reasoning, &providerInput, &cost, &pricingStatus, &reconciliationStatus); err != nil {
+		t.Fatal(err)
+	}
+	if id != "legacy-1" || sessionID != "session-1" || timestamp != "2026-09-01T12:00:00Z" || model != "legacy-model" ||
+		input != 7 || output != 5 || cacheRead != 3 || cacheWrite != 2 || cost != 99 {
+		t.Fatalf("legacy values changed: id=%q session=%q timestamp=%q model=%q usage=%d/%d/%d/%d cost=%d",
+			id, sessionID, timestamp, model, input, output, cacheRead, cacheWrite, cost)
+	}
+	if parentSessionID != "" || runID != "" || provider != "unknown" || sourceKind != "legacy" ||
+		sourceIdentity != "" || transcriptIdentity != "" || cacheWrite5m != 0 || cacheWrite1h != 0 ||
+		reasoning != 0 || providerInput.Valid || pricingStatus != "legacy_unresolved" || reconciliationStatus != "legacy_unreconciled" {
+		t.Fatalf("legacy defaults changed: parent=%q run=%q provider=%q kind=%q source=%q transcript=%q write=%d/%d reasoning=%d provider_input=%v pricing=%q reconciliation=%q",
+			parentSessionID, runID, provider, sourceKind, sourceIdentity, transcriptIdentity,
+			cacheWrite5m, cacheWrite1h, reasoning, providerInput, pricingStatus, reconciliationStatus)
 	}
 
 	if err := db.DB().QueryRow(`SELECT COUNT(*) FROM usage_scan_checkpoints`).Scan(&rowCount); err != nil {
