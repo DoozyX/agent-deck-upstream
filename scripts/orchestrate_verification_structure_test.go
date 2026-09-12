@@ -658,7 +658,42 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`.",
 		"An exhausted provider is never *preferred*",
 		"it is still returned when no candidate is eligible, so read `state` on every decision",
+		// Round-4 finding 6 named the rejection LAYER on this row, the
+		// `constrained_below` row, the `failover` row and the `frontier_window`
+		// row, and the round-4 brief exempted that finding from the mutation
+		// standard — so all four clauses landed with no pin at all and were
+		// revertible-green, the same shape as round-3 finding 15 and round-4
+		// finding 3. Each is pinned below as a WHOLE sentence, because the
+		// discriminator lives in the tail: a pin stopping before "only when both
+		// keys are set explicitly" survives an inversion of exactly the clause
+		// that was expensive to find.
+		//
+		// Re-driven for this round against a built binary, a fake `openusage`
+		// first in PATH and a scratch HOME/XDG_CONFIG_HOME. Exit codes for
+		// `accounts --json` / `config orchestrate` / `usage --all --json` /
+		// `usage recommend`:
+		//   failover = ["cla ude"]                     1 1 1 1  LOAD
+		//   exhausted_below = 101                      1 1 1 1  LOAD
+		//   exhausted_below = 90, constrained unset    0 0 0 1  POLICY
+		//   exhausted_below = 90 + constrained_below   1 1 1 1  LOAD
+		//   constrained_below = 101                    1 1 1 1  LOAD
+		//   constrained_below = 10, exhausted unset    0 0 0 1  POLICY
+		//   frontier_window.cluade                     0 0 0 1  POLICY
+		//   ladder.cluade (control)                    0 0 0 1  POLICY
+		// The last two rows print `invalid [usage.policy].frontier_window.cluade:
+		// unknown usage provider` and the ladder equivalent, so the doc's
+		// `<name>` template is the real message and not an inference from the
+		// ladder row. The two `constrained_below` rows are NEW: round 4 drove the
+		// ordering rule only from the `exhausted_below` side, so that row's
+		// "reject at the same two layers" was an untested symmetry claim until
+		// now. It holds — one key explicit is policy-layer from either side.
+		"The 0–100 range check is a config-LOAD rejection — `exhausted_below = 101` drives `accounts --json`, `config orchestrate` and `usage --all --json` to exit 1 as well — while the `<= constrained_below` comparison rejects at the load layer **only** when both keys are set explicitly; with `constrained_below` left at its default, `exhausted_below = 90` is a policy-layer rejection that only `usage recommend` reports, and the other three commands stay at exit 0.",
 		"| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`:",
+		// The delegated half of the same finding: this row asserts its own range
+		// check and its own side of the ordering comparison by reference. Both
+		// halves were driven directly (rows 5 and 6 above) rather than taken on
+		// the strength of the word "same".
+		"Its 0–100 range check and its half of the ordering comparison reject at the same two layers as `exhausted_below` above.",
 		"| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = \"codex\"` |",
 		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
 		// Round-4 finding 7: round 3 added this block to the TOML example
@@ -685,6 +720,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy \"\"`",
 		"Under `\"auto\"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order",
 		"a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed",
+		// Finding 6 on the failover row. The contrast half carries the point —
+		// without "unlike an unknown `ladder` or `frontier_window` table key" the
+		// sentence says only "this one exits 1", which is true of every rejection
+		// in the table and so distinguishes nothing.
+		"That shape check is a config-LOAD rejection, not a policy-layer one: `failover = [\"cla ude\"]` fails the load itself, so `accounts --json`, `config orchestrate` and `usage --all --json` each exit 1 alongside `recommend` — unlike an unknown `ladder` or `frontier_window` table key, which only `recommend` rejects.",
 		"the decision then carries the `--prefer` tool, or the first entry when `--prefer` was omitted, as its `tool`, with `state: unknown` and the reason `no candidate tools for tool strategy \"auto\"`",
 		// Driven discriminator: an uninstalled name that IS a usage provider
 		// keeps a non-empty `provider` and a model here, so the round-2 "with an
@@ -696,6 +736,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged",
 		"| `[usage.policy.frontier_window]` | table of strings | `{ claude = \"fable\" }` |",
 		"a window that is named here but absent from the snapshot the provider actually returned",
+		// Finding 6 on the frontier_window row. The ladder row's identical
+		// sentence has been pinned since criterion 11; this one had nothing, so
+		// the two rows could disagree about the layer while the suite stayed
+		// green.
+		"This table's KEYS share the ladder's closed provider set and reject at the same layer: an unknown name is accepted by the load, and `usage recommend` alone rejects it, printing `invalid [usage.policy].frontier_window.<name>: unknown usage provider` and exiting 1 while every other command keeps working.",
 		"`null` whenever the selected tool has no available snapshot",
 		// The round-2 wording closed an enumeration that is not closed and
 		// attached a guarantee a third case falsifies: `--profile` naming a
