@@ -47,6 +47,16 @@ type SessionCost struct {
 	Group            string
 	CostMicrodollars int64
 	EventCount       int
+	Coverage         Coverage
+}
+
+// GroupCost is an unbounded, one-row-per-group covered aggregate.
+type GroupCost struct {
+	Group            string
+	CostMicrodollars int64
+	EventCount       int
+	SessionCount     int
+	Coverage         Coverage
 }
 
 // DailyCost represents cost for a single day.

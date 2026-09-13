@@ -158,3 +158,13 @@ func TestRenderCoveredCostLineAddsCoverageVariablesWithoutChangingCostVariables(
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+func TestRenderCoveredCostLineUsesCanonicalKnownZeroStatus(t *testing.T) {
+	coverage := costs.Coverage{
+		EventCount: 2, KnownPriceEventCount: 2, KnownZeroEventCount: 2,
+		CoverageKnown: true, Complete: true,
+	}
+	if got := costs.RenderCoveredCostLine("{coverage_status}", nil, coverage, false); got != "verified" {
+		t.Fatalf("known-zero status = %q, want verified", got)
+	}
+}

@@ -75,7 +75,7 @@ func CostCoverageStatus(summary CoveredSummary) string {
 		return "price unknown"
 	}
 	if c.Complete {
-		if summary.TotalCostMicrodollars == 0 && c.EventCount > 0 {
+		if c.KnownPriceEventCount > 0 && c.KnownZeroEventCount == c.KnownPriceEventCount {
 			return "verified"
 		}
 		return "complete"

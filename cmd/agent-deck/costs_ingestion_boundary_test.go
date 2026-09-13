@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
@@ -215,6 +217,18 @@ func TestCostsRecomputeRejectsMalformedPricingConfig(t *testing.T) {
 	}
 }
 
+func TestWebStartupRejectsMalformedPricingConfigBeforeCostIngestion(t *testing.T) {
+	home := t.TempDir()
+	writeCostsConfig(t, home, "[costs.pricing.overrides.bad\ninput_per_mtok = 99\n")
+	out, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "web", "--no-tui", "--listen", "127.0.0.1:0")
+	if err == nil {
+		t.Fatalf("web startup accepted malformed pricing config:\n%s", out)
+	}
+	if !strings.Contains(out, "Error: failed to load user config") || strings.Contains(out, "input_per_mtok") {
+		t.Fatalf("startup diagnostic was absent or unsanitized:\n%s", out)
+	}
+}
+
 func TestPricerConfigFromUserConfigPreservesCacheWriteDurations(t *testing.T) {
 	cfg := &session.UserConfig{Costs: session.CostsSettings{Pricing: session.PricingSettings{
 		Overrides: map[string]session.PricingOverride{
@@ -230,6 +244,26 @@ func TestPricerConfigFromUserConfigPreservesCacheWriteDurations(t *testing.T) {
 	})
 	if !quote.Valid || quote.CostMicrodollars != 21_000_000 {
 		t.Fatalf("duration override quote=%+v, want known $21.00", quote)
+	}
+}
+
+func TestPricerConfigFromUserConfigPreservesExplicitZeroCacheWriteDurations(t *testing.T) {
+	var cfg session.UserConfig
+	if _, err := toml.Decode(`
+[costs.pricing.overrides.duration-free]
+cache_write_per_mtok = 9
+cache_write_5m_per_mtok = 0
+cache_write_1h_per_mtok = 0
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	quote := newPricerFromUserConfig(&cfg).Quote("duration-free", costs.TokenUsage{
+		CacheWriteTokens:   2_000_000,
+		CacheWrite5mTokens: 1_000_000,
+		CacheWrite1hTokens: 1_000_000,
+	})
+	if !quote.Valid || quote.CostMicrodollars != 0 {
+		t.Fatalf("duration zero override quote=%+v, want known $0.00", quote)
 	}
 }
 
@@ -295,9 +329,23 @@ func TestCostsSummaryReportsPricingCoverageWithoutChangingNumericJSON(t *testing
 			if err := json.NewDecoder(strings.NewReader(jsonOut)).Decode(&payload); err != nil {
 				t.Fatalf("decode json: %v\n%s", err, jsonOut)
 			}
-			for _, key := range []string{"cost_today_microdollars", "cost_projected_microdollars", "events_today"} {
-				if _, ok := payload[key].(float64); !ok {
-					t.Fatalf("legacy JSON field %q changed from number: %#v", key, payload[key])
+			knownMicro := int64(0)
+			for _, event := range tc.events {
+				if event.PricingStatus == costs.PricingKnown || event.PricingStatus == costs.PricingKnownZero {
+					knownMicro += event.CostMicrodollars
+				}
+			}
+			expectedNumbers := map[string]float64{
+				"cost_today_microdollars": float64(knownMicro), "cost_yesterday_microdollars": 0,
+				"cost_this_week_microdollars": float64(knownMicro), "cost_last_week_microdollars": 0,
+				"cost_this_month_microdollars": float64(knownMicro), "cost_last_month_microdollars": 0,
+				"cost_projected_microdollars": float64((knownMicro * 30) / 7),
+				"events_today":                float64(len(tc.events)), "events_this_week": float64(len(tc.events)), "events_this_month": float64(len(tc.events)),
+			}
+			for key, want := range expectedNumbers {
+				got, ok := payload[key].(float64)
+				if !ok || got != want {
+					t.Fatalf("legacy JSON field %q = %#v, want numeric %v", key, payload[key], want)
 				}
 			}
 			if _, ok := payload["today_coverage"].(map[string]any); !ok {
@@ -305,6 +353,114 @@ func TestCostsSummaryReportsPricingCoverageWithoutChangingNumericJSON(t *testing
 			}
 			if _, ok := payload["coverage_known"].(bool); !ok {
 				t.Fatalf("coverage_known missing: %s", jsonOut)
+			}
+		})
+	}
+}
+
+type failingCLICostSummaryStore struct {
+	*costs.Store
+	dimension string
+}
+
+func newCommandCostStore(t *testing.T) *costs.Store {
+	t.Helper()
+	db, err := statedb.Open(filepath.Join(t.TempDir(), "summary-errors.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return costs.NewStore(db.DB())
+}
+
+func (s failingCLICostSummaryStore) fail(name string) error {
+	if s.dimension == name {
+		return errors.New("synthetic " + name + " failure")
+	}
+	return nil
+}
+func (s failingCLICostSummaryStore) CoveredTotalToday() (costs.CoveredSummary, error) {
+	if err := s.fail("today"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalToday()
+}
+func (s failingCLICostSummaryStore) CoveredTotalYesterday() (costs.CoveredSummary, error) {
+	if err := s.fail("yesterday"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalYesterday()
+}
+func (s failingCLICostSummaryStore) CoveredTotalThisWeek() (costs.CoveredSummary, error) {
+	if err := s.fail("this week"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalThisWeek()
+}
+func (s failingCLICostSummaryStore) CoveredTotalLastWeek() (costs.CoveredSummary, error) {
+	if err := s.fail("last week"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalLastWeek()
+}
+func (s failingCLICostSummaryStore) CoveredTotalThisMonth() (costs.CoveredSummary, error) {
+	if err := s.fail("this month"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalThisMonth()
+}
+func (s failingCLICostSummaryStore) CoveredTotalLastMonth() (costs.CoveredSummary, error) {
+	if err := s.fail("last month"); err != nil {
+		return costs.CoveredSummary{}, err
+	}
+	return s.Store.CoveredTotalLastMonth()
+}
+func (s failingCLICostSummaryStore) CoveredProjectedMonthly() (int64, costs.Coverage, error) {
+	if err := s.fail("projection"); err != nil {
+		return 0, costs.Coverage{}, err
+	}
+	return s.Store.CoveredProjectedMonthly()
+}
+func (s failingCLICostSummaryStore) CoveredCostByDay() ([]costs.CostBreakdown, error) {
+	if err := s.fail("days"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByDay()
+}
+func (s failingCLICostSummaryStore) CoveredCostByProvider() ([]costs.CostBreakdown, error) {
+	if err := s.fail("providers"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByProvider()
+}
+func (s failingCLICostSummaryStore) CoveredCostByModel() ([]costs.CostBreakdown, error) {
+	if err := s.fail("models"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByModel()
+}
+func (s failingCLICostSummaryStore) CoveredCostBySession() ([]costs.CostBreakdown, error) {
+	if err := s.fail("sessions"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostBySession()
+}
+func (s failingCLICostSummaryStore) CoveredCostByRun() ([]costs.CostBreakdown, error) {
+	if err := s.fail("runs"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByRun()
+}
+
+func TestLoadCostSummaryPropagatesEveryQueryFailure(t *testing.T) {
+	for _, dimension := range []string{"today", "yesterday", "this week", "last week", "this month", "last month", "projection", "days", "providers", "models", "sessions", "runs"} {
+		t.Run(dimension, func(t *testing.T) {
+			store := failingCLICostSummaryStore{Store: newCommandCostStore(t), dimension: dimension}
+			if _, err := loadCostSummary(store); err == nil || !strings.Contains(err.Error(), dimension) {
+				t.Fatalf("loadCostSummary(%q) error=%v, want dimension-specific failure", dimension, err)
 			}
 		})
 	}

@@ -83,6 +83,8 @@ func pricerConfigFromUserConfig(cfg *session.UserConfig) costs.PricerConfig {
 				CacheWritePerMtok:   ov.CacheWritePerMtok,
 				CacheWrite5mPerMtok: ov.CacheWrite5mPerMtok,
 				CacheWrite1hPerMtok: ov.CacheWrite1hPerMtok,
+				CacheWrite5mSet:     ov.CacheWrite5mSet,
+				CacheWrite1hSet:     ov.CacheWrite1hSet,
 			}
 		}
 	}
@@ -191,6 +193,70 @@ func printCostSyncWarnings(warnings []costs.CoverageWarning) {
 	}
 }
 
+type costSummaryStore interface {
+	CoveredTotalToday() (costs.CoveredSummary, error)
+	CoveredTotalYesterday() (costs.CoveredSummary, error)
+	CoveredTotalThisWeek() (costs.CoveredSummary, error)
+	CoveredTotalLastWeek() (costs.CoveredSummary, error)
+	CoveredTotalThisMonth() (costs.CoveredSummary, error)
+	CoveredTotalLastMonth() (costs.CoveredSummary, error)
+	CoveredProjectedMonthly() (int64, costs.Coverage, error)
+	CoveredCostByDay() ([]costs.CostBreakdown, error)
+	CoveredCostByProvider() ([]costs.CostBreakdown, error)
+	CoveredCostByModel() ([]costs.CostBreakdown, error)
+	CoveredCostBySession() ([]costs.CostBreakdown, error)
+	CoveredCostByRun() ([]costs.CostBreakdown, error)
+}
+
+type costSummaryReport struct {
+	today, yesterday, week, lastWeek, month, lastMonth costs.CoveredSummary
+	projected                                          int64
+	projectionCoverage                                 costs.Coverage
+	days, providers, models, sessions, runs            []costs.CostBreakdown
+}
+
+func loadCostSummary(store costSummaryStore) (costSummaryReport, error) {
+	var report costSummaryReport
+	var err error
+	if report.today, err = store.CoveredTotalToday(); err != nil {
+		return report, fmt.Errorf("query today: %w", err)
+	}
+	if report.yesterday, err = store.CoveredTotalYesterday(); err != nil {
+		return report, fmt.Errorf("query yesterday: %w", err)
+	}
+	if report.week, err = store.CoveredTotalThisWeek(); err != nil {
+		return report, fmt.Errorf("query this week: %w", err)
+	}
+	if report.lastWeek, err = store.CoveredTotalLastWeek(); err != nil {
+		return report, fmt.Errorf("query last week: %w", err)
+	}
+	if report.month, err = store.CoveredTotalThisMonth(); err != nil {
+		return report, fmt.Errorf("query this month: %w", err)
+	}
+	if report.lastMonth, err = store.CoveredTotalLastMonth(); err != nil {
+		return report, fmt.Errorf("query last month: %w", err)
+	}
+	if report.projected, report.projectionCoverage, err = store.CoveredProjectedMonthly(); err != nil {
+		return report, fmt.Errorf("query projection: %w", err)
+	}
+	if report.days, err = store.CoveredCostByDay(); err != nil {
+		return report, fmt.Errorf("query days: %w", err)
+	}
+	if report.providers, err = store.CoveredCostByProvider(); err != nil {
+		return report, fmt.Errorf("query providers: %w", err)
+	}
+	if report.models, err = store.CoveredCostByModel(); err != nil {
+		return report, fmt.Errorf("query models: %w", err)
+	}
+	if report.sessions, err = store.CoveredCostBySession(); err != nil {
+		return report, fmt.Errorf("query sessions: %w", err)
+	}
+	if report.runs, err = store.CoveredCostByRun(); err != nil {
+		return report, fmt.Errorf("query runs: %w", err)
+	}
+	return report, nil
+}
+
 func handleCostsSummary(profile string, args []string) {
 	// #1101: --json output so a remote agent-deck can be queried over SSH and
 	// its cost totals merged into the local TUI's status-line cost segment.
@@ -203,18 +269,16 @@ func handleCostsSummary(profile string, args []string) {
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
 
-	today, _ := costStore.CoveredTotalToday()
-	yesterday, _ := costStore.CoveredTotalYesterday()
-	week, _ := costStore.CoveredTotalThisWeek()
-	lastWeek, _ := costStore.CoveredTotalLastWeek()
-	month, _ := costStore.CoveredTotalThisMonth()
-	lastMonth, _ := costStore.CoveredTotalLastMonth()
-	projected, projectionCoverage, _ := costStore.CoveredProjectedMonthly()
-	days, _ := costStore.CoveredCostByDay()
-	providers, _ := costStore.CoveredCostByProvider()
-	models, _ := costStore.CoveredCostByModel()
-	sessions, _ := costStore.CoveredCostBySession()
-	runs, _ := costStore.CoveredCostByRun()
+	report, err := loadCostSummary(costStore)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to load cost summary: %v\n", err)
+		os.Exit(1)
+	}
+	today, yesterday, week := report.today, report.yesterday, report.week
+	lastWeek, month, lastMonth := report.lastWeek, report.month, report.lastMonth
+	projected, projectionCoverage := report.projected, report.projectionCoverage
+	days, providers, models := report.days, report.providers, report.models
+	sessions, runs := report.sessions, report.runs
 	allCoverage := costs.MergeCoverage(today.Coverage, yesterday.Coverage, week.Coverage, lastWeek.Coverage, month.Coverage, lastMonth.Coverage)
 
 	if *jsonOutput {

@@ -1,12 +1,16 @@
 package web
 
 import (
+	"context"
 	"encoding/csv"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,6 +65,62 @@ func TestCostsSummaryCoveragePreservesNumericFields(t *testing.T) {
 	}
 }
 
+type failingBreakdownStore struct {
+	*costs.Store
+	dimension string
+}
+
+func (s failingBreakdownStore) failure(name string) error {
+	if s.dimension == name {
+		return errors.New("synthetic " + name + " failure")
+	}
+	return nil
+}
+func (s failingBreakdownStore) CoveredCostByDay() ([]costs.CostBreakdown, error) {
+	if err := s.failure("days"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByDay()
+}
+func (s failingBreakdownStore) CoveredCostByProvider() ([]costs.CostBreakdown, error) {
+	if err := s.failure("providers"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByProvider()
+}
+func (s failingBreakdownStore) CoveredCostByModel() ([]costs.CostBreakdown, error) {
+	if err := s.failure("models"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByModel()
+}
+func (s failingBreakdownStore) CoveredCostBySession() ([]costs.CostBreakdown, error) {
+	if err := s.failure("sessions"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostBySession()
+}
+func (s failingBreakdownStore) CoveredCostByRun() ([]costs.CostBreakdown, error) {
+	if err := s.failure("runs"); err != nil {
+		return nil, err
+	}
+	return s.Store.CoveredCostByRun()
+}
+
+func TestCostsSummaryPropagatesEveryBreakdownFailure(t *testing.T) {
+	for _, dimension := range []string{"days", "providers", "models", "sessions", "runs"} {
+		t.Run(dimension, func(t *testing.T) {
+			srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+			srv.costStore = failingBreakdownStore{Store: newTestCostStore(t), dimension: dimension}
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/summary", nil))
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("%s failure status=%d body=%s, want 500", dimension, rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
 func TestCostsExportIncludesCanonicalAuditFields(t *testing.T) {
 	store := newTestCostStore(t)
 	writeCoverageWebFixtures(t, store)
@@ -103,6 +163,214 @@ func TestCostsExportIncludesCanonicalAuditFields(t *testing.T) {
 		if !strings.Contains(header, field) {
 			t.Fatalf("CSV header missing %s: %s", field, header)
 		}
+	}
+	var csvKnown []string
+	for _, record := range records[1:] {
+		if record[6] == "claude:msg:known" {
+			csvKnown = record
+			break
+		}
+	}
+	wantCSV := []string{
+		time.Now().UTC().Format("2006-01-02"), known["timestamp"].(string), "UTC", "UTC calendar dates", "claude", "claude_direct",
+		"claude:msg:known", "claude:session", "session-a", "parent", "run-a", "session", "known-model",
+		"10", "20", "30", "11", "13", "6", "40", "7", "1.250000", "1.250000", "known", "authoritative",
+	}
+	if strings.Join(csvKnown, "\x00") != strings.Join(wantCSV, "\x00") {
+		t.Fatalf("CSV row = %#v, want %#v", csvKnown, wantCSV)
+	}
+}
+
+func TestCostsGroupsIncludesAllSessionsBeyondLegacyLimit(t *testing.T) {
+	store := newTestCostStore(t)
+	for i := 0; i < 1005; i++ {
+		event := costs.CostEvent{ID: fmt.Sprintf("e-%04d", i), SessionID: fmt.Sprintf("s-%04d", i), Timestamp: time.Now().UTC(), CostMicrodollars: 1, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/groups", nil))
+	var groups []struct {
+		CostUSD          float64 `json:"cost_usd"`
+		Events, Sessions int
+		Coverage         costs.Coverage
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &groups); err != nil {
+		t.Fatal(err)
+	}
+	if rr.Code != http.StatusOK || len(groups) != 1 || groups[0].Events != 1005 || groups[0].Sessions != 1005 || groups[0].Coverage.EventCount != 1005 || groups[0].CostUSD != 0.001005 {
+		t.Fatalf("groups=%+v status=%d body=%s", groups, rr.Code, rr.Body.String())
+	}
+}
+
+type failingListStore struct {
+	*costs.Store
+	target string
+}
+
+func (s failingListStore) CoveredTopSessionsByCost(limit int) ([]costs.SessionCost, error) {
+	if s.target == "sessions" {
+		return nil, errors.New("synthetic sessions failure")
+	}
+	return s.Store.CoveredTopSessionsByCost(limit)
+}
+func (s failingListStore) CoveredCostByGroup() ([]costs.GroupCost, error) {
+	if s.target == "groups" {
+		return nil, errors.New("synthetic groups failure")
+	}
+	return s.Store.CoveredCostByGroup()
+}
+
+func TestCostsSessionAndGroupQueriesPropagateFailures(t *testing.T) {
+	for _, tc := range []struct{ target, path string }{{"sessions", "/api/costs/sessions"}, {"groups", "/api/costs/groups"}} {
+		t.Run(tc.target, func(t *testing.T) {
+			srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+			srv.costStore = failingListStore{Store: newTestCostStore(t), target: tc.target}
+			rr := httptest.NewRecorder()
+			srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, tc.path, nil))
+			if rr.Code != http.StatusInternalServerError {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+		})
+	}
+}
+
+func TestCostsSessionsUseGroupedCoverageAndDailyRangeIsBounded(t *testing.T) {
+	store := newTestCostStore(t)
+	now := time.Now().UTC()
+	events := []costs.CostEvent{
+		{ID: "recent-known", SessionID: "session", Timestamp: now, CostMicrodollars: 10, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "recent-unknown", SessionID: "session", Timestamp: now, InputTokens: 4, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "old", SessionID: "old", Timestamp: now.AddDate(0, 0, -60), CostMicrodollars: 20, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	}
+	for _, event := range events {
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/sessions", nil))
+	var sessions []struct {
+		SessionID string         `json:"session_id"`
+		Events    int            `json:"events"`
+		Coverage  costs.Coverage `json:"coverage"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &sessions); err != nil {
+		t.Fatal(err)
+	}
+	byID := make(map[string]struct {
+		Events   int
+		Coverage costs.Coverage
+	}, len(sessions))
+	for _, item := range sessions {
+		byID[item.SessionID] = struct {
+			Events   int
+			Coverage costs.Coverage
+		}{item.Events, item.Coverage}
+	}
+	if item, ok := byID["session"]; len(sessions) != 2 || !ok || item.Events != 2 || item.Coverage.UnknownPriceEventCount != 1 {
+		t.Fatalf("sessions=%+v body=%s", sessions, rr.Body.String())
+	}
+
+	rr = httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/daily?days=30", nil))
+	var days []struct {
+		Date string `json:"date"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &days); err != nil {
+		t.Fatal(err)
+	}
+	if len(days) != 1 || days[0].Date != now.Format("2006-01-02") {
+		t.Fatalf("days=%+v body=%s", days, rr.Body.String())
+	}
+}
+
+func TestCostsSummaryPublicWeekAndProviderBoundaries(t *testing.T) {
+	store := newTestCostStore(t)
+	monday := time.Date(2025, 11, 10, 0, 0, 1, 0, time.UTC)
+	store.SetClock(func() time.Time { return monday })
+	events := []costs.CostEvent{
+		{ID: "current", SessionID: "s", Timestamp: monday, Provider: costs.ProviderClaude, Model: "same", InputTokens: 2, CostMicrodollars: 7, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "old", SessionID: "s", Timestamp: monday.Add(-24 * time.Hour), Provider: costs.ProviderCodex, Model: "same", OutputTokens: 3, CostMicrodollars: 9, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	}
+	for _, event := range events {
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/summary", nil))
+	var body struct {
+		WeekUSD   float64               `json:"week_usd"`
+		Providers []costs.CostBreakdown `json:"providers"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.WeekUSD != 0.000007 {
+		t.Fatalf("week_usd=%v body=%s", body.WeekUSD, rr.Body.String())
+	}
+	if len(body.Providers) != 2 || body.Providers[0].Key != costs.ProviderClaude || body.Providers[0].UncachedInputTokens != 2 || body.Providers[1].Key != costs.ProviderCodex || body.Providers[1].OutputTokens != 3 {
+		t.Fatalf("providers=%+v", body.Providers)
+	}
+}
+
+type synchronizedRecorder struct {
+	*httptest.ResponseRecorder
+	mu sync.Mutex
+}
+
+func (r *synchronizedRecorder) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ResponseRecorder.Write(p)
+}
+func (r *synchronizedRecorder) Flush() {}
+func (r *synchronizedRecorder) body() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.Body.String()
+}
+
+func TestCostsStreamEmitsCoverageOnlyChange(t *testing.T) {
+	store := newTestCostStore(t)
+	if err := store.WriteCostEvent(costs.CostEvent{ID: "stream", SessionID: "s", Timestamp: time.Now().UTC(), PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.SetCostStore(store)
+	oldPoll, oldHeartbeat := costStreamPollInterval, costStreamHeartbeatInterval
+	costStreamPollInterval, costStreamHeartbeatInterval = 5*time.Millisecond, time.Hour
+	t.Cleanup(func() { costStreamPollInterval, costStreamHeartbeatInterval = oldPoll, oldHeartbeat })
+	ctx, cancel := context.WithCancel(context.Background())
+	recorder := &synchronizedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	done := make(chan struct{})
+	go func() {
+		srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/costs/stream", nil).WithContext(ctx))
+		close(done)
+	}()
+	deadline := time.Now().Add(time.Second)
+	for strings.Count(recorder.body(), "event: cost_summary") < 1 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := store.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'stream'`, costs.PricingKnownZero); err != nil {
+		t.Fatal(err)
+	}
+	for strings.Count(recorder.body(), "event: cost_summary") < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
+	if count := strings.Count(recorder.body(), "event: cost_summary"); count < 2 {
+		t.Fatalf("coverage-only change emitted %d summaries: %s", count, recorder.body())
 	}
 }
 

@@ -536,19 +536,15 @@ func (p *AnalyticsPanel) renderCost() string {
 	b.WriteString(labelStyle.Render("Cost"))
 	b.WriteString("\n")
 
-	// Calculate cost if not already set
 	cost := p.analytics.EstimatedCost
-	if cost == 0 && p.analytics.TotalTokens() > 0 {
-		// Use default Sonnet pricing
-		cost = p.analytics.CalculateCost("default")
-	}
-
 	if cost > 0 {
 		costStr := fmt.Sprintf("$%.4f", cost)
 		b.WriteString(fmt.Sprintf("  %s %s\n",
 			dimStyle.Render("Estimated:"),
 			valueStyle.Render(costStr),
 		))
+	} else if p.analytics.TotalTokens() > 0 {
+		b.WriteString(dimStyle.Render("  Price unknown\n"))
 	} else {
 		b.WriteString(dimStyle.Render("  (calculating...)\n"))
 	}

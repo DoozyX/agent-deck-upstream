@@ -157,8 +157,8 @@ func TestRemoteFetch_StaleGuardIsPerRemote(t *testing.T) {
 func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 	home := newTestHomeWithItems(100, 30, nil)
 	home.remoteCosts = map[string]*costs.RemoteCostSummary{
-		"a": {CostTodayMicrodollars: 1},
-		"b": {CostTodayMicrodollars: 2},
+		"a": {CostTodayMicrodollars: 1, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}},
+		"b": {CostTodayMicrodollars: 2, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}},
 	}
 	rows := func(name string) map[string][]session.RemoteSessionInfo {
 		return map[string][]session.RemoteSessionInfo{name: {{ID: name + "-1", Title: name}}}
@@ -167,7 +167,7 @@ func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 	// a answers with a fresh summary: b's figure must survive.
 	model, _ := home.Update(remoteSessionsFetchedMsg{
 		sessions: rows("a"),
-		costs:    map[string]*costs.RemoteCostSummary{"a": {CostTodayMicrodollars: 10}},
+		costs:    map[string]*costs.RemoteCostSummary{"a": {CostTodayMicrodollars: 10, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}}},
 		failed:   map[string]bool{"b": true},
 	})
 	h := model.(*Home)
@@ -175,18 +175,19 @@ func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 		t.Fatalf("a per-remote cost update must not blank other remotes; got %+v", h.remoteCosts)
 	}
 
-	// a answers but its cost fetch failed: a contributes zero, b untouched.
+	// a answers but its cost fetch failed: both stale subtotals survive, but
+	// neither stale remote may continue claiming known/complete coverage.
 	model, _ = h.Update(remoteSessionsFetchedMsg{
 		sessions: rows("a"),
 		costs:    map[string]*costs.RemoteCostSummary{},
 		failed:   map[string]bool{"b": true},
 	})
 	h = model.(*Home)
-	if summary, ok := h.remoteCosts["a"]; !ok || summary != nil {
-		t.Fatalf("a remote whose cost fetch failed must contribute zero with unknown coverage; got %+v", h.remoteCosts)
+	if summary := h.remoteCosts["a"]; summary == nil || summary.CostTodayMicrodollars != 10 || summary.CoverageKnown || summary.TodayCoverage.CoverageKnown || summary.TodayCoverage.Complete {
+		t.Fatalf("reachable remote stale cost must be retained with unknown coverage; got %+v", h.remoteCosts)
 	}
-	if h.remoteCosts["b"] == nil {
-		t.Fatalf("a remote still marked failed must keep its last-good figure; got %+v", h.remoteCosts)
+	if summary := h.remoteCosts["b"]; summary == nil || summary.CostTodayMicrodollars != 2 || summary.CoverageKnown || summary.TodayCoverage.CoverageKnown || summary.TodayCoverage.Complete {
+		t.Fatalf("inaccessible remote stale cost must be retained with unknown coverage; got %+v", h.remoteCosts)
 	}
 
 	// b is no longer configured (absent from both lists): its figure goes.

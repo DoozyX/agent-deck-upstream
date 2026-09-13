@@ -845,7 +845,11 @@ func main() {
 		costStore = costs.NewStore(db.DB())
 
 		// Load user config for pricing overrides and budgets
-		userCfg, _ := session.LoadUserConfig()
+		userCfg, configErr := session.LoadUserConfig()
+		if configErr != nil {
+			fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+			os.Exit(1)
+		}
 
 		// Set up pricer with overrides
 		cacheDir, cacheErr := effectiveCacheDir()
