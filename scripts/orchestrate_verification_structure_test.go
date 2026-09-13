@@ -638,6 +638,13 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// plain omission. Anchored to its table's lead-in line.
 	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
 	parseMarkdownRow := func(line string) ([]string, bool) {
+		leadingSpaces := 0
+		for leadingSpaces < len(line) && line[leadingSpaces] == ' ' {
+			leadingSpaces++
+		}
+		if leadingSpaces >= 4 || leadingSpaces < len(line) && line[leadingSpaces] == '\t' {
+			return nil, false
+		}
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
 			return nil, false
@@ -647,6 +654,10 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 			parts[i] = strings.TrimSpace(parts[i])
 		}
 		return parts, true
+	}
+	frontierBaselineCells, ok := parseMarkdownRow(frontierBaselineRow)
+	if !ok || len(frontierBaselineCells) != 2 {
+		t.Fatalf("frontierBaselineRow must parse as a two-cell Markdown row; got cells=%q, ok=%t", frontierBaselineCells, ok)
 	}
 	markdownDelimiterCell := regexp.MustCompile(`^:?-{3,}:?$`)
 	frontierRowInTable := false
@@ -664,7 +675,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		for j < len(skillLines) && strings.TrimSpace(skillLines[j]) == "" {
 			j++
 		}
-		if j >= len(skillLines) || strings.TrimSpace(skillLines[j]) != "| Session | Tier |" {
+		if j >= len(skillLines) {
+			continue
+		}
+		headerCells, ok := parseMarkdownRow(skillLines[j])
+		if !ok || len(headerCells) != 2 || headerCells[0] != "Session" || headerCells[1] != "Tier" {
 			continue
 		}
 		j++
@@ -680,7 +695,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 			if !ok {
 				break
 			}
-			if len(cells) == 2 && cells[0] == "Implementer of a plan task tagged `tier: frontier`" && cells[1] == "frontier" {
+			if len(cells) == 2 && cells[0] == frontierBaselineCells[0] && cells[1] == frontierBaselineCells[1] {
 				frontierRowInTable = true
 			}
 		}
