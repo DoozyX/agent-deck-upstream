@@ -21,6 +21,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[fork] Section](#fork-section)
 - [[conductor] Section](#conductor-section)
 - [[orchestrate] Section](#orchestrate-section)
+- [[usage.policy] Section](#usagepolicy-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[interval_hooks.*] Section](#interval_hooks-section)
@@ -646,6 +647,34 @@ agent-deck config orchestrate
 Tool availability reuses Agent Deck's existing registry and command lookup.
 It detects installation, not provider authentication. Explicit workflow tool
 choices continue to override this strategy.
+
+## [usage.policy] Section
+
+Defines the separate availability-aware advisory used by `agent-deck usage
+recommend`. This policy never overwrites an explicit launch choice or the
+`[orchestrate.*]` role-resolution precedence above.
+
+```toml
+[usage.policy]
+exhausted_below = 10
+constrained_below = 30
+failover = ["claude", "codex"]
+
+[usage.policy.ladder.codex]
+cheap = "gpt-5.6-luna"
+mid = "gpt-5.6-terra"
+strong = "gpt-5.6-sol"
+frontier = "gpt-6-astra"
+
+[usage.policy.frontier_window]
+codex = "weekly"
+```
+
+Thresholds are remaining percentages from 0 through 100 and
+`exhausted_below` must not exceed `constrained_below`. Failover entries are
+tool names without whitespace. An omitted ladder tier inherits its default; an
+explicit empty tier marks it unavailable. The config loader validates shape,
+then the usage policy layer merges defaults and validates the resolved policy.
 
 ## [logs] Section
 
