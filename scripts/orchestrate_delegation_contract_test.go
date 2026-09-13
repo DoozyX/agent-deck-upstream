@@ -8,18 +8,34 @@ import (
 	"testing"
 )
 
+func readNormalizedSkillDocs(t *testing.T, paths ...string) string {
+	t.Helper()
+	var documents []string
+	for _, path := range paths {
+		content, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read skill document %s: %v", path, err)
+		}
+		documents = append(documents, string(content))
+	}
+	return strings.Join(strings.Fields(strings.Join(documents, "\n")), " ")
+}
+
 func TestOrchestrateDelegatesAllTaskExecution(t *testing.T) {
 	repoRoot := filepath.Clean("..")
 	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
-	skill, err := os.ReadFile(skillPath)
-	if err != nil {
-		t.Fatalf("read orchestrate skill: %v", err)
-	}
+	referenceDir := filepath.Join(repoRoot, "skills", "orchestrate", "references")
 
 	contract := "The conductor delegates all task execution to child sessions. It only " +
 		"decomposes and sequences work, launches and supervises children, routes decisions and results, " +
 		"maintains orchestration state, and reports outcomes."
-	normalizedSkill := strings.Join(strings.Fields(string(skill)), " ")
+	normalizedSkill := readNormalizedSkillDocs(t,
+		skillPath,
+		filepath.Join(referenceDir, "principles-and-permissions.md"),
+		filepath.Join(referenceDir, "delivery-startup.md"),
+		filepath.Join(referenceDir, "planning-and-role-selection.md"),
+		filepath.Join(referenceDir, "reporting.md"),
+	)
 	if !strings.Contains(normalizedSkill, contract) {
 		t.Fatalf("orchestrate skill missing delegation contract %q", contract)
 	}
@@ -106,6 +122,7 @@ func TestOrchestrateDelegatesAllTaskExecution(t *testing.T) {
 			name: "retrospective",
 			args: []string{
 				"RUN_DIR=/repo/.agent-deck/run", "RETRO_PATH=/repo/.agent-deck/run/retro.md",
+				"DIARY_PATH=/repo/.agent-deck/diary.md",
 			},
 			required: []string{
 				"Run retrospective", "Do not edit any other file, commit, push, or alter run state",
@@ -168,11 +185,12 @@ func TestBrainstormingUsesTypedRepositoryLocalRunLayout(t *testing.T) {
 func TestOrchestrateKeepsAllWorkflowArtifactsInRepositoryRunRoot(t *testing.T) {
 	repoRoot := filepath.Clean("..")
 	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
-	skill, err := os.ReadFile(skillPath)
-	if err != nil {
-		t.Fatalf("read orchestrate skill: %v", err)
-	}
-	normalizedSkill := strings.Join(strings.Fields(string(skill)), " ")
+	referenceDir := filepath.Join(repoRoot, "skills", "orchestrate", "references")
+	normalizedSkill := readNormalizedSkillDocs(t,
+		skillPath,
+		filepath.Join(referenceDir, "delivery-startup.md"),
+		filepath.Join(referenceDir, "modes-and-prompts.md"),
+	)
 	if !strings.Contains(normalizedSkill, "Never create a design, plan, task file, prompt, review, report, or retrospective outside `$RUN_ROOT`.") {
 		t.Fatal("orchestrate does not state the run-artifact boundary")
 	}
