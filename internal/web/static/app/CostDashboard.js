@@ -61,24 +61,59 @@ export function coverageLine(coverage) {
     parts.push(`${n} unreconciled event${n === 1 ? '' : 's'} / ${coverage.unreconciled_tokens || 0} tokens`)
   }
   if (parts.length > 0) return parts.join('; ')
-  return coverage.coverage_known === false ? 'coverage unknown' : 'coverage complete'
+	const status = coverageStatus(coverage)
+	return status === 'complete' || status === 'verified' ? 'coverage complete' : status
+}
+
+export function coverageStatus(coverage) {
+  if (!coverage || coverage.coverage_known === false) return 'coverage unknown'
+  if (coverage.event_count > 0 && coverage.known_price_event_count === 0 &&
+      (coverage.unknown_price_event_count > 0 || coverage.unreconciled_event_count > 0)) return 'price unknown'
+  if (!coverage.complete) return 'coverage incomplete'
+  if (coverage.known_price_event_count > 0 &&
+      coverage.known_zero_event_count === coverage.known_price_event_count) return 'verified'
+  return 'complete'
 }
 
 export function costDisplay(amount, coverage, projection = false) {
   let value
-  if (!coverage || coverage.coverage_known === false) {
-    value = 'coverage unknown'
-  } else if (coverage.event_count > 0 && coverage.known_price_event_count === 0 &&
-      (coverage.unknown_price_event_count > 0 || coverage.unreconciled_event_count > 0)) {
-    value = 'price unknown'
-  } else if (coverage.complete) {
-    value = fmt(amount)
-    if (amount === 0 && coverage.event_count > 0) value += ' (verified)'
-  } else {
-    value = `${fmt(amount)} known subtotal`
+	const status = coverageStatus(coverage)
+	if (status === 'coverage unknown') {
+		value = 'coverage unknown'
+	} else if (status === 'price unknown') {
+		value = 'price unknown'
+	} else if (status === 'complete' || status === 'verified') {
+		value = fmt(amount)
+		if (status === 'verified') value += ' (verified)'
+	} else {
+		value = `${fmt(amount)} known subtotal`
   }
   if (projection && (!coverage || !coverage.complete)) value += ' · incomplete projection'
   return value
+}
+
+function coveredChartLabel(label, coverage) {
+  const status = coverageStatus(coverage)
+  return `${label} · ${status === 'coverage incomplete' ? 'known subtotal' : status}`
+}
+
+export function buildCoveredChartData(dailyData, modelsData) {
+  const days = Array.isArray(dailyData) ? dailyData : []
+  const breakdowns = Array.isArray(modelsData?.breakdowns) ? modelsData.breakdowns : null
+  const legacyModels = modelsData?.costs || modelsData || {}
+  return {
+	 daily: {
+		labels: days.map(day => coveredChartLabel(day.date.slice(5), day.coverage)),
+		values: days.map(day => day.cost_usd),
+	 },
+	 models: breakdowns ? {
+		labels: breakdowns.map(model => coveredChartLabel(model.key, model.coverage)),
+		values: breakdowns.map(model => model.known_cost_microdollars / 1_000_000),
+	 } : {
+		labels: Object.keys(legacyModels),
+		values: Object.values(legacyModels),
+	 },
+  }
 }
 
 // readChartTheme reads chart palette CSS variables from the document root.
@@ -168,17 +203,15 @@ export function CostDashboard() {
         // always reflects the active theme without a page reload.
         const t = readChartTheme()
 
-        const dates = dailyData || []
-        const labels = dates.map(d => d.date.slice(5))
-        const costs = dates.map(d => d.cost_usd)
+		const chartData = buildCoveredChartData(dailyData, modelsData)
 
         dailyChartRef.current = new Chart(dailyCanvasRef.current, {
           type: 'line',
           data: {
-            labels,
+			labels: chartData.daily.labels,
             datasets: [{
               label: 'Daily Cost ($)',
-              data: costs,
+			  data: chartData.daily.values,
               borderColor: t.primary,
               backgroundColor: t.primaryFill,
               fill: true,
@@ -198,17 +231,13 @@ export function CostDashboard() {
           },
         })
 
-        const models = modelsData?.costs || modelsData || {}
-        const mLabels = Object.keys(models)
-        const mData = Object.values(models)
-
-        modelChartRef.current = new Chart(modelCanvasRef.current, {
+		modelChartRef.current = new Chart(modelCanvasRef.current, {
           type: 'doughnut',
           data: {
-            labels: mLabels,
+			labels: chartData.models.labels,
             datasets: [{
-              data: mData,
-              backgroundColor: t.categorical.slice(0, mLabels.length),
+			  data: chartData.models.values,
+			  backgroundColor: t.categorical.slice(0, chartData.models.labels.length),
             }],
           },
           options: {
@@ -281,7 +310,7 @@ export function CostDashboard() {
   return html`
     <div style="display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; overflow: auto;">
       <div class="stat-grid">
-        <div class="stat">
+		<div class="stat projected-stat">
           <div class="lab">TODAY</div>
 		  <div class="val">${costDisplay(summary.today_usd, summary.today_coverage)}</div>
 		  <div class="delta">${summary.today_events} events · ${coverageLine(summary.today_coverage)}</div>

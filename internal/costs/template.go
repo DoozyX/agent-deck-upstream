@@ -24,17 +24,7 @@ func RenderCostLine(template string, vars map[string]int64, hideWhenZero bool) s
 // RenderCoveredCostLine keeps all legacy cost variables numeric while adding
 // coverage/status placeholders for templates that want to explain subtotals.
 func RenderCoveredCostLine(template string, vars map[string]int64, coverage Coverage, hideWhenZero bool) string {
-	status := "coverage unknown"
-	if coverage.CoverageKnown {
-		switch {
-		case coverage.EventCount > 0 && coverage.KnownPriceEventCount == 0 && (coverage.UnknownPriceEventCount > 0 || coverage.UnreconciledEventCount > 0):
-			status = "price unknown"
-		case coverage.Complete:
-			status = "complete"
-		default:
-			status = "known subtotal"
-		}
-	}
+	status := CostCoverageStatus(CoveredSummary{Coverage: coverage})
 	text := map[string]string{
 		"coverage_status":     status,
 		"unpriced_events":     strconv.Itoa(coverage.UnknownPriceEventCount),

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -74,6 +75,29 @@ func TestPricerExactDatedOverridePrecedesNormalizedBuiltIn(t *testing.T) {
 	quote := p.Quote("claude-sonnet-5-20260301", TokenUsage{InputTokens: 1_000_000})
 	if quote.Source != "override" || quote.CostMicrodollars != 99_000_000 {
 		t.Fatalf("quote=%+v, want exact dated override", quote)
+	}
+}
+
+func TestPricerExplicitZeroDurationOverrideDoesNotInheritAggregateRate(t *testing.T) {
+	var cfg struct {
+		Overrides map[string]PriceOverride `toml:"overrides"`
+	}
+	if _, err := toml.Decode(`
+[overrides.duration-free]
+cache_write_per_mtok = 9
+cache_write_5m_per_mtok = 0
+cache_write_1h_per_mtok = 0
+`, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	p := NewPricer(PricerConfig{Overrides: cfg.Overrides})
+	quote := p.Quote("duration-free", TokenUsage{
+		CacheWriteTokens:   2_000_000,
+		CacheWrite5mTokens: 1_000_000,
+		CacheWrite1hTokens: 1_000_000,
+	})
+	if quote.CostMicrodollars != 0 || quote.Status != PricingKnown {
+		t.Fatalf("explicit zero duration quote = %+v, want known zero-dollar quote without aggregate inheritance", quote)
 	}
 }
 

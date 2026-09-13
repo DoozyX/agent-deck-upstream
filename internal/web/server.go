@@ -180,7 +180,7 @@ type Server struct {
 	menuSubscribersMu sync.Mutex
 	menuSubscribers   map[chan struct{}]struct{}
 
-	costStore       *costs.Store
+	costStore       costStore
 	mutator         SessionMutator
 	skills          SkillsService
 	mcpMgr          MCPManager
@@ -191,6 +191,25 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
+}
+
+type costStore interface {
+	CoveredTotalToday() (costs.CoveredSummary, error)
+	CoveredTotalThisWeek() (costs.CoveredSummary, error)
+	CoveredTotalThisMonth() (costs.CoveredSummary, error)
+	CoveredProjectedMonthly() (int64, costs.Coverage, error)
+	CoveredCostByDay() ([]costs.CostBreakdown, error)
+	CoveredCostByDayRange(time.Time, time.Time) ([]costs.CostBreakdown, error)
+	CoveredCostByProvider() ([]costs.CostBreakdown, error)
+	CoveredCostByModel() ([]costs.CostBreakdown, error)
+	CoveredCostBySession() ([]costs.CostBreakdown, error)
+	CoveredCostByRun() ([]costs.CostBreakdown, error)
+	CoveredTopSessionsByCost(int) ([]costs.SessionCost, error)
+	CoveredCostByGroup() ([]costs.GroupCost, error)
+	CoveredTotalBySession(string) (costs.CoveredSummary, error)
+	CoveredCostByDayForSession(string) ([]costs.CostBreakdown, error)
+	CoveredCostByModelForSession(string) ([]costs.CostBreakdown, error)
+	EventsByDateRange(time.Time, time.Time) ([]costs.CostEvent, error)
 }
 
 // NewServer creates a new web server with base routes and middleware.

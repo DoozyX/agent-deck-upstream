@@ -58,6 +58,13 @@ test('costs tab labels mixed coverage and incomplete projection', async ({ page 
   await expect(page.getByText('$1.25 known subtotal').first()).toBeVisible()
   await expect(page.getByText(/1 unpriced event \/ 7 tokens/).first()).toBeVisible()
   await expect(page.getByText(/incomplete projection/)).toBeVisible()
+	const projectionLayout = await page.locator('.projected-stat').evaluate(el => {
+		const card = el.getBoundingClientRect()
+		const value = el.querySelector('.val')!.getBoundingClientRect()
+		return { cardRight: card.right, valueRight: value.right, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }
+	})
+	expect(projectionLayout.valueRight).toBeLessThanOrEqual(projectionLayout.cardRight + 1)
+	expect(projectionLayout.scrollWidth).toBeLessThanOrEqual(projectionLayout.clientWidth + 1)
 
   const screenshotDir = process.env.ACCOUNTING_SCREENSHOT_DIR
   if (screenshotDir) {

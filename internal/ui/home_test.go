@@ -12,7 +12,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 	"github.com/asheshgoplani/agent-deck/internal/update"
 )
 
@@ -29,6 +31,37 @@ func TestNewHome(t *testing.T) {
 	}
 	if home.newDialog == nil {
 		t.Error("NewDialog component should be initialized")
+	}
+}
+
+func TestCostStatusLineUsesReferencedWindowCoverageWithoutDuplicateStatus(t *testing.T) {
+	db, err := statedb.Open(filepath.Join(t.TempDir(), "window-coverage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store := costs.NewStore(db.DB())
+	now := time.Now().UTC()
+	events := []costs.CostEvent{
+		{ID: "today-known", SessionID: "s", Timestamp: now, CostMicrodollars: 1_000_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "month-unknown", SessionID: "s", Timestamp: now.Add(-24 * time.Hour), InputTokens: 7, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	}
+	for _, event := range events {
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home := newTestHomeWithItems(120, 30, nil)
+	home.costStore = store
+	home.costLineTemplate = "{cost_this_month} month ({coverage_status})"
+	home.costLineHideWhenZero = false
+	home.refreshCostTotals()
+	view := home.View()
+	if !strings.Contains(view, "$1.00 month (known subtotal)") || strings.Count(view, "known subtotal") != 1 {
+		t.Fatalf("month template must use month coverage exactly once:\n%s", view)
 	}
 }
 

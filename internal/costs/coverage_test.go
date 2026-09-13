@@ -38,3 +38,43 @@ func TestPricingCoverageKnownZeroUnknownLegacyAndSuperseded(t *testing.T) {
 		t.Fatalf("coverage=%+v want=%+v", summary.Coverage, want)
 	}
 }
+
+func TestCostCoverageStatusVerifiedRequiresEveryKnownEventToBeKnownZero(t *testing.T) {
+	tests := []struct {
+		name    string
+		summary costs.CoveredSummary
+		want    string
+	}{
+		{
+			name: "genuine configured zero",
+			summary: costs.CoveredSummary{Coverage: costs.Coverage{
+				EventCount: 1, KnownPriceEventCount: 1, KnownZeroEventCount: 1,
+				CoverageKnown: true, Complete: true,
+			}},
+			want: "verified",
+		},
+		{
+			name: "positive priced event rounded below one microdollar",
+			summary: costs.CoveredSummary{Coverage: costs.Coverage{
+				EventCount: 1, KnownPriceEventCount: 1,
+				CoverageKnown: true, Complete: true,
+			}},
+			want: "complete",
+		},
+		{
+			name: "mixed known zero and positive priced events",
+			summary: costs.CoveredSummary{Coverage: costs.Coverage{
+				EventCount: 2, KnownPriceEventCount: 2, KnownZeroEventCount: 1,
+				CoverageKnown: true, Complete: true,
+			}},
+			want: "complete",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := costs.CostCoverageStatus(tt.summary); got != tt.want {
+				t.Fatalf("CostCoverageStatus() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

@@ -792,23 +792,29 @@ type Home struct {
 	groupScopeMu    sync.RWMutex // Guards groupScope for cross-goroutine read in reconcileClaims
 	lastOrphanSweep time.Time    // last time the primary polled for orphaned sessions
 	// Cost tracking
-	costStore            *costs.Store
-	costPricer           *costs.Pricer
-	costBudget           *costs.BudgetChecker
-	costToday            atomic.Int64 // microdollars
-	costYesterday        atomic.Int64 // microdollars
-	costWeek             atomic.Int64 // microdollars
-	costLastWeek         atomic.Int64 // microdollars
-	costThisMonth        atomic.Int64 // microdollars
-	costLastMonth        atomic.Int64 // microdollars
-	costProjected        atomic.Int64 // microdollars
-	costCoverageMu       sync.RWMutex
-	costTodayCoverage    costs.Coverage
-	costRefreshTime      time.Time
-	costLineTemplate     string // resolved at construction; see session.ResolveCostLineTemplate
-	costLineHideWhenZero bool
-	showCostDashboard    bool
-	costDashboard        costDashboard
+	costStore             *costs.Store
+	costPricer            *costs.Pricer
+	costBudget            *costs.BudgetChecker
+	costToday             atomic.Int64 // microdollars
+	costYesterday         atomic.Int64 // microdollars
+	costWeek              atomic.Int64 // microdollars
+	costLastWeek          atomic.Int64 // microdollars
+	costThisMonth         atomic.Int64 // microdollars
+	costLastMonth         atomic.Int64 // microdollars
+	costProjected         atomic.Int64 // microdollars
+	costCoverageMu        sync.RWMutex
+	costTodayCoverage     costs.Coverage
+	costYesterdayCoverage costs.Coverage
+	costWeekCoverage      costs.Coverage
+	costLastWeekCoverage  costs.Coverage
+	costMonthCoverage     costs.Coverage
+	costLastMonthCoverage costs.Coverage
+	costProjectedCoverage costs.Coverage
+	costRefreshTime       time.Time
+	costLineTemplate      string // resolved at construction; see session.ResolveCostLineTemplate
+	costLineHideWhenZero  bool
+	showCostDashboard     bool
+	costDashboard         costDashboard
 
 	// System stats collector (CPU, RAM, disk, etc.)
 	sysStatsCollector *sysinfo.Collector
@@ -2761,7 +2767,7 @@ func (h *Home) refreshCostTotals() {
 	lastWeek, _ := h.costStore.CoveredTotalLastWeek()
 	thisMonth, _ := h.costStore.CoveredTotalThisMonth()
 	lastMonth, _ := h.costStore.CoveredTotalLastMonth()
-	projected, _, _ := h.costStore.CoveredProjectedMonthly()
+	projected, projectedCoverage, _ := h.costStore.CoveredProjectedMonthly()
 	h.costToday.Store(today.TotalCostMicrodollars)
 	h.costYesterday.Store(yesterday.TotalCostMicrodollars)
 	h.costWeek.Store(week.TotalCostMicrodollars)
@@ -2771,6 +2777,12 @@ func (h *Home) refreshCostTotals() {
 	h.costProjected.Store(projected)
 	h.costCoverageMu.Lock()
 	h.costTodayCoverage = today.Coverage
+	h.costYesterdayCoverage = yesterday.Coverage
+	h.costWeekCoverage = week.Coverage
+	h.costLastWeekCoverage = lastWeek.Coverage
+	h.costMonthCoverage = thisMonth.Coverage
+	h.costLastMonthCoverage = lastMonth.Coverage
+	h.costProjectedCoverage = projectedCoverage
 	h.costCoverageMu.Unlock()
 }
 
@@ -4381,7 +4393,7 @@ func mergeRemoteCosts(prev map[string]*costs.RemoteCostSummary, msg remoteSessio
 			continue
 		}
 		if msg.failed[name] {
-			merged[name] = summary
+			merged[name] = staleRemoteCostSummary(summary)
 		}
 	}
 	for name, summary := range msg.costs {
@@ -4389,12 +4401,32 @@ func mergeRemoteCosts(prev map[string]*costs.RemoteCostSummary, msg remoteSessio
 	}
 	for name := range msg.sessions {
 		if _, ok := msg.costs[name]; !ok {
-			// A reachable remote whose cost endpoint is old, failed, or empty
-			// contributes no amount but must retain explicit unknown coverage.
-			merged[name] = nil
+			// Preserve the last numeric subtotal, but never preserve stale
+			// freshness or coverage claims.
+			merged[name] = staleRemoteCostSummary(prev[name])
 		}
 	}
 	return merged
+}
+
+func staleRemoteCostSummary(summary *costs.RemoteCostSummary) *costs.RemoteCostSummary {
+	if summary == nil {
+		return nil
+	}
+	stale := *summary
+	stale.CoverageKnown = false
+	stale.CoverageComplete = false
+	stale.ProjectionComplete = false
+	coverage := []*costs.Coverage{
+		&stale.TodayCoverage, &stale.YesterdayCoverage, &stale.ThisWeekCoverage,
+		&stale.LastWeekCoverage, &stale.ThisMonthCoverage, &stale.LastMonthCoverage,
+		&stale.ProjectionCoverage,
+	}
+	for _, item := range coverage {
+		item.CoverageKnown = false
+		item.Complete = false
+	}
+	return &stale
 }
 
 // remoteChangedMsg says a remote pushed "changed" over its persistent
@@ -18222,17 +18254,45 @@ func (h *Home) renderFrame() string {
 		"cost_projected":  h.costProjected.Load() + remoteAgg.CostProjectedMicrodollars,
 	}
 	h.costCoverageMu.RLock()
-	lineCoverage := h.costTodayCoverage
+	windowCoverage := []struct {
+		placeholder string
+		local       costs.Coverage
+		remote      costs.Coverage
+	}{
+		{"{cost_today}", h.costTodayCoverage, remoteAgg.TodayCoverage},
+		{"{cost_yesterday}", h.costYesterdayCoverage, remoteAgg.YesterdayCoverage},
+		{"{cost_this_week}", h.costWeekCoverage, remoteAgg.ThisWeekCoverage},
+		{"{cost_last_week}", h.costLastWeekCoverage, remoteAgg.LastWeekCoverage},
+		{"{cost_this_month}", h.costMonthCoverage, remoteAgg.ThisMonthCoverage},
+		{"{cost_last_month}", h.costLastMonthCoverage, remoteAgg.LastMonthCoverage},
+		{"{cost_projected}", h.costProjectedCoverage, remoteAgg.ProjectionCoverage},
+	}
 	h.costCoverageMu.RUnlock()
-	if hasRemotes {
-		lineCoverage = costs.MergeCoverage(lineCoverage, remoteAgg.TodayCoverage)
-		if !remoteAgg.CoverageKnown {
-			lineCoverage.CoverageKnown = false
-			lineCoverage.Complete = false
+	template := h.costLineTemplate
+	var lineCoverage costs.Coverage
+	foundWindow := false
+	for _, window := range windowCoverage {
+		if !strings.Contains(template, window.placeholder) {
+			continue
+		}
+		coverage := window.local
+		if hasRemotes {
+			coverage = costs.MergeCoverage(coverage, window.remote)
+		}
+		if !foundWindow {
+			lineCoverage = coverage
+			foundWindow = true
+		} else {
+			lineCoverage = costs.MergeCoverage(lineCoverage, coverage)
 		}
 	}
-	template := h.costLineTemplate
-	if lineCoverage.EventCount > 0 || hasRemotes {
+	if !foundWindow {
+		lineCoverage = h.costTodayCoverage
+		if hasRemotes {
+			lineCoverage = costs.MergeCoverage(lineCoverage, remoteAgg.TodayCoverage)
+		}
+	}
+	if (lineCoverage.EventCount > 0 || hasRemotes) && !strings.Contains(template, "{coverage_status}") {
 		template += " ({coverage_status})"
 	}
 	if rendered := costs.RenderCoveredCostLine(template, costVars, lineCoverage, h.costLineHideWhenZero); rendered != "" {

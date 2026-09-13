@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -558,7 +559,11 @@ func (s *Store) CoveredTotalYesterday() (CoveredSummary, error) {
 }
 
 func (s *Store) CoveredTotalThisWeek() (CoveredSummary, error) {
-	return s.queryCovered(`WHERE timestamp >= date('now', 'weekday 1', '-7 days')`)
+	now := s.now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(today.Weekday()) + 6) % 7
+	thisMonday := today.AddDate(0, 0, -daysSinceMonday)
+	return s.queryCovered(`WHERE timestamp >= ?`, thisMonday.Format(time.RFC3339))
 }
 
 func (s *Store) CoveredTotalLastWeek() (CoveredSummary, error) {
@@ -585,11 +590,21 @@ func (s *Store) CoveredProjectedMonthly() (int64, Coverage, error) {
 	if err != nil {
 		return 0, Coverage{}, err
 	}
-	return (summary.TotalCostMicrodollars / 7) * 30, summary.Coverage, nil
+	total := summary.TotalCostMicrodollars
+	if total > math.MaxInt64/30 || total < math.MinInt64/30 {
+		return 0, summary.Coverage, fmt.Errorf("monthly projection overflow for %d microdollars", total)
+	}
+	return (total * 30) / 7, summary.Coverage, nil
 }
 
 func (s *Store) CoveredCostByDay() ([]CostBreakdown, error) {
 	return s.coveredBreakdown("date(timestamp)", "", nil)
+}
+
+func (s *Store) CoveredCostByDayRange(from, to time.Time) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)", " AND timestamp >= ? AND timestamp < ?", []any{
+		from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339),
+	})
 }
 
 func (s *Store) CoveredCostByProvider() ([]CostBreakdown, error) {
@@ -621,48 +636,58 @@ func (s *Store) coveredBreakdown(expression, filter string, filterArgs []any) ([
 	if !allowed[expression] {
 		return nil, fmt.Errorf("unsupported cost breakdown %q", expression)
 	}
+	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
 	// #nosec G201 -- expression is selected from the fixed allowlist above.
-	distinctArgs := append([]any{ReconciliationLegacySuperseded}, filterArgs...)
-	rows, err := s.db.Query(`SELECT DISTINCT `+expression+` FROM cost_events WHERE reconciliation_status <> ?`+filter+` ORDER BY 1`, distinctArgs...)
+	query := `SELECT ` + expression + `,
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN cost_microdollars ELSE 0 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+		COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(cache_write_5m_tokens), 0),
+		COALESCE(SUM(cache_write_1h_tokens), 0), COALESCE(SUM(output_tokens), 0),
+		COALESCE(SUM(reasoning_tokens), 0), COUNT(*), COALESCE(SUM(` + tokens + `), 0),
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0)
+		FROM cost_events WHERE reconciliation_status <> ?` + filter + ` GROUP BY ` + expression + ` ORDER BY 1`
+	args := []any{
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded,
+	}
+	args = append(args, filterArgs...)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
-	var keys []string
+	defer rows.Close()
+	var result []CostBreakdown
 	for rows.Next() {
-		var key string
-		if err := rows.Scan(&key); err != nil {
-			_ = rows.Close()
-			return nil, err
-		}
-		keys = append(keys, key)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-
-	result := make([]CostBreakdown, 0, len(keys))
-	for _, key := range keys {
-		where := `WHERE ` + expression + ` = ?` + filter
-		summaryArgs := append([]any{key}, filterArgs...)
-		summary, err := s.queryCovered(where, summaryArgs...)
-		if err != nil {
-			return nil, err
-		}
 		var item CostBreakdown
-		item.Key = key
-		item.KnownCostMicrodollars = summary.TotalCostMicrodollars
-		item.Coverage = summary.Coverage
-		// #nosec G201 -- expression is selected from the fixed allowlist above.
-		tokenArgs := append(summaryArgs, ReconciliationLegacySuperseded)
-		err = s.db.QueryRow(`SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0), COALESCE(SUM(cache_write_5m_tokens),0), COALESCE(SUM(cache_write_1h_tokens),0), COALESCE(SUM(output_tokens),0), COALESCE(SUM(reasoning_tokens),0) FROM cost_events `+where+` AND reconciliation_status <> ?`, tokenArgs...).Scan(
+		if err := rows.Scan(
+			&item.Key, &item.KnownCostMicrodollars,
 			&item.UncachedInputTokens, &item.CacheReadInputTokens, &item.CacheWriteInputTokens,
-			&item.CacheWrite5mInputTokens, &item.CacheWrite1hInputTokens, &item.OutputTokens, &item.ReasoningOutputTokens)
-		if err != nil {
+			&item.CacheWrite5mInputTokens, &item.CacheWrite1hInputTokens,
+			&item.OutputTokens, &item.ReasoningOutputTokens,
+			&item.Coverage.EventCount, &item.Coverage.TotalTokens,
+			&item.Coverage.KnownPriceEventCount, &item.Coverage.KnownPriceTokens,
+			&item.Coverage.KnownZeroEventCount, &item.Coverage.UnknownPriceEventCount,
+			&item.Coverage.UnreconciledEventCount, &item.Coverage.UnknownPriceTokens,
+			&item.Coverage.UnreconciledTokens,
+		); err != nil {
 			return nil, err
 		}
+		item.Coverage.CoverageKnown = true
+		item.Coverage.Complete = item.Coverage.UnknownPriceEventCount == 0 && item.Coverage.UnreconciledEventCount == 0
 		result = append(result, item)
 	}
-	return result, nil
+	return result, rows.Err()
 }
 
 // TotalToday returns today's total costs.
@@ -739,17 +764,30 @@ func (s *Store) TopSessionsByCost(limit int) ([]SessionCost, error) {
 // known-price subtotal. Unknown and unreconciled events remain in the event
 // count so callers can report their coverage; superseded events are excluded.
 func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
+	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
 	rows, err := s.db.Query(`
 		SELECT ce.session_id, COALESCE(i.title, ce.session_id), COALESCE(i.group_path, ''),
 			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
-			COUNT(*)
+			COUNT(*), COALESCE(SUM(`+tokens+`), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
 		FROM cost_events ce
 		LEFT JOIN instances i ON ce.session_id = i.id
 		WHERE ce.reconciliation_status <> ?
 		GROUP BY ce.session_id
 		ORDER BY COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0) DESC,
 			ce.session_id
-		LIMIT ?`, PricingKnown, PricingKnownZero, ReconciliationLegacySuperseded,
+		LIMIT ?`, PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero, PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded,
 		PricingKnown, PricingKnownZero, limit)
 	if err != nil {
 		return nil, err
@@ -759,10 +797,70 @@ func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
 	var result []SessionCost
 	for rows.Next() {
 		var sc SessionCost
-		if err := rows.Scan(&sc.SessionID, &sc.SessionTitle, &sc.Group, &sc.CostMicrodollars, &sc.EventCount); err != nil {
+		if err := rows.Scan(
+			&sc.SessionID, &sc.SessionTitle, &sc.Group, &sc.CostMicrodollars, &sc.EventCount,
+			&sc.Coverage.TotalTokens, &sc.Coverage.KnownPriceEventCount, &sc.Coverage.KnownPriceTokens,
+			&sc.Coverage.KnownZeroEventCount, &sc.Coverage.UnknownPriceEventCount,
+			&sc.Coverage.UnreconciledEventCount, &sc.Coverage.UnknownPriceTokens,
+			&sc.Coverage.UnreconciledTokens,
+		); err != nil {
 			return nil, err
 		}
+		sc.Coverage.EventCount = sc.EventCount
+		sc.Coverage.CoverageKnown = true
+		sc.Coverage.Complete = sc.Coverage.UnknownPriceEventCount == 0 && sc.Coverage.UnreconciledEventCount == 0
 		result = append(result, sc)
+	}
+	return result, rows.Err()
+}
+
+// CoveredCostByGroup aggregates every current cost event by session group in
+// one query. It is intentionally unbounded: group totals must not depend on a
+// top-sessions presentation limit.
+func (s *Store) CoveredCostByGroup() ([]GroupCost, error) {
+	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
+	rows, err := s.db.Query(`
+		SELECT COALESCE(NULLIF(i.group_path, ''), '(ungrouped)'),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
+			COUNT(*), COUNT(DISTINCT ce.session_id), COALESCE(SUM(`+tokens+`), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
+		FROM cost_events ce
+		LEFT JOIN instances i ON ce.session_id = i.id
+		WHERE ce.reconciliation_status <> ?
+		GROUP BY COALESCE(NULLIF(i.group_path, ''), '(ungrouped)')
+		ORDER BY 1`,
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero, PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []GroupCost
+	for rows.Next() {
+		var item GroupCost
+		if err := rows.Scan(
+			&item.Group, &item.CostMicrodollars, &item.EventCount, &item.SessionCount,
+			&item.Coverage.TotalTokens, &item.Coverage.KnownPriceEventCount, &item.Coverage.KnownPriceTokens,
+			&item.Coverage.KnownZeroEventCount, &item.Coverage.UnknownPriceEventCount,
+			&item.Coverage.UnreconciledEventCount, &item.Coverage.UnknownPriceTokens,
+			&item.Coverage.UnreconciledTokens,
+		); err != nil {
+			return nil, err
+		}
+		item.Coverage.EventCount = item.EventCount
+		item.Coverage.CoverageKnown = true
+		item.Coverage.Complete = item.Coverage.UnknownPriceEventCount == 0 && item.Coverage.UnreconciledEventCount == 0
+		result = append(result, item)
 	}
 	return result, rows.Err()
 }

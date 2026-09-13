@@ -1,6 +1,7 @@
 package costs_test
 
 import (
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -8,6 +9,75 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
+
+func TestCoveredProjectionMultipliesBeforeDivisionAndRejectsOverflow(t *testing.T) {
+	t.Run("preserves remainder", func(t *testing.T) {
+		s := testStore(t)
+		if err := s.WriteCostEvent(costs.CostEvent{ID: "projection", SessionID: "s", Timestamp: time.Now().UTC(), CostMicrodollars: 8, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := s.CoveredProjectedMonthly()
+		if err != nil || got != 34 {
+			t.Fatalf("projection = %d, err=%v; want 34", got, err)
+		}
+	})
+	t.Run("checked overflow", func(t *testing.T) {
+		s := testStore(t)
+		if err := s.WriteCostEvent(costs.CostEvent{ID: "overflow", SessionID: "s", Timestamp: time.Now().UTC(), CostMicrodollars: math.MaxInt64, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative}); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := s.CoveredProjectedMonthly(); err == nil {
+			t.Fatal("CoveredProjectedMonthly() error = nil, want checked overflow")
+		}
+	})
+}
+
+func TestCoveredThisWeekUsesInjectedMondayBoundary(t *testing.T) {
+	s := testStore(t)
+	monday := time.Date(2025, 11, 10, 0, 0, 1, 0, time.UTC)
+	s.SetClock(func() time.Time { return monday })
+	events := []costs.CostEvent{
+		{ID: "current-monday", SessionID: "s", Timestamp: monday, CostMicrodollars: 11, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "previous-week", SessionID: "s", Timestamp: monday.Add(-24 * time.Hour), CostMicrodollars: 99, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	}
+	for _, event := range events {
+		if err := s.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.CoveredTotalThisWeek()
+	if err != nil || got.TotalCostMicrodollars != 11 || got.EventCount != 1 {
+		t.Fatalf("this week = %+v, err=%v; want only Monday event", got, err)
+	}
+}
+
+func TestCoveredProviderBreakdownPreservesProviderKeysAndCoverage(t *testing.T) {
+	s := testStore(t)
+	now := time.Now().UTC()
+	events := []costs.CostEvent{
+		{ID: "claude", SessionID: "s", Timestamp: now, Provider: costs.ProviderClaude, Model: "shared", InputTokens: 3, CacheReadTokens: 5, CostMicrodollars: 17, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "codex", SessionID: "s", Timestamp: now, Provider: costs.ProviderCodex, Model: "shared", OutputTokens: 7, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	}
+	for _, event := range events {
+		if err := s.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := s.CoveredCostByProvider()
+	if err != nil || len(got) != 2 {
+		t.Fatalf("providers = %#v, err=%v", got, err)
+	}
+	byKey := map[string]costs.CostBreakdown{}
+	for _, item := range got {
+		byKey[item.Key] = item
+	}
+	if item := byKey[costs.ProviderClaude]; item.KnownCostMicrodollars != 17 || item.UncachedInputTokens != 3 || item.CacheReadInputTokens != 5 || !item.Coverage.Complete {
+		t.Fatalf("claude breakdown = %+v", item)
+	}
+	if item := byKey[costs.ProviderCodex]; item.OutputTokens != 7 || item.Coverage.UnknownPriceEventCount != 1 || item.Coverage.Complete {
+		t.Fatalf("codex breakdown = %+v", item)
+	}
+}
 
 func testStore(t *testing.T) *costs.Store {
 	t.Helper()

@@ -49,11 +49,31 @@ func (s *Server) handleCostsSummary(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	days, _ := s.costStore.CoveredCostByDay()
-	providers, _ := s.costStore.CoveredCostByProvider()
-	models, _ := s.costStore.CoveredCostByModel()
-	sessions, _ := s.costStore.CoveredCostBySession()
-	runs, _ := s.costStore.CoveredCostByRun()
+	days, err := s.costStore.CoveredCostByDay()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query daily breakdown")
+		return
+	}
+	providers, err := s.costStore.CoveredCostByProvider()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query provider breakdown")
+		return
+	}
+	models, err := s.costStore.CoveredCostByModel()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query model breakdown")
+		return
+	}
+	sessions, err := s.costStore.CoveredCostBySession()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query session breakdown")
+		return
+	}
+	runs, err := s.costStore.CoveredCostByRun()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query run breakdown")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"today_usd":           microToUSD(today.TotalCostMicrodollars),
 		"week_usd":            microToUSD(week.TotalCostMicrodollars),
@@ -102,7 +122,7 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 	from := now.AddDate(0, 0, -days).Truncate(24 * time.Hour)
 	to := now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
 
-	dailyCosts, err := s.costStore.CoveredCostByDay()
+	dailyCosts, err := s.costStore.CoveredCostByDayRange(from, to)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query daily costs")
 		return
@@ -169,17 +189,13 @@ func (s *Server) handleCostsSessions(w http.ResponseWriter, r *http.Request) {
 
 	result := make([]sessionEntry, 0, len(sessions))
 	for _, sc := range sessions {
-		covered, queryErr := s.costStore.CoveredTotalBySession(sc.SessionID)
-		if queryErr != nil {
-			continue
-		}
 		result = append(result, sessionEntry{
 			SessionID: sc.SessionID,
 			Title:     sc.SessionTitle,
 			Group:     sc.Group,
-			CostUSD:   microToUSD(covered.TotalCostMicrodollars),
-			Events:    covered.EventCount,
-			Coverage:  covered.Coverage,
+			CostUSD:   microToUSD(sc.CostMicrodollars),
+			Events:    sc.EventCount,
+			Coverage:  sc.Coverage,
 		})
 	}
 
@@ -529,7 +545,7 @@ func (s *Server) handleCostsGroups(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sessions, err := s.costStore.CoveredTopSessionsByCost(1000)
+	groupCosts, err := s.costStore.CoveredCostByGroup()
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "INTERNAL_ERROR", "failed to query costs")
 		return
@@ -543,31 +559,12 @@ func (s *Server) handleCostsGroups(w http.ResponseWriter, r *http.Request) {
 		Coverage costs.Coverage `json:"coverage"`
 	}
 
-	groups := make(map[string]*groupEntry)
-	for _, sc := range sessions {
-		covered, queryErr := s.costStore.CoveredTotalBySession(sc.SessionID)
-		if queryErr != nil {
-			continue
-		}
-		g := sc.Group
-		if g == "" {
-			g = "(ungrouped)"
-		}
-		entry, ok := groups[g]
-		if !ok {
-			entry = &groupEntry{Group: g, Coverage: covered.Coverage}
-			groups[g] = entry
-		} else {
-			entry.Coverage = costs.MergeCoverage(entry.Coverage, covered.Coverage)
-		}
-		entry.CostUSD += microToUSD(covered.TotalCostMicrodollars)
-		entry.Events += covered.EventCount
-		entry.Sessions++
-	}
-
-	result := make([]groupEntry, 0, len(groups))
-	for _, entry := range groups {
-		result = append(result, *entry)
+	result := make([]groupEntry, 0, len(groupCosts))
+	for _, group := range groupCosts {
+		result = append(result, groupEntry{
+			Group: group.Group, CostUSD: microToUSD(group.CostMicrodollars),
+			Events: group.EventCount, Sessions: group.SessionCount, Coverage: group.Coverage,
+		})
 	}
 
 	writeJSON(w, http.StatusOK, result)
