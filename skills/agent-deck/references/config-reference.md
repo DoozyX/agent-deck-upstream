@@ -699,9 +699,10 @@ is empty when the applied tier's rung is empty, and stderr stays silent. Read
 the `reason`, not the emptiness of `tool`. Exit 2 is reserved for a bad flag: a
 missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
 positional argument, or anything else `flag.Parse` rejects — an undefined flag,
-or a defined flag given no value — except `-h`/`--help`, which print the usage
-line on stderr and exit 0. Exit 1 means the configuration could not be
-loaded or validated, or the JSON could not be encoded.
+or a defined flag given no value — except the four help spellings `-h`, `--h`,
+`-help`, and `--help`, which print the usage line on stderr and exit 0. Exit 1
+means the configuration could not be loaded or validated, or the JSON could not
+be encoded.
 
 `--json` prints the decision as ten snake_case keys: `tool`, `provider`,
 `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`,

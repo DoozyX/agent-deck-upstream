@@ -455,7 +455,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// EXIT=2 "flag provided but not defined: -bogus", and `--tier` with no
 		// value -> EXIT=2 "flag needs an argument: -tier". The open clause is
 		// pinned with the list so the list cannot re-close.
-		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value — except `-h`/`--help`, which print the usage line on stderr and exit 0.",
+		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value — except the four help spellings `-h`, `--h`, `-help`, and `--help`, which print the usage line on stderr and exit 0.",
 		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` —",
 		// Exit 1 was enumerated nowhere in the skill, though this section's own
 		// recipe redirects stdout into a file the shell creates either way — a
@@ -567,7 +567,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Round-4 finding 7: the two pins above hold the surrounding sentences
 		// but not the remedy itself, which survived replacement by "Launch
 		// without `-c` and let the connector default apply."
-		"On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the top-level `default_tool` in `config.toml`, before launching anything for that wave. That remedy does not reach the surviving-name branch: there `--prefer` picks which name survives without making the decision launchable — the `reason` is unchanged — and `default_tool` is filtered out with the rest. Fix the environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or miscased `failover` entry.",
+		"On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the top-level `default_tool` in `config.toml`, before launching anything for that wave. On the surviving-name branch, neither remedy makes the decision launchable: `--prefer` picks which name survives, and when `failover` is omitted `default_tool` supplies the default failover order and can change which name survives; an explicit `failover` controls that order instead. The `reason` still begins `no candidate tools for tool strategy`, so fix the environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or miscased `failover` entry.",
 		// Round-5 finding 13: this clause inverted into a wrong operational
 		// action while green — a mutant reading "which is a failure: stop the
 		// wave and report it rather than launching" SURVIVED. The lead confirms
@@ -886,7 +886,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Round-5 finding 5, config-reference half: the same closed exit-2
 		// enumeration as the skill's, widened to `flag.Parse` and pinned.
 		"It exits 0 for every decision — including `exhausted`, `unknown`, and the case where no candidate tool could be chosen at all — so a caller reads `state`, not the exit code.",
-		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value — except `-h`/`--help`, which print the usage line on stderr and exit 0. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
+		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value — except the four help spellings `-h`, `--h`, `-help`, and `--help`, which print the usage line on stderr and exit 0. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
 	})
 	// Round-5 findings 7 and 8, checked RAW — no normalize — so whitespace,
 	// position and every VALUE are held together.
