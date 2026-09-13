@@ -637,6 +637,18 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// manifest cross-references, so this was inconsistent rigor rather than a
 	// plain omission. Anchored to its table's lead-in line.
 	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
+	parseMarkdownRow := func(line string) ([]string, bool) {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
+			return nil, false
+		}
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(line, "|"), "|"), "|")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		return parts, true
+	}
+	markdownDelimiterCell := regexp.MustCompile(`^:?-{3,}:?$`)
 	frontierRowInTable := false
 	baselineTableLead := -1
 	for i, line := range skillLines {
@@ -655,8 +667,20 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		if j >= len(skillLines) || strings.TrimSpace(skillLines[j]) != "| Session | Tier |" {
 			continue
 		}
-		for ; j < len(skillLines) && strings.HasPrefix(strings.TrimSpace(skillLines[j]), "|"); j++ {
-			if strings.Contains(normalize(skillLines[j]), normalize(frontierBaselineRow)) {
+		j++
+		if j >= len(skillLines) {
+			continue
+		}
+		delimiterCells, ok := parseMarkdownRow(skillLines[j])
+		if !ok || len(delimiterCells) != 2 || !markdownDelimiterCell.MatchString(delimiterCells[0]) || !markdownDelimiterCell.MatchString(delimiterCells[1]) {
+			continue
+		}
+		for j++; j < len(skillLines); j++ {
+			cells, ok := parseMarkdownRow(skillLines[j])
+			if !ok {
+				break
+			}
+			if len(cells) == 2 && cells[0] == "Implementer of a plan task tagged `tier: frontier`" && cells[1] == "frontier" {
 				frontierRowInTable = true
 			}
 		}
