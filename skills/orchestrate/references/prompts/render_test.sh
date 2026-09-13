@@ -54,6 +54,28 @@ state_file="$(find "$FAILRUN/.review-state" -name '*.json' -type f)"
 jq -e '.attempts["failed-review"] | .status == "transport-failure" and .startup_retries == 1' "$state_file" >/dev/null
 [ -s "$FAILRUN/task/review.md" ]
 
+# Reusing a receipt creates a new launch generation and current launcher
+# identity. Cancellation cannot authorize itself against the dead prior owner.
+first_generation="$(jq -r '.launch_generation // empty' "$FAILRUN/task/review.receipt.json")"
+# shellcheck disable=SC2016
+"$ATTEMPT" launch --template review-full --out "$FAILRUN/task/review.md" --receipt "$FAILRUN/task/review.receipt.json" \
+  RUN_DIR="$FAILRUN" TASK_ID=failed-task ATTEMPT_ID=failed-review BASE_HEAD=base REVIEWED_HEAD=head SPEC_ID=spec-a \
+  -- VERDICT_FILE=x SPEC_BLOCK=spec BASE_BRANCH=main AGENT_DECK_REPO=/repo BASELINE=none \
+  --launch bash -c 'touch "$1"; trap '\''exit 143'\'' TERM INT; sleep 30' fixture "$FAILRUN/task/retry-began" &
+retry_wrapper=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ ! -e "$FAILRUN/task/retry-began" ] || break; sleep 0.1; done
+[ -e "$FAILRUN/task/retry-began" ]
+second_generation="$(jq -r '.launch_generation // empty' "$FAILRUN/task/review.receipt.json")"
+[ -n "$first_generation" ] && [ -n "$second_generation" ] && [ "$first_generation" != "$second_generation" ] || {
+  kill -TERM "$retry_wrapper" 2>/dev/null || true; wait "$retry_wrapper" 2>/dev/null || true
+  echo 'retry did not publish a fresh launch generation' >&2; exit 1; }
+if "$ATTEMPT" cancel --receipt "$FAILRUN/task/review.receipt.json" >/dev/null 2>&1; then
+  kill -TERM "$retry_wrapper" 2>/dev/null || true; wait "$retry_wrapper" 2>/dev/null || true
+  echo 'cancel ignored the active retry owner' >&2; exit 1
+fi
+kill -TERM "$retry_wrapper"
+wait "$retry_wrapper" 2>/dev/null || true
+
 # Structured usage-limit launch failures park the stable attempt as quota and
 # preserve reset metadata without spending a transport startup retry.
 QUOTARUN="$TMP/quota"; mkdir -p "$QUOTARUN/task"; printf 'conductor\n' > "$QUOTARUN/.conductor-id"
@@ -115,6 +137,31 @@ fi
 [ "$(cat "$PRERUN/task/review.md")" = 'legitimate prompt' ]
 [ ! -e "$PRERUN/.review-state" ]
 
+# Prompt, receipt, generation sidecar, and protected run state paths are
+# distinct by canonical identity before rendering or budget reservation.
+COLLIDE="$TMP/collisions"; mkdir -p "$COLLIDE/task"; printf 'conductor\n' > "$COLLIDE/.conductor-id"
+collision_common=(RUN_DIR="$COLLIDE" TASK_ID=collision ATTEMPT_ID=collision-review BASE_HEAD=b REVIEWED_HEAD=h SPEC_ID=s)
+if "$ATTEMPT" launch --template review-full --out "$COLLIDE/task/shared.json" --receipt "$COLLIDE/task/shared.json" \
+  "${collision_common[@]}" -- VERDICT_FILE=x SPEC_BLOCK=spec BASE_BRANCH=main AGENT_DECK_REPO=/repo BASELINE=none --launch true >/dev/null 2>&1; then
+  echo 'identical prompt and receipt paths were accepted' >&2; exit 1
+fi
+printf 'preserve alias target\n' > "$COLLIDE/task/alias-target"
+ln -s alias-target "$COLLIDE/task/prompt-link"
+ln -s alias-target "$COLLIDE/task/receipt-link"
+if "$ATTEMPT" launch --template review-full --out "$COLLIDE/task/prompt-link" --receipt "$COLLIDE/task/receipt-link" \
+  RUN_DIR="$COLLIDE" TASK_ID=collision-alias ATTEMPT_ID=collision-alias-review BASE_HEAD=b REVIEWED_HEAD=h SPEC_ID=s \
+  -- VERDICT_FILE=x SPEC_BLOCK=spec BASE_BRANCH=main AGENT_DECK_REPO=/repo BASELINE=none --launch true >/dev/null 2>&1; then
+  echo 'symlink-aliased prompt and receipt paths were accepted' >&2; exit 1
+fi
+[ "$(cat "$COLLIDE/task/alias-target")" = 'preserve alias target' ]
+if "$ATTEMPT" launch --template review-full --out "$COLLIDE/.conductor-id" --receipt "$COLLIDE/task/protected.receipt.json" \
+  RUN_DIR="$COLLIDE" TASK_ID=collision-state ATTEMPT_ID=collision-state-review BASE_HEAD=b REVIEWED_HEAD=h SPEC_ID=s \
+  -- VERDICT_FILE=x SPEC_BLOCK=spec BASE_BRANCH=main AGENT_DECK_REPO=/repo BASELINE=none --launch true >/dev/null 2>&1; then
+  echo 'protected run state path was accepted as a prompt' >&2; exit 1
+fi
+[ "$(cat "$COLLIDE/.conductor-id")" = conductor ]
+[ ! -e "$COLLIDE/.review-state" ]
+
 # A successful child recorded in the durable launch sidecar can be recovered
 # when final receipt publication is interrupted after launch.
 RECOVER="$TMP/recover"; mkdir -p "$RECOVER/task"; printf 'conductor\n' > "$RECOVER/.conductor-id"
@@ -131,6 +178,30 @@ jq -e '.status == "launching"' "$RECOVER/task/review.receipt.json" >/dev/null
 jq -e '.status == "launched" and .launch.session_id == "recover-child"' "$RECOVER/task/review.receipt.json" >/dev/null
 recover_state="$(find "$RECOVER/.review-state" -name '*.json' -type f)"
 jq -e '.attempts["recover-review"].status == "reserved"' "$recover_state" >/dev/null
+
+# Recovery accepts only the current launching generation and its reserved
+# state identity; a stale sidecar attached to a failed receipt is inert.
+STALE_RECOVER="$TMP/stale-recover"; mkdir -p "$STALE_RECOVER/task"; printf 'conductor\n' > "$STALE_RECOVER/.conductor-id"
+if "$ATTEMPT" launch --template review-full --out "$STALE_RECOVER/task/review.md" --receipt "$STALE_RECOVER/task/review.receipt.json" \
+  RUN_DIR="$STALE_RECOVER" TASK_ID=stale-recover ATTEMPT_ID=stale-recover-review BASE_HEAD=b REVIEWED_HEAD=h SPEC_ID=s \
+  -- VERDICT_FILE=x SPEC_BLOCK=spec BASE_BRANCH=main AGENT_DECK_REPO=/repo BASELINE=none --launch false >/dev/null 2>&1; then
+  echo 'stale recovery setup unexpectedly launched' >&2; exit 1
+fi
+stale_sidecar="$STALE_RECOVER/task/stale-sidecar.json"
+printf '{"session_id":"stale-child"}\n' > "$stale_sidecar"
+python3 - "$STALE_RECOVER/task/review.receipt.json" "$stale_sidecar" <<'PY'
+import json, os, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    receipt = json.load(handle)
+receipt["launch_output"] = os.path.realpath(sys.argv[2])
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(receipt, handle)
+PY
+if "$ATTEMPT" recover --receipt "$STALE_RECOVER/task/review.receipt.json" >/dev/null 2>&1; then
+  echo 'recovery accepted a stale unbound sidecar' >&2; exit 1
+fi
+stale_state="$(find "$STALE_RECOVER/.review-state" -name '*.json' -type f)"
+jq -e '.attempts["stale-recover-review"].status == "transport-failure"' "$stale_state" >/dev/null
 
 # Exit zero without a structured launch receipt is not launch confirmation and
 # must release the reservation through the same transport-failure path.

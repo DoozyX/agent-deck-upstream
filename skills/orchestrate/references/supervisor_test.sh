@@ -21,9 +21,14 @@ case "$1 $2" in
     cat "$T/children.json"
     ;;
   "session show")
+    [ ! -e "$T/fail-show-$3" ] || exit 2
     if [ -e "$T/hang-show-$3" ]; then
       touch "$T/began-show-$3"
       printf '%s\n' "$$" > "$T/pid-show-$3"
+      if [ -e "$T/stubborn-$3" ]; then
+        bash -c 'trap "" TERM INT; while :; do sleep 30; done' &
+        printf '%s\n' "$!" > "$T/descendant-show-$3"
+      fi
       trap 'touch "$T/terminated-show-$3"; exit 143' TERM INT
       sleep 30
     fi
@@ -33,6 +38,10 @@ case "$1 $2" in
     if [ -e "$T/hang-output-$3" ]; then
       touch "$T/began-output-$3"
       printf '%s\n' "$$" > "$T/pid-output-$3"
+      if [ -e "$T/stubborn-$3" ]; then
+        bash -c 'trap "" TERM INT; while :; do sleep 30; done' &
+        printf '%s\n' "$!" > "$T/descendant-output-$3"
+      fi
       trap 'touch "$T/terminated-output-$3"; exit 143' TERM INT
       sleep 30
     fi
@@ -224,6 +233,25 @@ printf '{"substate":"usage-limit","reset_at":7200}\n' > "$RUN/show-quota-transit
 observe 6020
 jq -e '[.pending[] | select(.child_id == "quota-transition" and .kind == "quota-blocked")] | length == 1 and .[0].backoff_until == 7200' <<<"$(status)" >/dev/null
 
+# Completion ends the quota incident. The same later reset identity is a new
+# incident and must create a fresh quota event.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"quota-recurrence","title":"quota recurrence","status":"waiting","substate":"usage-limit","reset_at":7300}]}
+JSON
+observe 6030
+first_quota_id="$(jq -r '.pending[] | select(.child_id == "quota-recurrence" and .kind == "quota-blocked") | .id' <<<"$(status)")"
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"quota-recurrence","title":"quota recurrence","status":"waiting","done_status":"ok","done_at":"2026-09-12T10:00:00Z"}]}
+JSON
+observe 6040
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"quota-recurrence","title":"quota recurrence","status":"waiting","substate":"usage-limit","reset_at":7300}]}
+JSON
+observe 6050
+recurrence_state="$(status)"
+jq -e '[.pending[],.delivered[] | select(.child_id == "quota-recurrence" and .kind == "quota-blocked")] | length == 1' <<<"$recurrence_state" >/dev/null
+[ "$(jq -r '.pending[] | select(.child_id == "quota-recurrence" and .kind == "quota-blocked") | .id' <<<"$recurrence_state")" != "$first_quota_id" ]
+
 # Error subtype changes are new incidents; recovery clears the generation so
 # the same later error can deliver again. A hard-to-soft context downshift does
 # not create a threshold event.
@@ -281,6 +309,12 @@ watchdog_wakes="$(grep -c '^watchdog-1|' "$RUN/nudges.log")"
 observe 6360
 observe 8160
 [ "$(grep -c '^watchdog-1|' "$RUN/nudges.log")" -eq "$watchdog_wakes" ]
+touch "$RUN/fail-show-cond-2"
+observe 8170
+rm -f "$RUN/fail-show-cond-2"
+observe 8180
+[ "$(grep -c '^watchdog-1|' "$RUN/nudges.log")" -eq "$watchdog_wakes" ] || {
+  echo 'unknown conductor observation rearmed unchanged stall' >&2; exit 1; }
 
 # Truly unreachable delivery stops after the configured bound, remains visible
 # as blocked operator attention, and does not keep waking models.
@@ -378,34 +412,86 @@ jq -e '[.pending[],.delivered[]] | any(.kind == "observer-failure")' <<<"$(statu
 rm -f "$RUN/hang-children"
 
 # Per-child detail and completion probes share one aggregate deadline. Three
-# fully slow children finish near one timeout window, and every owned process
-# group is reaped before the tick returns.
+# fully slow children finish near one timeout window, and every process group
+# actually created within that window is reaped before the tick returns.
 cat > "$RUN/children.json" <<'JSON'
 {"children":[{"id":"slow-a","status":"running"},{"id":"slow-b","status":"running"},{"id":"slow-c","status":"running"}]}
 JSON
 for slow in slow-a slow-b slow-c; do touch "$RUN/hang-show-$slow" "$RUN/hang-output-$slow"; done
+touch "$RUN/stubborn-slow-a"
 started="$(date +%s)"
 SUPERVISOR_COMMAND_TIMEOUT=1 observe 5610
 elapsed=$(( $(date +%s) - started ))
 [ "$elapsed" -lt 4 ] || { echo "aggregate observation exceeded deadline: ${elapsed}s" >&2; exit 1; }
 for slow in slow-a slow-b slow-c; do
-  [ -e "$RUN/terminated-show-$slow" ] && [ -e "$RUN/terminated-output-$slow" ]
   for kind in show output; do
-    slow_pid="$(cat "$RUN/pid-$kind-$slow")"
+    pid_file="$RUN/pid-$kind-$slow"
+    [ -e "$pid_file" ] || continue
+    slow_pid="$(cat "$pid_file")"
     if kill -0 "$slow_pid" 2>/dev/null; then
       echo "aggregate observation left $kind $slow alive" >&2; exit 1
     fi
   done
 done
+for descendant_file in "$RUN"/descendant-*-slow-a; do
+  [ -e "$descendant_file" ] || { echo 'deadline stubborn descendant fixture was not recorded' >&2; exit 1; }
+  descendant_pid="$(cat "$descendant_file")"
+  if kill -0 "$descendant_pid" 2>/dev/null; then
+    kill -KILL "$descendant_pid" 2>/dev/null || true
+    echo 'aggregate deadline left a stubborn descendant alive' >&2; exit 1
+  fi
+done
+
+# Output beyond the platform pipe buffer is drained while probes run, so a
+# supported final completion sentinel remains visible.
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"large-output","status":"waiting","last_sent_at":"2026-09-12T11:00:00Z"}]}
+JSON
+printf '{"substate":"idle-at-empty-prompt"}\n' > "$RUN/show-large-output.json"
+python3 - "$RUN/output-large-output.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"success": True, "stale": False, "timestamp": "2026-09-12T11:01:00Z",
+               "content": "x" * 200000 + "\n===AGENTDECK_DONE=== status=ok summary=large output"}, handle)
+PY
+SUPERVISOR_COMMAND_TIMEOUT=2 observe 5615
+jq -e '.pending | any(.child_id == "large-output" and .kind == "completed" and .detail == "large output")' <<<"$(status)" >/dev/null
+
+# Creation is bounded by the same deadline and partial Popen failure still
+# terminates and reaps every process group already owned by the observer.
+python3 - "$RUN/children.json" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"children": [{"id": f"fd-{index}", "status": "running"} for index in range(24)]}, handle)
+PY
+for n in $(seq 0 23); do touch "$RUN/hang-show-fd-$n" "$RUN/hang-output-fd-$n"; done
+(ulimit -n 16; SUPERVISOR_COMMAND_TIMEOUT=1 observe 5620)
+fd_leaked=0
+for pid_file in "$RUN"/pid-*-fd-*; do
+  [ -e "$pid_file" ] || continue
+  probe_pid="$(cat "$pid_file")"
+  if kill -0 "$probe_pid" 2>/dev/null; then
+    fd_leaked=1
+    kill -KILL -- "-$probe_pid" 2>/dev/null || kill -KILL "$probe_pid" 2>/dev/null || true
+  fi
+done
+[ "$fd_leaked" -eq 0 ] || { echo 'low-FD observer failure leaked a probe group' >&2; exit 1; }
+for n in $(seq 0 23); do rm -f "$RUN/hang-show-fd-$n" "$RUN/hang-output-fd-$n"; done
 
 # Prompt stop interrupts the aggregate owner, which terminates and reaps all
 # outstanding probes before supervisor ownership is released.
 rm -f "$RUN/.heartbeat-stop"
+cat > "$RUN/children.json" <<'JSON'
+{"children":[{"id":"slow-a","status":"running"},{"id":"slow-b","status":"running"},{"id":"slow-c","status":"running"}]}
+JSON
 for slow in slow-a slow-b slow-c; do
-  rm -f "$RUN/began-show-$slow" "$RUN/began-output-$slow" "$RUN/terminated-show-$slow" "$RUN/terminated-output-$slow" "$RUN/pid-show-$slow" "$RUN/pid-output-$slow"
+  rm -f "$RUN/began-show-$slow" "$RUN/began-output-$slow" "$RUN/terminated-show-$slow" "$RUN/terminated-output-$slow" "$RUN/pid-show-$slow" "$RUN/pid-output-$slow" "$RUN/descendant-show-$slow" "$RUN/descendant-output-$slow"
 done
 SUPERVISOR_COMMAND_TIMEOUT=30 SUPERVISOR_DETECT_INTERVAL=30 bash "$RUN/supervisor.sh" start "$RUN" >/dev/null
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ ! -e "$RUN/began-output-slow-c" ] || break; sleep 0.1; done
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [ ! -e "$RUN/descendant-show-slow-a" ] || [ ! -e "$RUN/descendant-output-slow-a" ] || break
+  sleep 0.1
+done
 stop_started="$(date +%s)"
 stop_rc=0; bash "$RUN/supervisor.sh" stop "$RUN" >/dev/null 2>&1 || stop_rc=$?
 stop_elapsed=$(( $(date +%s) - stop_started ))
@@ -417,9 +503,17 @@ for slow in slow-a slow-b slow-c; do
     [ "$leaked" -eq 0 ] || kill -KILL -- "-$slow_pid" 2>/dev/null || kill -KILL "$slow_pid" 2>/dev/null || true
   done
 done
+for descendant_file in "$RUN"/descendant-*-slow-a; do
+  [ -e "$descendant_file" ] || { echo 'stubborn descendant fixture was not recorded' >&2; exit 1; }
+  descendant_pid="$(cat "$descendant_file")"
+  if kill -0 "$descendant_pid" 2>/dev/null; then
+    leaked=1
+    kill -KILL "$descendant_pid" 2>/dev/null || true
+  fi
+done
 [ "$stop_rc" -eq 0 ] && [ "$stop_elapsed" -lt 5 ] && [ "$leaked" -eq 0 ] || {
   echo "prompt stop failed rc=$stop_rc elapsed=${stop_elapsed}s leaked=$leaked" >&2; exit 1; }
-for slow in slow-a slow-b slow-c; do rm -f "$RUN/hang-show-$slow" "$RUN/hang-output-$slow"; done
+for slow in slow-a slow-b slow-c; do rm -f "$RUN/hang-show-$slow" "$RUN/hang-output-$slow" "$RUN/stubborn-$slow"; done
 rm -f "$RUN/.heartbeat-stop"
 
 # Default cadence is part of persisted observability, not only an overridable
