@@ -1,6 +1,8 @@
 ---
 name: agent-deck
 description: Terminal session manager for AI coding agents. Use when user mentions "agent-deck", "session", "sub-agent", "MCP attach", "git worktree", or needs to create, supervise, configure, share, or troubleshoot agent sessions and worktree sessions.
+metadata:
+  compatibility: "claude, opencode"
 ---
 
 # Agent Deck
@@ -59,7 +61,7 @@ diagnose the live UI state.
 
 Explicit user/session/account/tool/model/effort settings win. Orchestrate role
 defaults fill only unspecified fields and must be applied through the supported
-`agent-deck launch --role <routing|routine|architecture>` path so the resolved
+`agent-deck launch --orchestrate-role <routing|routine|architecture>` path so the resolved
 role, provider, model, effort, sources, and loadout are persisted. Unsupported
 provider/model/effort combinations park with an error; do not silently upgrade
 or switch providers.
