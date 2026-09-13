@@ -238,7 +238,9 @@ else:
                 new_done,generation=incident("done:"+cid,done_signature)
                 kind="failed" if row.get("done_status")=="fail" else "completed"
                 if new_done:add(kind,cid,title,generation,row.get("done_summary"))
-                clear_incident("error:"+cid); clear_incident("input:"+cid); clear_incident("stall:"+cid)
+                # Completion closes every prior child incident. A later quota
+                # with identical reset metadata is a recurrence, not a duplicate.
+                clear_incident("error:"+cid); clear_incident("input:"+cid); clear_incident("quota:"+cid); clear_incident("stall:"+cid)
             elif row.get("substate")=="usage-limit":
                 clear_incident("done:"+cid);clear_incident("error:"+cid);clear_incident("input:"+cid)
                 reset=row.get("reset_at")
@@ -335,8 +337,8 @@ notify_user() {
 }
 
 handle_conductor_state() {
-  local now="$1" substate="$2" action wid out rc
-  action="$(STATE="$STATE" NOW="$now" SUBSTATE="$substate" HEALTH="$HEALTH" CHOICE_ESCALATE="$CHOICE_ESCALATE" python3 - <<'PY'
+  local now="$1" substate="$2" observation_known="${3:-1}" action wid out rc
+  action="$(STATE="$STATE" NOW="$now" SUBSTATE="$substate" OBSERVATION_KNOWN="$observation_known" HEALTH="$HEALTH" CHOICE_ESCALATE="$CHOICE_ESCALATE" python3 - <<'PY'
 import fcntl,json,os,tempfile
 p=os.environ["STATE"];now=int(os.environ["NOW"]);sub=os.environ["SUBSTATE"]
 lock=open(p+".lock","a+");fcntl.flock(lock.fileno(),fcntl.LOCK_EX)
@@ -345,7 +347,11 @@ try:
 except FileNotFoundError:print("none");raise SystemExit
 c=s.setdefault("conductor_condition",{})
 action="none"
-if sub=="awaiting-choice":
+if os.environ["OBSERVATION_KNOWN"] != "1":
+    # Unknown is not evidence of recovery. Preserve a bounded stall/choice
+    # condition until a successful observation reports a concrete transition.
+    pass
+elif sub=="awaiting-choice":
     if c.get("substate")!=sub:c={"substate":sub,"since":now,"next_notice":now+int(os.environ["CHOICE_ESCALATE"])}
     if now>=int(c.get("next_notice",now)):
         action="notify-choice";c["next_notice"]=now+int(os.environ["HEALTH"])
@@ -381,7 +387,7 @@ run_loop() {
   local ticks=0 max_ticks="${SUPERVISOR_MAX_TICKS:-0}"
   while :; do
     [ -e "$STOP" ] && return 0
-    local now cid obs ok due event_id kind title msg out rc outcome enriched conductor_show conductor_substate blocked
+    local now cid obs ok due event_id kind title msg out rc outcome enriched conductor_show conductor_substate conductor_known blocked
     now="${SUPERVISOR_NOW:-$(date +%s)}"
     cid="$(sed -n '1p' "$ID_FILE" 2>/dev/null)"
     [ -n "$cid" ] || { json_error conductor-id-missing; return 2; }
@@ -398,12 +404,13 @@ run_loop() {
     fi
     due="$(observe "$now" "$obs" "$ok")"
     rm -f "$obs"
-    conductor_show="$(mktemp "$RUN_DIR/.supervisor-conductor.XXXXXX")"; conductor_substate=""
+    conductor_show="$(mktemp "$RUN_DIR/.supervisor-conductor.XXXXXX")"; conductor_substate=""; conductor_known=0
     if "$TIMEOUT_HELPER" "$COMMAND_TIMEOUT" agent-deck session show "$cid" --json >"$conductor_show" 2>/dev/null; then
+      conductor_known=1
       conductor_substate="$(jq -r '.substate // empty' "$conductor_show" 2>/dev/null || true)"
     fi
     rm -f "$conductor_show"
-    handle_conductor_state "$now" "$conductor_substate"
+    handle_conductor_state "$now" "$conductor_substate" "$conductor_known"
     event_id="$(printf '%s' "$due" | jq -r '.id // empty')"
     if [ -n "$event_id" ]; then
       kind="$(printf '%s' "$due" | jq -r '.kind')"; title="$(printf '%s' "$due" | jq -r '.title')"

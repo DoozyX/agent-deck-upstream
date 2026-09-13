@@ -179,6 +179,23 @@ old_quota=(--run-dir "$STALE" --task-id stale-task --attempt-id old-quota --kind
 quota_retry="$("$RS" check "${old_quota[@]}" || true)"
 [ "$(jq -r '.reason' <<<"$quota_retry")" = stale-attempt-epoch ]
 
+# Retry and record eligibility is bound to the state revision that produced
+# the failure, not only to a nullable current-review identity. A later review
+# and fix cannot be rewound by retrying the older failed review.
+LINEAGE="$TMP/stale-lineage"; mkdir -p "$LINEAGE"; printf 'conductor\n' > "$LINEAGE/.conductor-id"
+lineage_old=(--run-dir "$LINEAGE" --task-id lineage --attempt-id old-review --kind full --base-head b --reviewed-head old-head --spec-id s)
+"$RS" check "${lineage_old[@]}" >/dev/null
+"$RS" record-review "${lineage_old[@]}" --outcome transport-failure >/dev/null
+"$RS" check --run-dir "$LINEAGE" --task-id lineage --attempt-id new-review --kind full --base-head b --reviewed-head new-head --spec-id s >/dev/null
+"$RS" record-review --run-dir "$LINEAGE" --task-id lineage --attempt-id new-review --reviewer rv --base-head b --reviewed-head new-head --spec-id s --verdict fix-needed --findings "$TMP/findings-1" >/dev/null
+"$RS" check --run-dir "$LINEAGE" --task-id lineage --attempt-id new-fix --kind fix --base-head b --reviewed-head new-head --spec-id s --originating-attempt new-review >/dev/null
+"$RS" record-fix --run-dir "$LINEAGE" --task-id lineage --attempt-id new-fix --originating-attempt new-review --resulting-revision fixed-head --unresolved-findings "$TMP/no-findings" >/dev/null
+lineage_retry="$("$RS" check "${lineage_old[@]}" || true)"
+[ "$(jq -r '.reason' <<<"$lineage_retry")" = stale-attempt-state ]
+lineage_record="$("$RS" record-review "${lineage_old[@]}" --reviewer stale --verdict fix-needed --findings "$TMP/findings-1" || true)"
+[ "$(jq -r '.reason' <<<"$lineage_record")" = stale-result ]
+jq -e '.state | .current_head == "fixed-head" and .current_review_attempt == null' <<<"$lineage_record" >/dev/null
+
 # Direct verdict input uses the same semantic rule as a verdict file: clean
 # permits defer-only evidence, while fix-needed requires blocking work.
 DIRECT="$TMP/direct-verdict"; mkdir -p "$DIRECT"; printf 'conductor\n' > "$DIRECT/.conductor-id"

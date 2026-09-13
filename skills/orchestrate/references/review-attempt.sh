@@ -7,6 +7,7 @@ STATE="$DIR/review-state.sh"
 RENDER="$DIR/prompts/render.sh"
 TIMEOUT="$DIR/command-timeout.sh"
 LAUNCHER_START="$(ps -o lstart= -p $$ 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+LAUNCHER_PID="$$"
 
 usage() {
   echo 'usage: review-attempt.sh launch --template NAME --out FILE --receipt FILE KEY=value ... -- TEMPLATE_KEY=value ... --launch COMMAND ...' >&2
@@ -21,14 +22,10 @@ write_receipt() {
   RECEIPT_PATH="$receipt" RECEIPT_STATUS="$1" LAUNCH_EXIT="${2:-0}" LAUNCH_FILE="${3:-}" \
     RUN_VALUE="$run_dir" TASK_VALUE="$task_id" ATTEMPT_VALUE="$attempt_id" KIND_VALUE="$kind" \
     BASE_VALUE="$base_head" REVIEWED_VALUE="$reviewed_head" SPEC_VALUE="$spec_id" \
-    ORIGIN_VALUE="$originating_attempt" PROMPT_VALUE="$out" LAUNCHER_START="$LAUNCHER_START" python3 - <<'PY'
+    ORIGIN_VALUE="$originating_attempt" PROMPT_VALUE="$out" LAUNCHER_PID="$LAUNCHER_PID" \
+    LAUNCHER_START="$LAUNCHER_START" LAUNCH_GENERATION="${launch_generation:-}" python3 - <<'PY'
 import json, os, tempfile
 path = os.environ["RECEIPT_PATH"]
-try:
-    with open(path, encoding="utf-8") as existing_handle:
-        existing = json.load(existing_handle)
-except (FileNotFoundError, json.JSONDecodeError, OSError):
-    existing = {}
 launch_path = os.environ.get("LAUNCH_FILE")
 launch = None
 if launch_path and os.path.exists(launch_path):
@@ -37,7 +34,7 @@ if launch_path and os.path.exists(launch_path):
         try: launch = json.loads(raw)
         except json.JSONDecodeError: launch = {"raw": raw}
 value = {
-    "version": 1, "status": os.environ["RECEIPT_STATUS"],
+    "version": 2, "status": os.environ["RECEIPT_STATUS"],
     "run_dir": os.path.realpath(os.environ["RUN_VALUE"]),
     "task_id": os.environ["TASK_VALUE"], "attempt_id": os.environ["ATTEMPT_VALUE"],
     "kind": os.environ["KIND_VALUE"], "base_head": os.environ["BASE_VALUE"],
@@ -45,9 +42,11 @@ value = {
     "originating_attempt": os.environ.get("ORIGIN_VALUE") or None,
     "prompt": os.environ["PROMPT_VALUE"], "launch_exit": int(os.environ["LAUNCH_EXIT"]),
     "launch": launch, "launch_output": os.path.realpath(launch_path) if launch_path else None,
-    "launcher_pid": existing.get("launcher_pid") or os.getppid(),
-    "launcher_start": existing.get("launcher_start") or os.environ.get("LAUNCHER_START", ""),
+    "launch_generation": os.environ.get("LAUNCH_GENERATION") or None,
+    "launcher_pid": int(os.environ["LAUNCHER_PID"]),
+    "launcher_start": os.environ.get("LAUNCHER_START", ""),
 }
+
 os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix=os.path.basename(path)+".", suffix=".tmp", dir=os.path.dirname(os.path.abspath(path)))
 try:
@@ -56,6 +55,25 @@ try:
     os.replace(tmp, path)
 finally:
     if os.path.exists(tmp): os.unlink(tmp)
+PY
+}
+
+validate_artifact_paths() {
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
+import os, sys
+prompt, receipt, sidecar, run_dir = map(lambda value: os.path.realpath(os.path.abspath(value)), sys.argv[1:])
+artifacts = {"prompt": prompt, "receipt": receipt, "launch sidecar": sidecar}
+if len(set(artifacts.values())) != len(artifacts):
+    raise SystemExit("review-attempt.sh: prompt, receipt, and launch sidecar paths must be distinct")
+marker = os.path.realpath(os.path.join(run_dir, ".conductor-id"))
+state_dir = os.path.realpath(os.path.join(run_dir, ".review-state"))
+for label, path in artifacts.items():
+    try:
+        in_state = os.path.commonpath((state_dir, path)) == state_dir
+    except ValueError:
+        in_state = False
+    if path == marker or in_state:
+        raise SystemExit(f"review-attempt.sh: {label} collides with protected run state")
 PY
 }
 
@@ -97,9 +115,9 @@ launch_is_quota() {
 record_launch_outcome() {
   local outcome="$1" reset_at="${2:-}" args
   if [ "$kind" = fix ]; then
-    args=(record-fix --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --originating-attempt "$originating_attempt" --outcome "$outcome")
+    args=(record-fix --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --originating-attempt "$originating_attempt" --outcome "$outcome" --launch-generation "$launch_generation")
   else
-    args=(record-review --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id" --outcome "$outcome")
+    args=(record-review --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id" --outcome "$outcome" --launch-generation "$launch_generation")
   fi
   [ -z "$reset_at" ] || args+=(--reset-at "$reset_at")
   "$STATE" "${args[@]}"
@@ -113,6 +131,9 @@ load_receipt_identity() {
   base_head="$(receipt_value "$receipt" .base_head)"; reviewed_head="$(receipt_value "$receipt" .reviewed_head)"
   spec_id="$(receipt_value "$receipt" .spec_id)"; originating_attempt="$(jq -r '.originating_attempt // empty' "$receipt")"
   out="$(receipt_value "$receipt" .prompt)"
+  launch_generation="$(jq -r '.launch_generation // empty' "$receipt")"
+  LAUNCHER_PID="$(jq -r '.launcher_pid // empty' "$receipt")"
+  LAUNCHER_START="$(jq -r '.launcher_start // empty' "$receipt")"
 }
 
 action="${1:-}"; [ -n "$action" ] || usage; shift
@@ -158,6 +179,11 @@ case "$action" in
     case "$template" in
       review-full) kind="${review_kind:-full}" ;; review-round) kind="${review_kind:-incremental}" ;; fix) kind=fix ;; *) usage ;;
     esac
+    launch_generation="$(python3 -c 'import secrets; print(secrets.token_hex(16))')"
+    launch_output="${receipt}.launch.${launch_generation}.json"
+    # Artifact identity is resolved before render or reservation. Symlink and
+    # lexical aliases cannot collapse a prompt, receipt, sidecar, or state file.
+    validate_artifact_paths "$out" "$receipt" "$launch_output" "$run_dir"
     mkdir -p "$(dirname "$out")" "$(dirname "$receipt")"
     [ ! -d "$receipt" ] || { echo 'review-attempt.sh: receipt path is a directory' >&2; exit 2; }
     receipt_probe="$(mktemp "$(dirname "$receipt")/.$(basename "$receipt").probe.XXXXXX")" || exit 2
@@ -166,11 +192,10 @@ case "$action" in
     cleanup_candidate() { rm -f "${candidate:-}"; }
     trap cleanup_candidate EXIT
     "$RENDER" "$template" "$candidate" "${render_args[@]}" >/dev/null
-    guard=(check --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --kind "$kind" --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id")
+    guard=(check --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --kind "$kind" --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id" --launch-generation "$launch_generation")
     [ -n "$originating_attempt" ] && guard+=(--originating-attempt "$originating_attempt")
     [ -n "$material_reason" ] && guard+=(--material-reason "$material_reason")
     guard_out="$($STATE "${guard[@]}")" || { rc=$?; printf '%s\n' "$guard_out" >&2; exit "$rc"; }
-    launch_output="${receipt}.launch.json"
     launch_pid=""
     cancel_interrupted_launch() {
       trap - INT TERM
@@ -179,19 +204,21 @@ case "$action" in
       if launch_has_session "$launch_output"; then
         write_receipt launched 0 "$launch_output" || true
       else
-        "$STATE" cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" >/dev/null 2>&1 || true
+        "$STATE" cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --launch-generation "$launch_generation" >/dev/null 2>&1 || true
         write_receipt cancelled 130 "$launch_output" || true
       fi
       exit 130
     }
     trap cancel_interrupted_launch INT TERM
+    # This generation owns a fresh, empty sidecar before `launching` becomes
+    # durable. Recovery can never consume output from an earlier generation.
+    : > "$launch_output"
     if ! write_receipt launching 0 "$launch_output"; then
-      "$STATE" cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" >/dev/null 2>&1 || true
+      "$STATE" cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" --launch-generation "$launch_generation" >/dev/null 2>&1 || true
       exit 2
     fi
     mv "$candidate" "$out"
     candidate=""
-    : > "$launch_output"
     launch_rc=0
     "$TIMEOUT" "${REVIEW_LAUNCH_TIMEOUT:-120}" "${launch_args[@]}" >"$launch_output" 2>&1 &
     launch_pid=$!
@@ -220,8 +247,20 @@ case "$action" in
     load_receipt_identity "$2"
     receipt_status="$(receipt_value "$receipt" .status)"
     launch_output="$(jq -r '.launch_output // empty' "$receipt")"
-    [ -n "$launch_output" ] || launch_output="${receipt}.launch.json"
-    if [ "$action" = recover ] && [ -s "$launch_output" ] && launch_has_session "$launch_output"; then
+    if [ "$action" = recover ]; then
+      [ "$receipt_status" = launching ] || { echo 'review-attempt.sh: only a launching receipt can be recovered' >&2; exit 2; }
+      [ -n "$launch_generation" ] && [ -n "$launch_output" ] || {
+        echo 'review-attempt.sh: launching receipt lacks generation-bound sidecar identity' >&2; exit 2; }
+      expected_output="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1] + ".launch." + sys.argv[2] + ".json"))' "$receipt" "$launch_generation")"
+      [ "$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$launch_output")" = "$expected_output" ] || {
+        echo 'review-attempt.sh: launch sidecar does not match receipt generation' >&2; exit 2; }
+      "$STATE" validate-launch --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" \
+        --launch-generation "$launch_generation" >/dev/null || {
+        echo 'review-attempt.sh: launch generation is not the current reservation' >&2; exit 2; }
+      if [ ! -s "$launch_output" ] || ! launch_has_session "$launch_output"; then
+        echo 'review-attempt.sh: generation-bound sidecar has no successful session' >&2
+        exit 2
+      fi
       write_receipt launched 0 "$launch_output"
       printf '{"result":"allowed","reason":"launch-recovered","attempt_id":"%s"}\n' "$attempt_id"
       exit 0
@@ -231,7 +270,9 @@ case "$action" in
       echo 'review-attempt.sh: launch owner is still active; interrupt it before cancellation' >&2
       exit 2
     fi
-    cancel_out="$($STATE cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id")" || {
+    cancel_args=(cancel --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id")
+    [ -z "$launch_generation" ] || cancel_args+=(--launch-generation "$launch_generation")
+    cancel_out="$("$STATE" "${cancel_args[@]}")" || {
       rc=$?; printf '%s\n' "$cancel_out" >&2; exit "$rc"; }
     write_receipt cancelled 0 "$launch_output"
     printf '%s\n' "$cancel_out"
@@ -242,13 +283,15 @@ case "$action" in
     [ "$(receipt_value "$receipt" .status)" = launched ] || { echo 'review-attempt.sh: receipt is not launched' >&2; exit 2; }
     if [ "$action" = record-review ]; then
       [ "$kind" != fix ] || { echo 'review-attempt.sh: fix receipt cannot record review' >&2; exit 2; }
-      "$STATE" record-review --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" \
-        --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id" "$@"
+      record_args=(record-review --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" \
+        --base-head "$base_head" --reviewed-head "$reviewed_head" --spec-id "$spec_id")
     else
       [ "$kind" = fix ] || { echo 'review-attempt.sh: review receipt cannot record fix' >&2; exit 2; }
-      "$STATE" record-fix --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" \
-        --originating-attempt "$originating_attempt" "$@"
+      record_args=(record-fix --run-dir "$run_dir" --task-id "$task_id" --attempt-id "$attempt_id" \
+        --originating-attempt "$originating_attempt")
     fi
+    [ -z "$launch_generation" ] || record_args+=(--launch-generation "$launch_generation")
+    "$STATE" "${record_args[@]}" "$@"
     ;;
   *) usage ;;
 esac

@@ -36,10 +36,11 @@ def parser_for(action):
     p.add_argument("--resulting-revision")
     p.add_argument("--unresolved-findings")
     p.add_argument("--changed-requirement")
+    p.add_argument("--launch-generation")
     return p
 
-if len(sys.argv) < 2 or sys.argv[1] not in {"check", "record-review", "record-fix", "cancel", "override"}:
-    sys.exit("usage: review-state.sh check|record-review|record-fix|cancel|override --run-dir DIR --task-id ID --attempt-id ID ...")
+if len(sys.argv) < 2 or sys.argv[1] not in {"check", "record-review", "record-fix", "cancel", "validate-launch", "override"}:
+    sys.exit("usage: review-state.sh check|record-review|record-fix|cancel|validate-launch|override --run-dir DIR --task-id ID --attempt-id ID ...")
 action = sys.argv[1]
 args = parser_for(action).parse_args(sys.argv[2:])
 run_dir = os.path.realpath(args.run_dir)
@@ -104,6 +105,24 @@ def load_state():
             and candidate.get("recorded_at", "") <= reserved_at
         ]
         attempt["prior_review_attempt"] = max(prior, default=("", None))[1]
+    # Older state can be continued safely without guessing lineage. A sole
+    # active reservation is necessarily current; a retryable outcome is
+    # current only when it is the latest recorded transition in this epoch.
+    retryable = {"transport-failure", "quota", "cancelled"}
+    latest_transition = max(
+        (a.get("recorded_at", "") for a in state.get("attempts", {}).values()),
+        default="",
+    )
+    for attempt in state.get("attempts", {}).values():
+        if attempt.get("status") == "reserved":
+            attempt.setdefault("reservation_revision", state.get("revision", 0))
+        elif attempt.get("status") in retryable and "retry_revision" not in attempt:
+            is_current = (
+                attempt.get("epoch") == state.get("epoch")
+                and attempt.get("recorded_at", "") == latest_transition
+                and attempt.get("prior_review_attempt") == state.get("current_review_attempt")
+            )
+            attempt["retry_revision"] = state.get("revision", 0) if is_current else -1
     return state
 
 def save_state(state):
@@ -222,6 +241,10 @@ def epoch_count(state, kind):
     return sum(1 for a in state["attempts"].values()
                if a.get("epoch") == epoch and a.get("kind") in kinds and a.get("status") == "completed")
 
+def launch_generation_matches(attempt):
+    generation = attempt.get("launch_generation")
+    return not generation or generation == args.launch_generation
+
 with open(lock_path, "a+", encoding="utf-8") as lock:
     fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
     state = load_state()
@@ -248,12 +271,17 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             if prior.get("prior_review_attempt") != state.get("current_review_attempt"):
                 reply(state, "needs-attention", "stale-attempt-state")
                 sys.exit(1)
+            if prior.get("retry_revision") != state["revision"]:
+                reply(state, "needs-attention", "stale-attempt-state")
+                sys.exit(1)
             if status in {"transport-failure", "cancelled"}:
                 if prior.get("startup_retries", 0) > 2:
                     reply(state, "needs-attention", "startup-retry-budget-exhausted")
                     sys.exit(1)
                 prior["status"] = "reserved"
                 prior["reserved_at"] = now_text()
+                prior["launch_generation"] = args.launch_generation
+                prior["reservation_revision"] = state["revision"] + 1
                 save_state(state)
                 reply(state, "allowed", "cancelled-retry" if status == "cancelled" else "startup-retry")
                 sys.exit(0)
@@ -267,6 +295,8 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
                     sys.exit(1)
                 prior["status"] = "reserved"
                 prior["reserved_at"] = now_text()
+                prior["launch_generation"] = args.launch_generation
+                prior["reservation_revision"] = state["revision"] + 1
                 save_state(state)
                 reply(state, "allowed", "quota-reset-reached")
                 sys.exit(0)
@@ -340,6 +370,8 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             "originating_verdict": origin.get("verdict") if args.kind == "fix" else None,
             "material_reason": args.material_reason, "startup_retries": 0,
             "prior_review_attempt": state.get("current_review_attempt"),
+            "launch_generation": args.launch_generation,
+            "reservation_revision": state["revision"] + 1,
             "reserved_at": now_text(),
         }
         if state["current_head"] is None:
@@ -362,7 +394,9 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             reply(state, "needs-attention", "reserved-kind-mismatch")
             sys.exit(1)
         if (attempt.get("epoch") != state["epoch"]
-                or attempt.get("prior_review_attempt") != state.get("current_review_attempt")):
+                or attempt.get("prior_review_attempt") != state.get("current_review_attempt")
+                or attempt.get("reservation_revision") != state["revision"]
+                or not launch_generation_matches(attempt)):
             reply(state, "needs-attention", "stale-result")
             sys.exit(1)
         if attempt.get("status") != "reserved":
@@ -372,6 +406,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             attempt["status"] = "transport-failure"
             attempt["startup_retries"] = attempt.get("startup_retries", 0) + 1
             attempt["recorded_at"] = now_text()
+            attempt["retry_revision"] = state["revision"] + 1
             save_state(state)
             reply(state, "allowed", "transport-failure-recorded")
             sys.exit(0)
@@ -379,6 +414,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             attempt["status"] = "quota"
             attempt["reset_at"] = args.reset_at
             attempt["recorded_at"] = now_text()
+            attempt["retry_revision"] = state["revision"] + 1
             save_state(state)
             reason = "quota-wait" if args.reset_at else "quota-reset-unknown"
             reply(state, "needs-attention", reason, reset_at=args.reset_at)
@@ -440,7 +476,9 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
                 or origin.get("epoch") != state["epoch"]
                 or state.get("current_review_attempt") != args.originating_attempt
                 or origin.get("verdict") != "fix-needed"
-                or current_identity != reserved_identity):
+                or current_identity != reserved_identity
+                or attempt.get("reservation_revision") != state["revision"]
+                or not launch_generation_matches(attempt)):
             reply(state, "needs-attention", "stale-fix-result")
             sys.exit(1)
         if attempt.get("status") != "reserved":
@@ -450,6 +488,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             attempt["status"] = "transport-failure"
             attempt["startup_retries"] = attempt.get("startup_retries", 0) + 1
             attempt["recorded_at"] = now_text()
+            attempt["retry_revision"] = state["revision"] + 1
             save_state(state)
             reply(state, "allowed", "transport-failure-recorded")
             sys.exit(0)
@@ -457,6 +496,7 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             attempt["status"] = "quota"
             attempt["reset_at"] = args.reset_at
             attempt["recorded_at"] = now_text()
+            attempt["retry_revision"] = state["revision"] + 1
             save_state(state)
             reason = "quota-wait" if args.reset_at else "quota-reset-unknown"
             reply(state, "needs-attention", reason, reset_at=args.reset_at)
@@ -492,7 +532,9 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
         if not attempt:
             reply(state, "needs-attention", "attempt-not-reserved")
             sys.exit(1)
-        if attempt.get("epoch") != state["epoch"]:
+        if (attempt.get("epoch") != state["epoch"]
+                or attempt.get("reservation_revision") != state["revision"]
+                or not launch_generation_matches(attempt)):
             reply(state, "needs-attention", "stale-result")
             sys.exit(1)
         if attempt.get("status") == "cancelled":
@@ -503,8 +545,20 @@ with open(lock_path, "a+", encoding="utf-8") as lock:
             sys.exit(1)
         attempt["status"] = "cancelled"
         attempt["recorded_at"] = now_text()
+        attempt["retry_revision"] = state["revision"] + 1
         save_state(state)
         reply(state, "allowed", "attempt-cancelled")
+
+    elif action == "validate-launch":
+        require("launch_generation")
+        attempt = attempts.get(args.attempt_id)
+        if (not attempt or attempt.get("status") != "reserved"
+                or attempt.get("epoch") != state["epoch"]
+                or attempt.get("reservation_revision") != state["revision"]
+                or not launch_generation_matches(attempt)):
+            reply(state, "needs-attention", "stale-launch-state")
+            sys.exit(1)
+        reply(state, "allowed", "current-launch")
 
     else:
         require("changed_requirement", "spec_id")
