@@ -32,7 +32,8 @@ The command is read-only and advisory. It exits 0 for every decision — includi
 a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
 positional, and anything else `flag.Parse` rejects, which is wider than that
 list — an undefined flag such as `--bogus`, or a defined flag given no value —
-except `-h`/`--help`, which print the usage line on stderr and exit 0.
+except the four help spellings `-h`, `--h`, `-help`, and `--help`, which print
+the usage line on stderr and exit 0.
 Exit 1 means the configuration could not be loaded or validated, or the JSON
 could not be encoded — check the exit code before reading the saved file,
 because the `>` redirect creates that file even when nothing was written to it.
@@ -59,11 +60,13 @@ for that one, but never read a silent stderr as a launchable decision.
 
 On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the
 top-level `default_tool` in `config.toml`, before launching anything for that
-wave. That remedy does not reach the surviving-name branch: there `--prefer`
-picks which name survives without making the decision launchable — the `reason`
-is unchanged — and `default_tool` is filtered out with the rest. Fix the
-environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or
-correct a misspelled or miscased `failover` entry.
+wave. On the surviving-name branch, neither remedy makes the decision
+launchable: `--prefer` picks which name survives, and when `failover` is omitted
+`default_tool` supplies the default failover order and can change which name
+survives; an explicit `failover` controls that order instead. The `reason` still
+begins `no candidate tools for tool strategy`, so fix the environment instead:
+un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or
+miscased `failover` entry.
 
 Launch with the decision's `tool`, and with its `model` when that field is
 non-empty:
