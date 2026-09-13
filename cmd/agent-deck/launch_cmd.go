@@ -166,6 +166,11 @@ func defaultAssertDoneForTool(tool string) bool {
 	return session.IsClaudeCompatible(tool) || session.IsCodexCompatible(tool)
 }
 
+func orchestrateExplicitExtraArgs(tool string, args []string) (model, effort string, err error) {
+	selected, err := session.ParseLaunchExtraArgSelections(tool, args)
+	return selected.Model, selected.Effort, err
+}
+
 // handleLaunch combines add + start + optional send into a single command.
 // It creates a new session, starts it, and optionally sends an initial message.
 func handleLaunch(profile string, args []string) {
@@ -207,6 +212,9 @@ func handleLaunch(profile string, args []string) {
 	jsonOutput := fs.Bool("json", false, "Output as JSON")
 	quiet := fs.Bool("quiet", false, "Minimal output")
 	quietShort := fs.Bool("q", false, "Minimal output (short)")
+	orchestrateRole := fs.String("orchestrate-role", "", "Apply a role-aware orchestrated child loadout: routing, routine, or architecture")
+	orchestrateBrowser := fs.Bool("orchestrate-browser", false, "Retain browser tools for a role-aware Claude child")
+	orchestrateEscalation := fs.Bool("orchestrate-justified-escalation", false, "Mark an explicit Astra/Opus role launch as justified")
 
 	// Worktree flags
 	worktreeBranch := fs.String("w", "", "Create session in git worktree for branch")
@@ -839,6 +847,29 @@ func handleLaunch(profile string, args []string) {
 	if selectedModelID != "" {
 		if err := applyCLIModelOverride(newInstance, selectedModelID); err != nil {
 			out.Error(err.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+	}
+	if role := strings.TrimSpace(*orchestrateRole); role != "" {
+		cfg, cfgErr := session.LoadUserConfig()
+		if cfgErr != nil {
+			out.Error(fmt.Sprintf("load orchestrate configuration: %v", cfgErr), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		extraModel, extraEffort, extraErr := orchestrateExplicitExtraArgs(newInstance.Tool, newInstance.ExtraArgs)
+		if extraErr != nil {
+			out.Error(extraErr.Error(), ErrCodeInvalidOperation)
+			os.Exit(1)
+		}
+		explicitModel := selectedModelID
+		if extraModel != "" {
+			explicitModel = extraModel
+		}
+		_, resolveErr := newInstance.ApplyResolvedOrchestrateLaunch(session.OrchestrateRole(role), session.OrchestrateLaunchExplicit{
+			Model: explicitModel, Effort: extraEffort, UserSelectedModel: explicitModel != "", GroupPath: newInstance.GroupPath, Browser: *orchestrateBrowser, MCPs: append([]string(nil), mcpFlags...), JustifiedEscalation: *orchestrateEscalation,
+		}, cfg)
+		if resolveErr != nil {
+			out.Error(resolveErr.Error(), ErrCodeInvalidOperation)
 			os.Exit(1)
 		}
 	}
