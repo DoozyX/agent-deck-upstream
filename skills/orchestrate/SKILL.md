@@ -102,18 +102,19 @@ and all routing and write the failure receipt.
 
 ## Role and tool selection
 
-Use the supported `agent-deck launch --role
-<deterministic|routing|routine|architecture>` path. Explicit user/session,
+Use the supported `agent-deck launch --orchestrate-role
+<routing|routine|architecture>` path. Explicit user/session,
 account, provider, tool, model, effort, group, browser, and MCP choices win;
 configured group/global values follow; role defaults fill only empty fields.
 Persist the resolved role, provider, model, effort, source fields, and tool
 loadout, and verify the launch receipt from the supported entrypoint.
 
-Built-in defaults are process/no-model for deterministic checks; Luna low or
-Haiku for routing; Terra medium or Sonnet medium for routine work; Sol high or
-Opus medium for architecture. Astra/frontier use requires an explicit model
-choice or justified escalation. Unsupported choices park visibly; do not
-silently fall back to a stronger model or another provider.
+Deterministic checks run directly through shell/process execution and do not
+use model-role resolution. Built-in model defaults are Luna low or Haiku for
+routing; Terra medium or Sonnet medium for routine work; Sol high or Opus
+medium for architecture. Astra/frontier use requires an explicit model choice
+or justified escalation. Unsupported choices park visibly; do not silently
+fall back to a stronger model or another provider.
 
 Claude non-browser children default to strict empty MCP configuration. Browser
 work retains browser tools. Codex receives only Codex-supported loadout flags;

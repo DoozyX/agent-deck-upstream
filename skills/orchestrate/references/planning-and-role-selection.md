@@ -128,8 +128,10 @@ you no context — you read it only when a task goes needs-attention.
 
 ## Model & connector tiering
 
-Apply role defaults through `agent-deck launch --role`; do not reproduce the
-resolution by hand from the examples below. The supported launch path preserves
+Apply role defaults through `agent-deck launch --orchestrate-role
+<routing|routine|architecture>`; do not reproduce the resolution by hand from
+the examples below. Run deterministic checks directly through shell/process
+execution. The supported launch path preserves
 explicit session/provider/model/effort values, then group and provider config,
 then fills only missing values from `[orchestrate.<role>]` or built-in role
 defaults. It persists the resolved role, provider, model, effort, source fields,

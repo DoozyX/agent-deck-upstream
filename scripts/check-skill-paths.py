@@ -9,7 +9,11 @@ from pathlib import Path
 from urllib.parse import unquote
 
 
-MARKDOWN_LINK = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
+REFERENCE_DEFINITION = re.compile(
+    r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]+>|(?:\\[^\n]|[^\s])+)",
+    re.MULTILINE,
+)
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 INCLUDE = re.compile(r"\{\{include:([^}]+)}}")
 CODE_PATH = re.compile(r"(?<![A-Za-z0-9_./-])((?:references|scripts)/[A-Za-z0-9_.@/-]+)")
 REPO_PATH = re.compile(r"(?:<agent-deck-repo>|\$ROOT)?/?(skills/(?:agent-deck|orchestrate)/[A-Za-z0-9_.@/-]+)")
@@ -32,12 +36,67 @@ def clean_link(raw: str) -> str:
     return value.split(maxsplit=1)[0]
 
 
+def inline_markdown_destinations(text: str):
+    """Yield the supported CommonMark inline destinations, including parentheses."""
+    search_from = 0
+    while True:
+        marker = text.find("](", search_from)
+        if marker < 0:
+            return
+        search_from = marker + 2
+        if text.rfind("[", 0, marker) < 0:
+            continue
+
+        start = marker + 2
+        if start < len(text) and text[start] == "<":
+            cursor = start + 1
+            while cursor < len(text):
+                if text[cursor] == "\\":
+                    cursor += 2
+                    continue
+                if text[cursor] == ">":
+                    yield text[start : cursor + 1]
+                    break
+                cursor += 1
+            continue
+
+        depth = 0
+        cursor = start
+        while cursor < len(text):
+            char = text[cursor]
+            if char == "\\":
+                cursor += 2
+                continue
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                if depth == 0:
+                    yield text[start:cursor]
+                    break
+                depth -= 1
+            elif char.isspace() and depth == 0:
+                yield text[start:cursor]
+                break
+            cursor += 1
+
+
+def markdown_destinations(text: str):
+    yield from inline_markdown_destinations(text)
+    for match in REFERENCE_DEFINITION.finditer(text):
+        yield match.group(1)
+
+
+def markdown_unescape(value: str) -> str:
+    return value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+
+
 def local_link_target(source: Path, raw: str) -> tuple[Path, str] | None:
-    link = clean_link(raw)
-    if not link or "://" in link or link.startswith("mailto:"):
+    link = markdown_unescape(clean_link(raw))
+    if not link or URI_SCHEME.match(link):
         return None
     path_part, _, anchor = link.partition("#")
-    target = source if not path_part else (source.parent / path_part).resolve()
+    decoded_path = unquote(path_part)
+    target = source if not decoded_path else (source.parent / decoded_path).resolve()
     return target, unquote(anchor)
 
 
@@ -48,7 +107,7 @@ def markdown_anchors(path: Path) -> set[str]:
         match = re.match(r"^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$", line)
         if not match:
             continue
-        heading = re.sub(r"[`*_~]", "", match.group(1)).strip().lower()
+        heading = re.sub(r"[`*~]", "", match.group(1)).strip().lower()
         slug = re.sub(r"[^\w\- ]", "", heading, flags=re.UNICODE).replace(" ", "-")
         occurrence = counts.get(slug, 0)
         counts[slug] = occurrence + 1
@@ -65,6 +124,41 @@ def iter_files(root: Path):
             yield path
 
 
+def unreachable_reference_errors(root: Path) -> set[str]:
+    """Require routed top-level references to be reachable from the skill core."""
+    if not root.is_dir():
+        return set()
+    core = root / "SKILL.md"
+    reference_dir = root / "references"
+    if not core.is_file() or not reference_dir.is_dir():
+        return set()
+
+    reachable = {core.resolve()}
+    pending = [core.resolve()]
+    while pending:
+        source = pending.pop()
+        text = source.read_text(encoding="utf-8")
+        for raw in markdown_destinations(text):
+            resolved = local_link_target(source, raw)
+            if resolved is None:
+                continue
+            target, _ = resolved
+            if (
+                target.is_file()
+                and target.suffix == ".md"
+                and (target == root or root in target.parents)
+                and target not in reachable
+            ):
+                reachable.add(target)
+                pending.append(target)
+
+    return {
+        f"{path}: unreachable reference from {core}"
+        for path in reference_dir.glob("*.md")
+        if path.resolve() not in reachable
+    }
+
+
 def validate(roots: list[Path]) -> list[str]:
     errors: set[str] = set()
     repo_root = Path(__file__).resolve().parent.parent
@@ -77,11 +171,11 @@ def validate(roots: list[Path]) -> list[str]:
             anchors: list[tuple[str, Path, str]] = []
 
             if source.suffix == ".md":
-                for match in MARKDOWN_LINK.finditer(text):
-                    resolved = local_link_target(source, match.group(1))
+                for raw in markdown_destinations(text):
+                    resolved = local_link_target(source, raw)
                     if resolved is not None:
                         target, anchor = resolved
-                        display = clean_link(match.group(1))
+                        display = clean_link(raw)
                         candidates.append((display, target))
                         if anchor:
                             anchors.append((display, target, anchor))
@@ -116,6 +210,9 @@ def validate(roots: list[Path]) -> list[str]:
             for display, target, anchor in anchors:
                 if target.is_file() and target.suffix == ".md" and anchor not in markdown_anchors(target):
                     errors.add(f"{source}: missing local anchor {anchor} in {display} -> {target}")
+
+    for root in roots:
+        errors.update(unreachable_reference_errors(root))
 
     return sorted(errors)
 

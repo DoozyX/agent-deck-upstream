@@ -45,7 +45,7 @@ list of tasks/issues (2+) ─→ parallel per-task pipelines, one PR each
 single small task ─────────→ one pipeline, one PR
 single big task, no spec ──→ split it: obvious decomposition → inspection or
                              planner child proposes the split; conductor
-                             sequences it (references/single-issue-split.md);
+                             sequences it ([single-issue split](single-issue-split.md));
                              approach unclear → planner child first,
                              then plan-driven split. One branch, one PR.
 design/spec document ──────→ focused-first gate → one implementation worker
@@ -106,7 +106,8 @@ manifest.
 Have an inspection or planner child assess splitting by **context hygiene**:
 would one session have to hold too much, and does it decompose into clearly
 separable pieces? The conductor decides from that bounded summary. If you
-split, **read `references/single-issue-split.md` now** and follow it.
+split, **read the [single-issue split](single-issue-split.md) reference now**
+and follow it.
 Brainstorming/design with the user is upstream of this skill entirely — it
 happens only when the user chooses it, and its output arrives here as just
 another input: the spec document, or the spec *and* a plan if the user's

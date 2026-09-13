@@ -5,7 +5,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 ## Table of Contents
 
 - [Top-Level](#top-level)
-- [[quick_create] Section](#quick_create-section)
+- [[quick_create] Section](#alternate-quick-create)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
 - [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
