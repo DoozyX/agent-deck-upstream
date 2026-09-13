@@ -101,6 +101,15 @@ cache_write_1h_per_mtok = 0
 	}
 }
 
+func TestPriceOverrideRejectsNonTableTOML(t *testing.T) {
+	var cfg struct {
+		Overrides map[string]PriceOverride `toml:"overrides"`
+	}
+	if _, err := toml.Decode(`overrides = { bad = 1 }`, &cfg); err == nil {
+		t.Fatal("scalar pricing override decoded successfully, want a table error")
+	}
+}
+
 func TestPricerExactDatedCacheEntryPrecedesNormalizedBuiltIn(t *testing.T) {
 	dir := t.TempDir()
 	p := NewPricer(PricerConfig{CachePath: dir})

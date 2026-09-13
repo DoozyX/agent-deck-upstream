@@ -268,7 +268,10 @@ func handleCostsSummary(profile string, args []string) {
 
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
+	handleCostsSummaryWithStore(costStore, *jsonOutput)
+}
 
+func handleCostsSummaryWithStore(costStore costSummaryStore, jsonOutput bool) {
 	report, err := loadCostSummary(costStore)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to load cost summary: %v\n", err)
@@ -281,7 +284,7 @@ func handleCostsSummary(profile string, args []string) {
 	sessions, runs := report.sessions, report.runs
 	allCoverage := costs.MergeCoverage(today.Coverage, yesterday.Coverage, week.Coverage, lastWeek.Coverage, month.Coverage, lastMonth.Coverage)
 
-	if *jsonOutput {
+	if jsonOutput {
 		// Wire shape mirrors costs.RemoteCostSummary so SSHRunner can json.Unmarshal directly.
 		remote := costs.RemoteCostSummary{
 			CostTodayMicrodollars: today.TotalCostMicrodollars, CostYesterdayMicrodollars: yesterday.TotalCostMicrodollars,

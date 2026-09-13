@@ -79,6 +79,27 @@ backend = { daily_limit = 25.0 }
 	}
 }
 
+func TestLoadUserConfig_RejectsScalarPricingOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("[costs.pricing]\noverrides = { bad = 1 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadUserConfig(); err == nil {
+		t.Fatal("LoadUserConfig accepted scalar pricing override")
+	}
+}
+
 func TestCostsSettings_Defaults(t *testing.T) {
 	var cfg CostsSettings
 	if cfg.GetRetentionDays() != 90 {

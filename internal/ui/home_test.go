@@ -65,6 +65,37 @@ func TestCostStatusLineUsesReferencedWindowCoverageWithoutDuplicateStatus(t *tes
 	}
 }
 
+func TestCostStatusLineUsesOneDetailScopeForOverlappingWindows(t *testing.T) {
+	db, err := statedb.Open(filepath.Join(t.TempDir(), "overlap-coverage.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	store := costs.NewStore(db.DB())
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	store.SetClock(func() time.Time { return now })
+	for _, event := range []costs.CostEvent{
+		{ID: "today", SessionID: "s", Timestamp: now, InputTokens: 7, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "earlier-week", SessionID: "s", Timestamp: now.Add(-24 * time.Hour), InputTokens: 5, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+	} {
+		if err := store.WriteCostEvent(event); err != nil {
+			t.Fatal(err)
+		}
+	}
+	home := newTestHomeWithItems(160, 30, nil)
+	home.costStore = store
+	home.costLineTemplate = "{cost_today} today / {cost_this_week} week | {unpriced_events} unpriced / {unpriced_tokens} tokens"
+	home.costLineHideWhenZero = false
+	home.refreshCostTotals()
+	view := home.View()
+	if !strings.Contains(view, "2 unpriced / 12 tokens") || strings.Contains(view, "3 unpriced / 19 tokens") {
+		t.Fatalf("overlapping windows must expose one truthful detail scope:\n%s", view)
+	}
+}
+
 func TestAlternateQuickCreateHotkeyDispatchesWithoutDialog(t *testing.T) {
 	home := NewHome()
 	home.setHotkeys(resolveHotkeys(map[string]string{

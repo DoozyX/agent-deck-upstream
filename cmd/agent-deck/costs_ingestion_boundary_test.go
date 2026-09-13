@@ -229,6 +229,18 @@ func TestWebStartupRejectsMalformedPricingConfigBeforeCostIngestion(t *testing.T
 	}
 }
 
+func TestWebStartupRejectsScalarPricingConfigBeforeCostIngestion(t *testing.T) {
+	home := t.TempDir()
+	writeCostsConfig(t, home, "[costs.pricing]\noverrides = { bad = 1 }\n")
+	out, err := runCostsIngestionCLI(t, home, nil, "-p", "work", "web", "--no-tui", "--listen", "127.0.0.1:0")
+	if err == nil {
+		t.Fatalf("web startup accepted scalar pricing config:\n%s", out)
+	}
+	if !strings.Contains(out, "Error: failed to load user config") {
+		t.Fatalf("startup diagnostic was absent:\n%s", out)
+	}
+}
+
 func TestPricerConfigFromUserConfigPreservesCacheWriteDurations(t *testing.T) {
 	cfg := &session.UserConfig{Costs: session.CostsSettings{Pricing: session.PricingSettings{
 		Overrides: map[string]session.PricingOverride{
@@ -464,6 +476,26 @@ func TestLoadCostSummaryPropagatesEveryQueryFailure(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCostsSummaryCommandExitsNonZeroOnQueryFailure(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestCostsSummaryQueryFailureHelperProcess$")
+	cmd.Env = append(os.Environ(), "AGENT_DECK_COSTS_SUMMARY_FAILURE_HELPER=1")
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Fatalf("costs summary returned zero after a query failure:\n%s", out)
+	}
+	if !strings.Contains(string(out), "Error: failed to load cost summary: query today") {
+		t.Fatalf("query failure did not reach the CLI boundary:\n%s", out)
+	}
+}
+
+func TestCostsSummaryQueryFailureHelperProcess(t *testing.T) {
+	if os.Getenv("AGENT_DECK_COSTS_SUMMARY_FAILURE_HELPER") != "1" {
+		return
+	}
+	handleCostsSummaryWithStore(failingCLICostSummaryStore{dimension: "today"}, true)
+	os.Exit(0)
 }
 
 func writeCostsSummaryFixture(t *testing.T, home string, events []costs.CostEvent) {

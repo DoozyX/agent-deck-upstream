@@ -49,8 +49,25 @@ test('costs tab labels mixed coverage and incomplete projection', async ({ page 
     projection_coverage: mixedCoverage, projection_complete: false,
 		} })
 	})
-  await page.route(/\/api\/costs\/daily(?:\?|$)/, route => route.fulfill({ json: [] }))
-  await page.route(/\/api\/costs\/models(?:\?|$)/, route => route.fulfill({ json: { costs: { known: 1.25 }, breakdowns: [] } }))
+  const knownZeroCoverage = {
+    event_count: 1, known_price_event_count: 1, known_zero_event_count: 1,
+    unknown_price_event_count: 0, unreconciled_event_count: 0, coverage_known: true, complete: true,
+  }
+  const unknownCoverage = {
+    event_count: 1, known_price_event_count: 0, known_zero_event_count: 0,
+    unknown_price_event_count: 1, unreconciled_event_count: 0, unknown_price_tokens: 5,
+    coverage_known: true, complete: false,
+  }
+  await page.route(/\/api\/costs\/daily(?:\?|$)/, route => route.fulfill({ json: [
+    { date: '2026-09-12', cost_usd: 1.25, coverage: mixedCoverage },
+    { date: '2026-09-13', cost_usd: 0, coverage: unknownCoverage },
+    { date: '2026-09-14', cost_usd: 0, coverage: knownZeroCoverage },
+  ] }))
+  await page.route(/\/api\/costs\/models(?:\?|$)/, route => route.fulfill({ json: { breakdowns: [
+    { key: 'mixed-model', known_cost_microdollars: 1250000, coverage: mixedCoverage },
+    { key: 'future-model', known_cost_microdollars: 0, coverage: unknownCoverage },
+    { key: 'free-model', known_cost_microdollars: 0, coverage: knownZeroCoverage },
+  ] } }))
 
   await page.goto('/', { waitUntil: 'domcontentloaded' })
 	await page.locator('button.top-tab', { hasText: /^Costs$/ }).click()
@@ -58,13 +75,34 @@ test('costs tab labels mixed coverage and incomplete projection', async ({ page 
   await expect(page.getByText('$1.25 known subtotal').first()).toBeVisible()
   await expect(page.getByText(/1 unpriced event \/ 7 tokens/).first()).toBeVisible()
   await expect(page.getByText(/incomplete projection/)).toBeVisible()
-	const projectionLayout = await page.locator('.projected-stat').evaluate(el => {
+	const projectedCard = page.locator('.stat').filter({ has: page.getByText(/^PROJECTED$/) })
+	await expect(projectedCard).toHaveClass(/projected-stat/)
+	const projectionLayout = await projectedCard.evaluate(el => {
 		const card = el.getBoundingClientRect()
 		const value = el.querySelector('.val')!.getBoundingClientRect()
 		return { cardRight: card.right, valueRight: value.right, scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }
 	})
 	expect(projectionLayout.valueRight).toBeLessThanOrEqual(projectionLayout.cardRight + 1)
 	expect(projectionLayout.scrollWidth).toBeLessThanOrEqual(projectionLayout.clientWidth + 1)
+
+  await expect.poll(async () => page.evaluate(() => {
+    const canvases = document.querySelectorAll('canvas')
+    const Chart = (window as any).Chart
+    if (!Chart || canvases.length < 2) return null
+    const daily = Chart.getChart(canvases[0])
+    const models = Chart.getChart(canvases[1])
+    if (!daily || !models) return null
+    return [daily.data.labels, models.data.labels]
+  })).not.toBeNull()
+  const actualChartLabels = await page.evaluate(() => {
+    const canvases = document.querySelectorAll('canvas')
+    const Chart = (window as any).Chart
+    return [Chart.getChart(canvases[0]).data.labels, Chart.getChart(canvases[1]).data.labels]
+  })
+  expect(actualChartLabels).toEqual([
+    ['09-12 · known subtotal', '09-13 · price unknown', '09-14 · verified'],
+    ['mixed-model · known subtotal', 'future-model · price unknown', 'free-model · verified'],
+  ])
 
   const screenshotDir = process.env.ACCOUNTING_SCREENSHOT_DIR
   if (screenshotDir) {
