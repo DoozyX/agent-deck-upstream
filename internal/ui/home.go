@@ -1708,7 +1708,7 @@ type remoteFetchRunner interface {
 
 // remoteSessionsFetchedMsg carries one remote's fetch result (or a pushed
 // change shaped like one). Every other configured remote is listed in
-// failed/groupsFailed so the merge keeps their rows untouched.
+// untouched so the merge preserves its rows without treating it as failed.
 type remoteSessionsFetchedMsg struct {
 	// gen is the fetch's sequence number (see Home.remoteFetchSeq).
 	gen uint64
@@ -1735,6 +1735,9 @@ type remoteSessionsFetchedMsg struct {
 	// groupsFailed marks remotes whose group-list fetch errored this round;
 	// the handler keeps their last-good cached group paths.
 	groupsFailed map[string]bool
+	// untouched marks configured peers that this per-remote response did not
+	// attempt. Their last-good sessions, groups, and cost coverage stay intact.
+	untouched map[string]bool
 	// failed marks remotes whose fetch errored this round (issue #1170).
 	// The handler keeps their last-good sessions instead of wiping them,
 	// so one slow/offline remote can't flicker the whole list.
@@ -4237,7 +4240,8 @@ func (h *Home) applyRemoteFetch(msg remoteSessionsFetchedMsg) (tea.Model, tea.Cm
 	prevSessions := h.remoteSessions
 	// #1170: merge rather than wholesale-replace so a remote that errored
 	// this round keeps its last-good sessions instead of flickering out.
-	h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, msg.failed)
+	preserved := mergeRemoteFlags(msg.failed, msg.untouched)
+	h.remoteSessions = mergeRemoteSessions(h.remoteSessions, msg.sessions, preserved)
 	if msg.gen != 0 {
 		if h.remoteFetchApplied == nil {
 			h.remoteFetchApplied = make(map[string]uint64)
@@ -4248,21 +4252,20 @@ func (h *Home) applyRemoteFetch(msg remoteSessionsFetchedMsg) (tea.Model, tea.Cm
 		// A remote this message deconfigured (absent from both lists) must
 		// not come back when a slower result from an older round lands.
 		for name := range prevSessions {
-			if _, fetched := msg.sessions[name]; !fetched && !msg.failed[name] {
+			if _, fetched := msg.sessions[name]; !fetched && !preserved[name] {
 				h.remoteFetchApplied[name] = msg.gen
 			}
 		}
 	}
 	groupsFailed := msg.groupsFailed
-	if len(msg.failed) > 0 {
-		// A failed session fetch cannot provide a trustworthy group list either.
-		// Preserve that remote's last-good folders during this partial round,
-		// while still allowing a fresh group result to win below.
-		groupsFailed = make(map[string]bool, len(msg.groupsFailed)+len(msg.failed))
+	if len(preserved) > 0 {
+		// Failed and untouched remotes both keep their last-good folders during
+		// this partial response, while a fresh group result still wins below.
+		groupsFailed = make(map[string]bool, len(msg.groupsFailed)+len(preserved))
 		for name, failed := range msg.groupsFailed {
 			groupsFailed[name] = failed
 		}
-		for name := range msg.failed {
+		for name := range preserved {
 			groupsFailed[name] = true
 		}
 	}
@@ -4383,17 +4386,20 @@ func (h *Home) remoteFetchLanded(msg remoteSessionsFetchedMsg) bool {
 
 // mergeRemoteCosts folds one remote's cost summary into the per-remote map
 // without blanking the other remotes' figures: a remote whose result this
-// message carries either gets its fresh summary or, when its cost fetch
-// failed, contributes zero (as before); remotes still marked failed keep
-// their last-good figure; remotes absent from both lists were deconfigured.
+// message carries either gets its fresh summary or an unknown stale summary
+// when its cost fetch failed. Untouched peers keep their last-good figure;
+// actual failures without a cache retain an explicit unknown entry. Remotes
+// absent from fetched, failed, and untouched were deconfigured.
 func mergeRemoteCosts(prev map[string]*costs.RemoteCostSummary, msg remoteSessionsFetchedMsg) map[string]*costs.RemoteCostSummary {
-	merged := make(map[string]*costs.RemoteCostSummary, len(prev)+len(msg.costs))
+	merged := make(map[string]*costs.RemoteCostSummary, len(prev)+len(msg.costs)+len(msg.failed))
 	for name, summary := range prev {
 		if _, fetched := msg.sessions[name]; fetched {
 			continue
 		}
 		if msg.failed[name] {
 			merged[name] = staleRemoteCostSummary(summary)
+		} else if msg.untouched[name] {
+			merged[name] = summary
 		}
 	}
 	for name, summary := range msg.costs {
@@ -4406,12 +4412,17 @@ func mergeRemoteCosts(prev map[string]*costs.RemoteCostSummary, msg remoteSessio
 			merged[name] = staleRemoteCostSummary(prev[name])
 		}
 	}
+	for name := range msg.failed {
+		if _, ok := merged[name]; !ok {
+			merged[name] = staleRemoteCostSummary(nil)
+		}
+	}
 	return merged
 }
 
 func staleRemoteCostSummary(summary *costs.RemoteCostSummary) *costs.RemoteCostSummary {
 	if summary == nil {
-		return nil
+		return &costs.RemoteCostSummary{}
 	}
 	stale := *summary
 	stale.CoverageKnown = false
@@ -4460,7 +4471,7 @@ func (h *Home) remoteIsConfigured(remoteName string) bool {
 }
 
 // pushedRemoteFetch shapes a pushed change as a fetch result for that one
-// remote: every other remote is marked failed (the merge keeps its rows),
+// remote: every other remote is marked untouched (the merge keeps its rows),
 // costs are absent (left untouched), and the sequence number advances so an
 // older poll cannot overwrite this newer state. The caller has checked that
 // the pusher is still configured (remoteIsConfigured).
@@ -4472,13 +4483,14 @@ func (h *Home) pushedRemoteFetch(ch session.RemoteChange) remoteSessionsFetchedM
 		failed:       map[string]bool{},
 		groups:       map[string][]string{},
 		groupsFailed: map[string]bool{},
+		untouched:    map[string]bool{},
 	}
 	if ch.Groups != nil {
 		msg.groups[ch.Remote] = ch.Groups
 	} else {
 		msg.groupsFailed[ch.Remote] = true
 	}
-	// Every other remote is marked failed: the ones the config lists, and
+	// Every other remote is marked untouched: the ones the config lists, and
 	// the ones the TUI still knows by rows, a group list or a cost figure
 	// (a remote with zero sessions still has a host header and folders to
 	// keep, finding 12; the startup cache may know remotes the config has
@@ -4486,28 +4498,24 @@ func (h *Home) pushedRemoteFetch(ch session.RemoteChange) remoteSessionsFetchedM
 	h.remoteSessionsMu.RLock()
 	for name := range h.remoteConfigured {
 		if name != ch.Remote {
-			msg.failed[name] = true
-			msg.groupsFailed[name] = true
+			msg.untouched[name] = true
 		}
 	}
 	for name := range h.remoteSessions {
 		if name != ch.Remote {
-			msg.failed[name] = true
-			msg.groupsFailed[name] = true
+			msg.untouched[name] = true
 		}
 	}
 	for name := range h.remoteGroups {
 		if name != ch.Remote {
-			msg.failed[name] = true
-			msg.groupsFailed[name] = true
+			msg.untouched[name] = true
 		}
 	}
 	h.remoteSessionsMu.RUnlock()
 	h.remoteCostsMu.RLock()
 	for name := range h.remoteCosts {
 		if name != ch.Remote {
-			msg.failed[name] = true
-			msg.groupsFailed[name] = true
+			msg.untouched[name] = true
 		}
 	}
 	h.remoteCostsMu.RUnlock()
@@ -4715,7 +4723,7 @@ func (h *Home) remoteFetchCmds(gen uint64, remotes map[string]session.RemoteConf
 
 // fetchOneRemote fetches one remote's sessions, cost summary and group list
 // and shapes them as a result for that remote alone: every other configured
-// remote is marked failed so the merge keeps its rows, and a remote missing
+// remote is marked untouched so the merge keeps its rows, and a remote missing
 // from the config altogether is absent from both lists and so drops out.
 func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, configured []string) remoteSessionsFetchedMsg {
 	msg := remoteSessionsFetchedMsg{
@@ -4725,12 +4733,12 @@ func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, 
 		costs:        make(map[string]*costs.RemoteCostSummary, 1),
 		groups:       make(map[string][]string, 1),
 		groupsFailed: make(map[string]bool, len(configured)),
+		untouched:    make(map[string]bool, len(configured)),
 		failed:       make(map[string]bool, len(configured)),
 	}
 	for _, other := range configured {
 		if other != name {
-			msg.failed[other] = true
-			msg.groupsFailed[other] = true
+			msg.untouched[other] = true
 		}
 	}
 
@@ -4819,6 +4827,18 @@ func (h *Home) fetchOneRemote(gen uint64, name string, rc session.RemoteConfig, 
 // SSH or the Bubble Tea event loop.
 func mergeRemoteSessions(prev, fetched map[string][]session.RemoteSessionInfo, failed map[string]bool) map[string][]session.RemoteSessionInfo {
 	return mergeRemoteValues(prev, fetched, failed)
+}
+
+func mergeRemoteFlags(flags ...map[string]bool) map[string]bool {
+	merged := make(map[string]bool)
+	for _, set := range flags {
+		for name, enabled := range set {
+			if enabled {
+				merged[name] = true
+			}
+		}
+	}
+	return merged
 }
 
 func mergeRemoteValues[T any](prev, fetched map[string][]T, failed map[string]bool) map[string][]T {
@@ -18271,6 +18291,7 @@ func (h *Home) renderFrame() string {
 	template := h.costLineTemplate
 	var lineCoverage costs.Coverage
 	foundWindow := false
+	allKnown, allComplete := true, true
 	for _, window := range windowCoverage {
 		if !strings.Contains(template, window.placeholder) {
 			continue
@@ -18279,18 +18300,26 @@ func (h *Home) renderFrame() string {
 		if hasRemotes {
 			coverage = costs.MergeCoverage(coverage, window.remote)
 		}
-		if !foundWindow {
+		allKnown = allKnown && coverage.CoverageKnown
+		allComplete = allComplete && coverage.Complete
+		if !foundWindow || coverage.EventCount > lineCoverage.EventCount ||
+			(coverage.EventCount == lineCoverage.EventCount && coverage.TotalTokens > lineCoverage.TotalTokens) {
 			lineCoverage = coverage
-			foundWindow = true
-		} else {
-			lineCoverage = costs.MergeCoverage(lineCoverage, coverage)
 		}
+		foundWindow = true
 	}
 	if !foundWindow {
 		lineCoverage = h.costTodayCoverage
 		if hasRemotes {
 			lineCoverage = costs.MergeCoverage(lineCoverage, remoteAgg.TodayCoverage)
 		}
+	} else {
+		// Detail placeholders describe one referenced window (the one with the
+		// broadest observed event/token scope). Other referenced windows affect
+		// only the aggregate truth flags, so overlapping periods are not counted
+		// twice while an incomplete companion window cannot be presented as complete.
+		lineCoverage.CoverageKnown = allKnown
+		lineCoverage.Complete = allComplete
 	}
 	if (lineCoverage.EventCount > 0 || hasRemotes) && !strings.Contains(template, "{coverage_status}") {
 		template += " ({coverage_status})"

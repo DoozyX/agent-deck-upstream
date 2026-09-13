@@ -49,7 +49,7 @@ type PriceOverride struct {
 func (p *PriceOverride) UnmarshalTOML(data any) error {
 	values, ok := data.(map[string]any)
 	if !ok {
-		return nil
+		return fmt.Errorf("pricing override must be a table, got %T", data)
 	}
 	set := func(key string, target *float64) error {
 		value, present := values[key]

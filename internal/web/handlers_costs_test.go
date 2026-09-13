@@ -18,18 +18,20 @@ import (
 	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
-func writeCoverageWebFixtures(t *testing.T, store *costs.Store) {
+func writeCoverageWebFixtures(t *testing.T, store *costs.Store) time.Time {
 	t.Helper()
+	fixtureTime := time.Now().UTC()
 	events := []costs.CostEvent{
-		{ID: "known", SessionID: "session-a", ParentSessionID: "parent", RunID: "run-a", Timestamp: time.Now().UTC(), Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeDirect, SourceIdentity: "claude:msg:known", TranscriptIdentity: "claude:session", Model: "known-model", InputTokens: 10, CacheReadTokens: 20, CacheWriteTokens: 30, CacheWrite5mTokens: 11, CacheWrite1hTokens: 13, OutputTokens: 40, ReasoningTokens: 7, CostMicrodollars: 1_250_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
-		{ID: "unknown", SessionID: "session-b", RunID: "run-b", Timestamp: time.Now().UTC(), Provider: costs.ProviderCodex, SourceKind: costs.SourceKindCodexRollout, SourceIdentity: "codex:event:unknown", TranscriptIdentity: "codex:session", Model: "future-model", InputTokens: 5, CacheReadTokens: 3, OutputTokens: 2, ReasoningTokens: 1, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
-		{ID: "legacy", SessionID: "session-b", Timestamp: time.Now().UTC(), Model: "legacy", InputTokens: 9, CostMicrodollars: 9_000_000},
+		{ID: "known", SessionID: "session-a", ParentSessionID: "parent", RunID: "run-a", Timestamp: fixtureTime, Provider: costs.ProviderClaude, SourceKind: costs.SourceKindClaudeDirect, SourceIdentity: "claude:msg:known", TranscriptIdentity: "claude:session", Model: "known-model", InputTokens: 10, CacheReadTokens: 20, CacheWriteTokens: 30, CacheWrite5mTokens: 11, CacheWrite1hTokens: 13, OutputTokens: 40, ReasoningTokens: 7, CostMicrodollars: 1_250_000, PricingStatus: costs.PricingKnown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "unknown", SessionID: "session-b", RunID: "run-b", Timestamp: fixtureTime, Provider: costs.ProviderCodex, SourceKind: costs.SourceKindCodexRollout, SourceIdentity: "codex:event:unknown", TranscriptIdentity: "codex:session", Model: "future-model", InputTokens: 5, CacheReadTokens: 3, OutputTokens: 2, ReasoningTokens: 1, PricingStatus: costs.PricingUnknown, ReconciliationStatus: costs.ReconciliationAuthoritative},
+		{ID: "legacy", SessionID: "session-b", Timestamp: fixtureTime, Model: "legacy", InputTokens: 9, CostMicrodollars: 9_000_000},
 	}
 	for _, event := range events {
 		if err := store.WriteCostEvent(event); err != nil {
 			t.Fatal(err)
 		}
 	}
+	return fixtureTime
 }
 
 func TestCostsSummaryCoveragePreservesNumericFields(t *testing.T) {
@@ -123,7 +125,7 @@ func TestCostsSummaryPropagatesEveryBreakdownFailure(t *testing.T) {
 
 func TestCostsExportIncludesCanonicalAuditFields(t *testing.T) {
 	store := newTestCostStore(t)
-	writeCoverageWebFixtures(t, store)
+	fixtureTime := writeCoverageWebFixtures(t, store)
 	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
 	srv.SetCostStore(store)
 
@@ -172,7 +174,7 @@ func TestCostsExportIncludesCanonicalAuditFields(t *testing.T) {
 		}
 	}
 	wantCSV := []string{
-		time.Now().UTC().Format("2006-01-02"), known["timestamp"].(string), "UTC", "UTC calendar dates", "claude", "claude_direct",
+		fixtureTime.Format("2006-01-02"), fixtureTime.Format(time.RFC3339Nano), "UTC", "UTC calendar dates", "claude", "claude_direct",
 		"claude:msg:known", "claude:session", "session-a", "parent", "run-a", "session", "known-model",
 		"10", "20", "30", "11", "13", "6", "40", "7", "1.250000", "1.250000", "known", "authoritative",
 	}
@@ -291,6 +293,32 @@ func TestCostsSessionsUseGroupedCoverageAndDailyRangeIsBounded(t *testing.T) {
 	}
 }
 
+type recordingDailyRangeStore struct {
+	*costs.Store
+	from, to time.Time
+}
+
+func (s *recordingDailyRangeStore) CoveredCostByDayRange(from, to time.Time) ([]costs.CostBreakdown, error) {
+	s.from, s.to = from, to
+	return s.Store.CoveredCostByDayRange(from, to)
+}
+
+func TestCostsDailyUsesSQLBoundedRange(t *testing.T) {
+	store := &recordingDailyRangeStore{Store: newTestCostStore(t)}
+	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+	srv.costStore = store
+	rr := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/daily?days=30", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if store.from.IsZero() || store.to.IsZero() || store.to.Sub(store.from) != 31*24*time.Hour ||
+		store.from.Location() != time.UTC || store.to.Location() != time.UTC ||
+		store.from.Hour() != 0 || store.to.Hour() != 0 {
+		t.Fatalf("CoveredCostByDayRange bounds = %s..%s, want 31 UTC calendar days", store.from, store.to)
+	}
+}
+
 func TestCostsSummaryPublicWeekAndProviderBoundaries(t *testing.T) {
 	store := newTestCostStore(t)
 	monday := time.Date(2025, 11, 10, 0, 0, 1, 0, time.UTC)
@@ -325,19 +353,38 @@ func TestCostsSummaryPublicWeekAndProviderBoundaries(t *testing.T) {
 
 type synchronizedRecorder struct {
 	*httptest.ResponseRecorder
-	mu sync.Mutex
+	mu      sync.Mutex
+	changed chan struct{}
 }
 
 func (r *synchronizedRecorder) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.ResponseRecorder.Write(p)
+	n, err := r.ResponseRecorder.Write(p)
+	select {
+	case r.changed <- struct{}{}:
+	default:
+	}
+	return n, err
 }
 func (r *synchronizedRecorder) Flush() {}
 func (r *synchronizedRecorder) body() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.Body.String()
+}
+
+func waitForCostSummaries(t *testing.T, recorder *synchronizedRecorder, want int) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for strings.Count(recorder.body(), "event: cost_summary") < want {
+		select {
+		case <-recorder.changed:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %d cost summaries: %s", want, recorder.body())
+		}
+	}
 }
 
 func TestCostsStreamEmitsCoverageOnlyChange(t *testing.T) {
@@ -351,22 +398,17 @@ func TestCostsStreamEmitsCoverageOnlyChange(t *testing.T) {
 	costStreamPollInterval, costStreamHeartbeatInterval = 5*time.Millisecond, time.Hour
 	t.Cleanup(func() { costStreamPollInterval, costStreamHeartbeatInterval = oldPoll, oldHeartbeat })
 	ctx, cancel := context.WithCancel(context.Background())
-	recorder := &synchronizedRecorder{ResponseRecorder: httptest.NewRecorder()}
+	recorder := &synchronizedRecorder{ResponseRecorder: httptest.NewRecorder(), changed: make(chan struct{}, 1)}
 	done := make(chan struct{})
 	go func() {
 		srv.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/costs/stream", nil).WithContext(ctx))
 		close(done)
 	}()
-	deadline := time.Now().Add(time.Second)
-	for strings.Count(recorder.body(), "event: cost_summary") < 1 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitForCostSummaries(t, recorder, 1)
 	if _, err := store.DB().Exec(`UPDATE cost_events SET pricing_status = ? WHERE id = 'stream'`, costs.PricingKnownZero); err != nil {
 		t.Fatal(err)
 	}
-	for strings.Count(recorder.body(), "event: cost_summary") < 2 && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	waitForCostSummaries(t, recorder, 2)
 	cancel()
 	<-done
 	if count := strings.Count(recorder.body(), "event: cost_summary"); count < 2 {

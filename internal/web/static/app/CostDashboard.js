@@ -310,7 +310,7 @@ export function CostDashboard() {
   return html`
     <div style="display: flex; flex-direction: column; gap: 12px; flex: 1; min-height: 0; overflow: auto;">
       <div class="stat-grid">
-		<div class="stat projected-stat">
+		<div class="stat">
           <div class="lab">TODAY</div>
 		  <div class="val">${costDisplay(summary.today_usd, summary.today_coverage)}</div>
 		  <div class="delta">${summary.today_events} events · ${coverageLine(summary.today_coverage)}</div>
@@ -325,7 +325,7 @@ export function CostDashboard() {
 		  <div class="val">${costDisplay(summary.month_usd, summary.month_coverage)}</div>
 		  <div class="delta">${summary.month_events} events · ${coverageLine(summary.month_coverage)}</div>
         </div>
-        <div class="stat">
+		<div class="stat projected-stat">
           <div class="lab">PROJECTED</div>
 		  <div class="val">${costDisplay(summary.projected_usd, summary.projection_coverage, true)}</div>
 		  <div class="delta">based on 7-day known-price subtotal · ${coverageLine(summary.projection_coverage)}</div>
