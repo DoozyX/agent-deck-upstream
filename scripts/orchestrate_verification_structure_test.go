@@ -635,7 +635,8 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// KILLED, which is why the gap was invisible). The same test already
 	// enforces adjacency for the `usage recommend` command row and both
 	// manifest cross-references, so this was inconsistent rigor rather than a
-	// plain omission. Anchored to its table's lead-in line.
+	// plain omission. The line-local scan below is anchored to the section's
+	// lead-in line.
 	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
 	parseMarkdownRow := func(line string) ([]string, bool) {
 		leadingSpaces := 0
@@ -660,6 +661,8 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		t.Fatalf("frontierBaselineRow must parse as a two-cell Markdown row; got cells=%q, ok=%t", frontierBaselineCells, ok)
 	}
 	markdownDelimiterCell := regexp.MustCompile(`^:?-{3,}:?$`)
+	// This check is line-local and does not establish Markdown block context.
+	// A fenced-code or raw-HTML wrapper around the same lines still satisfies it, while a table nested in a list item or blockquote is rejected even though GFM renders it.
 	frontierRowInTable := false
 	baselineTableLead := -1
 	for i, line := range skillLines {
@@ -701,7 +704,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		}
 	}
 	if !frontierRowInTable {
-		t.Errorf("criterion 7's frontier row %q must appear inside the consecutive pipe rows of the \"Baseline tier per session\" table; it does not", frontierBaselineRow)
+		t.Errorf("criterion 7's frontier row %q must appear among the contiguous pipe-delimited rows following the two-cell header represented by \"| Session | Tier |\" and a two-cell Markdown delimiter represented by \"| --- | --- |\", under the \"Baseline tier per session\" lead-in; it does not", frontierBaselineRow)
 	}
 	// Round-4 finding 5: the third per-launch instruction carried the
 	// pre-existing THREE-field form while the code block and both
