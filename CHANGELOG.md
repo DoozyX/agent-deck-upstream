@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS Docker sandboxes no longer copy the host's Claude OAuth token out of the Keychain. Every copy of the single-use refresh token forked the host's refresh chain, so the host was logged out (`/login` prompt) after a sandbox refreshed. The sandbox now keeps a login of its own: run `/login` once inside the first sandbox session (or pass `CLAUDE_CODE_OAUTH_TOKEN` via `[docker] environment`); `~/.claude/sandbox/.credentials.json` is then canonical, never overwritten on session start and no longer deleted on teardown. The old behaviour is available as `[docker] seed_credentials_from_keychain = true`, which seeds a new sandbox exactly once and warns that this forks the host chain ([#2153](https://github.com/asheshgoplani/agent-deck/issues/2153)).
+
 ## [1.16.8] - 2026-09-13
 
 Sessions are told they run inside agent-deck, unattended updates stay out of tests and CI, and a verified remote deploy off the non-interactive `$PATH` is a warning rather than a failure.
