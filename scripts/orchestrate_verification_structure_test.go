@@ -421,6 +421,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	}
 
 	skill := read("skills", "orchestrate", "SKILL.md")
+	configReference := read("skills", "agent-deck", "references", "config-reference.md")
 	requireAll("orchestrate skill", skill, []string{
 		// One call per distinct role+tier per wave, saved under $RUN_DIR.
 		// The pin is the WHOLE clause, not just the "once per distinct
@@ -451,7 +452,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Round-5 finding 5: the exit-2 enumeration read as a CLOSED list and
 		// omitted `flag.Parse`'s own rejections, which
 		// cmd/agent-deck/usage_recommend_cmd.go:155-159 names as a fifth exit-2
-		// path and itself calls "wider than a bad flag". Driven: `--bogus` ->
+		// path and itself calls "wider than a bad flag value". Driven: `--bogus` ->
 		// EXIT=2 "flag provided but not defined: -bogus", and `--tier` with no
 		// value -> EXIT=2 "flag needs an argument: -tier". The open clause is
 		// pinned with the list so the list cannot re-close.
@@ -552,14 +553,15 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		//     -> EXIT=0 {"tool":"Codex","provider":"","model":"", ...
 		//        "reason":"no candidate tools for tool strategy \"auto\""}
 		//        with STDERR EMPTY;
-		//   hidden_tools = ["codex","claude"] + failover = ["codex","claude"]
+		//   [ui] hidden_tools = ["codex","claude"] + failover = ["codex","claude"]
+		//     with `--tier strong`
 		//     -> EXIT=0 {"tool":"codex","provider":"codex",
 		//        "model":"gpt-5.6-sol", ...} — same reason, STDERR still EMPTY.
 		// So neither `tool == ""` NOR `provider == ""` discriminates; only the
 		// `reason` does. cmd/agent-deck/usage_recommend_cmd.go:238 gates the
 		// remedy on `if decision.Tool == ""`, which is why stderr is silent.
-		// The guard is pinned ahead of the launch block because `model` is
-		// filled in on that branch too.
+		// The guard is pinned ahead of the launch block because `model` follows
+		// the applied tier's rung on that branch and can therefore be empty.
 		"A `reason` *beginning* `no candidate tools for tool strategy` means no candidate tool resolved at all, and nothing in that decision may be launched. Match on the prefix, not on the substring: that clause comes first, but a profile-miss clause, a tier floor or a model clause can follow it after a `;`, and a `--profile` name is interpolated into `reason` verbatim — so a substring match can fire on a launchable decision whose profile is named `no candidate tools`.",
 		"Do not use `tool == \"\"` as the test — `tool` is empty only when the strategy resolved no name either.",
 		"`tool` is that name, `provider` comes back filled in whenever it maps to a usage provider, `model` follows that provider's ladder and is empty when the applied tier's rung is empty, `state` is `unknown`, and **stderr is empty**",
@@ -570,10 +572,8 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the top-level `default_tool` in `config.toml`, before launching anything for that wave. On the surviving-name branch, neither remedy makes the decision launchable: `--prefer` picks which name survives, and when `failover` is omitted `default_tool` supplies the default failover order and can change which name survives; an explicit `failover` controls that order instead. The `reason` still begins `no candidate tools for tool strategy`, so fix the environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or miscased `failover` entry.",
 		// Round-5 finding 13: this clause inverted into a wrong operational
 		// action while green — a mutant reading "which is a failure: stop the
-		// wave and report it rather than launching" SURVIVED. The lead confirms
-		// the clause is UNDRIVABLE on this machine (usage.Runner is built with
-		// an empty Path, so exec.LookPath("openusage") always runs and there is
-		// no env override), so a pin is the only protection it can have.
+		// wave and report it rather than launching" SURVIVED, so the operational
+		// outcome remains pinned here.
 		"A machine with no `openusage` binary gets `state: unknown` and the preferred tool when one resolves, which is an answer, not a failure; continue unchanged there.",
 		// Round-5 finding 14: the negative half of the re-run rule inverted
 		// while green — "Query it during ordinary polling, focused single
@@ -638,18 +638,31 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// plain omission. Anchored to its table's lead-in line.
 	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
 	frontierRowInTable := false
+	baselineTableLead := -1
 	for i, line := range skillLines {
-		if !strings.Contains(line, "Baseline tier per session:") {
+		if strings.TrimSpace(line) != "Baseline tier per session:" {
 			continue
 		}
-		for j := i; j < len(skillLines) && j <= i+12; j++ {
+		if baselineTableLead >= 0 {
+			t.Errorf("criterion 7's \"Baseline tier per session\" lead-in must appear exactly once")
+			continue
+		}
+		baselineTableLead = i
+		j := i + 1
+		for j < len(skillLines) && strings.TrimSpace(skillLines[j]) == "" {
+			j++
+		}
+		if j >= len(skillLines) || strings.TrimSpace(skillLines[j]) != "| Session | Tier |" {
+			continue
+		}
+		for ; j < len(skillLines) && strings.HasPrefix(strings.TrimSpace(skillLines[j]), "|"); j++ {
 			if strings.Contains(normalize(skillLines[j]), normalize(frontierBaselineRow)) {
 				frontierRowInTable = true
 			}
 		}
 	}
 	if !frontierRowInTable {
-		t.Errorf("criterion 7's frontier row %q must appear inside the \"Baseline tier per session\" table, within 12 lines of its lead-in; it does not", frontierBaselineRow)
+		t.Errorf("criterion 7's frontier row %q must appear inside the consecutive pipe rows of the \"Baseline tier per session\" table; it does not", frontierBaselineRow)
 	}
 	// Round-4 finding 5: the third per-launch instruction carried the
 	// pre-existing THREE-field form while the code block and both
@@ -664,7 +677,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	})
 	// fold is deliberately LOCAL to the negative checks rather than folded into
 	// normalize: normalize backs every positive pin above, and making those
-	// case-insensitive and markup-blind would weaken ~60 assertions to
+	// case-insensitive and markup-blind would weaken the positive assertions to
 	// strengthen these. The negative checks need it because their whole content
 	// is a removal, and a bare Contains was case-sensitive and markup-blind
 	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
@@ -707,9 +720,22 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 	// A document asserting both the old rule and the new one is worse than one
 	// asserting only the old one, so this is checked over the whole file.
 	//
-	for _, dead := range []string{"never blocks a launch", "overrides an explicit tool"} {
-		if strings.Contains(fold(skill), fold(dead)) {
-			t.Errorf("orchestrate skill still asserts the now-false clause %q", dead)
+	for _, document := range []struct {
+		name    string
+		content string
+	}{
+		{"orchestrate skill", skill},
+		{"config reference", configReference},
+	} {
+		for _, dead := range []string{
+			"never blocks a launch",
+			"overrides an explicit tool",
+			"An empty `tool` is different: the remedy reaches **stderr only**.",
+			"the decision then carries an empty `tool`, and a remedy hint goes to stderr",
+		} {
+			if strings.Contains(fold(document.content), fold(dead)) {
+				t.Errorf("%s still asserts the now-false clause %q", document.name, dead)
+			}
 		}
 	}
 
@@ -734,7 +760,6 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		"`agent-deck usage recommend --role <role> --tier <tier>` returns a read-only, advisory tool/model choice from live quota; `skills/orchestrate/SKILL.md` carries the full contract for using it.",
 	})
 
-	configReference := read("skills", "agent-deck", "references", "config-reference.md")
 	requireAll("config reference", configReference, []string{
 		"## [usage.policy] Section",
 		"- [[usage.policy] Section](#usagepolicy-section)",
