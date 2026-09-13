@@ -31,7 +31,8 @@ The command is read-only and advisory. It exits 0 for every decision — includi
 `state: exhausted` and `state: unknown` — and exit 2 is reserved for a bad flag:
 a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
 positional, and anything else `flag.Parse` rejects, which is wider than that
-list — an undefined flag such as `--bogus`, or a defined flag given no value.
+list — an undefined flag such as `--bogus`, or a defined flag given no value —
+except `-h`/`--help`, which print the usage line on stderr and exit 0.
 Exit 1 means the configuration could not be loaded or validated, or the JSON
 could not be encoded — check the exit code before reading the saved file,
 because the `>` redirect creates that file even when nothing was written to it.
@@ -40,19 +41,29 @@ tool when one resolves, which is an answer, not a failure; continue unchanged
 there.
 
 **Check that the decision is launchable before you build the launch.** A
-`reason` that *contains* `no candidate tools` means no candidate tool resolved
-at all, and nothing in that decision may be launched. Match on the substring:
-that clause comes first, but a tier floor or a model clause can follow it after
-a `;`. Do not use `tool == ""` as the test — `tool` is empty only when the
-strategy resolved no name either. When a name survives the empty candidate list,
-`tool` is that name, `provider` and `model` come back filled in whenever it maps
-to a usage provider, `state` is `unknown`, and **stderr is empty**, so a
+`reason` *beginning* `no candidate tools for tool strategy` means no candidate
+tool resolved at all, and nothing in that decision may be launched. Match on the
+prefix, not on the substring: that clause comes first, but a profile-miss
+clause, a tier floor or a model clause can follow it after a `;`, and a
+`--profile` name is interpolated into `reason` verbatim — so a substring match
+can fire on a launchable decision whose profile is named `no candidate tools`.
+Do not use `tool == ""` as the test — `tool` is empty only when the strategy
+resolved no name either. When a name survives the empty candidate list, `tool`
+is that name, `provider` comes back filled in whenever it maps to a usage
+provider, `model` follows that provider's ladder and is empty when the applied
+tier's rung is empty, `state` is `unknown`, and **stderr is empty**, so a
 `tool == ""` guard passes that decision straight through and the launch below is
-built — with a `--model` — for a tool the policy just filtered out. The exit
-code is 0 either way. The remedy hint reaches stderr on the empty-`tool` branch
-only: capture stderr for that one, but never read a silent stderr as a
-launchable decision. Re-run the call with `--prefer <tool>`, or set
-`default_tool` in `config.toml`, before launching anything for that wave.
+built for a tool the policy just filtered out. The exit code is 0 either way.
+The remedy hint reaches stderr on the empty-`tool` branch only: capture stderr
+for that one, but never read a silent stderr as a launchable decision.
+
+On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the
+top-level `default_tool` in `config.toml`, before launching anything for that
+wave. That remedy does not reach the surviving-name branch: there `--prefer`
+picks which name survives without making the decision launchable — the `reason`
+is unchanged — and `default_tool` is filtered out with the rest. Fix the
+environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or
+correct a misspelled or miscased `failover` entry.
 
 Launch with the decision's `tool`, and with its `model` when that field is
 non-empty:

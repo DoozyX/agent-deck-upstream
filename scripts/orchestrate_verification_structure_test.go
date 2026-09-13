@@ -455,7 +455,8 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// EXIT=2 "flag provided but not defined: -bogus", and `--tier` with no
 		// value -> EXIT=2 "flag needs an argument: -tier". The open clause is
 		// pinned with the list so the list cannot re-close.
-		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value.",
+		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value — except `-h`/`--help`, which print the usage line on stderr and exit 0.",
+		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` —",
 		// Exit 1 was enumerated nowhere in the skill, though this section's own
 		// recipe redirects stdout into a file the shell creates either way — a
 		// conductor with no reason to check the code saves a zero-byte "decision".
@@ -559,14 +560,14 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// remedy on `if decision.Tool == ""`, which is why stderr is silent.
 		// The guard is pinned ahead of the launch block because `model` is
 		// filled in on that branch too.
-		"A `reason` that *contains* `no candidate tools` means no candidate tool resolved at all, and nothing in that decision may be launched.",
+		"A `reason` *beginning* `no candidate tools for tool strategy` means no candidate tool resolved at all, and nothing in that decision may be launched. Match on the prefix, not on the substring: that clause comes first, but a profile-miss clause, a tier floor or a model clause can follow it after a `;`, and a `--profile` name is interpolated into `reason` verbatim — so a substring match can fire on a launchable decision whose profile is named `no candidate tools`.",
 		"Do not use `tool == \"\"` as the test — `tool` is empty only when the strategy resolved no name either.",
-		"`tool` is that name, `provider` and `model` come back filled in whenever it maps to a usage provider, `state` is `unknown`, and **stderr is empty**",
+		"`tool` is that name, `provider` comes back filled in whenever it maps to a usage provider, `model` follows that provider's ladder and is empty when the applied tier's rung is empty, `state` is `unknown`, and **stderr is empty**",
 		"The remedy hint reaches stderr on the empty-`tool` branch only: capture stderr for that one, but never read a silent stderr as a launchable decision.",
 		// Round-4 finding 7: the two pins above hold the surrounding sentences
 		// but not the remedy itself, which survived replacement by "Launch
 		// without `-c` and let the connector default apply."
-		"Re-run the call with `--prefer <tool>`, or set `default_tool` in `config.toml`, before launching anything for that wave.",
+		"On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the top-level `default_tool` in `config.toml`, before launching anything for that wave. That remedy does not reach the surviving-name branch: there `--prefer` picks which name survives without making the decision launchable — the `reason` is unchanged — and `default_tool` is filtered out with the rest. Fix the environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or miscased `failover` entry.",
 		// Round-5 finding 13: this clause inverted into a wrong operational
 		// action while green — a mutant reading "which is a failure: stop the
 		// wave and report it rather than launching" SURVIVED. The lead confirms
@@ -827,7 +828,7 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// Driven discriminator: an uninstalled name that IS a usage provider
 		// keeps a non-empty `provider` and a model here, so the round-2 "with an
 		// empty `provider`, no model" clause was false and is not re-pinned.
-		"`provider` and `model` come back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way",
+		"`provider` comes back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way; `model` follows that provider's ladder, and is empty when the applied tier's rung is empty or when there is no provider",
 		"| `[usage.policy.ladder.<claude\\|codex>]` | table of strings |",
 		"Only `claude` and `codex` are accepted, and the rejection is not a startup error",
 		"`usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1",
@@ -881,10 +882,11 @@ func TestUsageAwareLaunchContract(t *testing.T) {
 		// this same file 13 lines above (":679", the `failover` row). A pin on
 		// a false claim freezes the falsehood, so prose and pin changed in the
 		// same commit. Same driven evidence as finding 1 above.
-		"That last case is not always an empty `tool`: it always carries a `reason` beginning `no candidate tools for tool strategy`, but only when the strategy resolved no name either does `tool` come back empty with a remedy hint on stderr; when a name survives, as the `failover` row above describes, `tool` is that name, `provider` and `model` are filled in whenever it maps to a usage provider, and stderr stays silent. Read the `reason`, not the emptiness of `tool`.",
+		"That last case is not always an empty `tool`: it always carries a `reason` beginning `no candidate tools for tool strategy`, but only when the strategy resolved no name either does `tool` come back empty with a remedy hint on stderr; when a name survives, as the `failover` row above describes, `tool` is that name, `provider` is filled in whenever it maps to a usage provider, `model` follows that provider's ladder and is empty when the applied tier's rung is empty, and stderr stays silent. Read the `reason`, not the emptiness of `tool`.",
 		// Round-5 finding 5, config-reference half: the same closed exit-2
 		// enumeration as the skill's, widened to `flag.Parse` and pinned.
-		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
+		"It exits 0 for every decision — including `exhausted`, `unknown`, and the case where no candidate tool could be chosen at all — so a caller reads `state`, not the exit code.",
+		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value — except `-h`/`--help`, which print the usage line on stderr and exit 0. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
 	})
 	// Round-5 findings 7 and 8, checked RAW — no normalize — so whitespace,
 	// position and every VALUE are held together.
