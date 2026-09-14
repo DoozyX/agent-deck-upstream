@@ -21,6 +21,39 @@ func readNormalizedSkillDocs(t *testing.T, paths ...string) string {
 	return strings.Join(strings.Fields(strings.Join(documents, "\n")), " ")
 }
 
+func readLinkedSkillDoc(t *testing.T, skillPath, linkText string) string {
+	t.Helper()
+	core, err := os.ReadFile(skillPath)
+	if err != nil {
+		t.Fatalf("read skill document %s: %v", skillPath, err)
+	}
+	marker := "[" + linkText + "]("
+	start := strings.Index(string(core), marker)
+	if start < 0 {
+		t.Fatalf("skill document %s has no route labeled %q", skillPath, linkText)
+	}
+	targetStart := start + len(marker)
+	targetEnd := strings.Index(string(core)[targetStart:], ")")
+	if targetEnd < 0 {
+		t.Fatalf("skill document %s has an unterminated route labeled %q", skillPath, linkText)
+	}
+	target := string(core)[targetStart : targetStart+targetEnd]
+	if anchor := strings.Index(target, "#"); anchor >= 0 {
+		target = target[:anchor]
+	}
+	linkedPath := filepath.Join(filepath.Dir(skillPath), filepath.FromSlash(target))
+	linked, err := os.ReadFile(linkedPath)
+	if err != nil {
+		t.Fatalf("read routed skill document %s: %v", linkedPath, err)
+	}
+	return string(linked)
+}
+
+func readNormalizedLinkedSkillDoc(t *testing.T, skillPath, linkText string) string {
+	t.Helper()
+	return strings.Join(strings.Fields(readLinkedSkillDoc(t, skillPath, linkText)), " ")
+}
+
 func TestOrchestrateDelegatesAllTaskExecution(t *testing.T) {
 	repoRoot := filepath.Clean("..")
 	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
@@ -172,7 +205,7 @@ func TestBrainstormingUsesTypedRepositoryLocalRunLayout(t *testing.T) {
 	if strings.Contains(normalizedSkill, `.agent-deck/designs/`) {
 		t.Fatal("brainstorming still uses the legacy global designs directory")
 	}
-	for _, forbidden := range []string{"docs/", ".agent-deck/designs/"} {
+	for _, forbidden := range []string{"docs/design", "docs/plans", "docs/retros", "docs/superpowers", ".agent-deck/designs/"} {
 		if strings.Contains(normalizedSkill, forbidden) {
 			t.Fatalf("brainstorming still permits workflow artifacts outside .agent-deck: %q", forbidden)
 		}

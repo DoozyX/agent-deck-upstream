@@ -148,35 +148,54 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 			name: "review-full",
 			args: []string{
 				"AGENT_DECK_REPO=/tmp/agent-deck",
+				"ATTEMPT_ID=review-full-r1",
 				"BASE_BRANCH=main",
+				"BASE_HEAD=base-head",
 				"BASELINE=baseline: none",
+				"REVIEWED_HEAD=reviewed-head",
+				"RUN_DIR=/tmp/orchestrate/run",
 				"SPEC_BLOCK=Review requirements block",
+				"SPEC_ID=approved-design-v1",
+				"TASK_ID=contract-task",
 				"VERDICT_FILE=/tmp/orchestrate/review-r1.md",
 			},
-			required: []string{"git merge-base main HEAD", "Review requirements block", "/tmp/orchestrate/review-r1.md"},
+			required: []string{"git merge-base main HEAD", "Review requirements block", "/tmp/orchestrate/review-r1.md", "Stable review identity: run=/tmp/orchestrate/run task=contract-task attempt=review-full-r1 base=base-head reviewed=reviewed-head spec=approved-design-v1."},
 		},
 		{
 			name: "review-round",
 			args: []string{
 				"AGENT_DECK_REPO=/tmp/agent-deck",
+				"ATTEMPT_ID=review-round-r2",
+				"BASE_HEAD=base-head",
 				"BASE_REF=main",
 				"BASELINE=baseline: none",
 				"FOCUSED_TESTS=go test ./internal/usage",
 				"PREVIOUS_FINDINGS=One previous finding",
+				"REVIEWED_HEAD=reviewed-head",
 				"REVIEWED_SHA=0123456789abcdef",
+				"RUN_DIR=/tmp/orchestrate/run",
 				"SPEC_BLOCK=Review requirements block",
+				"SPEC_ID=approved-design-v1",
+				"TASK_ID=contract-task",
 				"VERDICT_FILE=/tmp/orchestrate/review-r2.md",
 			},
-			required: []string{"One previous finding", "git diff 0123456789abcdef...HEAD", "git diff main...HEAD", "/tmp/orchestrate/review-r2.md"},
+			required: []string{"One previous finding", "git diff 0123456789abcdef...HEAD", "git diff main...HEAD", "/tmp/orchestrate/review-r2.md", "Stable review identity: run=/tmp/orchestrate/run task=contract-task attempt=review-round-r2 base=base-head reviewed=reviewed-head spec=approved-design-v1."},
 		},
 		{
 			name: "fix",
 			args: []string{
+				"ATTEMPT_ID=fix-r2",
+				"BASE_HEAD=base-head",
 				"FINDINGS=Fix this concrete finding",
 				"FOCUSED_TESTS=go test ./internal/usage",
+				"ORIGINATING_ATTEMPT=review-round-r2",
+				"REVIEWED_HEAD=reviewed-head",
 				"ROUND=2",
+				"RUN_DIR=/tmp/orchestrate/run",
+				"SPEC_ID=approved-design-v1",
+				"TASK_ID=contract-task",
 			},
-			required: []string{"Review round 2", "Fix this concrete finding"},
+			required: []string{"Review round 2", "Fix this concrete finding", "Stable fix identity: run=/tmp/orchestrate/run task=contract-task attempt=fix-r2 originating-review=review-round-r2 base=base-head reviewed=reviewed-head spec=approved-design-v1."},
 		},
 		{
 			name: "ab-judge",
@@ -220,18 +239,24 @@ func TestExistingDeliveryPromptTemplatesStillRender(t *testing.T) {
 // PRs, and a deploy child that fast-forwarded a primary checkout.
 func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 	repoRoot := filepath.Clean("..")
-	skillBytes, err := os.ReadFile(filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"))
-	if err != nil {
-		t.Fatalf("read orchestration skill: %v", err)
-	}
-	skill := strings.Join(strings.Fields(string(skillBytes)), " ")
+	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
+	deliveryStartup := readNormalizedLinkedSkillDoc(t, skillPath, "delivery startup")
+	taskDelivery := readNormalizedLinkedSkillDoc(t, skillPath, "task delivery")
 
-	rules := []string{
+	taskDeliveryRules := []string{
 		// Silent send drop: never send into a mid-turn child unguarded, and
 		// never treat a zero exit as arrival.
 		"`--defer-if-busy` on every send to a working child, without exception",
 		"--message-file \"$RUN_DIR/<slug>/fix-r<n>.md\" --defer-if-busy",
 		"**A zero exit is not arrival.**",
+	}
+	for _, rule := range taskDeliveryRules {
+		if !strings.Contains(taskDelivery, strings.Join(strings.Fields(rule), " ")) {
+			t.Errorf("task delivery route missing retro-hardened rule %q", rule)
+		}
+	}
+
+	deliveryStartupRules := []string{
 		// Landing policy is asked, not defaulted.
 		"Then settle the landing policy with the user, at triage, before a single branch is cut",
 		"**Mechanism** — pull request, or direct merge into an integration branch?",
@@ -243,13 +268,13 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 		"sh \"$GUARD\" verify --repo <repo> --run-dir \"$RUN_DIR\" --label deploy-<repo>",
 		"Verify **before deleting the child**",
 	}
-	for _, rule := range rules {
-		if !strings.Contains(skill, strings.Join(strings.Fields(rule), " ")) {
-			t.Errorf("skill missing retro-hardened rule %q", rule)
+	for _, rule := range deliveryStartupRules {
+		if !strings.Contains(deliveryStartup, strings.Join(strings.Fields(rule), " ")) {
+			t.Errorf("delivery startup route missing retro-hardened rule %q", rule)
 		}
 	}
 
-	if !strings.Contains(skill, `cp <agent-deck-repo>/skills/orchestrate/references/primary-checkout-guard.sh "$RUN_DIR/"`) {
+	if !strings.Contains(deliveryStartup, `cp <agent-deck-repo>/skills/orchestrate/references/primary-checkout-guard.sh "$RUN_DIR/"`) {
 		t.Error("run setup no longer installs the primary-checkout guard")
 	}
 
@@ -326,6 +351,8 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 
 	full := render(t, "review-full",
 		"AGENT_DECK_REPO=/tmp/agent-deck", "BASE_BRANCH=main", "BASELINE=baseline: none",
+		"ATTEMPT_ID=review-full-r1", "BASE_HEAD=base-head", "REVIEWED_HEAD=reviewed-head",
+		"RUN_DIR=/tmp/orchestrate/run", "SPEC_ID=approved-design-v1", "TASK_ID=contract-task",
 		"SPEC_BLOCK=Review requirements block", "VERDICT_FILE=/tmp/orchestrate/review-r1.md")
 	requireAll(t, "review-full", full, []string{
 		// D1: the suite starts first, detached, into the sibling log.
@@ -347,6 +374,8 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 
 	round := render(t, "review-round",
 		"AGENT_DECK_REPO=/tmp/agent-deck", "BASE_REF=main", "BASELINE=baseline: none",
+		"ATTEMPT_ID=review-round-r2", "BASE_HEAD=base-head", "REVIEWED_HEAD=reviewed-head",
+		"RUN_DIR=/tmp/orchestrate/run", "SPEC_ID=approved-design-v1", "TASK_ID=contract-task",
 		"FOCUSED_TESTS=go test ./internal/usage", "PREVIOUS_FINDINGS=One previous finding",
 		"REVIEWED_SHA=0123456789abcdef", "SPEC_BLOCK=Review requirements block",
 		"VERDICT_FILE=/tmp/orchestrate/review-r2.md")
@@ -359,12 +388,10 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"Checked: tests focused cmd=",
 	})
 
-	skillBytes, err := os.ReadFile(filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"))
-	if err != nil {
-		t.Fatalf("read orchestration skill: %v", err)
-	}
-	skill := strings.Join(strings.Fields(string(skillBytes)), " ")
-	requireAll(t, "orchestrate skill", skill, []string{
+	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
+	deliveryContracts := readNormalizedLinkedSkillDoc(t, skillPath, "delivery startup") + " " +
+		readNormalizedLinkedSkillDoc(t, skillPath, "task delivery")
+	requireAll(t, "orchestrate delivery routes", deliveryContracts, []string{
 		// D3: the contract carries a focused-test command for incremental rounds.
 		"the focused-test command",
 		"FOCUSED_TESTS=",

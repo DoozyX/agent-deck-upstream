@@ -56,7 +56,7 @@ func TestNormalizeEvent(t *testing.T) {
 
 func TestStoreBaselineAndDeduplicatesPersistently(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.json")
-	now := time.Date(2026, 8, 14, 10, 0, 0, 0, time.UTC)
+	now := time.Now().UTC()
 	event := Event{Class: Attention, SessionID: "worker-1", Title: "Worker", Timestamp: now}
 
 	store, err := OpenStore(path)
