@@ -304,18 +304,30 @@ func (s *recordingDailyRangeStore) CoveredCostByDayRange(from, to time.Time) ([]
 }
 
 func TestCostsDailyUsesSQLBoundedRange(t *testing.T) {
-	store := &recordingDailyRangeStore{Store: newTestCostStore(t)}
-	srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
-	srv.costStore = store
-	rr := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/costs/daily?days=30", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
-	}
-	if store.from.IsZero() || store.to.IsZero() || store.to.Sub(store.from) != 31*24*time.Hour ||
-		store.from.Location() != time.UTC || store.to.Location() != time.UTC ||
-		store.from.Hour() != 0 || store.to.Hour() != 0 {
-		t.Fatalf("CoveredCostByDayRange bounds = %s..%s, want 31 UTC calendar days", store.from, store.to)
+	for _, days := range []int{30, 1} {
+		t.Run(fmt.Sprintf("days=%d", days), func(t *testing.T) {
+			store := &recordingDailyRangeStore{Store: newTestCostStore(t)}
+			srv := NewServer(Config{ListenAddr: "127.0.0.1:0"})
+			srv.costStore = store
+			rr := httptest.NewRecorder()
+			before := time.Now().UTC()
+			srv.Handler().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/costs/daily?days=%d", days), nil))
+			after := time.Now().UTC()
+			if rr.Code != http.StatusOK {
+				t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+			}
+			midnightAfter := func(now time.Time) time.Time {
+				today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+				return today.AddDate(0, 0, 1)
+			}
+			if store.from.IsZero() || store.to.IsZero() || store.to.Sub(store.from) != time.Duration(days)*24*time.Hour ||
+				(store.to != midnightAfter(before) && store.to != midnightAfter(after)) ||
+				store.from.Location() != time.UTC || store.to.Location() != time.UTC ||
+				store.from.Hour() != 0 || store.from.Minute() != 0 || store.from.Second() != 0 || store.from.Nanosecond() != 0 ||
+				store.to.Hour() != 0 || store.to.Minute() != 0 || store.to.Second() != 0 || store.to.Nanosecond() != 0 {
+				t.Fatalf("CoveredCostByDayRange bounds = %s..%s, want %d-day half-open UTC interval at midnight", store.from, store.to, days)
+			}
+		})
 	}
 }
 

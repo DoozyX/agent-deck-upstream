@@ -69,17 +69,18 @@ func TestCostStatusLineUsesOneDetailScopeForOverlappingWindows(t *testing.T) {
 	home := newTestHomeWithItems(160, 30, nil)
 	home.costTodayCoverage = costs.Coverage{
 		EventCount: 1, TotalTokens: 7, UnknownPriceEventCount: 1,
-		UnknownPriceTokens: 7, CoverageKnown: true, Complete: false,
+		UnknownPriceTokens: 7, CoverageKnown: false, Complete: false,
 	}
 	home.costWeekCoverage = costs.Coverage{
 		EventCount: 2, TotalTokens: 12, UnknownPriceEventCount: 2,
-		UnknownPriceTokens: 12, CoverageKnown: true, Complete: false,
+		UnknownPriceTokens: 12, CoverageKnown: true, Complete: true,
 	}
 	home.costLineTemplate = "{cost_today} today / {cost_this_week} week | {unpriced_events} unpriced / {unpriced_tokens} tokens"
 	home.costLineHideWhenZero = false
 	view := home.View()
-	if !strings.Contains(view, "2 unpriced / 12 tokens") || strings.Contains(view, "3 unpriced / 19 tokens") {
-		t.Fatalf("overlapping windows must expose one truthful detail scope:\n%s", view)
+	if !strings.Contains(view, "2 unpriced / 12 tokens") || strings.Contains(view, "3 unpriced / 19 tokens") ||
+		!strings.Contains(view, "coverage unknown") || strings.Contains(view, "known subtotal") {
+		t.Fatalf("overlapping windows must expose one truthful detail scope and aggregate status:\n%s", view)
 	}
 }
 
