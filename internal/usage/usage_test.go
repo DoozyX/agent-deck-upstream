@@ -365,6 +365,30 @@ func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	}
 }
 
+func TestRunCodexUsesSelectedHomeAndIsolatesChildEnvironment(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "openusage")
+	log := filepath.Join(dir, "args")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s|%s|%s' \"$1\" \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '{\\\"limits\\\":{\\\"weekly\\\":{\\\"remaining_percent\\\":55}}}'\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OPENUSAGE_LOG", log)
+	t.Setenv("CODEX_HOME", "/inherited/codex")
+	t.Setenv("CLAUDE_CONFIG_DIR", "/inherited/claude")
+	t.Setenv("TELEGRAM_TOKEN", "must-not-reach-openusage")
+
+	s, err := (Runner{Path: bin, Timeout: 5 * time.Second}).Query(context.Background(), Account{Provider: Codex, Home: "/selected/codex", Label: "Personal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(log); string(got) != "codex|/selected/codex||" {
+		t.Fatalf("arguments/environment = %q", got)
+	}
+	if s.Windows.Weekly == nil || s.Windows.Weekly.RemainingPercent != 55 {
+		t.Fatalf("snapshot = %#v", s)
+	}
+}
+
 func TestRunTimeoutIsUnavailable(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
