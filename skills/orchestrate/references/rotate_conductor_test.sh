@@ -311,6 +311,7 @@ if log_has "$TMP/archive.log" "archive new-codex"; then
 else
   fail "quota: rejected successor archived after evidence capture" "$(cat "$TMP/archive.log" 2>/dev/null)"
 fi
+sleep 1
 if log_has "$TMP/archive.log" "archive self-gen1"; then
   fail "quota: predecessor must NOT be archived" "$(cat "$TMP/archive.log")"
 else
