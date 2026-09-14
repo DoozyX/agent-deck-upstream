@@ -660,7 +660,20 @@ func TestBulkFinalizationDoesNotOverwriteConcurrentGroupUpdate(t *testing.T) {
 		if err := original(s, target, nil, nil, token); err != nil {
 			return err
 		}
-		return s.SaveGroupsOnly(session.NewGroupTreeWithGroups(nil, updated))
+		_, stored, err := s.LoadWithGroups()
+		if err != nil {
+			return err
+		}
+		for _, group := range stored {
+			if group.Path == updated[0].Path {
+				group.Name = updated[0].Name
+				group.Expanded = updated[0].Expanded
+				group.Order = updated[0].Order
+				group.DefaultPath = updated[0].DefaultPath
+				group.MaxConcurrent = updated[0].MaxConcurrent
+			}
+		}
+		return s.SaveGroupsOnly(session.NewGroupTreeWithGroups(nil, stored))
 	}
 	t.Cleanup(func() { bulkSessionReverifyPersist = original })
 	if err := finalizeCommittedBulkRemovals(storage, []string{id}, []*session.RuntimeQueueTransaction{tx}, []session.LifecycleIntentHandle{intent}); err != nil {
