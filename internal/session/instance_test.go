@@ -675,11 +675,11 @@ func TestWaitForClaudeSession(t *testing.T) {
 }
 
 func TestInstance_GetSessionIDFromTmux(t *testing.T) {
-	skipIfNoTmuxServer(t)
-	skipIfNoClaudeBinary(t)
+	skipIfNoTmuxBinary(t)
 
-	// Create instance with tmux session
-	inst := NewInstanceWithTool("tmux-env-test", "/tmp", "claude")
+	// The environment read is tool-independent. A shell keeps the isolated
+	// tmux pane alive without depending on a real Claude install or account.
+	inst := NewInstanceWithTool("tmux-env-test", "/tmp", "shell")
 
 	// Start the session
 	err := inst.Start()
@@ -1261,21 +1261,13 @@ func TestInstance_Restart_ResumesClaudeSession(t *testing.T) {
 }
 
 func TestInstance_Restart_InterruptsAndResumes(t *testing.T) {
-	skipIfNoTmuxServer(t)
-	// This test requires claude to be installed (restart generates claude --resume command)
-	if _, err := exec.LookPath("claude"); err != nil {
-		t.Skip("claude not available - test requires claude CLI for restart functionality")
-	}
+	skipIfNoTmuxBinary(t)
 
-	// Isolate from user's environment (don't pick up their config.toml)
-	origHome := os.Getenv("HOME")
+	// Use the package's long-lived Claude stand-in. A real installed Claude can
+	// exit on auth or resume state and must never be consulted by this test.
 	tmpDir := t.TempDir()
-	os.Setenv("HOME", tmpDir)
-	ClearUserConfigCache()
-	defer func() {
-		os.Setenv("HOME", origHome)
-		ClearUserConfigCache()
-	}()
+	setupStubClaudeOnPATH(t, tmpDir)
+	t.Setenv("HOME", tmpDir)
 
 	// Create instance with known session ID
 	inst := NewInstanceWithTool("restart-interrupt-test", "/tmp", "claude")
