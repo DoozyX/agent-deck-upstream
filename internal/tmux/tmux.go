@@ -2759,6 +2759,31 @@ func (s *Session) Start(command string) error {
 	s.createdSessionID = createdSessionIdentityFromOutput(output)
 	createdID, identityErr := s.captureCreatedSessionIdentity()
 	if identityErr != nil {
+		// A short-lived initial command can exit after new-session returns but
+		// before the marker-based identity probe reaches tmux. The identity
+		// printed by this exact new-session invocation remains a safe target;
+		// use it only to read the retained dead pane's authoritative exit code.
+		// An allowed clean one-shot remains usable, while every other known exit
+		// reports its actual status instead of an unrelated probe failure.
+		if s.createdSessionID != "" {
+			if exitCode, exited := s.paneDeadExitStatusForTarget(s.createdSessionID + ":0.0"); exited {
+				if exitCode == 0 && s.AllowInitialProcessExit {
+					identityErr = nil
+				} else {
+					cleanupLaunchAckFiles(s.launchAckPath)
+					s.launchAckPath = ""
+					if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
+						statusLog.Warn("created_session_rollback_failed",
+							slog.String("session", logging.SanitizeValue(s.Name)),
+							slog.String("identity", logging.SanitizeValue(s.createdSessionID)),
+							slog.String("error", rollbackErr.Error()))
+					}
+					return fmt.Errorf("initial command exited before immutable identity capture (exit status %d)", exitCode)
+				}
+			}
+		}
+	}
+	if identityErr != nil {
 		cleanupLaunchAckFiles(s.launchAckPath)
 		s.launchAckPath = ""
 		if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
@@ -3076,7 +3101,11 @@ func (s *Session) AcknowledgeInitialProcess() error {
 			}
 			if time.Now().After(deadline) {
 				if !childAlive {
-					return waitForLaunchAckCompletion(ackPath, marker)
+					err := waitForLaunchAckCompletion(ackPath, marker, s.AllowInitialProcessExit)
+					if err == nil {
+						retainAck = s.AllowInitialProcessExit
+					}
+					return err
 				}
 				retainAck = s.AllowInitialProcessExit
 				return nil
@@ -3108,7 +3137,7 @@ const (
 // observable marker/output progress, while the absolute cap keeps a broken
 // wrapper bounded. This avoids converting a slow filesystem or a large
 // diagnostic into a false early launch failure.
-func waitForLaunchAckCompletion(ackPath, marker string) error {
+func waitForLaunchAckCompletion(ackPath, marker string, allowCleanExit bool) error {
 	quietDeadline := time.Now().Add(launchAckDrainQuietPeriod)
 	absoluteDeadline := time.Now().Add(launchAckDrainMax)
 	lastProgress := launchAckProgress(ackPath, marker)
@@ -3116,6 +3145,9 @@ func waitForLaunchAckCompletion(ackPath, marker string) error {
 		if raw, err := os.ReadFile(ackPath); err == nil {
 			marker = strings.TrimSpace(string(raw))
 			if exitCode, _, ok := parseLaunchAckMarker(marker); ok && exitCode != nil {
+				if *exitCode == 0 && allowCleanExit {
+					return nil
+				}
 				diagnostic := launchAckDiagnostic(marker)
 				if diagnostic != "" {
 					return fmt.Errorf("initial command exited before launch acknowledgement (exit status %d): %s", *exitCode, diagnostic)
@@ -3657,11 +3689,18 @@ func (s *Session) IsPaneDead() bool {
 // pair to distinguish a clean exit (0) from a crash (non-zero) instead of
 // treating every terminated pane as an error.
 func (s *Session) PaneDeadExitStatus() (int, bool) {
+	return s.paneDeadExitStatusForTarget(s.Name + ":0.0")
+}
+
+func (s *Session) paneDeadExitStatusForTarget(target string) (int, bool) {
+	if strings.TrimSpace(target) == "" {
+		return 0, false
+	}
 	// Bounded like IsPaneDead: this runs on the notify-daemon poll loop, so a
 	// wedged tmux server must not stall it.
 	ctx, cancel := context.WithTimeout(context.Background(), hasSessionProbeTimeout)
 	defer cancel()
-	out, err := s.tmuxCmdContext(ctx, "list-panes", "-t", s.Name+":0.0", "-F", "#{pane_dead}|#{pane_dead_status}").Output()
+	out, err := s.tmuxCmdContext(ctx, "list-panes", "-t", target, "-F", "#{pane_dead}|#{pane_dead_status}").Output()
 	if err != nil {
 		return 0, false
 	}
