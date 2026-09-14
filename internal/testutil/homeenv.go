@@ -91,6 +91,7 @@ func HomeAlreadyIsolated() bool {
 //
 // It sets:
 //   - HOME             -> <tempdir>            (os.UserHomeDir source on Unix)
+//   - CODEX_HOME       -> ""  (cleared; resolves under $HOME/.codex)
 //   - XDG_CONFIG_HOME  -> ""  (cleared; resolves under $HOME/.config)
 //   - XDG_DATA_HOME    -> ""  (cleared; resolves under $HOME/.local/share)
 //   - XDG_CACHE_HOME   -> ""  (cleared; resolves under $HOME/.cache)
@@ -145,6 +146,7 @@ func IsolatePackageHome(pattern string) func() {
 
 	keys := []string{
 		"HOME",
+		"CODEX_HOME",
 		"XDG_CONFIG_HOME",
 		"XDG_DATA_HOME",
 		"XDG_CACHE_HOME",
@@ -175,6 +177,9 @@ func IsolatePackageHome(pattern string) func() {
 	}
 
 	_ = os.Setenv("HOME", dir)
+	// Let Codex follow per-test HOME changes instead of an inherited live profile.
+	// Tests can still set an explicit CODEX_HOME override after isolation.
+	_ = os.Unsetenv("CODEX_HOME")
 	// Clear (do NOT pin) the XDG base dirs so they fall back to $HOME/*. This
 	// keeps the per-package shared HOME from accumulating stale XDG config/data
 	// across tests, and lets the common "swap HOME via t.TempDir()" pattern
