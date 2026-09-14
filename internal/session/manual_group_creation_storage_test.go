@@ -70,6 +70,10 @@ func TestStorageRejectsNewGroupFromManagedSessionBeforeInstanceWrite(t *testing.
 	if err := storage.SaveGroupsOnly(trustedTree); err != nil {
 		t.Fatalf("trusted declarative group save: %v", err)
 	}
+	_, storedGroups, err := storage.LoadWithGroups()
+	if err != nil {
+		t.Fatalf("reload trusted declarative group: %v", err)
+	}
 	allowed := &Instance{
 		ID:          "allowed-instance",
 		Title:       "allowed",
@@ -80,7 +84,7 @@ func TestStorageRejectsNewGroupFromManagedSessionBeforeInstanceWrite(t *testing.
 		CreatedAt:   time.Now(),
 	}
 	if err := storage.SaveWithGroups([]*Instance{allowed}, NewGroupTreeWithGroups(
-		[]*Instance{allowed}, []*GroupData{{Name: "user-made", Path: "user-made"}})); err != nil {
+		[]*Instance{allowed}, storedGroups)); err != nil {
 		t.Fatalf("managed session could not use existing group: %v", err)
 	}
 }

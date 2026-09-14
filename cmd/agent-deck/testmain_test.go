@@ -24,6 +24,14 @@ func TestMain(m *testing.M) {
 // Skipping this leaked per-run temp dirs on every run — the 2026-06-07
 // pty-exhaustion incident class.
 func runTestMain(m *testing.M) int {
+	// A package test may itself run inside a managed Agent Deck session. The
+	// isolated registry below cannot contain that external parent, so carrying
+	// its identity into CLI handlers makes otherwise top-level test launches
+	// abort before their assertions run. Individual tests that exercise
+	// parenting set their own identity after TestMain has established isolation.
+	_ = os.Unsetenv("AGENT_DECK_SESSION_ID")
+	_ = os.Unsetenv("AGENTDECK_INSTANCE_ID")
+
 	// Tests frequently replace HOME with a per-test directory. Keep Go's
 	// downloaded module and build caches outside those t.TempDir trees so
 	// read-only module-cache files cannot make testing.T cleanup fail.

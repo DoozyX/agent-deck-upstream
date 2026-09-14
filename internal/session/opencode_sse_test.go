@@ -199,6 +199,14 @@ func TestBuildOpenCodeCommand_SSEPortFlag(t *testing.T) {
 // The package TestMain isolates HOME, so the effective config path is a
 // sandboxed temp home — writing it never touches a real user config.
 func TestBuildOpenCodeSSEPortFlag_Disabled(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	for _, name := range []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"} {
+		t.Setenv(name, filepath.Join(home, name))
+	}
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+
 	configPath, err := GetUserConfigPath()
 	if err != nil {
 		t.Fatalf("GetUserConfigPath: %v", err)

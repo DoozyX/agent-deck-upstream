@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/tmux"
@@ -58,38 +56,37 @@ func TestGetLastResponseBestEffort_GoneReturnsEmpty(t *testing.T) {
 }
 
 func TestGetLastResponseBestEffort_UsesFinalCaptureError(t *testing.T) {
+	permissionErr := errors.New("capture permission denied")
 	for _, tc := range []struct {
-		name, first, last string
-		wantGone          bool
+		name        string
+		first, last error
+		wantGone    bool
 	}{
-		{"gone then permission", "no server running on /tmp/test", "error connecting to /tmp/test (Permission denied)", false},
-		{"permission then gone", "error connecting to /tmp/test (Permission denied)", "no server running on /tmp/test", true},
-		{"other failure then gone", "unknown capture failure", "no server running on /tmp/test", true},
+		{"gone then permission", tmux.ErrCaptureGone, permissionErr, false},
+		{"permission then gone", permissionErr, tmux.ErrCaptureGone, true},
+		{"other failure then gone", errors.New("unknown capture failure"), tmux.ErrCaptureGone, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir := t.TempDir()
-			// Two attempts model a teardown/reconnect changing the socket between reads.
-			script := "#!/bin/sh\nif [ ! -f \"$CAPTURE_STATE\" ]; then touch \"$CAPTURE_STATE\"; printf '%s\\n' \"$FIRST_ERROR\" >&2; else printf '%s\\n' \"$LAST_ERROR\" >&2; fi\nexit 1\n"
-			if err := os.WriteFile(filepath.Join(dir, "tmux"), []byte(script), 0700); err != nil {
-				t.Fatal(err)
-			}
-			t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-			t.Setenv("CAPTURE_STATE", filepath.Join(dir, "captured"))
-			t.Setenv("FIRST_ERROR", tc.first)
-			t.Setenv("LAST_ERROR", tc.last)
+			attempt := 0
 			i := &Instance{Tool: "codex", tmuxSession: goneTmuxSession()}
-			resp, err := i.GetLastResponseBestEffort()
+			capture := func() (*ResponseOutput, error) {
+				attempt++
+				if attempt == 1 {
+					return nil, tc.first
+				}
+				return nil, tc.last
+			}
+			resp, err := i.getLastResponseBestEffort(capture)
+			if attempt != 2 {
+				t.Fatalf("capture attempts = %d, want 2", attempt)
+			}
 			if tc.wantGone {
 				if err != nil || resp == nil || resp.Content != "" {
 					t.Fatalf("final gone capture = %+v, %v; want empty response", resp, err)
 				}
 			} else {
-				if err == nil {
-					t.Fatal("final permission error was swallowed")
-				}
-				var exitErr *exec.ExitError
-				if !errors.As(err, &exitErr) || !strings.Contains(string(exitErr.Stderr), "Permission denied") {
-					t.Fatalf("wrong final error: %v", err)
+				if !errors.Is(err, permissionErr) {
+					t.Fatalf("final permission error = %v, want %v", err, permissionErr)
 				}
 			}
 		})
