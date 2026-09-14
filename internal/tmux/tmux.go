@@ -3206,6 +3206,7 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 				continue
 			case sessionIdentityOwned:
 				indeterminateAttempts = 0
+				pollAttempt = 0
 				if !sessionIdentityMatches(sessionID, probe.identity) {
 					return
 				}
