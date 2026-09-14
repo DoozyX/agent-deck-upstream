@@ -48,6 +48,7 @@ REPO="$(jq -r '(.data // .) | .path // empty' <<<"$SELF_JSON")"
 # successor landed in `doozyx`, derived from the path. The only place
 # `group_path` is a real key is `status --stale --json`.
 GROUP="$(jq -r '(.data // .) | .group // empty' <<<"$SELF_JSON")"
+PARENT_ID="$(jq -r '(.data // .) | .parent_session_id // .parent_id // empty' <<<"$SELF_JSON")"
 SELF_TOOL="$(jq -r '(.data // .) | .tool // empty' <<<"$SELF_JSON")"
 if [ -z "$SELF_ID" ] || [ -z "$REPO" ]; then
   echo "rotate-conductor: could not resolve this session (id=$SELF_ID path=$REPO)." >&2
@@ -253,13 +254,17 @@ await_successor() {
   return 1
 }
 
-# --no-parent: a conductor is the root of its own tree.
 launch_successor() {
   local tool="$1" rc=0
   local -a cmd
-  cmd=(launch "$REPO" -t "$NEXT_TITLE" -c "$tool" --no-parent
-       --message-file "$PROMPT_FILE")
-  [ -n "$GROUP" ] && cmd+=(-g "$GROUP")
+  cmd=(launch "$REPO" -t "$NEXT_TITLE" -c "$tool" --conductor)
+  if [ -n "$PARENT_ID" ]; then
+    cmd+=(--parent "$PARENT_ID" --inherit-group)
+  else
+    cmd+=(--no-parent)
+    [ -n "$GROUP" ] && cmd+=(-g "$GROUP")
+  fi
+  cmd+=(--message-file "$PROMPT_FILE")
   # Clear the previous attempt's readings, so a retry that never gets far
   # enough to probe cannot log the FIRST attempt's session show under its own
   # heading in rotate-failure-*.log.

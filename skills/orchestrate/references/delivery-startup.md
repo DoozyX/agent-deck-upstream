@@ -52,9 +52,15 @@ AVAILABLE_TOOLS=$(jq -r '.available_tools | join(", ")' "$RUN_DIR/tool-policy.js
   prefer another connector. If it is unavailable, select an available tool and
   record that fallback.
 - An explicit workflow choice (for example the cross-provider Codex reviewer)
-  overrides the policy.
-- Before launching, append `role=<role> tool=<tool> reason=<one line>` to
-  `$RUN_DIR/manifest.md`. Automatic selection that is not recorded is not a
+  overrides the policy. "The policy" here is the tool policy from `agent-deck
+  config orchestrate` — a different object from the usage recommendation, which
+  the same choice yields to only when that provider's state is `exhausted`, as
+  "Explicit workflow tool choices" in [principles and
+  permissions](principles-and-permissions.md) qualifies it.
+- Before launching, append the full manifest line defined under "Record every
+  launch" in [principles and permissions](principles-and-permissions.md) —
+  `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`, all six fields —
+  to `$RUN_DIR/manifest.md`. Automatic selection that is not recorded is not a
   selection; it is hidden drift.
 - Connector flags move with the connector. `LEAN` is Claude-only. Build a
   role-specific argument array for another connector rather than passing
@@ -277,7 +283,10 @@ silently replace the shared contract.
 
 Then record per task: slug, base ref and resolved base sha, branch, worktree
 path, verified launch HEAD and merge base, session ids with each session's
-connector + model (and any escalation), current stage, review round, the HEAD
+connector + model (and any escalation), the per-launch usage decision line
+`role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>`
+from "Usage-aware launch" in [principles and
+permissions](principles-and-permissions.md), current stage, review round, the HEAD
 sha each review round saw, per review round `launched=<unix> done=<unix>
 span=<s>` (from `session children --json`, so the next run can be compared
 against this one's round times), the `AB_SUMMARY:` line of each blind A/B

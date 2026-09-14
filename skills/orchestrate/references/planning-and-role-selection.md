@@ -38,8 +38,9 @@ and any safety/rollback steps. It does not embed production code, duplicate
 the approved design, or predict unobserved output. Short signatures, schemas,
 and pseudocode are allowed only when they are the shared interface the plan
 exists to settle. Each task file carries an `## Interfaces` block and an empty
-`## Record (append-only)` section. It tags every task `tier: mid | strong` and
-sizes it to fit one fresh session. It implements nothing, and it commits
+`## Record (append-only)` section. It tags every task
+`tier: mid | strong | frontier` and sizes it to fit one fresh session. It
+implements nothing, and it commits
 nothing — the plan is scaffolding under `$PLAN_ROOT`, not a change to the branch.
 Verify that after it finishes:
 
@@ -149,10 +150,14 @@ Passing a model is per-connector: `-c claude` and `-c codex` both accept
 `--extra-arg --model --extra-arg <model>`; a connector with no known model
 flag runs its default (tier by connector choice alone). Omit the flag to
 use the user's default. Each provider maps its own ladder onto
-cheap/mid/strong — Claude: `haiku` / `sonnet` / `opus` (aliases
-self-update to the latest release, so pass them bare; `fable` sits above
-opus for the very hardest work); Codex (GPT-5.6): `gpt-5.6-luna` /
-`gpt-5.6-terra` / `gpt-5.6-sol` (generation-prefixed, so these do drift).
+cheap/mid/strong/frontier — Claude: `haiku` / `sonnet` / `opus` / `fable`
+(the first three are aliases that self-update to the latest release, so pass
+them bare); Codex (GPT-5.6): `gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` /
+`gpt-6-astra` (generation-prefixed, so these do drift). The top rung is
+special: frontier is never a baseline the conductor picks on its own. It is
+reached only by a planner `tier: frontier` tag — which is why the baseline
+table's frontier row names that tag — or by an escalation, which reaches it
+through strong whatever tier the role started at.
 Trust the user's config/defaults over any example here. Connector-specific mechanics move with the role:
 read-only enforcement for a **Codex** reviewer is
 `--extra-arg --sandbox --extra-arg read-only` (not `--disallowedTools`,
@@ -177,6 +182,7 @@ Baseline tier per session:
 | --- | --- |
 | Planner, plan reviewer, merge-conflict, integration check | strong (e.g. opus) |
 | Implementer of a reviewed plan task | the plan task's `tier:` tag — never below mid |
+| Implementer of a plan task tagged `tier: frontier` | frontier |
 | Implementer, clear spec but no plan | mid (e.g. sonnet) |
 | Implementer, freeform — designs its own approach | strong |
 | Reviewer, default | mid (e.g. sonnet) |
@@ -185,8 +191,9 @@ Baseline tier per session:
 
 For planned tasks the planner's `tier:` tags (see the planner prompt) are
 authoritative — the planner read the codebase; you'd be guessing from
-titles. Mid is the floor for any implementer, though, and the planner only
-tags `mid` or `strong` for that reason: an implementer never merely
+titles. Mid is the floor for any implementer, though, and the planner tags
+`mid`, `strong` or `frontier` for that reason — never below mid: an
+implementer never merely
 transcribes the plan. It also edits real files, runs the verification
 commands, diagnoses a failure the plan did not predict, commits, and emits
 the sentinel — and a cheap-tier session that drops one of those does not
@@ -223,19 +230,22 @@ that gets it wrong costs you one re-read; doing it yourself costs you the
 context permanently. Cheap does not extend to implementing or reviewing —
 those have their own floor above.
 
-Escalations are one-way — once a role escalates, it stays strong for the
-rest of that task:
+Escalations are one-way — once a role escalates, it stays at the escalated
+tier for the rest of that task:
 
 - **Reviewer oscillates** — a round reports new findings in code an earlier
   round already passed, meaning the reviewer is missing things → escalate
-  the reviewer to strong.
+  the reviewer to strong → frontier.
 - **Downgraded implementer fails round 2** — round 2 still reports `patch`
   or `decision-needed` findings → don't send a third round to the same
   session; launch the fix
-  as a NEW strong-model session in the same worktree (tell it to read
-  `git log` and the diff first). Caps the worst case at roughly
-  strong-model cost.
+  as a NEW session in the same worktree, escalated strong → frontier (tell it
+  to read `git log` and the diff first). Caps the worst case at roughly
+  one frontier-model session.
 
 Record every session's connector + model in the manifest, escalations
-included — the final report surfaces them, and that record is the only way
+included, on the launch line from "Usage-aware launch" in [principles and
+permissions](principles-and-permissions.md)
+(`role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>`)
+— the final report surfaces them, and that record is the only way
 to tell whether tiering saved cost or just bought extra rounds.

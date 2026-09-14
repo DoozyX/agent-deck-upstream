@@ -5,7 +5,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 ## Table of Contents
 
 - [Top-Level](#top-level)
-- [[quick_create] Section](#alternate-quick-create)
+- [[quick_create] Section](#quick_create-section)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
 - [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
@@ -625,18 +625,11 @@ default_tool = "codex"
 
 [orchestrate]
 tool_strategy = "auto"
-
-[orchestrate.routine]
-codex_model = "gpt-5.6-terra"
-codex_effort = "medium"
-claude_model = "sonnet"
-claude_effort = "medium"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `tool_strategy` | string | `""` (legacy) | `"default"` uses the top-level `default_tool` for every non-explicit orchestrated launch. `"auto"` lets the conductor mix locally installed, non-hidden tools by role and task, falling back to `default_tool` when no connector is clearly better. An omitted value preserves the workflow's historical explicit choices. |
-| `routing.*`, `routine.*`, `architecture.*` | strings | built-in role defaults | Optional role-default tables. Supported keys are `codex_model`, `codex_effort`, `claude_model`, and `claude_effort`. They fill only missing launch settings after explicit session/provider choices, group settings, and root provider defaults. Unsupported values make the launch visibly parked; they never upgrade to a stronger model. |
 
 Inspect the policy and the locally available auto-selection candidates:
 
@@ -652,13 +645,24 @@ choices continue to override this strategy.
 
 Defines the separate availability-aware advisory used by `agent-deck usage
 recommend`. This policy never overwrites an explicit launch choice or the
-`[orchestrate.*]` role-resolution precedence above.
+`[orchestrate.*]` role-resolution precedence above. Its thresholds,
+cross-provider failover order, and per-provider model ladder are optional; an
+omitted block uses the defaults below.
 
 ```toml
+[orchestrate]
+tool_strategy = "auto"
+
 [usage.policy]
-exhausted_below = 10
-constrained_below = 30
-failover = ["claude", "codex"]
+exhausted_below = 15
+constrained_below = 35
+failover = ["codex", "claude"]
+
+[usage.policy.ladder.claude]
+cheap = "haiku"
+mid = "sonnet"
+strong = "opus"
+frontier = "fable"
 
 [usage.policy.ladder.codex]
 cheap = "gpt-5.6-luna"
@@ -667,14 +671,61 @@ strong = "gpt-5.6-sol"
 frontier = "gpt-6-astra"
 
 [usage.policy.frontier_window]
-codex = "weekly"
+claude = "fable"
 ```
 
-Thresholds are remaining percentages from 0 through 100 and
-`exhausted_below` must not exceed `constrained_below`. Failover entries are
-tool names without whitespace. An omitted ladder tier inherits its default; an
-explicit empty tier marks it unavailable. The config loader validates shape,
-then the usage policy layer merges defaults and validates the resolved policy.
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`. An exhausted provider is never *preferred* — unlike a constrained one it does not win the `strong` and `frontier` tiers — but it is still returned when no candidate is eligible, so read `state` on every decision. Must be `<= constrained_below`. The 0–100 range check is a config-LOAD rejection — `exhausted_below = 101` drives `accounts --json`, `config orchestrate` and `usage --all --json` to exit 1 as well — while the `<= constrained_below` comparison rejects at the load layer **only** when both keys are set explicitly; with `constrained_below` left at its default, `exhausted_below = 90` is a policy-layer rejection that only `usage recommend` reports, and the other three commands stay at exit 0. |
+| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`: avoided while a healthy candidate exists, but a constrained *preferred* tool still wins for the `strong` and `frontier` tiers. Its 0–100 range check and its half of the ordering comparison reject at the same two layers as `exhausted_below` above. |
+| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = "codex"` | Tool-name failover order. The ORDER is consulted **only** under `[orchestrate] tool_strategy = "auto"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool — that strategy has at most one candidate to choose from, so there is no other tool it could change to. With the shipped default — that key unset, as the `tool_strategy` row above documents — there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy ""`. Either way cross-provider failover does not happen there: no second provider is queried and `alternatives` comes back empty. Under `"auto"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order; when `--prefer` is omitted the first entry also *becomes* the preferred tool, so setting this key replaces `default_tool` in the order rather than being tried after it. A `default_tool` that is not itself a usage provider does not enter the order at all. An explicitly empty list is treated exactly like an omitted key and keeps the default order. Entries are validated by shape only and are never matched against the set of known tools, but under `"auto"` every entry is filtered against the locally installed, non-hidden tools, so a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed. That shape check is a config-LOAD rejection, not a policy-layer one: `failover = ["cla ude"]` fails the load itself, so `accounts --json`, `config orchestrate` and `usage --all --json` each exit 1 alongside `recommend` — unlike an unknown `ladder` or `frontier_window` table key, which only `recommend` rejects. Only when the candidate list ends up empty — every entry dropped, and the `--prefer` tool dropped or never passed — does a name survive verbatim: the decision then carries the `--prefer` tool, or the first entry when `--prefer` was omitted, as its `tool`, with `state: unknown` and the reason `no candidate tools for tool strategy "auto"`. `provider` comes back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way; `model` follows that provider's ladder, and is empty when the applied tier's rung is empty or when there is no provider. `--prefer` is checked against the tool registry rather than the installed set, so a registry name that is not installed passes the flag check and is then dropped here like any other entry. |
+| `[usage.policy.ladder.<claude\|codex>]` | table of strings | Claude `haiku`/`sonnet`/`opus`/`fable`; Codex `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol`/`gpt-6-astra` | Model per tier (`cheap`, `mid`, `strong`, `frontier`) for that provider. Only `claude` and `codex` are accepted, and the rejection is not a startup error: loading the config accepts an unknown table name and every other command keeps working — `usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1, so a ladder named for a non-usage tool breaks every `recommend` call rather than being ignored. An explicitly empty `frontier` rung marks that tier unavailable and the recommendation falls back to `strong`; an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged, which tells the caller to launch the connector's own default; an absent rung keeps the default. |
+| `[usage.policy.frontier_window]` | table of strings | `{ claude = "fable" }` | Per-provider name of the separate OpenUsage consumption window that gates the `frontier` tier. When that window is present in the snapshot and below `constrained_below`, `frontier` is applied as `strong`. A window that is unset gates nothing — and so does a window that is named here but absent from the snapshot the provider actually returned, which leaves `frontier` applied in full. This table's KEYS share the ladder's closed provider set and reject at the same layer: an unknown name is accepted by the load, and `usage recommend` alone rejects it, printing `invalid [usage.policy].frontier_window.<name>: unknown usage provider` and exiting 1 while every other command keeps working. |
+
+Read the current decision for a role and tier:
+
+```bash
+agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]
+```
+
+The command is read-only: it queries usage and prints a decision, and writes no
+configuration, session or account. It exits 0 for every decision — including
+`exhausted`, `unknown`, and the case where no candidate tool could be chosen at
+all — so a caller reads `state`, not the exit code. That last case is not always
+an empty `tool`: it always carries a `reason` beginning `no candidate tools for
+tool strategy`, but only when the strategy resolved no name either does `tool`
+come back empty with a remedy hint on stderr; when a name survives, as the
+`failover` row above describes, `tool` is that name, `provider` is filled in
+whenever it maps to a usage provider, `model` follows that provider's ladder and
+is empty when the applied tier's rung is empty, and stderr stays silent. Read
+the `reason`, not the emptiness of `tool`. Exit 2 is reserved for a bad flag: a
+missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
+positional argument, or anything else `flag.Parse` rejects — an undefined flag,
+or a defined flag given no value — except the four help spellings `-h`, `--h`,
+`-help`, and `--help`, which print the usage line on stderr and exit 0. Exit 1
+means the configuration could not be loaded or validated, or the JSON could not
+be encoded.
+
+`--json` prints the decision as ten snake_case keys: `tool`, `provider`,
+`model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`,
+`alternatives` (each entry `tool` / `state` / `remaining_percent`), and
+`fetched_at` (`null` whenever the selected tool has no available snapshot —
+because it was never queried at all, because its own query
+failed, or because `--profile` named no snapshot for it; among those,
+only the failed-query case still reports a non-empty `account` alongside the
+`null`; an RFC 3339 timestamp otherwise). A
+`remaining_percent` of `-1` covers both a reading that was not available and a
+provider that genuinely reported a negative remaining; read
+`state` to tell those apart. `tier_requested` and `tier_applied` differ whenever
+the recommendation moved the tier: a role floor raises `cheap` to `mid` for an
+implementer or reviewer, and an empty `frontier` ladder rung or a fired
+frontier-window gate lowers `frontier` to `strong`. The `reason` line says which
+happened.
+
+Known limitation: `agent-deck usage <session>` dispatches on the literal word
+`recommend` before it looks a session up, so a session titled exactly
+`recommend` is unreachable that way — pass the flag first
+(`agent-deck usage --json recommend`) to reach the session instead.
 
 ## [logs] Section
 

@@ -15,11 +15,11 @@
   write a plan; when the gate justifies one, a planner child writes a concise
   coordination plan against the codebase in the worktree.
   A design path arriving in a session titled `conductor-<run-id>` is the
-  **hand-off entrance**: the brainstorm session launched you detached
-  (`--no-parent`) so it stays free for the next feature. You are the root of
-  your own session tree; behaviour is otherwise identical to the in-session
-  entrance, and your questions reach the user through the watchdog banner
-  and your own `waiting` state, never through the session that launched you.
+  **hand-off entrance**: the brainstorm session launched you in the background
+  with the explicit conductor role, parented for group inheritance and event
+  routing. You own the run's orchestration subtree; behaviour is otherwise
+  identical to the in-session entrance, and your questions reach the user
+  through the watchdog banner, your own `waiting` state, and parent routing.
 - An argument that is already an **implementation plan** (ordered tasks with
   file paths and verification steps) → plan-fed: skip the planner child, then
   apply the fan-out gate in "Reviewing the plan" exactly as if a planner had
