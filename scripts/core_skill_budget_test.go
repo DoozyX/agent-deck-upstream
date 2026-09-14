@@ -49,6 +49,31 @@ func TestCoreSkillByteCeilingAndRepresentativeRouteBudgets(t *testing.T) {
 	if deliveryStartupRoute > 50_000 {
 		t.Fatalf("delivery startup route = %d bytes, want <= 50000", deliveryStartupRoute)
 	}
+
+	for label, contract := range map[string]struct {
+		path      string
+		stageOnly string
+	}{
+		"agent-deck": {
+			path:      agentCore,
+			stageOnly: "Load only the reference for the current operation",
+		},
+		"orchestrate": {
+			path:      orchestrateCore,
+			stageOnly: "Load only the row for the current stage",
+		},
+	} {
+		core, err := os.ReadFile(contract.path)
+		if err != nil {
+			t.Fatalf("read %s core: %v", label, err)
+		}
+		if !strings.Contains(string(core), contract.stageOnly) {
+			t.Errorf("%s core lost stage-only loading rule %q", label, contract.stageOnly)
+		}
+		if strings.Contains(string(core), "{{include:") {
+			t.Errorf("%s core eagerly includes a routed reference", label)
+		}
+	}
 }
 
 func TestCoreSkillRoutingAndCompatibilityContracts(t *testing.T) {
@@ -69,6 +94,7 @@ func TestCoreSkillRoutingAndCompatibilityContracts(t *testing.T) {
 	agentCore := string(agentCoreBytes)
 	orchestrateCore := string(orchestrateCoreBytes)
 	planning := string(planningBytes)
+	normalizedPlanning := strings.Join(strings.Fields(planning), " ")
 	for label, document := range map[string]string{
 		"agent-deck core":  agentCore,
 		"orchestrate core": orchestrateCore,
@@ -93,6 +119,15 @@ func TestCoreSkillRoutingAndCompatibilityContracts(t *testing.T) {
 	}
 	if !strings.Contains(orchestrateCore, "Deterministic checks run directly through shell/process execution") {
 		t.Error("orchestrate core does not route deterministic checks to process execution")
+	}
+	if !strings.Contains(normalizedPlanning, "<routing|routine|architecture>") {
+		t.Error("planning route does not assert the complete supported orchestrate role set")
+	}
+	if strings.Contains(normalizedPlanning, "<deterministic|routing|routine|architecture>") {
+		t.Error("planning route advertises deterministic as a supported model role")
+	}
+	if !strings.Contains(normalizedPlanning, "Run deterministic checks directly through shell/process execution") {
+		t.Error("planning route does not distinguish process-only deterministic checks")
 	}
 	if !strings.Contains(agentCore, "metadata:\n  compatibility: \"claude, opencode\"") {
 		t.Error("agent-deck core lost compatibility metadata")

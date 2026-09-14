@@ -10,9 +10,11 @@ from urllib.parse import unquote
 
 
 REFERENCE_DEFINITION = re.compile(
-    r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*(<[^>\n]+>|(?:\\[^\n]|[^\s])+)",
+    r"^[ \t]{0,3}\[([^\]\n]+)\]:[ \t]*(<[^>\n]+>|(?:\\[^\n]|[^\s])+)",
     re.MULTILINE,
 )
+REFERENCE_USAGE = re.compile(r"\[([^\]\n]+)\]\[([^\]\n]*)\]")
+FENCE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})")
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 INCLUDE = re.compile(r"\{\{include:([^}]+)}}")
 CODE_PATH = re.compile(r"(?<![A-Za-z0-9_./-])((?:references|scripts)/[A-Za-z0-9_.@/-]+)")
@@ -36,15 +38,54 @@ def clean_link(raw: str) -> str:
     return value.split(maxsplit=1)[0]
 
 
+def markdown_without_fences(text: str) -> str:
+    active: list[str] = []
+    fence_character = ""
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        match = FENCE.match(line)
+        if not fence_character:
+            if match:
+                fence_character = match.group(1)[0]
+                fence_length = len(match.group(1))
+                active.append("\n" if line.endswith("\n") else "")
+            else:
+                active.append(line)
+            continue
+
+        if (
+            match
+            and match.group(1)[0] == fence_character
+            and len(match.group(1)) >= fence_length
+            and not line[match.end() :].strip()
+        ):
+            fence_character = ""
+            fence_length = 0
+        active.append("\n" if line.endswith("\n") else "")
+    return "".join(active)
+
+
+def has_line_closing_parenthesis(text: str, cursor: int) -> bool:
+    while cursor < len(text) and text[cursor] != "\n":
+        if text[cursor] == "\\":
+            cursor += 2
+            continue
+        if text[cursor] == ")":
+            return True
+        cursor += 1
+    return False
+
+
 def inline_markdown_destinations(text: str):
-    """Yield the supported CommonMark inline destinations, including parentheses."""
+    """Yield complete destinations from the declared inline-link surface."""
     search_from = 0
     while True:
         marker = text.find("](", search_from)
         if marker < 0:
             return
         search_from = marker + 2
-        if text.rfind("[", 0, marker) < 0:
+        line_start = text.rfind("\n", 0, marker) + 1
+        if text.rfind("[", line_start, marker) < 0:
             continue
 
         start = marker + 2
@@ -55,7 +96,8 @@ def inline_markdown_destinations(text: str):
                     cursor += 2
                     continue
                 if text[cursor] == ">":
-                    yield text[start : cursor + 1]
+                    if has_line_closing_parenthesis(text, cursor + 1):
+                        yield text[start : cursor + 1]
                     break
                 cursor += 1
             continue
@@ -75,29 +117,60 @@ def inline_markdown_destinations(text: str):
                     break
                 depth -= 1
             elif char.isspace() and depth == 0:
-                yield text[start:cursor]
+                if has_line_closing_parenthesis(text, cursor):
+                    yield text[start:cursor]
                 break
             cursor += 1
 
 
 def markdown_destinations(text: str):
-    yield from inline_markdown_destinations(text)
-    for match in REFERENCE_DEFINITION.finditer(text):
-        yield match.group(1)
+    active_text = markdown_without_fences(text)
+    yield from inline_markdown_destinations(active_text)
+    for match in REFERENCE_DEFINITION.finditer(active_text):
+        yield match.group(2)
+
+
+def normalize_reference_label(label: str) -> str:
+    return " ".join(label.split()).lower()
+
+
+def undefined_reference_labels(text: str) -> set[str]:
+    active_text = markdown_without_fences(text)
+    defined = {
+        normalize_reference_label(match.group(1))
+        for match in REFERENCE_DEFINITION.finditer(active_text)
+    }
+    used = {
+        normalize_reference_label(match.group(2) or match.group(1))
+        for match in REFERENCE_USAGE.finditer(active_text)
+    }
+    return used - defined
 
 
 def markdown_unescape(value: str) -> str:
-    return value.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    return re.sub(r"\\([!\"#$%&'()*+,./:;<=>?@\[\]^_`{|}~\\-])", r"\1", value)
+
+
+def partition_unescaped_fragment(link: str) -> tuple[str, str]:
+    cursor = 0
+    while cursor < len(link):
+        if link[cursor] == "\\":
+            cursor += 2
+            continue
+        if link[cursor] == "#":
+            return link[:cursor], link[cursor + 1 :]
+        cursor += 1
+    return link, ""
 
 
 def local_link_target(source: Path, raw: str) -> tuple[Path, str] | None:
-    link = markdown_unescape(clean_link(raw))
-    if not link or URI_SCHEME.match(link):
+    link = clean_link(raw)
+    if not link or URI_SCHEME.match(markdown_unescape(link)):
         return None
-    path_part, _, anchor = link.partition("#")
-    decoded_path = unquote(path_part)
+    path_part, anchor = partition_unescaped_fragment(link)
+    decoded_path = unquote(markdown_unescape(path_part))
     target = source if not decoded_path else (source.parent / decoded_path).resolve()
-    return target, unquote(anchor)
+    return target, unquote(markdown_unescape(anchor))
 
 
 def markdown_anchors(path: Path) -> set[str]:
@@ -124,8 +197,45 @@ def iter_files(root: Path):
             yield path
 
 
-def unreachable_reference_errors(root: Path) -> set[str]:
-    """Require routed top-level references to be reachable from the skill core."""
+def routed_targets(source: Path, text: str, root: Path, repo_root: Path):
+    for raw in markdown_destinations(text):
+        resolved = local_link_target(source, raw)
+        if resolved is not None:
+            yield resolved[0]
+    for match in INCLUDE.finditer(text):
+        yield (source.parent / match.group(1).strip()).resolve()
+    for match in CODE_PATH.finditer(text):
+        yield (root / match.group(1).rstrip(".,;:")).resolve()
+    for match in REPO_PATH.finditer(text):
+        yield (repo_root / match.group(1).rstrip(".,;:")).resolve()
+    for match in SKILL_PATH.finditer(text):
+        yield (root / match.group(1).rstrip(".,;:")).resolve()
+
+
+def required_routed_resources(root: Path) -> set[Path]:
+    reference_dir = root / "references"
+    required = {path.resolve() for path in reference_dir.glob("*.md")}
+    prompt_dir = reference_dir / "prompts"
+    if prompt_dir.is_dir():
+        required.update(
+            path.resolve()
+            for path in prompt_dir.iterdir()
+            if path.is_file()
+            and path.suffix in {".md", ".sh", ".py"}
+            and not path.name.endswith("_test.sh")
+        )
+    required.update(
+        path.resolve()
+        for path in reference_dir.iterdir()
+        if path.is_file()
+        and path.suffix in {".sh", ".py"}
+        and not path.name.endswith("_test.sh")
+    )
+    return required
+
+
+def unreachable_resource_errors(root: Path, repo_root: Path) -> set[str]:
+    """Require Task04-owned references, prompts, and helpers to route from core."""
     if not root.is_dir():
         return set()
     core = root / "SKILL.md"
@@ -138,24 +248,20 @@ def unreachable_reference_errors(root: Path) -> set[str]:
     while pending:
         source = pending.pop()
         text = source.read_text(encoding="utf-8")
-        for raw in markdown_destinations(text):
-            resolved = local_link_target(source, raw)
-            if resolved is None:
-                continue
-            target, _ = resolved
+        for target in routed_targets(source, text, root, repo_root):
             if (
                 target.is_file()
-                and target.suffix == ".md"
-                and (target == root or root in target.parents)
+                and root in target.parents
                 and target not in reachable
             ):
                 reachable.add(target)
-                pending.append(target)
+                if target.suffix == ".md":
+                    pending.append(target)
 
     return {
-        f"{path}: unreachable reference from {core}"
-        for path in reference_dir.glob("*.md")
-        if path.resolve() not in reachable
+        f"{path}: unreachable routed resource from {core}"
+        for path in required_routed_resources(root)
+        if path not in reachable
     }
 
 
@@ -179,6 +285,8 @@ def validate(roots: list[Path]) -> list[str]:
                         candidates.append((display, target))
                         if anchor:
                             anchors.append((display, target, anchor))
+                for label in undefined_reference_labels(text):
+                    errors.add(f"{source}: undefined Markdown reference label {label}")
 
             if source.suffix == ".md":
                 for match in INCLUDE.finditer(text):
@@ -212,7 +320,7 @@ def validate(roots: list[Path]) -> list[str]:
                     errors.add(f"{source}: missing local anchor {anchor} in {display} -> {target}")
 
     for root in roots:
-        errors.update(unreachable_reference_errors(root))
+        errors.update(unreachable_resource_errors(root, repo_root))
 
     return sorted(errors)
 
