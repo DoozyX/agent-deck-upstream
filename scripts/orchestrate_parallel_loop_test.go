@@ -9,11 +9,11 @@ import (
 )
 
 // Design 2026-09-10-parallel-orchestrate-loop: the brainstorm session hands
-// an approved design to a detached conductor, review rounds after the first
-// are full-branch so any clean round is terminal, minor-only findings never
-// park a task, relay subtasks stack instead of waiting for a clean sibling,
-// and the design itself carries architecture, interfaces and a decomposition
-// sketch so the planner elaborates instead of re-deciding.
+// an approved design to a parented background conductor, review rounds after
+// the first are full-branch so any clean round is terminal, minor-only findings
+// never park a task, relay subtasks stack instead of waiting for a clean
+// sibling, and the design itself carries architecture, interfaces and a
+// decomposition sketch so the planner elaborates instead of re-deciding.
 func TestParallelOrchestrateLoop(t *testing.T) {
 	repoRoot := filepath.Clean("..")
 	readNormalized := func(t *testing.T, rel ...string) string {
@@ -56,11 +56,11 @@ func TestParallelOrchestrateLoop(t *testing.T) {
 		return strings.Join(strings.Fields(string(rendered)), " ")
 	}
 
-	t.Run("brainstorming launches a detached conductor and demands interfaces", func(t *testing.T) {
+	t.Run("brainstorming launches a parented conductor and demands interfaces", func(t *testing.T) {
 		skill := readNormalized(t, "skills", "brainstorming", "SKILL.md")
 		requireAll(t, "brainstorming skill", skill, []string{
 			// D1: the orchestrated exit is a launch, not an in-session skill call.
-			`-t "conductor-$RUN_ID" --no-parent`,
+			`-t "conductor-$RUN_ID" --conductor --inherit-group`,
 			`--message-file "$RUN_ROOT/design/conductor-prompt.md"`,
 			"this session is free",
 			// D5: feature designs settle contracts before any planner runs.
@@ -70,6 +70,7 @@ func TestParallelOrchestrateLoop(t *testing.T) {
 			"parallel-safe: yes|no",
 			"A planner that later has to ask a data-model question is a design gap",
 		})
+		forbidAll(t, "brainstorming skill", skill, []string{`conductor-$RUN_ID" --no-parent`})
 	})
 
 	t.Run("review-round replaces review-incremental", func(t *testing.T) {
