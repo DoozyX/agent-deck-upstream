@@ -92,8 +92,9 @@ type UserConfig struct {
 	// Default: true (nil = true)
 	SyncTitle *bool `toml:"sync_title,omitempty"`
 
-	// PushTitle passes the exact deck title via --name on supported Claude
-	// startup commands. Live renames take effect at the next start/restart.
+	// PushTitle derives a stable peer address from the deck title and immutable
+	// session id for --name on supported Claude startup commands. Live renames
+	// take effect at the next start/restart.
 	// Default: true (nil = true); unreadable config disables automatic naming.
 	PushTitle *bool `toml:"push_title,omitempty"`
 

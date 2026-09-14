@@ -7,9 +7,8 @@ import (
 	"unicode/utf8"
 )
 
-// claudeTitleName preserves the operator's title as one argv value. Controls
-// cannot be displayed safely; invalid titles omit the default instead of being
-// normalized into a different, potentially colliding name.
+// claudeTitleName validates the title source for a generated peer address.
+// Controls cannot be displayed safely; invalid titles omit the default.
 func claudeTitleName(title string) string {
 	if !utf8.ValidString(title) {
 		return ""
@@ -66,11 +65,12 @@ func pushTitleEnabled() bool {
 	return err == nil && cfg != nil && cfg.GetPushTitle()
 }
 
-// ClaudeLaunchName supplies a default for a supported Claude startup command.
-// It never reads an agent registry or sends input to a running process. Existing
-// startup builders retain ownership of account and conversation selection.
+// ClaudeLaunchName supplies the stable, collision-resistant peer address for a
+// supported Claude startup command. It never reads an agent registry or sends
+// input to a running process. Existing startup builders retain ownership of
+// account and conversation selection.
 func (i *Instance) ClaudeLaunchName() string {
-	if i == nil || !IsClaudeCompatible(i.Tool) || extraArgsSupplyName(i.ExtraArgs) || extraArgsSelectSession(i.ExtraArgs) || !pushTitleEnabled() {
+	if i == nil || !IsClaudeCompatible(i.Tool) || i.suppliesClaudeName() || extraArgsSelectSession(i.ExtraArgs) || !pushTitleEnabled() {
 		return ""
 	}
 	// Match the resume builder's generated-fork distinction. Arbitrary per-row
@@ -78,5 +78,8 @@ func (i *Instance) ClaudeLaunchName() string {
 	if i.Command != "" && i.Command != "claude" && !commandHasToken(i.Command, "--fork-session") && !commandHasToken(i.Command, "--session-id") {
 		return ""
 	}
-	return claudeTitleName(i.GetTitleThreadSafe())
+	if claudeTitleName(i.GetTitleThreadSafe()) == "" {
+		return ""
+	}
+	return i.ClaudePeerName()
 }
