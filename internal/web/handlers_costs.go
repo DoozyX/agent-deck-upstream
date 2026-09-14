@@ -119,8 +119,9 @@ func (s *Server) handleCostsDaily(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now().UTC()
-	from := now.AddDate(0, 0, -days).Truncate(24 * time.Hour)
-	to := now.AddDate(0, 0, 1).Truncate(24 * time.Hour)
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	from := today.AddDate(0, 0, -(days - 1))
+	to := today.AddDate(0, 0, 1)
 
 	dailyCosts, err := s.costStore.CoveredCostByDayRange(from, to)
 	if err != nil {
