@@ -348,7 +348,10 @@ func TestRunUsesFixedProviderAndHome(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Setenv("OPENUSAGE_LOG", log)
-	r := Runner{Path: bin, Timeout: time.Second}
+	// This test verifies argv/environment wiring, not the timeout boundary. Give
+	// the tiny helper enough scheduling room when every package runs in parallel;
+	// TestRunTimeoutIsUnavailable below retains the bounded-timeout coverage.
+	r := Runner{Path: bin, Timeout: 5 * time.Second}
 	s, err := r.Query(context.Background(), Account{Provider: Claude, Home: "/tmp/claude", Label: "Personal"})
 	if err != nil {
 		t.Fatal(err)
