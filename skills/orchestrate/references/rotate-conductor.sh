@@ -316,10 +316,16 @@ if attempt_rotation "$NEXT_TOOL"; then
 else
   FIRST_TOOL="$NEXT_TOOL"
   FIRST_REASON="$LIVENESS_REASON"
+  FIRST_QUOTA_BLOCKED=0
+  [ "$PROBE_SUBSTATE" = "usage-limit" ] && FIRST_QUOTA_BLOCKED=1
   FIRST_LOG="$(record_failure "$FIRST_TOOL" "$FIRST_REASON")"
   echo "rotate-conductor: successor on '$FIRST_TOOL' was dead on arrival: $FIRST_REASON" >&2
   echo "rotate-conductor:   evidence: $FIRST_LOG" >&2
   discard_successor
+
+  if [ "$FIRST_QUOTA_BLOCKED" -eq 1 ]; then
+    echo "rotate-conductor: rotation parked: '$FIRST_TOOL' exhausted its quota; automatic cross-provider retry is disabled. Wait for reset or an explicit operator decision." >&2
+  fi
 
   # 5b. Exactly one retry, on this conductor's own tool.
   #
@@ -333,9 +339,11 @@ else
   #
   # Bounded to one, and it burns nothing: GEN_FILE is written only after a
   # successor is confirmed alive, so a rejected attempt costs a session id and
-  # no generation. The retry is not conditioned on WHY the first one died —
-  # by that point a different tool is the only lever this script has.
+  # no generation. Quota exhaustion is different from an ordinary startup or
+  # liveness failure: it parks for reset or an operator decision instead of
+  # silently crossing providers.
   if [ "${ROTATE_NO_RETRY:-0}" != "1" ] && [ "$QUEUED_SUCCESSOR" -eq 0 ] && \
+     [ "$FIRST_QUOTA_BLOCKED" -eq 0 ] && \
      [ -n "$SELF_TOOL" ] && [ "$SELF_TOOL" != "$FIRST_TOOL" ]; then
     echo "rotate-conductor: retrying once on this conductor's own tool '$SELF_TOOL'." >&2
     if attempt_rotation "$SELF_TOOL"; then

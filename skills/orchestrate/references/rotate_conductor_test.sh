@@ -244,9 +244,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Usage limit, then one retry on the predecessor's own tool. Status is
-#    "idle" here on purpose: SubstateUsageLimit pairs with idle/waiting, so
-#    a status-only gate would wave this through.
+# 3. Usage limit parks the rotation without trying the predecessor's other
+#    provider. Status is "idle" here on purpose: SubstateUsageLimit pairs with
+#    idle/waiting, so a status-only gate would wave this through.
 # ---------------------------------------------------------------------------
 setup_case
 cat > "$TMP/policy.json" <<'JSON'
@@ -256,30 +256,26 @@ printf '%s\n' '{"id":"new-codex","status":"idle","substate":"usage-limit"}' > "$
 printf '%s\n' '{"id":"new-claude","status":"running","substate":"running"}' > "$TMP/plan_new-claude"
 printf '%s\n' "You've hit your usage limit." > "$TMP/output_new-codex"
 run_rotate
-check_rc "retry: exit 0" 0
-check_contains "retry: surfaces the usage limit" "usage-limit"
-check_contains "retry: names the predecessor tool it fell back to" "claude"
-check_file_is "retry: exactly one generation burned" "$RUN/.conductor-generation" 2
-check_file_is "retry: watchdog points at the live successor" "$RUN/.conductor-id" new-claude
-if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 2 ]; then
-  echo "ok   retry: bounded to exactly one retry"
+check_rc "quota: exit 4" 4
+check_contains "quota: surfaces the usage limit" "usage-limit"
+check_contains "quota: reports the parked rotation" "rotation parked"
+check_absent "quota: no generation burned" "$RUN/.conductor-generation"
+check_absent "quota: watchdog not repointed" "$RUN/.conductor-id"
+check_absent "quota: no children re-parented" "$TMP/setparent.log"
+if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 1 ]; then
+  echo "ok   quota: no cross-provider retry"
 else
-  fail "retry: bounded to exactly one retry" "$(cat "$TMP/launch.log")"
-fi
-if log_has "$TMP/setparent.log" "set-parent kid-1 new-claude"; then
-  echo "ok   retry: children re-parented to the live successor"
-else
-  fail "retry: children re-parented to the live successor" "$(cat "$TMP/setparent.log" 2>/dev/null)"
+  fail "quota: no cross-provider retry" "$(cat "$TMP/launch.log")"
 fi
 if log_has "$TMP/archive.log" "archive new-codex"; then
-  echo "ok   retry: the DOA successor is archived"
+  echo "ok   quota: rejected successor archived after evidence capture"
 else
-  fail "retry: the DOA successor is archived" "$(cat "$TMP/archive.log" 2>/dev/null)"
+  fail "quota: rejected successor archived after evidence capture" "$(cat "$TMP/archive.log" 2>/dev/null)"
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Retry also dead on arrival. One retry, not two, and the predecessor is
-#    still standing to tell the user.
+# 4. Ordinary non-quota startup failure still retries once, not twice, and the
+#    predecessor stays active when that retry also fails.
 # ---------------------------------------------------------------------------
 setup_case
 cat > "$TMP/policy.json" <<'JSON'
@@ -298,9 +294,9 @@ else
   echo "ok   both DOA: self not archived"
 fi
 if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 2 ]; then
-  echo "ok   both DOA: stopped after one retry"
+  echo "ok   both DOA: ordinary failure retained one bounded retry"
 else
-  fail "both DOA: stopped after one retry" "$(cat "$TMP/launch.log")"
+  fail "both DOA: ordinary failure retained one bounded retry" "$(cat "$TMP/launch.log")"
 fi
 
 # ---------------------------------------------------------------------------
