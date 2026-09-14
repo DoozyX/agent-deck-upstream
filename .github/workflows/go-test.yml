@@ -141,6 +141,17 @@ jobs:
           HOOK_TEST_STRICT: '1'   # python3 is guaranteed here; a skip is a bug
         run: bash hooks/test-session-start.sh
 
+      - name: Resolve packages
+        id: pkgs
+        run: |
+          if [ "${{ matrix.shard.packages }}" = "REST" ]; then
+            pkgs=$(go list ./... | grep -vE '/cmd/|/internal/session|/internal/ui|/internal/web|/tests/' | tr '\n' ' ')
+          else
+            pkgs="${{ matrix.shard.packages }}"
+          fi
+          echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
+          echo "$pkgs" | tr ' ' '\n'
+
       # Mirrors release.yml "Run tests" exactly — same gotestsum flags, same
       # -race, same 20m per-package timeout, same PERF_BUDGET_MULTIPLIER.
       - name: Run tests
