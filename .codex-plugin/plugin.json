@@ -1,0 +1,24 @@
+{
+  "name": "agent-deck",
+  "version": "1.3.2",
+  "description": "Complete guide for managing AI coding agent sessions via agent-deck CLI - session lifecycle, MCP management, groups, profiles, automation, and the workflow discipline suite (brainstorming, review, tdd, debug, verify)",
+  "author": {
+    "name": "Ashesh Goplani",
+    "email": "ashesh.goplani96@gmail.com"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Deck",
+    "shortDescription": "Manage AI coding agent sessions with Agent Deck.",
+    "longDescription": "Complete guide for managing AI coding agent sessions via agent-deck CLI - session lifecycle, MCP management, groups, profiles, automation, and the workflow discipline suite (brainstorming, review, tdd, debug, verify)",
+    "developerName": "Ashesh Goplani",
+    "category": "Productivity",
+    "capabilities": [
+      "Skills"
+    ],
+    "defaultPrompt": [
+      "Show me my Agent Deck sessions.",
+      "Help me manage work with Agent Deck."
+    ]
+  }
+}

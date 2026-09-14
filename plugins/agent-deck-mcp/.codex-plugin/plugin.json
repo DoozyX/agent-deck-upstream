@@ -1,0 +1,24 @@
+{
+  "name": "agent-deck-mcp",
+  "version": "0.1.0",
+  "description": "Connect Codex to the hosted Agent Deck MCP server.",
+  "author": {
+    "name": "DoozyX"
+  },
+  "interface": {
+    "displayName": "Agent Deck MCP",
+    "shortDescription": "Use hosted Agent Deck tools from Codex.",
+    "longDescription": "Connects Codex to the hosted Agent Deck MCP endpoint for session and agent workflows exposed by that server.",
+    "developerName": "DoozyX",
+    "category": "Productivity",
+    "capabilities": [
+      "MCP"
+    ],
+    "defaultPrompt": [
+      "Show me the Agent Deck tools available.",
+      "List my Agent Deck sessions.",
+      "Help me manage work with Agent Deck."
+    ]
+  },
+  "mcpServers": "./.mcp.json"
+}
