@@ -411,6 +411,37 @@ func TestStartHandlesImmediateExitWhenIdentityCaptureIsIndeterminate(t *testing.
 	}
 }
 
+// TestStartOrdersRetainedInitialProcessAfterOwnershipCapture pins the H01
+// launch ordering: the process that may exit immediately must not be spawned
+// until both its immutable session ID and remain-on-exit setting are ready.
+// The fake tmux rejects an early respawn deterministically, avoiding a timing
+// dependent fast-exit test.
+func TestStartOrdersRetainedInitialProcessAfterOwnershipCapture(t *testing.T) {
+	dir := t.TempDir()
+	ordered := filepath.Join(dir, "remain-on-exit-ready")
+	respawned := filepath.Join(dir, "initial-process-respawned")
+	createLog := filepath.Join(dir, "create.log")
+	writeFakeTmux(t, dir, "case \" $* \" in\n"+
+		"  *' has-session '*) exit 1 ;;\n"+
+		"  *' new-session '*) echo \"$*\" > "+shellQuote(createLog)+"; echo '$created'; exit 0 ;;\n"+
+		"  *' list-sessions '*) name=$(sed -n 's/.*-s \\([^ ]*\\).*/\\1/p' "+shellQuote(createLog)+"); marker=$(sed -n 's/.*AGENTDECK_SESSION_CREATION_MARKER=\\([^ ]*\\).*/\\1/p' "+shellQuote(createLog)+"); printf '$created\\t%s\\t%s\\n' \"$name\" \"$marker\"; exit 0 ;;\n"+
+		"  *' set-option '*"+"' remain-on-exit on '*) : > "+shellQuote(ordered)+"; exit 0 ;;\n"+
+		"  *' respawn-pane '*) [ -f "+shellQuote(ordered)+" ] || { echo respawn-before-remain-on-exit >&2; exit 9; }; case \" $* \" in *' -t $created:0.0 '*) : > "+shellQuote(respawned)+"; exit 0 ;; *) echo respawn-missing-created-identity >&2; exit 8 ;; esac ;;\n"+
+		"  *) exit 0 ;;\n"+
+		"esac\n")
+
+	sess := NewSession("ordered-initial-process", t.TempDir())
+	sess.RunCommandAsInitialProcess = true
+	sess.AllowInitialProcessExit = true
+	sess.OptionOverrides = map[string]string{"remain-on-exit": "on"}
+	if err := sess.Start("exit 0"); err != nil {
+		t.Fatalf("Start() = %v, want the initial process respawned only after ownership and retain-on-exit setup", err)
+	}
+	if _, err := os.Stat(respawned); err != nil {
+		t.Fatalf("Start() did not respawn the real initial process after setup: %v", err)
+	}
+}
+
 func TestStartRollsBackCreatedSessionWhenCreationOutputIsEmpty(t *testing.T) {
 	dir := t.TempDir()
 	createLog := filepath.Join(dir, "create.log")
