@@ -5387,6 +5387,12 @@ func (i *Instance) ensureClaudeSessionIDFromDiskForRestart() {
 // SpawnAttempt helper) to preserve the structural-grep contract that
 // checks Start()'s body for the #745 IsForkAwaitingStart guard.
 func (i *Instance) Start() error {
+	// Account refusal is a lifecycle precondition: validate before scratch
+	// preparation, repository temp creation, trust writes, or tmux spawn.
+	if err := i.ValidateAccount(); err != nil {
+		return err
+	}
+
 	// Clear the per-spawn resume marker before this start decides between a
 	// fresh and a resuming command (see shouldAutoConfirmResumePicker).
 	i.resetResumeMarker()
@@ -5624,6 +5630,7 @@ func (i *Instance) Start() error {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
+	i.ensureInteractiveShellAccount()
 	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 
@@ -5671,7 +5678,10 @@ func (i *Instance) Start() error {
 
 	// New sessions start as STARTING - shows they're initializing
 	// After 5s grace period, status will be properly detected from tmux
-	if command != "" {
+	// prepareCommand adds the repository-temp export prefix even when an
+	// interactive shell has no user command. That setup prefix is not launch
+	// work and must not move an idle shell into the starting state.
+	if i.Tool != "shell" || strings.TrimSpace(i.Command) != "" {
 		i.SetStatusThreadSafe(StatusStarting)
 	}
 
@@ -5720,6 +5730,12 @@ func (i *Instance) StartWithMessage(message string) error {
 }
 
 func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
+	// Match Start's fail-closed account boundary before any lifecycle side
+	// effect or message-delivery attempt.
+	if err := i.ValidateAccount(); err != nil {
+		return send.DeliverySendFailed, err
+	}
+
 	// Clear the per-spawn resume marker before this start decides between a
 	// fresh and a resuming command (see shouldAutoConfirmResumePicker).
 	i.resetResumeMarker()
@@ -5954,6 +5970,7 @@ func (i *Instance) StartWithMessageDelivery(message string) (string, error) {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
+	i.ensureInteractiveShellAccount()
 	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 
@@ -8206,6 +8223,10 @@ type ResponseOutput struct {
 // For Gemini: Parses the JSON session file for the last assistant message
 // For Codex/Others: Attempts to parse terminal output
 func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
+	return i.getLastResponse(i.getTerminalLastResponse)
+}
+
+func (i *Instance) getLastResponse(terminalCapture func() (*ResponseOutput, error)) (*ResponseOutput, error) {
 	if IsClaudeCompatible(i.Tool) {
 		return i.getClaudeLastResponse()
 	}
@@ -8215,7 +8236,7 @@ func (i *Instance) GetLastResponse() (*ResponseOutput, error) {
 	if i.Tool == "pi" {
 		return i.getPiLastResponse()
 	}
-	return i.getTerminalLastResponse()
+	return terminalCapture()
 }
 
 // GetLastResponseBestEffortChecked is the collision-aware variant of
@@ -8254,7 +8275,11 @@ func (i *Instance) GetLastResponseBestEffortChecked(peers []*Instance) (*Respons
 // 4. Fallback to terminal parsing.
 // 5. If still unavailable, return an empty response (no error).
 func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
-	resp, err := i.GetLastResponse()
+	return i.getLastResponseBestEffort(i.getTerminalLastResponse)
+}
+
+func (i *Instance) getLastResponseBestEffort(terminalCapture func() (*ResponseOutput, error)) (*ResponseOutput, error) {
+	resp, err := i.getLastResponse(terminalCapture)
 	if err == nil {
 		return resp, nil
 	}
@@ -8313,7 +8338,7 @@ func (i *Instance) GetLastResponseBestEffort() (*ResponseOutput, error) {
 
 	// Final fallback: terminal parsing (works for all tools).
 	if i.tmuxSession != nil {
-		terminalResp, terminalErr := i.getTerminalLastResponse()
+		terminalResp, terminalErr := terminalCapture()
 		if terminalErr == nil {
 			return terminalResp, nil
 		}
@@ -9501,6 +9526,12 @@ func (i *Instance) RestartWithEnv(env map[string]string) error {
 }
 
 func (i *Instance) restart(env map[string]string) error {
+	// Restart has several early respawn branches, so account validation belongs
+	// at the common entry boundary before signaling or replacing a process.
+	if err := i.ValidateAccount(); err != nil {
+		return err
+	}
+
 	i.resetResumeMarker()
 	beforeLock := nowFn()
 	release, lockErr := acquireInstanceSpawnLock(i.ID)
@@ -10110,6 +10141,7 @@ func (i *Instance) restart(env map[string]string) error {
 	// than falling back to "default". Covers shells/OpenCode/etc. that have no
 	// inline env-prefix injection of their own.
 	i.ensureProfileEnv()
+	i.ensureInteractiveShellAccount()
 	i.ensureRoleEnv()
 	i.ensureClaudeConfigDirEnv()
 

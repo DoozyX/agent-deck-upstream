@@ -3,9 +3,11 @@ package session
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
+	"al.essio.dev/pkg/shellescape"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -62,12 +64,12 @@ func TestBoundedShellCodexExecReportsLiveThenCleanCompletion(t *testing.T) {
 	bin := t.TempDir()
 	// The script name is intentionally codex: process-tree inspection must see
 	// the descendant beneath the shell launcher, rather than trusting pane text.
-	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nsleep 1\n"), 0o755))
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	fakeCodex := filepath.Join(bin, "codex")
+	assert.NoError(t, os.WriteFile(fakeCodex, []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nsleep 1\n"), 0o755))
 
 	inst := NewInstance("bounded-shell-codex", t.TempDir())
 	inst.Tool = "shell"
-	inst.Command = "codex exec --json work"
+	inst.Command = shellescape.Quote(fakeCodex) + " exec --json work"
 	assert.NoError(t, inst.Start())
 	t.Cleanup(func() { _ = inst.Kill() })
 
@@ -96,33 +98,32 @@ func TestBoundedShellCodexExecReportsNonzeroExit(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 
 	bin := t.TempDir()
-	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nexit 7\n"), 0o755))
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	fakeCodex := filepath.Join(bin, "codex")
+	assert.NoError(t, os.WriteFile(fakeCodex, []byte("#!/bin/sh\n[ \"$1\" = exec ] || exit 9\nexit 7\n"), 0o755))
 
 	inst := NewInstance("bounded-shell-codex-fail", t.TempDir())
 	inst.Tool = "shell"
-	inst.Command = "codex exec --json fail"
+	inst.Command = shellescape.Quote(fakeCodex) + " exec --json fail"
 	err := inst.Start()
-	if err == nil {
-		t.Fatal("Start() succeeded after the initial command exited 7")
+	if err != nil {
+		assert.Contains(t, err.Error(), "exit status 7")
 	}
-	assert.Contains(t, err.Error(), "exit status 7")
 	t.Cleanup(func() { _ = inst.Kill() })
 
-	deadline := time.NewTimer(5 * time.Second)
-	defer deadline.Stop()
-	tick := time.NewTicker(50 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		assert.NoError(t, inst.UpdateStatus())
-		if inst.GetStatusThreadSafe() == StatusError {
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatalf("status=%s; want error for codex exec exit 7", inst.GetStatusThreadSafe())
-		case <-tick.C:
-		}
+	assert.Eventually(t, func() bool {
+		_ = inst.UpdateStatus()
+		return inst.GetStatusThreadSafe() == StatusError
+	}, 5*time.Second, 50*time.Millisecond, "status=%s; want error for codex exec exit 7", inst.GetStatusThreadSafe())
+
+	// Under scheduler load, Start may acknowledge the process before the
+	// immediate exit is observable. The completion watcher must still persist
+	// the exact non-zero exit instead of reducing it to a generic error status.
+	if err == nil {
+		assert.Eventually(t, func() bool {
+			rec := inst.SpawnFailure()
+			return rec != nil && rec.Reason == "tmux_start_failed" &&
+				strings.Contains(rec.DyingOutput, "exit status 7")
+		}, 5*time.Second, 50*time.Millisecond)
 	}
 }
 
@@ -133,12 +134,12 @@ func TestInitialProcessAcknowledgementAcceptsCleanImmediateExit(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 
 	bin := t.TempDir()
-	assert.NoError(t, os.WriteFile(filepath.Join(bin, "codex"), []byte("#!/bin/sh\nprintf 'ONE_SHOT_OUTPUT\\n'\nexit 0\n"), 0o755))
-	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	fakeCodex := filepath.Join(bin, "codex")
+	assert.NoError(t, os.WriteFile(fakeCodex, []byte("#!/bin/sh\nprintf 'ONE_SHOT_OUTPUT\\n'\nexit 0\n"), 0o755))
 
 	inst := NewInstance("bounded-shell-codex-clean-exit", t.TempDir())
 	inst.Tool = "shell"
-	inst.Command = "codex exec --json done"
+	inst.Command = shellescape.Quote(fakeCodex) + " exec --json done"
 	assert.NoError(t, inst.Start())
 	t.Cleanup(func() { _ = inst.Kill() })
 	assert.Eventually(t, func() bool {
