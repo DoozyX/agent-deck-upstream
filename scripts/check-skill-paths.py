@@ -76,6 +76,43 @@ def has_line_closing_parenthesis(text: str, cursor: int) -> bool:
     return False
 
 
+def markdown_active_text(text: str) -> str:
+    """Mask fenced code, inline code, and escaped reference openers."""
+    active = list(markdown_without_fences(text))
+    cursor = 0
+    while cursor < len(active):
+        if (
+            active[cursor] == "\\"
+            and cursor + 1 < len(active)
+            and active[cursor + 1] == "["
+        ):
+            active[cursor] = " "
+            active[cursor + 1] = " "
+            cursor += 2
+            continue
+        if active[cursor] != "`":
+            cursor += 1
+            continue
+
+        run_end = cursor
+        while run_end < len(active) and active[run_end] == "`":
+            run_end += 1
+        delimiter = "`" * (run_end - cursor)
+        closing = re.search(
+            rf"(?<!`)({re.escape(delimiter)})(?!`)",
+            "".join(active[run_end:]),
+        )
+        if closing is None:
+            cursor = run_end
+            continue
+        closing_end = run_end + closing.end()
+        for index in range(cursor, closing_end):
+            if active[index] != "\n":
+                active[index] = " "
+        cursor = closing_end
+    return "".join(active)
+
+
 def inline_markdown_destinations(text: str):
     """Yield complete destinations from the declared inline-link surface."""
     search_from = 0
@@ -84,8 +121,8 @@ def inline_markdown_destinations(text: str):
         if marker < 0:
             return
         search_from = marker + 2
-        line_start = text.rfind("\n", 0, marker) + 1
-        if text.rfind("[", line_start, marker) < 0:
+        opening = text.rfind("[", 0, marker)
+        if opening < 0 or text.rfind("]", 0, marker) > opening:
             continue
 
         start = marker + 2
@@ -124,7 +161,7 @@ def inline_markdown_destinations(text: str):
 
 
 def markdown_destinations(text: str):
-    active_text = markdown_without_fences(text)
+    active_text = markdown_active_text(text)
     yield from inline_markdown_destinations(active_text)
     for match in REFERENCE_DEFINITION.finditer(active_text):
         yield match.group(2)
@@ -135,7 +172,7 @@ def normalize_reference_label(label: str) -> str:
 
 
 def undefined_reference_labels(text: str) -> set[str]:
-    active_text = markdown_without_fences(text)
+    active_text = markdown_active_text(text)
     defined = {
         normalize_reference_label(match.group(1))
         for match in REFERENCE_DEFINITION.finditer(active_text)
