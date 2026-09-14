@@ -39,7 +39,7 @@ const doneScanTailLines = 25
 
 // ValidateTranscriptPath cleans a Claude Code transcript path and applies the
 // same traversal / containment guards as the hook cost path: no "..", and the
-// path must live under ~/.claude (where Claude Code keeps transcripts). Both
+// path must live under the default or explicitly resolved Claude config home. Both
 // the hook handler (payload-supplied path) and the daemon (path re-read from
 // a hook status file) gate on this before opening the file.
 //
@@ -48,9 +48,36 @@ const doneScanTailLines = 25
 // whose string prefix matches but which lives outside the transcript root), so
 // the path must equal the root exactly OR begin with root + path separator. If
 // the home directory cannot be resolved we cannot establish the containment
-// root, so we REJECT rather than fall through (a missing root must never
-// disable containment for a payload-supplied path).
+// root. When neither the default home nor an explicit provider home can be
+// resolved, containment fails closed.
 func ValidateTranscriptPath(path string) (string, bool) {
+	var roots []string
+	if home, err := os.UserHomeDir(); err == nil {
+		roots = append(roots, filepath.Join(home, ".claude"))
+	}
+	if IsClaudeConfigDirExplicit() {
+		roots = append(roots, GetClaudeConfigDir())
+	}
+	return validateTranscriptPathIn(path, roots)
+}
+
+// ValidateTranscriptPathForInstance also admits the provider home selected by
+// the retained instance's account/conductor/group resolution chain.
+func ValidateTranscriptPathForInstance(path string, inst *Instance) (string, bool) {
+	var roots []string
+	if home, err := os.UserHomeDir(); err == nil {
+		roots = append(roots, filepath.Join(home, ".claude"))
+	}
+	if IsClaudeConfigDirExplicit() {
+		roots = append(roots, GetClaudeConfigDir())
+	}
+	if inst != nil && IsClaudeConfigDirExplicitForInstance(inst) {
+		roots = append(roots, GetClaudeConfigDirForInstance(inst))
+	}
+	return validateTranscriptPathIn(path, roots)
+}
+
+func validateTranscriptPathIn(path string, roots []string) (string, bool) {
 	if strings.TrimSpace(path) == "" {
 		return "", false
 	}
@@ -58,15 +85,16 @@ func ValidateTranscriptPath(path string) (string, bool) {
 	if strings.Contains(cleanPath, "..") {
 		return "", false
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", false
+	for _, root := range roots {
+		root = filepath.Clean(root)
+		if root == "." || root == "" {
+			continue
+		}
+		if cleanPath == root || strings.HasPrefix(cleanPath, root+string(os.PathSeparator)) {
+			return cleanPath, true
+		}
 	}
-	root := filepath.Join(home, ".claude")
-	if cleanPath != root && !strings.HasPrefix(cleanPath, root+string(os.PathSeparator)) {
-		return "", false
-	}
-	return cleanPath, true
+	return "", false
 }
 
 // ScanTranscriptTailForDone scans the transcript tail for a completion

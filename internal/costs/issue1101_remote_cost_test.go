@@ -103,6 +103,29 @@ func TestIssue1101_MergeRemoteCostSummaries_EmptyInput(t *testing.T) {
 	}
 }
 
+func TestRemoteCostSummary_NewCoverageAggregatesAndOldPeerStaysUnknown(t *testing.T) {
+	newPeer := RemoteCostSummary{
+		CoverageKnown: true,
+		TodayCoverage: Coverage{EventCount: 2, TotalTokens: 10, KnownPriceEventCount: 1, KnownPriceTokens: 4, UnknownPriceEventCount: 1, UnknownPriceTokens: 6, CoverageKnown: true, Complete: false},
+	}
+	legacyJSON := []byte(`{"cost_today_microdollars":250000,"events_today":3}`)
+	var oldPeer RemoteCostSummary
+	if err := json.Unmarshal(legacyJSON, &oldPeer); err != nil {
+		t.Fatal(err)
+	}
+	if oldPeer.CoverageKnown {
+		t.Fatal("older peer without metadata was treated as complete")
+	}
+
+	got := MergeRemoteCostSummaries(map[string]*RemoteCostSummary{"new": &newPeer, "old": &oldPeer, "failed": nil})
+	if got.CoverageKnown {
+		t.Fatal("unknown/failed remote coverage made aggregate look known")
+	}
+	if got.TodayCoverage.EventCount != 5 || got.TodayCoverage.TotalTokens != 10 || got.TodayCoverage.UnknownPriceTokens != 6 {
+		t.Fatalf("coverage aggregate = %+v", got.TodayCoverage)
+	}
+}
+
 func contains(s, sub string) bool {
 	return len(s) >= len(sub) && indexOf(s, sub) >= 0
 }

@@ -220,9 +220,12 @@ func (s *StateDB) DeleteInstanceRow(id string) error {
 // through time.Time without risking timezone drift.
 func (s *StateDB) LoadCostEventsForSession(sessionID string) ([]*CostEventRow, error) {
 	rows, err := s.db.Query(`
-		SELECT id, session_id, timestamp, model,
+		SELECT id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			cost_microdollars, budget_stop_triggered
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status, budget_stop_triggered
 		FROM cost_events WHERE session_id = ?
 	`, sessionID)
 	if err != nil {
@@ -233,12 +236,20 @@ func (s *StateDB) LoadCostEventsForSession(sessionID string) ([]*CostEventRow, e
 	for rows.Next() {
 		r := &CostEventRow{}
 		var budgetStop int
+		var providerInput sql.NullInt64
 		if err := rows.Scan(
-			&r.ID, &r.SessionID, &r.Timestamp, &r.Model,
+			&r.ID, &r.SessionID, &r.ParentSessionID, &r.RunID, &r.Timestamp,
+			&r.Provider, &r.SourceKind, &r.SourceIdentity, &r.TranscriptIdentity, &r.Model,
 			&r.InputTokens, &r.OutputTokens, &r.CacheReadTokens, &r.CacheWriteTokens,
-			&r.CostMicrodollars, &budgetStop,
+			&r.CacheWrite5mTokens, &r.CacheWrite1hTokens, &r.ReasoningTokens,
+			&providerInput, &r.CostMicrodollars, &r.PricingStatus,
+			&r.ReconciliationStatus, &budgetStop,
 		); err != nil {
 			return nil, err
+		}
+		if providerInput.Valid {
+			value := providerInput.Int64
+			r.ProviderInputTokens = &value
 		}
 		r.BudgetStopTriggered = budgetStop != 0
 		out = append(out, r)
@@ -254,17 +265,27 @@ func (s *StateDB) InsertCostEventRow(ev *CostEventRow) error {
 	if ev.BudgetStopTriggered {
 		budgetStop = 1
 	}
+	providerInput := any(nil)
+	if ev.ProviderInputTokens != nil {
+		providerInput = *ev.ProviderInputTokens
+	}
 	return withBusyRetry(func() error {
 		_, err := s.db.Exec(`
 			INSERT OR IGNORE INTO cost_events (
-				id, session_id, timestamp, model,
+				id, session_id, parent_session_id, run_id, timestamp,
+				provider, source_kind, source_identity, transcript_identity, model,
 				input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-				cost_microdollars, budget_stop_triggered
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+				provider_input_tokens, cost_microdollars, pricing_status,
+				reconciliation_status, budget_stop_triggered
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		`,
-			ev.ID, ev.SessionID, ev.Timestamp, ev.Model,
+			ev.ID, ev.SessionID, ev.ParentSessionID, ev.RunID, ev.Timestamp,
+			ev.Provider, ev.SourceKind, ev.SourceIdentity, ev.TranscriptIdentity, ev.Model,
 			ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens,
-			ev.CostMicrodollars, budgetStop,
+			ev.CacheWrite5mTokens, ev.CacheWrite1hTokens, ev.ReasoningTokens,
+			providerInput, ev.CostMicrodollars, ev.PricingStatus,
+			ev.ReconciliationStatus, budgetStop,
 		)
 		return err
 	})

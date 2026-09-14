@@ -2,6 +2,7 @@ package testutil_test
 
 import (
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -184,9 +185,13 @@ func hasPrefix(s, prefix string) bool {
 // from an unrelated tool) must not convince a TestMain that the real home is a
 // sandbox. Getting this wrong re-arms the 2026-06-04 data-loss incident.
 func TestHomeAlreadyIsolatedRejectsUnbackedMarker(t *testing.T) {
-	realHome, err := os.UserHomeDir()
+	account, err := user.Current()
 	if err != nil {
 		t.Skipf("cannot resolve the real home: %v", err)
+	}
+	realHome := account.HomeDir
+	if realHome == "" {
+		t.Skip("account database reports no real home")
 	}
 
 	t.Setenv(testutil.HomeIsolationMarkerEnv, "1")

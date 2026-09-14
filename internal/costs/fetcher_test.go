@@ -3,6 +3,7 @@ package costs_test
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -48,11 +49,21 @@ func TestFetcherWritesCache(t *testing.T) {
 	if err := pricer.LoadCache(); err != nil {
 		t.Fatal(err)
 	}
-	price, ok := pricer.GetPrice("claude-sonnet-4-6")
+	price, ok := pricer.GetPrice("claude-sonnet-5")
 	if !ok {
 		t.Fatal("missing price after cache load")
 	}
-	if price.InputPerMtokMicro != 3_000_000 {
-		t.Errorf("input = %d, want 3000000", price.InputPerMtokMicro)
+	if price.InputPerMtokMicro != 2_000_000 {
+		t.Errorf("input = %d, want 2000000", price.InputPerMtokMicro)
+	}
+	data, err := os.ReadFile(cachePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"provenance": "bundled"`) {
+		t.Fatalf("cache provenance is not bundled: %s", data)
+	}
+	if _, ok := pricer.GetPrice("gpt-5.6-sol"); !ok {
+		t.Fatal("bundled refresh did not reuse verified pricing catalog")
 	}
 }

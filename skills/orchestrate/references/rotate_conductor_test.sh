@@ -58,6 +58,11 @@ case "\$1 \$2" in
     printf 'set-parent %s %s\n' "\$3" "\$4" >> "\$T/setparent.log"
     ;;
   "session archive")
+    requirement="\$T/archive_require_\$3"
+    if [ -f "\$requirement" ]; then
+      receipt="\$(cat "\$requirement")"
+      [ ! -f "\$receipt" ] || cp "\$receipt" "\$T/receipt_at_archive_\$3"
+    fi
     printf 'archive %s\n' "\$3" >> "\$T/archive.log"
     ;;
   "session output")
@@ -104,6 +109,7 @@ setup_case() {
   # or its write lands in this case's archive.log.
   sleep 0.5
   rm -rf "$RUN" "$TMP"/plan_* "$TMP"/probes_* "$TMP"/launch_*.json "$TMP"/output_* \
+         "$TMP"/archive_require_* "$TMP"/receipt_at_archive_* \
          "$TMP/launch.log" "$TMP/setparent.log" "$TMP/archive.log" "$TMP/calls.log"
   mkdir -p "$RUN"
   cp "$SCRIPT" "$RUN/rotate-conductor.sh"
@@ -149,6 +155,22 @@ check_file_is() {
   local name=$1 path=$2 want=$3 got
   got="$(cat "$path" 2>/dev/null || true)"
   if [ "$got" = "$want" ]; then echo "ok   $name"; else fail "$name: $path is '$got', want '$want'"; fi
+}
+
+check_file_contains() {
+  if grep -qF -- "$3" "$2" 2>/dev/null; then
+    echo "ok   $1"
+  else
+    fail "$1: $2 missing fixed text '$3'" "$(cat "$2" 2>/dev/null)"
+  fi
+}
+
+check_files_equal() {
+  if cmp -s "$2" "$3"; then
+    echo "ok   $1"
+  else
+    fail "$1: files differ" "$(cmp "$2" "$3" 2>&1)"
+  fi
 }
 
 check_absent() {
@@ -264,42 +286,93 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Usage limit, then one retry on the predecessor's own tool. Status is
-#    "idle" here on purpose: SubstateUsageLimit pairs with idle/waiting, so
-#    a status-only gate would wave this through.
+# 3. Usage limit parks the rotation without trying the predecessor's other
+#    provider. Status is "idle" here on purpose: SubstateUsageLimit pairs with
+#    idle/waiting, so a status-only gate would wave this through.
 # ---------------------------------------------------------------------------
 setup_case
 cat > "$TMP/policy.json" <<'JSON'
 {"strategy":"default","fallback_tool":"codex"}
 JSON
+printf 'self-gen1\n' > "$RUN/.conductor-id"
+cp "$RUN/.conductor-id" "$TMP/quota-conductor-id.expected"
+printf '%s\n' "$RUN/rotate-failure-c2-codex.log" > "$TMP/archive_require_new-codex"
 printf '%s\n' '{"id":"new-codex","status":"idle","substate":"usage-limit"}' > "$TMP/plan_new-codex"
 printf '%s\n' '{"id":"new-claude","status":"running","substate":"running"}' > "$TMP/plan_new-claude"
 printf '%s\n' "You've hit your usage limit." > "$TMP/output_new-codex"
 run_rotate
-check_rc "retry: exit 0" 0
-check_contains "retry: surfaces the usage limit" "usage-limit"
-check_contains "retry: names the predecessor tool it fell back to" "claude"
-check_file_is "retry: exactly one generation burned" "$RUN/.conductor-generation" 2
-check_file_is "retry: watchdog points at the live successor" "$RUN/.conductor-id" new-claude
-if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 2 ]; then
-  echo "ok   retry: bounded to exactly one retry"
+check_rc "quota: exit 4" 4
+check_contains "quota: surfaces the usage limit" "usage-limit"
+check_contains "quota: reports the parked rotation" "rotation parked"
+check_absent "quota: no generation burned" "$RUN/.conductor-generation"
+check_files_equal "quota: conductor id preserved byte-for-byte" \
+  "$TMP/quota-conductor-id.expected" "$RUN/.conductor-id"
+check_absent "quota: no children re-parented" "$TMP/setparent.log"
+if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 1 ]; then
+  echo "ok   quota: no cross-provider retry"
 else
-  fail "retry: bounded to exactly one retry" "$(cat "$TMP/launch.log")"
+  fail "quota: no cross-provider retry" "$(cat "$TMP/launch.log")"
 fi
-if log_has "$TMP/setparent.log" "set-parent kid-1 new-claude"; then
-  echo "ok   retry: children re-parented to the live successor"
-else
-  fail "retry: children re-parented to the live successor" "$(cat "$TMP/setparent.log" 2>/dev/null)"
-fi
+quota_receipt="$RUN/rotate-failure-c2-codex.log"
+check_file_contains "quota: receipt records reason" "$quota_receipt" \
+  "reason: successor status is 'idle' but its substate is 'usage-limit'"
+check_file_contains "quota: receipt records successor id" "$quota_receipt" \
+  "successor id: new-codex"
+check_file_contains "quota: receipt records launch result" "$quota_receipt" \
+  '{"id":"new-codex"}'
+check_file_contains "quota: receipt records final probe" "$quota_receipt" \
+  '{"id":"new-codex","status":"idle","substate":"usage-limit"}'
+check_file_contains "quota: receipt captures session output" "$quota_receipt" \
+  "You've hit your usage limit."
+check_files_equal "quota: complete receipt captured before archival" \
+  "$quota_receipt" "$TMP/receipt_at_archive_new-codex"
 if log_has "$TMP/archive.log" "archive new-codex"; then
-  echo "ok   retry: the DOA successor is archived"
+  echo "ok   quota: rejected successor archived after evidence capture"
 else
-  fail "retry: the DOA successor is archived" "$(cat "$TMP/archive.log" 2>/dev/null)"
+  fail "quota: rejected successor archived after evidence capture" "$(cat "$TMP/archive.log" 2>/dev/null)"
+fi
+sleep 1
+if log_has "$TMP/archive.log" "archive self-gen1"; then
+  fail "quota: predecessor must NOT be archived" "$(cat "$TMP/archive.log")"
+else
+  echo "ok   quota: predecessor not archived"
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Retry also dead on arrival. One retry, not two, and the predecessor is
-#    still standing to tell the user.
+# 4. An ordinary non-quota startup failure retries once on the predecessor's
+#    tool. A live alternate must complete the same handoff as the happy path.
+# ---------------------------------------------------------------------------
+setup_case
+cat > "$TMP/policy.json" <<'JSON'
+{"strategy":"default","fallback_tool":"codex"}
+JSON
+printf '%s\n' '{"id":"new-codex","status":"error"}' > "$TMP/plan_new-codex"
+printf '%s\n' '{"id":"new-claude","status":"running","substate":"running"}' > "$TMP/plan_new-claude"
+run_rotate
+check_rc "alternate live: exit 0" 0
+check_file_is "alternate live: generation written" "$RUN/.conductor-generation" 2
+check_file_is "alternate live: watchdog repointed" "$RUN/.conductor-id" new-claude
+if log_has "$TMP/setparent.log" "set-parent kid-1 new-claude" &&
+   log_has "$TMP/setparent.log" "set-parent kid-2 new-claude"; then
+  echo "ok   alternate live: live children re-parented"
+else
+  fail "alternate live: live children re-parented" "$(cat "$TMP/setparent.log" 2>/dev/null)"
+fi
+if log_has "$TMP/archive.log" "archive new-codex"; then
+  echo "ok   alternate live: rejected first successor archived"
+else
+  fail "alternate live: rejected first successor archived" "$(cat "$TMP/archive.log" 2>/dev/null)"
+fi
+sleep 1
+if log_has "$TMP/archive.log" "archive self-gen1"; then
+  echo "ok   alternate live: predecessor archived"
+else
+  fail "alternate live: predecessor archived" "$(cat "$TMP/archive.log" 2>/dev/null)"
+fi
+
+# ---------------------------------------------------------------------------
+# 5. Ordinary non-quota startup failure still retries once, not twice, and the
+#    predecessor stays active when that retry also fails.
 # ---------------------------------------------------------------------------
 setup_case
 cat > "$TMP/policy.json" <<'JSON'
@@ -318,13 +391,13 @@ else
   echo "ok   both DOA: self not archived"
 fi
 if [ "$(grep -c '^launch ' "$TMP/launch.log")" = 2 ]; then
-  echo "ok   both DOA: stopped after one retry"
+  echo "ok   both DOA: ordinary failure retained one bounded retry"
 else
-  fail "both DOA: stopped after one retry" "$(cat "$TMP/launch.log")"
+  fail "both DOA: ordinary failure retained one bounded retry" "$(cat "$TMP/launch.log")"
 fi
 
 # ---------------------------------------------------------------------------
-# 5. A successor that never resolves to a live status is not a live successor.
+# 6. A successor that never resolves to a live status is not a live successor.
 #    StatusStarting serializes to "unknown" (StatusString has no case for it),
 #    so "unknown" keeps the poll going and must never pass the gate.
 # ---------------------------------------------------------------------------
@@ -336,7 +409,7 @@ check_absent "never live: watchdog not repointed" "$RUN/.conductor-id"
 check_contains "never live: says the window expired" "never reached a live status"
 
 # ---------------------------------------------------------------------------
-# 6. The successor is not in the deck at all: `session show` fails on every
+# 7. The successor is not in the deck at all: `session show` fails on every
 #    probe (no plan file, so the stub exits 2 the way the real CLI does for a
 #    not-found id). One failed read is tolerated as a startup blip; two in a
 #    row is a verdict.
@@ -350,7 +423,7 @@ check_absent "gone: watchdog not repointed" "$RUN/.conductor-id"
 check_absent "gone: no children re-parented" "$TMP/setparent.log"
 
 # ---------------------------------------------------------------------------
-# 7. Queued successor. `launch` into a group already at its max_concurrent cap
+# 8. Queued successor. `launch` into a group already at its max_concurrent cap
 #    STORES the session queued and never starts it — reachable precisely
 #    because the -g fix now puts the successor in the predecessor's group. A
 #    queued session supervises nothing, and a different tool cannot clear a
@@ -374,7 +447,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 8. Generation cap. Checked before anything is launched, so a capped run
+# 9. Generation cap. Checked before anything is launched, so a capped run
 #    costs nothing.
 # ---------------------------------------------------------------------------
 setup_case
@@ -391,7 +464,7 @@ MAX_CONDUCTOR_GEN=3 run_rotate
 check_rc "cap: honours MAX_CONDUCTOR_GEN override" 3
 
 # ---------------------------------------------------------------------------
-# 9. The step-1 precondition still holds: no rotation into an empty handoff.
+# 10. The step-1 precondition still holds: no rotation into an empty handoff.
 # ---------------------------------------------------------------------------
 setup_case
 : > "$RUN/conductor-handoff.md"
@@ -400,7 +473,7 @@ check_rc "empty handoff: exit 2" 2
 check_absent "empty handoff: nothing launched" "$TMP/launch.log"
 
 # ---------------------------------------------------------------------------
-# 10. No goal on disk, no rotation. Same cheap failure as the empty handoff:
+# 11. No goal on disk, no rotation. Same cheap failure as the empty handoff:
 #     the conductor is still alive and can write the file and re-run.
 # ---------------------------------------------------------------------------
 setup_case

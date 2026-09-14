@@ -876,27 +876,20 @@ func main() {
 		costStore = costs.NewStore(db.DB())
 
 		// Load user config for pricing overrides and budgets
-		userCfg, _ := session.LoadUserConfig()
+		userCfg, configErr := session.LoadUserConfig()
+		if configErr != nil {
+			fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+			os.Exit(1)
+		}
 
 		// Set up pricer with overrides
 		cacheDir, cacheErr := effectiveCacheDir()
 		if cacheErr != nil {
 			cacheDir = ""
 		}
-		pricerCfg := costs.PricerConfig{}
+		pricerCfg := pricerConfigFromUserConfig(userCfg)
 		if cacheDir != "" {
 			pricerCfg.CachePath = cacheDir
-		}
-		if userCfg != nil && len(userCfg.Costs.Pricing.Overrides) > 0 {
-			pricerCfg.Overrides = make(map[string]costs.PriceOverride)
-			for model, ov := range userCfg.Costs.Pricing.Overrides {
-				pricerCfg.Overrides[model] = costs.PriceOverride{
-					InputPerMtok:      ov.InputPerMtok,
-					OutputPerMtok:     ov.OutputPerMtok,
-					CacheReadPerMtok:  ov.CacheReadPerMtok,
-					CacheWritePerMtok: ov.CacheWritePerMtok,
-				}
-			}
 		}
 		pricer := costs.NewPricer(pricerCfg)
 		if cacheDir != "" {
@@ -939,19 +932,13 @@ func main() {
 
 			// Process incoming cost events from hooks
 			go func() {
-				for raw := range costWatcher.EventCh() {
-					ev := costs.CostEvent{
-						ID:               fmt.Sprintf("%s_%d", raw.InstanceID, raw.Timestamp),
-						SessionID:        raw.InstanceID,
-						Timestamp:        time.Unix(0, raw.Timestamp),
-						Model:            raw.Model,
-						InputTokens:      raw.InputTokens,
-						OutputTokens:     raw.OutputTokens,
-						CacheReadTokens:  raw.CacheReadTokens,
-						CacheWriteTokens: raw.CacheWriteTokens,
-						CostMicrodollars: pricer.ComputeCost(raw.Model, raw.InputTokens, raw.OutputTokens, raw.CacheReadTokens, raw.CacheWriteTokens),
+				for delivery := range costWatcher.EventCh() {
+					if err := persistCostEventDelivery(delivery, costStore, pricer); err != nil {
+						logging.ForComponent(logging.CompWatcher).Error("cost_event_persist_failed",
+							slog.String("instance", delivery.InstanceID),
+							slog.String("error", err.Error()),
+						)
 					}
-					_ = costStore.WriteCostEvent(ev)
 				}
 			}()
 		}
@@ -1115,6 +1102,14 @@ func main() {
 		fmt.Printf("Error: %v\n", runErr)
 		os.Exit(1)
 	}
+}
+
+func persistCostEventDelivery(delivery *costs.CostEventDelivery, store *costs.Store, pricer *costs.Pricer) error {
+	if err := store.WriteRawCostEvent(delivery.RawCostEvent, pricer); err != nil {
+		delivery.Retry()
+		return err
+	}
+	return delivery.Ack()
 }
 
 // commandRegistry lists every token that main()'s dispatch switch treats

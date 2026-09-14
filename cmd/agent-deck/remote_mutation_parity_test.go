@@ -53,6 +53,7 @@ func TestRemoteSuccessfulMutationParity(t *testing.T) {
 		write(filepath.Join(home, "receiver.py"), `import os, tty, hashlib
 tty.setraw(0)
 print("READY", flush=True)
+print("esc to interrupt", flush=True)
 buf = b""
 while True:
     data = os.read(0, 8192)

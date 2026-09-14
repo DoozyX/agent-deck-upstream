@@ -16,7 +16,7 @@ import (
 // TestStatusCycle_ShellSessionWithCommand verifies the full lifecycle:
 // StatusStarting (after Start with command) -> running/idle (after grace period + UpdateStatus) -> StatusStopped (after Kill)
 func TestStatusCycle_ShellSessionWithCommand(t *testing.T) {
-	skipIfNoTmuxServer(t)
+	skipIfNoTmuxBinary(t)
 
 	inst := NewInstance("test-lifecycle-cmd", "/tmp")
 	inst.Tool = "shell"
@@ -60,7 +60,7 @@ func TestStatusCycle_ShellSessionWithCommand(t *testing.T) {
 // actual tmux state which may be "starting" during the 2-minute startup window
 // or "waiting"/"idle" depending on prompt detection.
 func TestStatusCycle_ShellSessionNoCommand(t *testing.T) {
-	skipIfNoTmuxServer(t)
+	skipIfNoTmuxBinary(t)
 
 	inst := NewInstance("test-lifecycle-nocmd", "/tmp")
 	inst.Tool = "shell"
