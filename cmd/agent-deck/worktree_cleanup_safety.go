@@ -261,17 +261,30 @@ func processWithCWDInsideLsof(root string) (int, error) {
 	// shell); root is a worktree path from the repo's own worktree list.
 	out, err := exec.Command("lsof", "-a", "-d", "cwd", "+D", root, "-F", "p").Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 && len(out) == 0 {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok || exitErr.ExitCode() != 1 {
+			return 0, err
+		}
+		if len(out) == 0 {
 			return 0, nil
 		}
-		return 0, err
 	}
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.HasPrefix(line, "p") {
-			if pid, convErr := strconv.Atoi(strings.TrimPrefix(line, "p")); convErr == nil {
-				return pid, nil
-			}
+		if !strings.HasPrefix(line, "p") {
+			continue
 		}
+		pid, convErr := strconv.Atoi(strings.TrimPrefix(line, "p"))
+		if convErr == nil && pid > 0 {
+			// On Darwin lsof may report usable cwd records while exiting 1
+			// because another inspected file disappeared. A validated live PID
+			// is already a deletion veto, so it resolves the probe safely.
+			return pid, nil
+		}
+	}
+	if err != nil {
+		// Exit 1 with non-empty output is safe only when a valid PID record
+		// above resolved it. Anything else remains an inspection failure.
+		return 0, err
 	}
 	return 0, nil
 }
