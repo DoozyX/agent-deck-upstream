@@ -316,7 +316,7 @@ func TestAnalyticsPanel_View_NoToolCalls(t *testing.T) {
 	}
 }
 
-func TestAnalyticsPanel_View_CostEstimate(t *testing.T) {
+func TestAnalyticsPanel_View_TokensWithoutCanonicalQuoteShowsPriceUnknown(t *testing.T) {
 	panel := NewAnalyticsPanel()
 
 	analytics := &session.SessionAnalytics{
@@ -333,8 +333,8 @@ func TestAnalyticsPanel_View_CostEstimate(t *testing.T) {
 	if !strings.Contains(view, "Cost") {
 		t.Error("View should show cost section")
 	}
-	if !strings.Contains(view, "$") {
-		t.Error("View should show cost with dollar sign")
+	if !strings.Contains(view, "Price unknown") || strings.Contains(view, "Estimated:") || strings.Contains(view, "$3.0000") {
+		t.Fatalf("token-only analytics must not guess Sonnet pricing:\n%s", view)
 	}
 }
 

@@ -29,7 +29,7 @@ backend = { daily_limit = 25.0 }
 "my-session" = { total_limit = 100.0 }
 
 [costs.pricing.overrides]
-"claude-sonnet-4-6" = { input_per_mtok = 3.0, output_per_mtok = 15.0 }
+"claude-sonnet-4-6" = { input_per_mtok = 3.0, output_per_mtok = 15.0, cache_write_per_mtok = 3.75, cache_write_5m_per_mtok = 4.0, cache_write_1h_per_mtok = 6.0 }
 `), 0644)
 	if err != nil {
 		t.Fatal(err)
@@ -73,6 +73,30 @@ backend = { daily_limit = 25.0 }
 	}
 	if override.OutputPerMtok != 15.0 {
 		t.Errorf("output_per_mtok = %f, want 15.0", override.OutputPerMtok)
+	}
+	if override.CacheWritePerMtok != 3.75 || override.CacheWrite5mPerMtok != 4.0 || override.CacheWrite1hPerMtok != 6.0 {
+		t.Fatalf("cache-write duration override lost: %+v", override)
+	}
+}
+
+func TestLoadUserConfig_RejectsScalarPricingOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, ".config"))
+	ClearUserConfigCache()
+	t.Cleanup(ClearUserConfigCache)
+	configPath, err := GetUserConfigPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(configPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, []byte("[costs.pricing]\noverrides = { bad = 1 }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadUserConfig(); err == nil {
+		t.Fatal("LoadUserConfig accepted scalar pricing override")
 	}
 }
 

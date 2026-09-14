@@ -21,25 +21,11 @@ func (f *Fetcher) CacheAge() time.Duration {
 	return time.Since(info.ModTime())
 }
 
-// FetchAndCache writes current known prices to cache.
-// Real HTML scraping is deferred — for now, writes hardcoded defaults.
+// FetchAndCache refreshes bundled, verified pricing metadata. It does not make
+// a provider request and records that provenance in the cache.
 func (f *Fetcher) FetchAndCache() error {
-	defaults := map[string]pricingCacheModel{
-		// Anthropic rates: https://docs.anthropic.com/en/docs/about-claude/pricing
-		"claude-opus-4-7":   {InputPerMtok: 5.0, OutputPerMtok: 25.0, CacheReadPerMtok: 0.50, CacheWritePerMtok: 6.25},
-		"claude-opus-4-6":   {InputPerMtok: 5.0, OutputPerMtok: 25.0, CacheReadPerMtok: 0.50, CacheWritePerMtok: 6.25},
-		"claude-sonnet-4-6": {InputPerMtok: 3.0, OutputPerMtok: 15.0, CacheReadPerMtok: 0.30, CacheWritePerMtok: 3.75},
-		"claude-haiku-4-5":  {InputPerMtok: 1.0, OutputPerMtok: 5.0, CacheReadPerMtok: 0.10, CacheWritePerMtok: 1.25},
-		"gemini-2.5-pro":    {InputPerMtok: 1.25, OutputPerMtok: 10.0},
-		"gemini-2.5-flash":  {InputPerMtok: 0.15, OutputPerMtok: 0.60},
-		"gpt-4o":            {InputPerMtok: 2.50, OutputPerMtok: 10.0},
-		"gpt-4.1":           {InputPerMtok: 2.0, OutputPerMtok: 8.0},
-		"o3":                {InputPerMtok: 2.0, OutputPerMtok: 8.0},
-		"o4-mini":           {InputPerMtok: 1.10, OutputPerMtok: 4.40},
-	}
-
 	if f.Pricer != nil {
-		return f.Pricer.SaveCache(defaults)
+		return f.Pricer.saveBundledCache()
 	}
 	return nil
 }

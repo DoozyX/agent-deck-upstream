@@ -3,7 +3,9 @@ package costs
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -11,6 +13,469 @@ import (
 type Store struct {
 	db  *sql.DB
 	now func() time.Time
+}
+
+type IngestResult struct {
+	Inserted            int
+	Updated             int
+	Duplicates          int
+	Superseded          int
+	CheckpointsAdvanced int
+}
+
+// Ingest atomically persists canonical events, reconciliation, and complete
+// checkpoints.
+func (s *Store) Ingest(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint) (result IngestResult, err error) {
+	return s.ingest(ctx, events, checkpoints, nil)
+}
+
+// IngestPriced atomically ingests events and requotes any merged correction
+// against the final stored usage.
+func (s *Store) IngestPriced(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint, pricer *Pricer) (result IngestResult, err error) {
+	return s.ingest(ctx, events, checkpoints, pricer)
+}
+
+func (s *Store) ingest(ctx context.Context, events []UsageEvent, checkpoints []ScanCheckpoint, pricer *Pricer) (result IngestResult, err error) {
+	for i := range events {
+		if err := events[i].Usage.Validate(); err != nil {
+			return result, fmt.Errorf("validate usage event %q: %w", events[i].ID, err)
+		}
+		if events[i].ID == "" {
+			return result, fmt.Errorf("usage event id is required")
+		}
+		if events[i].SourceIdentity != "" && (events[i].Provider == "" || events[i].SourceKind == "") {
+			return result, fmt.Errorf("usage event %q source identity requires provider and source kind", events[i].ID)
+		}
+	}
+
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return result, fmt.Errorf("begin usage ingest: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	completeSources := make(map[string]bool, len(checkpoints))
+	for _, checkpoint := range checkpoints {
+		if checkpoint.Complete {
+			completeSources[checkpointKey(checkpoint.Provider, checkpoint.SourceIdentity)] = true
+		}
+	}
+
+	for _, event := range events {
+		inserted, updated, err := insertUsageEventTx(tx, event, pricer)
+		if err != nil {
+			return IngestResult{}, fmt.Errorf("insert usage event %q: %w", event.ID, err)
+		}
+		if updated {
+			result.Updated++
+		} else if !inserted {
+			result.Duplicates++
+		} else {
+			result.Inserted++
+		}
+
+		canReconcile := completeSources[checkpointKey(event.Provider, event.TranscriptIdentity)]
+		if !canReconcile || len(event.SupersedesEventIDs) == 0 {
+			continue
+		}
+		for _, legacyID := range event.SupersedesEventIDs {
+			update, err := tx.ExecContext(ctx, `
+				UPDATE cost_events
+				SET reconciliation_status = ?
+				WHERE id = ? AND reconciliation_status = ?`,
+				ReconciliationLegacySuperseded, legacyID, ReconciliationLegacyUnreconciled)
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("supersede legacy event %q: %w", legacyID, err)
+			}
+			count, err := update.RowsAffected()
+			if err != nil {
+				return IngestResult{}, fmt.Errorf("count superseded legacy event %q: %w", legacyID, err)
+			}
+			result.Superseded += int(count)
+		}
+	}
+
+	for _, checkpoint := range checkpoints {
+		if checkpoint.Receipt != nil {
+			if err := persistSyncReceiptTx(ctx, tx, *checkpoint.Receipt); err != nil {
+				return IngestResult{}, err
+			}
+		}
+		if err := persistCoverageAndReconcileTx(ctx, tx, checkpoint, &result); err != nil {
+			return IngestResult{}, err
+		}
+		if !checkpoint.Complete {
+			continue
+		}
+		if checkpoint.Provider == "" || checkpoint.SourceKind == "" || checkpoint.SourceIdentity == "" {
+			return IngestResult{}, fmt.Errorf("complete checkpoint requires provider, source kind, and source identity")
+		}
+		updatedAt := checkpoint.UpdatedAt
+		if updatedAt.IsZero() {
+			return IngestResult{}, fmt.Errorf("complete checkpoint %q requires updated timestamp", checkpoint.SourceIdentity)
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO usage_scan_checkpoints (
+				provider, source_kind, source_identity, offset, fingerprint, source_fingerprint, updated_at
+			) VALUES (?, ?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+				offset = excluded.offset,
+				fingerprint = excluded.fingerprint,
+				source_fingerprint = excluded.source_fingerprint,
+				updated_at = excluded.updated_at`,
+			checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity,
+			checkpoint.Offset, checkpoint.Fingerprint, checkpoint.SourceFingerprint,
+			updatedAt.UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return IngestResult{}, fmt.Errorf("advance checkpoint %q: %w", checkpoint.SourceIdentity, err)
+		}
+		result.CheckpointsAdvanced++
+	}
+
+	if err := tx.Commit(); err != nil {
+		return IngestResult{}, fmt.Errorf("commit usage ingest: %w", err)
+	}
+	return result, nil
+}
+
+func persistSyncReceiptTx(ctx context.Context, tx *sql.Tx, receipt SyncReceipt) error {
+	warnings, err := json.Marshal(receipt.Warnings)
+	if err != nil {
+		return fmt.Errorf("encode sync receipt warnings: %w", err)
+	}
+	blockedUntil := ""
+	if !receipt.BlockedUntil.IsZero() {
+		blockedUntil = receipt.BlockedUntil.UTC().Format(time.RFC3339Nano)
+	}
+	resetKnown := 0
+	if receipt.ResetKnown {
+		resetKnown = 1
+	}
+	coverageComplete := 0
+	if receipt.CoverageComplete {
+		coverageComplete = 1
+	}
+	_, err = tx.ExecContext(ctx, `
+		INSERT INTO usage_sync_receipts (
+			provider, source_kind, source_identity, account, blocked_status,
+			blocked_until, reset_known, backoff_seconds, coverage_complete,
+			warnings_json, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+			account = excluded.account,
+			blocked_status = excluded.blocked_status,
+			blocked_until = excluded.blocked_until,
+			reset_known = excluded.reset_known,
+			backoff_seconds = excluded.backoff_seconds,
+			coverage_complete = excluded.coverage_complete,
+			warnings_json = excluded.warnings_json,
+			updated_at = excluded.updated_at`,
+		receipt.Provider, receipt.SourceKind, receipt.SourceIdentity, receipt.Account,
+		receipt.Status, blockedUntil, resetKnown, int64(receipt.Backoff/time.Second),
+		coverageComplete, string(warnings), receipt.UpdatedAt.UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		return fmt.Errorf("persist sync receipt %q: %w", receipt.SourceIdentity, err)
+	}
+	return nil
+}
+
+func persistCoverageAndReconcileTx(ctx context.Context, tx *sql.Tx, checkpoint ScanCheckpoint, result *IngestResult) error {
+	if checkpoint.Provider == "" || checkpoint.SourceKind == "" || checkpoint.SourceIdentity == "" {
+		return nil
+	}
+	hasCurrentRange := checkpoint.CoverageSessionID != "" &&
+		checkpoint.CoverageSessionID != UnassignedSessionID &&
+		!checkpoint.CoverageStart.IsZero() && !checkpoint.CoverageEnd.IsZero()
+	if !checkpoint.Complete {
+		if !hasCurrentRange {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO usage_pending_coverage (
+				provider, source_kind, source_identity, session_id, start_at, end_at
+			) VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(provider, source_kind, source_identity) DO UPDATE SET
+				session_id = excluded.session_id,
+				start_at = MIN(usage_pending_coverage.start_at, excluded.start_at),
+				end_at = MAX(usage_pending_coverage.end_at, excluded.end_at)`,
+			checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity,
+			checkpoint.CoverageSessionID, checkpoint.CoverageStart.UTC().Format(time.RFC3339Nano),
+			checkpoint.CoverageEnd.UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return fmt.Errorf("persist pending coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		return nil
+	}
+
+	sessionID := checkpoint.CoverageSessionID
+	from, to := checkpoint.CoverageStart, checkpoint.CoverageEnd
+	var pendingSession, pendingStart, pendingEnd string
+	err := tx.QueryRowContext(ctx, `
+		SELECT session_id, start_at, end_at FROM usage_pending_coverage
+		WHERE provider = ? AND source_kind = ? AND source_identity = ?`,
+		checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity).Scan(
+		&pendingSession, &pendingStart, &pendingEnd)
+	if err != nil && err != sql.ErrNoRows {
+		return fmt.Errorf("load pending coverage %q: %w", checkpoint.SourceIdentity, err)
+	}
+	if err == nil {
+		pendingFrom, parseErr := time.Parse(time.RFC3339Nano, pendingStart)
+		if parseErr != nil {
+			return fmt.Errorf("parse pending coverage start %q: %w", checkpoint.SourceIdentity, parseErr)
+		}
+		pendingTo, parseErr := time.Parse(time.RFC3339Nano, pendingEnd)
+		if parseErr != nil {
+			return fmt.Errorf("parse pending coverage end %q: %w", checkpoint.SourceIdentity, parseErr)
+		}
+		if sessionID == "" {
+			sessionID = pendingSession
+		}
+		if from.IsZero() || pendingFrom.Before(from) {
+			from = pendingFrom
+		}
+		if to.IsZero() || pendingTo.After(to) {
+			to = pendingTo
+		}
+	}
+	if sessionID != "" && sessionID != UnassignedSessionID && !from.IsZero() && !to.IsZero() {
+		update, err := tx.ExecContext(ctx, `
+			UPDATE cost_events SET reconciliation_status = ?
+			WHERE session_id = ? AND timestamp >= ? AND timestamp <= ?
+				AND reconciliation_status = ?`,
+			ReconciliationLegacySuperseded, sessionID,
+			from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano),
+			ReconciliationLegacyUnreconciled)
+		if err != nil {
+			return fmt.Errorf("reconcile coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		count, err := update.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count reconciled coverage %q: %w", checkpoint.SourceIdentity, err)
+		}
+		result.Superseded += int(count)
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM usage_pending_coverage WHERE provider = ? AND source_kind = ? AND source_identity = ?`, checkpoint.Provider, checkpoint.SourceKind, checkpoint.SourceIdentity); err != nil {
+		return fmt.Errorf("clear pending coverage %q: %w", checkpoint.SourceIdentity, err)
+	}
+	return nil
+}
+
+func checkpointKey(provider, sourceIdentity string) string {
+	return provider + "\x00" + sourceIdentity
+}
+
+func insertUsageEventTx(tx *sql.Tx, event UsageEvent, pricer *Pricer) (bool, bool, error) {
+	existingID, existingSource, found, err := findUsageEventByAliases(tx, event)
+	if err != nil {
+		return false, false, err
+	}
+	if found {
+		updated, err := updateUsageEventCorrection(tx, existingID, event, pricer)
+		if err != nil {
+			return false, false, err
+		}
+		if err := registerUsageEventAliases(tx, event.Provider, existingSource, append(event.SourceAliases, event.SourceIdentity)); err != nil {
+			return false, false, err
+		}
+		return false, updated, nil
+	}
+	providerInput := any(nil)
+	if event.Usage.ProviderInputTokens != nil {
+		providerInput = *event.Usage.ProviderInputTokens
+	}
+	result, err := tx.Exec(`
+		INSERT OR IGNORE INTO cost_events (
+			id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.SessionID, event.ParentSessionID, event.RunID,
+		event.Timestamp.UTC().Format(time.RFC3339Nano), event.Provider, event.SourceKind,
+		event.SourceIdentity, event.TranscriptIdentity, event.Model,
+		event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens,
+		event.Usage.CacheWriteTokens, event.Usage.CacheWrite5mTokens,
+		event.Usage.CacheWrite1hTokens, event.Usage.ReasoningTokens, providerInput,
+		event.CostMicrodollars, event.PricingStatus, event.ReconciliationStatus)
+	if err != nil {
+		return false, false, err
+	}
+	count, err := result.RowsAffected()
+	if err != nil {
+		return false, false, err
+	}
+	if count != 1 {
+		return false, false, nil
+	}
+	if err := registerUsageEventAliases(tx, event.Provider, event.SourceIdentity, append(event.SourceAliases, event.SourceIdentity)); err != nil {
+		return false, false, err
+	}
+	return true, false, nil
+}
+
+func findUsageEventByAliases(tx *sql.Tx, event UsageEvent) (id, sourceIdentity string, found bool, err error) {
+	aliases := uniqueNonEmpty(append(event.SourceAliases, event.SourceIdentity))
+	for _, alias := range aliases {
+		err = tx.QueryRow(`
+			SELECT ce.id, ce.source_identity
+			FROM usage_event_aliases a
+			JOIN cost_events ce ON ce.provider = a.provider AND ce.source_identity = a.source_identity
+			WHERE a.provider = ? AND a.alias = ?`, event.Provider, alias).Scan(&id, &sourceIdentity)
+		if err == nil {
+			return id, sourceIdentity, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, err
+		}
+		err = tx.QueryRow(`SELECT id, source_identity FROM cost_events WHERE provider = ? AND source_identity = ?`, event.Provider, alias).Scan(&id, &sourceIdentity)
+		if err == nil {
+			return id, sourceIdentity, true, nil
+		}
+		if err != sql.ErrNoRows {
+			return "", "", false, err
+		}
+	}
+	return "", "", false, nil
+}
+
+func updateUsageEventCorrection(tx *sql.Tx, existingID string, incoming UsageEvent, pricer *Pricer) (bool, error) {
+	var current TokenUsage
+	var providerInput sql.NullInt64
+	var currentCost int64
+	var reconciliation string
+	err := tx.QueryRow(`
+		SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, reconciliation_status
+		FROM cost_events WHERE id = ?`, existingID).Scan(
+		&current.InputTokens, &current.OutputTokens, &current.CacheReadTokens,
+		&current.CacheWriteTokens, &current.CacheWrite5mTokens,
+		&current.CacheWrite1hTokens, &current.ReasoningTokens,
+		&providerInput, &currentCost, &reconciliation)
+	if err != nil {
+		return false, err
+	}
+	if providerInput.Valid {
+		value := providerInput.Int64
+		current.ProviderInputTokens = &value
+	}
+	if ReconciliationStatus(reconciliation) != ReconciliationAuthoritative || incoming.ReconciliationStatus != ReconciliationAuthoritative {
+		return false, nil
+	}
+	merged, changed := mergeMonotoneUsage(current, incoming.Usage)
+	if !changed {
+		return false, nil
+	}
+	cost, status := correctionPrice(incoming, merged, currentCost, pricer)
+	providerInputValue := any(nil)
+	if merged.ProviderInputTokens != nil {
+		providerInputValue = *merged.ProviderInputTokens
+	}
+	_, err = tx.Exec(`
+		UPDATE cost_events SET
+			session_id = ?, parent_session_id = ?, run_id = ?, timestamp = ?,
+			source_kind = ?, transcript_identity = ?, model = ?,
+			input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+			cache_write_5m_tokens = ?, cache_write_1h_tokens = ?, reasoning_tokens = ?,
+			provider_input_tokens = ?, cost_microdollars = ?, pricing_status = ?
+		WHERE id = ?`,
+		incoming.SessionID, incoming.ParentSessionID, incoming.RunID,
+		incoming.Timestamp.UTC().Format(time.RFC3339Nano), incoming.SourceKind,
+		incoming.TranscriptIdentity, incoming.Model,
+		merged.InputTokens, merged.OutputTokens, merged.CacheReadTokens,
+		merged.CacheWriteTokens, merged.CacheWrite5mTokens, merged.CacheWrite1hTokens,
+		merged.ReasoningTokens, providerInputValue, cost, status, existingID)
+	return err == nil, err
+}
+
+func correctionPrice(incoming UsageEvent, merged TokenUsage, currentCost int64, pricer *Pricer) (int64, PricingStatus) {
+	if pricer != nil {
+		quote := pricer.Quote(incoming.Model, merged)
+		if quote.Valid {
+			if quote.Status == PricingUnknown {
+				return currentCost, PricingUnknown
+			}
+			return quote.CostMicrodollars, quote.Status
+		}
+		return currentCost, PricingUnknown
+	}
+	if incoming.PricingStatus == PricingKnown || incoming.PricingStatus == PricingKnownZero {
+		builtIn := NewPricer(PricerConfig{})
+		incomingQuote := builtIn.Quote(incoming.Model, incoming.Usage)
+		if incomingQuote.Valid && incomingQuote.Status == incoming.PricingStatus && incomingQuote.CostMicrodollars == incoming.CostMicrodollars {
+			mergedQuote := builtIn.Quote(incoming.Model, merged)
+			return mergedQuote.CostMicrodollars, mergedQuote.Status
+		}
+	}
+	if incoming.PricingStatus == PricingUnknown {
+		return currentCost, PricingUnknown
+	}
+	return incoming.CostMicrodollars, incoming.PricingStatus
+}
+
+func mergeMonotoneUsage(current, incoming TokenUsage) (TokenUsage, bool) {
+	if incoming.InputTokens < current.InputTokens || incoming.OutputTokens < current.OutputTokens ||
+		incoming.CacheReadTokens < current.CacheReadTokens || incoming.CacheWriteTokens < current.CacheWriteTokens {
+		return current, false
+	}
+	merged := incoming
+	if current.ReasoningTokens > merged.ReasoningTokens {
+		merged.ReasoningTokens = current.ReasoningTokens
+	}
+	currentDetail := current.CacheWrite5mTokens + current.CacheWrite1hTokens
+	incomingDetail := incoming.CacheWrite5mTokens + incoming.CacheWrite1hTokens
+	if currentDetail > incomingDetail {
+		merged.CacheWrite5mTokens = current.CacheWrite5mTokens
+		merged.CacheWrite1hTokens = current.CacheWrite1hTokens
+	}
+	if current.ProviderInputTokens != nil && (merged.ProviderInputTokens == nil || *current.ProviderInputTokens > *merged.ProviderInputTokens) {
+		value := *current.ProviderInputTokens
+		merged.ProviderInputTokens = &value
+	}
+	if err := merged.Validate(); err != nil {
+		return current, false
+	}
+	return merged, !tokenUsageEqual(current, merged)
+}
+
+func tokenUsageEqual(left, right TokenUsage) bool {
+	if left.InputTokens != right.InputTokens || left.OutputTokens != right.OutputTokens ||
+		left.CacheReadTokens != right.CacheReadTokens || left.CacheWriteTokens != right.CacheWriteTokens ||
+		left.CacheWrite5mTokens != right.CacheWrite5mTokens || left.CacheWrite1hTokens != right.CacheWrite1hTokens ||
+		left.ReasoningTokens != right.ReasoningTokens {
+		return false
+	}
+	if left.ProviderInputTokens == nil || right.ProviderInputTokens == nil {
+		return left.ProviderInputTokens == nil && right.ProviderInputTokens == nil
+	}
+	return *left.ProviderInputTokens == *right.ProviderInputTokens
+}
+
+func registerUsageEventAliases(tx *sql.Tx, provider, sourceIdentity string, aliases []string) error {
+	for _, alias := range uniqueNonEmpty(aliases) {
+		if _, err := tx.Exec(`
+			INSERT INTO usage_event_aliases (provider, alias, source_identity)
+			VALUES (?, ?, ?)
+			ON CONFLICT(provider, alias) DO NOTHING`, provider, alias, sourceIdentity); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func uniqueNonEmpty(values []string) []string {
+	seen := make(map[string]bool, len(values))
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		result = append(result, value)
+	}
+	return result
 }
 
 // NewStore creates a Store using an existing database connection.
@@ -31,33 +496,198 @@ func (s *Store) DB() *sql.DB {
 
 // WriteCostEvent inserts a cost event.
 func (s *Store) WriteCostEvent(ev CostEvent) error {
-	_, err := s.db.Exec(`
-		INSERT INTO cost_events (id, session_id, timestamp, model, input_tokens, output_tokens,
-			cache_read_tokens, cache_write_tokens, cost_microdollars)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.SessionID, ev.Timestamp.UTC().Format(time.RFC3339), ev.Model,
-		ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens,
-		ev.CostMicrodollars,
-	)
+	event := UsageEventFromCostEvent(ev)
+	if err := event.Usage.Validate(); err != nil {
+		return fmt.Errorf("validate cost event %q: %w", event.ID, err)
+	}
+	_, err := insertCanonicalEvent(s.db, event)
 	return err
 }
 
 // WriteCostEventTx inserts a cost event within a transaction.
 func (s *Store) WriteCostEventTx(tx *sql.Tx, ev CostEvent) error {
-	_, err := tx.Exec(`
-		INSERT INTO cost_events (id, session_id, timestamp, model, input_tokens, output_tokens,
-			cache_read_tokens, cache_write_tokens, cost_microdollars)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ev.ID, ev.SessionID, ev.Timestamp.UTC().Format(time.RFC3339), ev.Model,
-		ev.InputTokens, ev.OutputTokens, ev.CacheReadTokens, ev.CacheWriteTokens,
-		ev.CostMicrodollars,
-	)
+	event := UsageEventFromCostEvent(ev)
+	if err := event.Usage.Validate(); err != nil {
+		return fmt.Errorf("validate cost event %q: %w", event.ID, err)
+	}
+	_, err := insertCanonicalEvent(tx, event)
 	return err
+}
+
+type sqlExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func insertCanonicalEvent(exec sqlExecer, event UsageEvent) (sql.Result, error) {
+	providerInput := any(nil)
+	if event.Usage.ProviderInputTokens != nil {
+		providerInput = *event.Usage.ProviderInputTokens
+	}
+	return exec.Exec(`
+		INSERT INTO cost_events (
+			id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		event.ID, event.SessionID, event.ParentSessionID, event.RunID,
+		event.Timestamp.UTC().Format(time.RFC3339Nano), event.Provider, event.SourceKind,
+		event.SourceIdentity, event.TranscriptIdentity, event.Model,
+		event.Usage.InputTokens, event.Usage.OutputTokens, event.Usage.CacheReadTokens,
+		event.Usage.CacheWriteTokens, event.Usage.CacheWrite5mTokens,
+		event.Usage.CacheWrite1hTokens, event.Usage.ReasoningTokens, providerInput,
+		event.CostMicrodollars, event.PricingStatus, event.ReconciliationStatus)
 }
 
 // TotalBySession returns aggregated costs for a session.
 func (s *Store) TotalBySession(sessionID string) (CostSummary, error) {
 	return s.querySum(`WHERE session_id = ?`, sessionID)
+}
+
+func (s *Store) CoveredTotalBySession(sessionID string) (CoveredSummary, error) {
+	return s.queryCovered(`WHERE session_id = ?`, sessionID)
+}
+
+func (s *Store) CoveredTotalToday() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of day')`)
+}
+
+func (s *Store) CoveredTotalYesterday() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of day', '-1 day') AND timestamp < date('now', 'start of day')`)
+}
+
+func (s *Store) CoveredTotalThisWeek() (CoveredSummary, error) {
+	now := s.now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(today.Weekday()) + 6) % 7
+	thisMonday := today.AddDate(0, 0, -daysSinceMonday)
+	return s.queryCovered(`WHERE timestamp >= ?`, thisMonday.Format(time.RFC3339))
+}
+
+func (s *Store) CoveredTotalLastWeek() (CoveredSummary, error) {
+	now := s.now().UTC()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.UTC)
+	daysSinceMonday := (int(today.Weekday()) + 6) % 7
+	thisMonday := today.AddDate(0, 0, -daysSinceMonday)
+	lastMonday := thisMonday.AddDate(0, 0, -7)
+	return s.queryCovered(`WHERE timestamp >= ? AND timestamp < ?`, lastMonday.Format(time.RFC3339), thisMonday.Format(time.RFC3339))
+}
+
+func (s *Store) CoveredTotalThisMonth() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of month')`)
+}
+
+func (s *Store) CoveredTotalLastMonth() (CoveredSummary, error) {
+	return s.queryCovered(`WHERE timestamp >= date('now', 'start of month', '-1 month') AND timestamp < date('now', 'start of month')`)
+}
+
+// CoveredProjectedMonthly returns the rolling-seven-day known-price subtotal
+// projected to 30 days and the exact coverage behind that projection.
+func (s *Store) CoveredProjectedMonthly() (int64, Coverage, error) {
+	summary, err := s.queryCovered(`WHERE timestamp >= datetime('now', '-7 days')`)
+	if err != nil {
+		return 0, Coverage{}, err
+	}
+	total := summary.TotalCostMicrodollars
+	if total > math.MaxInt64/30 || total < math.MinInt64/30 {
+		return 0, summary.Coverage, fmt.Errorf("monthly projection overflow for %d microdollars", total)
+	}
+	return (total * 30) / 7, summary.Coverage, nil
+}
+
+func (s *Store) CoveredCostByDay() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)", "", nil)
+}
+
+func (s *Store) CoveredCostByDayRange(from, to time.Time) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)", " AND timestamp >= ? AND timestamp < ?", []any{
+		from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339),
+	})
+}
+
+func (s *Store) CoveredCostByProvider() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("provider", "", nil)
+}
+
+func (s *Store) CoveredCostByModel() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("model", "", nil)
+}
+
+func (s *Store) CoveredCostBySession() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("session_id", "", nil)
+}
+
+func (s *Store) CoveredCostByRun() ([]CostBreakdown, error) {
+	return s.coveredBreakdown("run_id", "", nil)
+}
+
+func (s *Store) CoveredCostByDayForSession(sessionID string) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("date(timestamp)", " AND session_id = ?", []any{sessionID})
+}
+
+func (s *Store) CoveredCostByModelForSession(sessionID string) ([]CostBreakdown, error) {
+	return s.coveredBreakdown("model", " AND session_id = ?", []any{sessionID})
+}
+
+func (s *Store) coveredBreakdown(expression, filter string, filterArgs []any) ([]CostBreakdown, error) {
+	allowed := map[string]bool{"date(timestamp)": true, "provider": true, "model": true, "session_id": true, "run_id": true}
+	if !allowed[expression] {
+		return nil, fmt.Errorf("unsupported cost breakdown %q", expression)
+	}
+	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
+	// #nosec G201 -- expression is selected from the fixed allowlist above.
+	query := `SELECT ` + expression + `,
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN cost_microdollars ELSE 0 END), 0),
+		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
+		COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(cache_write_5m_tokens), 0),
+		COALESCE(SUM(cache_write_1h_tokens), 0), COALESCE(SUM(output_tokens), 0),
+		COALESCE(SUM(reasoning_tokens), 0), COUNT(*), COALESCE(SUM(` + tokens + `), 0),
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0)
+		FROM cost_events WHERE reconciliation_status <> ?` + filter + ` GROUP BY ` + expression + ` ORDER BY 1`
+	args := []any{
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded,
+	}
+	args = append(args, filterArgs...)
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []CostBreakdown
+	for rows.Next() {
+		var item CostBreakdown
+		if err := rows.Scan(
+			&item.Key, &item.KnownCostMicrodollars,
+			&item.UncachedInputTokens, &item.CacheReadInputTokens, &item.CacheWriteInputTokens,
+			&item.CacheWrite5mInputTokens, &item.CacheWrite1hInputTokens,
+			&item.OutputTokens, &item.ReasoningOutputTokens,
+			&item.Coverage.EventCount, &item.Coverage.TotalTokens,
+			&item.Coverage.KnownPriceEventCount, &item.Coverage.KnownPriceTokens,
+			&item.Coverage.KnownZeroEventCount, &item.Coverage.UnknownPriceEventCount,
+			&item.Coverage.UnreconciledEventCount, &item.Coverage.UnknownPriceTokens,
+			&item.Coverage.UnreconciledTokens,
+		); err != nil {
+			return nil, err
+		}
+		item.Coverage.CoverageKnown = true
+		item.Coverage.Complete = item.Coverage.UnknownPriceEventCount == 0 && item.Coverage.UnreconciledEventCount == 0
+		result = append(result, item)
+	}
+	return result, rows.Err()
 }
 
 // TotalToday returns today's total costs.
@@ -126,6 +756,111 @@ func (s *Store) TopSessionsByCost(limit int) ([]SessionCost, error) {
 			return nil, err
 		}
 		result = append(result, sc)
+	}
+	return result, rows.Err()
+}
+
+// CoveredTopSessionsByCost returns the top N sessions ranked by their
+// known-price subtotal. Unknown and unreconciled events remain in the event
+// count so callers can report their coverage; superseded events are excluded.
+func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
+	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
+	rows, err := s.db.Query(`
+		SELECT ce.session_id, COALESCE(i.title, ce.session_id), COALESCE(i.group_path, ''),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
+			COUNT(*), COALESCE(SUM(`+tokens+`), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
+		FROM cost_events ce
+		LEFT JOIN instances i ON ce.session_id = i.id
+		WHERE ce.reconciliation_status <> ?
+		GROUP BY ce.session_id
+		ORDER BY COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0) DESC,
+			ce.session_id
+		LIMIT ?`, PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero, PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded,
+		PricingKnown, PricingKnownZero, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var result []SessionCost
+	for rows.Next() {
+		var sc SessionCost
+		if err := rows.Scan(
+			&sc.SessionID, &sc.SessionTitle, &sc.Group, &sc.CostMicrodollars, &sc.EventCount,
+			&sc.Coverage.TotalTokens, &sc.Coverage.KnownPriceEventCount, &sc.Coverage.KnownPriceTokens,
+			&sc.Coverage.KnownZeroEventCount, &sc.Coverage.UnknownPriceEventCount,
+			&sc.Coverage.UnreconciledEventCount, &sc.Coverage.UnknownPriceTokens,
+			&sc.Coverage.UnreconciledTokens,
+		); err != nil {
+			return nil, err
+		}
+		sc.Coverage.EventCount = sc.EventCount
+		sc.Coverage.CoverageKnown = true
+		sc.Coverage.Complete = sc.Coverage.UnknownPriceEventCount == 0 && sc.Coverage.UnreconciledEventCount == 0
+		result = append(result, sc)
+	}
+	return result, rows.Err()
+}
+
+// CoveredCostByGroup aggregates every current cost event by session group in
+// one query. It is intentionally unbounded: group totals must not depend on a
+// top-sessions presentation limit.
+func (s *Store) CoveredCostByGroup() ([]GroupCost, error) {
+	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
+	rows, err := s.db.Query(`
+		SELECT COALESCE(NULLIF(i.group_path, ''), '(ungrouped)'),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
+			COUNT(*), COUNT(DISTINCT ce.session_id), COALESCE(SUM(`+tokens+`), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
+		FROM cost_events ce
+		LEFT JOIN instances i ON ce.session_id = i.id
+		WHERE ce.reconciliation_status <> ?
+		GROUP BY COALESCE(NULLIF(i.group_path, ''), '(ungrouped)')
+		ORDER BY 1`,
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero, PricingKnown, PricingKnownZero,
+		PricingKnownZero, PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown, PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		ReconciliationLegacySuperseded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []GroupCost
+	for rows.Next() {
+		var item GroupCost
+		if err := rows.Scan(
+			&item.Group, &item.CostMicrodollars, &item.EventCount, &item.SessionCount,
+			&item.Coverage.TotalTokens, &item.Coverage.KnownPriceEventCount, &item.Coverage.KnownPriceTokens,
+			&item.Coverage.KnownZeroEventCount, &item.Coverage.UnknownPriceEventCount,
+			&item.Coverage.UnreconciledEventCount, &item.Coverage.UnknownPriceTokens,
+			&item.Coverage.UnreconciledTokens,
+		); err != nil {
+			return nil, err
+		}
+		item.Coverage.EventCount = item.EventCount
+		item.Coverage.CoverageKnown = true
+		item.Coverage.Complete = item.Coverage.UnknownPriceEventCount == 0 && item.Coverage.UnreconciledEventCount == 0
+		result = append(result, item)
 	}
 	return result, rows.Err()
 }
@@ -214,8 +949,9 @@ func (s *Store) RunningTotal(tx *sql.Tx, sessionID string, since time.Time) (int
 	var total sql.NullInt64
 	err := tx.QueryRow(`
 		SELECT SUM(cost_microdollars) FROM cost_events
-		WHERE session_id = ? AND timestamp >= ?`,
-		sessionID, since.UTC().Format(time.RFC3339)).Scan(&total)
+		WHERE session_id = ? AND timestamp >= ?
+			AND pricing_status IN (?, ?) AND reconciliation_status <> ?`,
+		sessionID, since.UTC().Format(time.RFC3339), PricingKnown, PricingKnownZero, ReconciliationLegacySuperseded).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -230,7 +966,8 @@ func (s *Store) GlobalRunningTotal(tx *sql.Tx, since time.Time) (int64, error) {
 	var total sql.NullInt64
 	err := tx.QueryRow(`
 		SELECT SUM(cost_microdollars) FROM cost_events
-		WHERE timestamp >= ?`, since.UTC().Format(time.RFC3339)).Scan(&total)
+		WHERE timestamp >= ? AND pricing_status IN (?, ?) AND reconciliation_status <> ?`,
+		since.UTC().Format(time.RFC3339), PricingKnown, PricingKnownZero, ReconciliationLegacySuperseded).Scan(&total)
 	if err != nil {
 		return 0, err
 	}
@@ -248,12 +985,15 @@ func (s *Store) GroupRunningTotal(tx *sql.Tx, sessionIDs []string, since time.Ti
 	placeholders := "?" + repeatArg(len(sessionIDs)-1)
 	// #nosec G201 -- placeholders is "?, ?, ?" generated by repeatArg; all
 	// values flow through args[], never interpolated into the SQL string.
-	query := fmt.Sprintf(`SELECT COALESCE(SUM(cost_microdollars), 0) FROM cost_events WHERE session_id IN (%s) AND timestamp >= ?`, placeholders)
-	args := make([]any, len(sessionIDs)+1)
+	query := fmt.Sprintf(`SELECT COALESCE(SUM(cost_microdollars), 0) FROM cost_events WHERE session_id IN (%s) AND timestamp >= ? AND pricing_status IN (?, ?) AND reconciliation_status <> ?`, placeholders)
+	args := make([]any, len(sessionIDs)+4)
 	for i, id := range sessionIDs {
 		args[i] = id
 	}
 	args[len(sessionIDs)] = since.UTC().Format(time.RFC3339)
+	args[len(sessionIDs)+1] = PricingKnown
+	args[len(sessionIDs)+2] = PricingKnownZero
+	args[len(sessionIDs)+3] = ReconciliationLegacySuperseded
 	var total int64
 	err := tx.QueryRow(query, args...).Scan(&total)
 	return total, err
@@ -263,12 +1003,12 @@ func (s *Store) querySum(where string, args ...any) (CostSummary, error) {
 	var cs CostSummary
 	err := s.db.QueryRow(`
 		SELECT COALESCE(SUM(cost_microdollars), 0),
-			COALESCE(SUM(input_tokens), 0),
+			COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens), 0),
 			COALESCE(SUM(output_tokens), 0),
 			COALESCE(SUM(cache_read_tokens), 0),
 			COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(*)
-		FROM cost_events `+where, args...).Scan(
+		FROM cost_events `+where+` AND reconciliation_status <> ?`, append(args, ReconciliationLegacySuperseded)...).Scan(
 		&cs.TotalCostMicrodollars,
 		&cs.TotalInputTokens,
 		&cs.TotalOutputTokens,
@@ -277,6 +1017,63 @@ func (s *Store) querySum(where string, args ...any) (CostSummary, error) {
 		&cs.EventCount,
 	)
 	return cs, err
+}
+
+func (s *Store) queryCovered(where string, args ...any) (CoveredSummary, error) {
+	var summary CoveredSummary
+	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
+	query := `
+		SELECT
+			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN cost_microdollars ELSE 0 END), 0),
+			COALESCE(SUM(input_tokens + cache_read_tokens + cache_write_tokens), 0),
+			COALESCE(SUM(output_tokens), 0),
+			COALESCE(SUM(cache_read_tokens), 0),
+			COALESCE(SUM(cache_write_tokens), 0),
+			COUNT(*),
+			COALESCE(SUM(` + tokens + `), 0),
+			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + tokens + ` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0)
+		FROM cost_events ` + where + ` AND reconciliation_status <> ?`
+	queryArgs := []any{
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnown, PricingKnownZero,
+		PricingKnownZero,
+		PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+		PricingUnknown,
+		PricingLegacyUnresolved, ReconciliationLegacyUnreconciled,
+	}
+	queryArgs = append(queryArgs, args...)
+	queryArgs = append(queryArgs, ReconciliationLegacySuperseded)
+	err := s.db.QueryRow(query, queryArgs...).Scan(
+		&summary.TotalCostMicrodollars,
+		&summary.TotalInputTokens,
+		&summary.TotalOutputTokens,
+		&summary.TotalCacheReadTokens,
+		&summary.TotalCacheWriteTokens,
+		&summary.EventCount,
+		&summary.Coverage.TotalTokens,
+		&summary.Coverage.KnownPriceEventCount,
+		&summary.Coverage.KnownPriceTokens,
+		&summary.Coverage.KnownZeroEventCount,
+		&summary.Coverage.UnknownPriceEventCount,
+		&summary.Coverage.UnreconciledEventCount,
+		&summary.Coverage.UnknownPriceTokens,
+		&summary.Coverage.UnreconciledTokens,
+	)
+	if err != nil {
+		return CoveredSummary{}, err
+	}
+	summary.Coverage.EventCount = summary.EventCount
+	summary.Coverage.CoverageKnown = true
+	summary.Coverage.Complete = summary.Coverage.UnknownPriceEventCount == 0 && summary.Coverage.UnreconciledEventCount == 0
+	return summary, nil
 }
 
 // DailyBySession returns daily costs for a specific session.
@@ -344,9 +1141,12 @@ func repeatArg(n int) string {
 // afterRowID. Cursor-based pagination is stable under concurrent inserts.
 func (s *Store) PageEventsAfter(afterRowID int64, limit int) ([]CostEvent, int64, error) {
 	rows, err := s.db.Query(`
-		SELECT rowid, id, session_id, timestamp, model,
+		SELECT rowid, id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
 			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-			cost_microdollars
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
 		FROM cost_events
 		WHERE rowid > ?
 		ORDER BY rowid ASC
@@ -360,22 +1160,100 @@ func (s *Store) PageEventsAfter(afterRowID int64, limit int) ([]CostEvent, int64
 	var result []CostEvent
 	for rows.Next() {
 		var (
-			rowid int64
-			ev    CostEvent
-			ts    string
+			rowid         int64
+			ev            CostEvent
+			ts            string
+			providerInput sql.NullInt64
 		)
 		if err := rows.Scan(
-			&rowid, &ev.ID, &ev.SessionID, &ts, &ev.Model,
+			&rowid, &ev.ID, &ev.SessionID, &ev.ParentSessionID, &ev.RunID, &ts,
+			&ev.Provider, &ev.SourceKind, &ev.SourceIdentity, &ev.TranscriptIdentity, &ev.Model,
 			&ev.InputTokens, &ev.OutputTokens, &ev.CacheReadTokens, &ev.CacheWriteTokens,
-			&ev.CostMicrodollars,
+			&ev.CacheWrite5mTokens, &ev.CacheWrite1hTokens, &ev.ReasoningTokens,
+			&providerInput, &ev.CostMicrodollars, &ev.PricingStatus,
+			&ev.ReconciliationStatus,
 		); err != nil {
 			return nil, afterRowID, err
 		}
-		ev.Timestamp, _ = time.Parse(time.RFC3339, ts)
+		if providerInput.Valid {
+			value := providerInput.Int64
+			ev.ProviderInputTokens = &value
+		}
+		ev.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
 		lastRowID = rowid
 		result = append(result, ev)
 	}
 	return result, lastRowID, rows.Err()
+}
+
+// EventsByDateRange returns auditable ledger rows for reports and exports.
+// Superseded estimates remain stored but are excluded from current totals.
+func (s *Store) EventsByDateRange(from, to time.Time) ([]CostEvent, error) {
+	rows, err := s.db.Query(`
+		SELECT id, session_id, parent_session_id, run_id, timestamp,
+			provider, source_kind, source_identity, transcript_identity, model,
+			input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+			cache_write_5m_tokens, cache_write_1h_tokens, reasoning_tokens,
+			provider_input_tokens, cost_microdollars, pricing_status,
+			reconciliation_status
+		FROM cost_events
+		WHERE timestamp >= ? AND timestamp < ? AND reconciliation_status <> ?
+		ORDER BY timestamp, id`, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339), ReconciliationLegacySuperseded)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var result []CostEvent
+	for rows.Next() {
+		var ev CostEvent
+		var ts string
+		var providerInput sql.NullInt64
+		if err := rows.Scan(
+			&ev.ID, &ev.SessionID, &ev.ParentSessionID, &ev.RunID, &ts,
+			&ev.Provider, &ev.SourceKind, &ev.SourceIdentity, &ev.TranscriptIdentity, &ev.Model,
+			&ev.InputTokens, &ev.OutputTokens, &ev.CacheReadTokens, &ev.CacheWriteTokens,
+			&ev.CacheWrite5mTokens, &ev.CacheWrite1hTokens, &ev.ReasoningTokens,
+			&providerInput, &ev.CostMicrodollars, &ev.PricingStatus, &ev.ReconciliationStatus,
+		); err != nil {
+			return nil, err
+		}
+		if providerInput.Valid {
+			value := providerInput.Int64
+			ev.ProviderInputTokens = &value
+		}
+		ev.Timestamp, _ = time.Parse(time.RFC3339Nano, ts)
+		result = append(result, ev)
+	}
+	return result, rows.Err()
+}
+
+type PricingUpdate struct {
+	CostMicrodollars int64
+	Status           PricingStatus
+}
+
+// ApplyPricingUpdates atomically updates quote fields without changing event
+// identity, tokens, attribution, or reconciliation state.
+func (s *Store) ApplyPricingUpdates(ctx context.Context, updates map[string]PricingUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin pricing update: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	stmt, err := tx.PrepareContext(ctx, `UPDATE cost_events SET cost_microdollars = ?, pricing_status = ? WHERE id = ?`)
+	if err != nil {
+		return fmt.Errorf("prepare pricing update: %w", err)
+	}
+	defer stmt.Close()
+	for id, update := range updates {
+		if _, err := stmt.ExecContext(ctx, update.CostMicrodollars, update.Status, id); err != nil {
+			return fmt.Errorf("update pricing %s: %w", id, err)
+		}
+	}
+	return tx.Commit()
 }
 
 // ApplyCostUpdates writes a batch of cost_microdollars updates within a single
