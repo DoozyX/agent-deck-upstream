@@ -30,6 +30,11 @@ cat >"$skill_root/references/working.md" <<'EOF'
 [telephone](tel:+9955550100)
 [embedded data](data:text/plain,fixture)
 [undefined manual][missing-label]
+[multiline
+inline link](multiline-missing.md)
+`[inline code reference][inline-code-label]`
+\[escaped reference][escaped-label]
+[incomplete angle destination](<angle-missing.md>
 [defined manual][reference target]
 [reference target]: missing-reference.md
 {{include:prompts/missing.md}}
@@ -71,6 +76,7 @@ for expected in \
   "missing-heading" \
   "missing.md" \
   "missing-reference.md" \
+  "multiline-missing.md" \
   "undefined Markdown reference label missing-label" \
   "balanced-missing(test).md" \
   'escaped-missing\(test\).md' \
@@ -96,6 +102,9 @@ for ignored in \
   "script-path-resolution-important" \
   "fenced-missing.md" \
   "fenced-label" \
+  "inline-code-label" \
+  "escaped-label" \
+  "angle-missing.md" \
   "unclosed.md"; do
   if [[ "$output" == *"missing local target $ignored"* || "$output" == *"missing local anchor $ignored"* || "$output" == *"undefined Markdown reference label $ignored"* ]]; then
     echo "FAIL: checker treated inactive or valid Markdown syntax as broken: $ignored" >&2
@@ -106,6 +115,7 @@ done
 
 touch "$skill_root/references/missing.md" \
   "$skill_root/references/missing-reference.md" \
+  "$skill_root/references/multiline-missing.md" \
   "$skill_root/references/balanced-missing(test).md" \
   "$skill_root/references/escaped-missing(test).md" \
   "$skill_root/references/encoded-missing file.md" \
