@@ -83,6 +83,50 @@ func waitForFixtureCWD(t *testing.T, pid int, path string) {
 	}
 }
 
+func TestProcessWithCWDInsideLsofParsesValidPIDWhenLsofExitsOne(t *testing.T) {
+	fakeBin := t.TempDir()
+	fakeLsof := filepath.Join(fakeBin, "lsof")
+	const fixturePID = 424242
+	if err := os.WriteFile(fakeLsof, []byte("#!/bin/sh\nprintf 'p424242\\nfcwd\\n'\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	pid, err := processWithCWDInsideLsof(t.TempDir())
+	if err != nil {
+		t.Fatalf("valid lsof PID record with exit 1: %v", err)
+	}
+	if pid != fixturePID {
+		t.Fatalf("pid = %d, want %d", pid, fixturePID)
+	}
+}
+
+func TestProcessWithCWDInsideLsofRejectsInvalidOutputWhenLsofExitsOne(t *testing.T) {
+	fakeBin := t.TempDir()
+	fakeLsof := filepath.Join(fakeBin, "lsof")
+	if err := os.WriteFile(fakeLsof, []byte("#!/bin/sh\nprintf 'pnot-a-pid\\nfcwd\\n'\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if pid, err := processWithCWDInsideLsof(t.TempDir()); err == nil {
+		t.Fatalf("invalid lsof output returned pid %d without an error", pid)
+	}
+}
+
+func TestProcessWithCWDInsideLsofDoesNotSwallowOtherExitErrors(t *testing.T) {
+	fakeBin := t.TempDir()
+	fakeLsof := filepath.Join(fakeBin, "lsof")
+	if err := os.WriteFile(fakeLsof, []byte("#!/bin/sh\nprintf 'p424242\\nfcwd\\n'\nexit 2\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if pid, err := processWithCWDInsideLsof(t.TempDir()); err == nil {
+		t.Fatalf("lsof exit 2 returned pid %d without an error", pid)
+	}
+}
+
 func TestCleanupExcludesUnpushedCommit(t *testing.T) {
 	_, unpushed, _, empty, worktrees := cleanupFixture(t)
 	orphans, protected := classifyUnregisteredWorktrees(worktrees, nil)
