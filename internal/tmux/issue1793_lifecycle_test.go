@@ -51,29 +51,21 @@ func TestIssue1793_WatcherResetsIndeterminateAttemptsAfterOwnedProbe(t *testing.
 	if err := os.WriteFile(countPath, []byte("0"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	ackPath := filepath.Join(t.TempDir(), "ack")
 	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
 		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
-		"if [ \"$1\" = \"display-message\" ]; then n=$(cat "+shellQuote(countPath)+"); n=$((n+1)); echo $n > "+shellQuote(countPath)+"; if [ $((n % 2)) -eq 1 ]; then exit 1; fi; echo '$owned'; exit 0; fi\n"+"exit 1\n")
-	ackPath := filepath.Join(t.TempDir(), "ack")
-	go func() {
-		deadline := time.Now().Add(4 * time.Second)
-		for time.Now().Before(deadline) {
-			raw, _ := os.ReadFile(countPath)
-			var probes int
-			_, _ = fmt.Sscanf(string(raw), "%d", &probes)
-			if probes >= 6 {
-				_ = os.WriteFile(ackPath, []byte("exit:7\nINTERLEAVED\n"), 0o600)
-				return
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-	}()
+		"if [ \"$1\" = \"display-message\" ]; then n=$(cat "+shellQuote(countPath)+"); n=$((n+1)); echo $n > "+shellQuote(countPath)+"; if [ $((n % 2)) -eq 1 ]; then exit 1; fi; if [ \"$n\" -ge 10 ]; then printf 'exit:7\\nINTERLEAVED\\n' > "+shellQuote(ackPath)+"; fi; echo '$owned'; exit 0; fi\n"+"exit 1\n")
 	sess := &Session{Name: "interleaved-watcher", createdSessionID: "$owned", launchAckPath: ackPath}
-	called := make(chan struct{}, 1)
-	sess.WatchInitialProcessCompletion(make(chan struct{}), func(int, string) { called <- struct{}{} })
+	called := make(chan string, 1)
+	sess.WatchInitialProcessCompletion(make(chan struct{}), func(exitCode int, diagnostic string) {
+		called <- fmt.Sprintf("%d:%s", exitCode, diagnostic)
+	})
 	select {
-	case <-called:
-	case <-time.After(5 * time.Second):
+	case got := <-called:
+		if got != "7:INTERLEAVED" {
+			t.Fatalf("completion = %q, want exit and diagnostic from owned probe", got)
+		}
+	case <-time.After(3 * time.Second):
 		t.Fatal("interleaved indeterminate probes prevented completion")
 	}
 	calls, err := os.ReadFile(countPath)
@@ -81,8 +73,8 @@ func TestIssue1793_WatcherResetsIndeterminateAttemptsAfterOwnedProbe(t *testing.
 		t.Fatal(err)
 	}
 	var probes int
-	if _, err := fmt.Sscanf(string(calls), "%d", &probes); err != nil || probes < launchAckIdentityMaxRetries+1 {
-		t.Fatalf("interleaved watcher probes=%d, want attempts reset after ownership", probes)
+	if _, err := fmt.Sscanf(string(calls), "%d", &probes); err != nil || probes != 2*launchAckIdentityMaxRetries {
+		t.Fatalf("interleaved watcher probes=%d, want %d proving attempts reset after ownership", probes, 2*launchAckIdentityMaxRetries)
 	}
 }
 
