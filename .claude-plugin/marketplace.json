@@ -25,6 +25,11 @@
         "./skills/debug",
         "./skills/verify"
       ]
+    },
+    {
+      "name": "agent-deck-mcp",
+      "description": "Connect Codex to the hosted Agent Deck MCP server.",
+      "source": "./plugins/agent-deck-mcp"
     }
   ]
 }

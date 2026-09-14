@@ -1,0 +1,9 @@
+{
+  "name": "agent-deck-mcp",
+  "version": "0.1.0",
+  "description": "Connect Codex to the hosted Agent Deck MCP server.",
+  "author": {
+    "name": "DoozyX"
+  },
+  "mcpServers": "./.mcp.json"
+}
