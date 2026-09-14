@@ -1488,6 +1488,13 @@ func isSystemdUserScopeAvailable() bool {
 }
 
 func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
+	return s.startCommandSpecWithLaunchAck(workDir, command, true)
+}
+
+// startCommandSpecWithLaunchAck builds the session-creation command. The
+// bootstrap launch intentionally omits the acknowledgement wrapper: it only
+// holds the pane open while Start establishes immutable ownership and options.
+func (s *Session) startCommandSpecWithLaunchAck(workDir, command string, includeLaunchAck bool) (string, []string) {
 	startWithInitialProcess := command != "" && s.RunCommandAsInitialProcess
 	// Socket isolation (issue #687, v1.7.50): prepend `-L <name>` to the
 	// bare tmux args so the new-session spawn and every subsequent lookup
@@ -1543,20 +1550,7 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 		// pass through as the command argument verbatim — bash -c "bash -c '…'"
 		// tail-exec's the inner bash, so no extra lingering process and no
 		// re-escaping of the nested single quotes.
-		bashPath := initialProcessBashBinary()
-		if s.launchAckPath != "" {
-			// Keep the acknowledgement protocol out of the command string: both
-			// the marker path and user command are positional arguments, so an
-			// unusual project path or command cannot alter the wrapper script.
-			launchMode := "interactive"
-			if s.AllowInitialProcessExit {
-				launchMode = "isolated"
-			}
-			tmuxArgs = append(tmuxArgs, bashPath, "-c", launchAckScript,
-				"agent-deck-launch-ack", s.launchAckPath, launchMode, command)
-		} else {
-			tmuxArgs = append(tmuxArgs, bashPath, "-c", command)
-		}
+		tmuxArgs = append(tmuxArgs, s.initialProcessArgs(command, includeLaunchAck)...)
 	}
 
 	unitBase := serviceUnitBase(s.Name)
@@ -1605,6 +1599,22 @@ func (s *Session) startCommandSpec(workDir, command string) (string, []string) {
 	default:
 		return "tmux", tmuxArgs
 	}
+}
+
+// initialProcessArgs returns the direct argv form tmux must exec for the
+// initial command. Keeping the acknowledgement inputs positional avoids
+// command-string injection through either the marker path or user command.
+func (s *Session) initialProcessArgs(command string, includeLaunchAck bool) []string {
+	bashPath := initialProcessBashBinary()
+	if includeLaunchAck && s.launchAckPath != "" {
+		launchMode := "interactive"
+		if s.AllowInitialProcessExit {
+			launchMode = "isolated"
+		}
+		return []string{bashPath, "-c", launchAckScript,
+			"agent-deck-launch-ack", s.launchAckPath, launchMode, command}
+	}
+	return []string{bashPath, "-c", command}
 }
 
 // initialProcessBashBinary returns a command name when Bash is discoverable
@@ -2653,7 +2663,17 @@ func (s *Session) Start(command string) error {
 	// workDir was resolved and validated at the top of Start (#1713).
 	s.creationMarker = generateShortID()
 	s.captureSessionIdentityOnCreate = true
-	launcher, args := s.startCommandSpec(workDir, command)
+	launchCommand := command
+	launchWithAck := true
+	if command != "" && s.RunCommandAsInitialProcess {
+		// A short-lived command cannot be the session's creation process:
+		// tmux starts it before Start can capture the immutable session ID or
+		// install remain-on-exit. Keep a harmless pane leader alive instead,
+		// then respawn the real command once both facts are established.
+		launchCommand = "while :; do sleep 3600; done"
+		launchWithAck = false
+	}
+	launcher, args := s.startCommandSpecWithLaunchAck(workDir, launchCommand, launchWithAck)
 	// newSpawnCommand (not bare execCommand) so the spawn — and any tmux server
 	// it starts — runs from SpawnBaseDir and can never inherit a directory that
 	// is later deleted. See workdir_guard.go.
@@ -2795,6 +2815,19 @@ func (s *Session) Start(command string) error {
 		return fmt.Errorf("tmux session created but immutable identity was not captured: %w", identityErr)
 	}
 	s.createdSessionID = createdID
+	if command != "" && s.RunCommandAsInitialProcess {
+		if launchErr := s.launchInitialProcessAfterSetup(command); launchErr != nil {
+			cleanupLaunchAckFiles(s.launchAckPath)
+			s.launchAckPath = ""
+			if rollbackErr := s.rollbackCreatedSession(s.createdSessionID); rollbackErr != nil {
+				statusLog.Warn("created_session_rollback_failed",
+					slog.String("session", logging.SanitizeValue(s.Name)),
+					slog.String("identity", logging.SanitizeValue(s.createdSessionID)),
+					slog.String("error", rollbackErr.Error()))
+			}
+			return fmt.Errorf("failed to launch initial process after ownership setup: %w", launchErr)
+		}
+	}
 
 	// Register session in cache immediately to prevent race condition
 	// where Exists() returns false because cache was refreshed before session creation
@@ -3000,6 +3033,24 @@ func createdSessionIdentityFromOutput(output []byte) string {
 		}
 	}
 	return ""
+}
+
+// launchInitialProcessAfterSetup starts the real command only after immutable
+// session ownership is captured and its effective retain-on-exit setting is
+// installed. This ordering keeps an immediate exit observable for both clean
+// one-shots and failed interactive launches.
+func (s *Session) launchInitialProcessAfterSetup(command string) error {
+	if value, ok := s.OptionOverrides["remain-on-exit"]; ok {
+		if err := s.runBoundedMutation("set-option", "-t", s.createdSessionID, "-q", "remain-on-exit", value); err != nil {
+			return fmt.Errorf("set pre-launch remain-on-exit: %w", err)
+		}
+	}
+	target := s.createdSessionID + ":0.0"
+	args := append([]string{"respawn-pane", "-k", "-t", target}, s.initialProcessArgs(command, true)...)
+	if err := s.runBoundedMutation(args...); err != nil {
+		return fmt.Errorf("respawn initial process: %w", err)
+	}
+	return nil
 }
 
 // rollbackCreatedSession addresses the session by the immutable identity
