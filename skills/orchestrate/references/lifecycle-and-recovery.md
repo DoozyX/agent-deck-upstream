@@ -298,9 +298,10 @@ any point. Then:
   predecessor still active: no child moves, no generation is burned, and
   supervision still points at the predecessor. Evidence lands in
   `$RUN_DIR/rotate-failure-c<gen>-<tool>.log`; tell the user and quote the
-  reason. Cross-provider behavior for a quota-limited successor is finalized by
-  the integration task, so do not infer or advertise provider switching or
-  parking from this reference alone.
+  reason. A quota-limited successor parks the rotation until its reset or an
+  explicit operator decision; it never triggers the automatic cross-provider
+  retry. An ordinary non-quota startup or liveness failure retains exactly one
+  alternate-tool retry when the predecessor's tool differs.
 
   **`poll.sh` exits 3 from here on, every beat, until you go** — your
   heartbeat is a failing command now, not a warning you can read past. A

@@ -125,8 +125,10 @@ connector mechanics.
 `[usage.policy]` remains a separate advisory, availability-aware recommendation
 surface. Query it only before a relevant launch wave or after reported quota
 change; unavailable data does not block work. It never overrides explicit
-choices or role precedence. Cross-provider quota rotation and installed replay
-are integration obligations outside this skill edit; do not claim them here.
+choices or role precedence. Rotation parks a quota-limited successor until its
+reset or an explicit operator decision; ordinary non-quota startup failure may
+use only the bounded alternate-tool retry. Installed replay remains a rollout
+verification obligation.
 
 ## Verification
 
