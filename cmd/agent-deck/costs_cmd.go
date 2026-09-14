@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
 	"github.com/asheshgoplani/agent-deck/internal/session"
@@ -63,25 +64,42 @@ func openCostStore(profile string) (*costs.Store, *session.Storage) {
 // newPricerFromConfig creates a Pricer using the user's config overrides.
 func newPricerFromConfig() *costs.Pricer {
 	cfg, _ := session.LoadUserConfig()
+	return newPricerFromUserConfig(cfg)
+}
+
+func newPricerFromUserConfig(cfg *session.UserConfig) *costs.Pricer {
+	return costs.NewPricer(pricerConfigFromUserConfig(cfg))
+}
+
+func pricerConfigFromUserConfig(cfg *session.UserConfig) costs.PricerConfig {
 	pricerCfg := costs.PricerConfig{}
 	if cfg != nil && len(cfg.Costs.Pricing.Overrides) > 0 {
 		pricerCfg.Overrides = make(map[string]costs.PriceOverride)
 		for model, ov := range cfg.Costs.Pricing.Overrides {
 			pricerCfg.Overrides[model] = costs.PriceOverride{
-				InputPerMtok:      ov.InputPerMtok,
-				OutputPerMtok:     ov.OutputPerMtok,
-				CacheReadPerMtok:  ov.CacheReadPerMtok,
-				CacheWritePerMtok: ov.CacheWritePerMtok,
+				InputPerMtok:        ov.InputPerMtok,
+				OutputPerMtok:       ov.OutputPerMtok,
+				CacheReadPerMtok:    ov.CacheReadPerMtok,
+				CacheWritePerMtok:   ov.CacheWritePerMtok,
+				CacheWrite5mPerMtok: ov.CacheWrite5mPerMtok,
+				CacheWrite1hPerMtok: ov.CacheWrite1hPerMtok,
+				CacheWrite5mSet:     ov.CacheWrite5mSet,
+				CacheWrite1hSet:     ov.CacheWrite1hSet,
 			}
 		}
 	}
-	return costs.NewPricer(pricerCfg)
+	return pricerCfg
 }
 
 func handleCostsSync(profile string) {
+	userConfig, err := session.LoadUserConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+		os.Exit(1)
+	}
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
-	pricer := newPricerFromConfig()
+	pricer := newPricerFromUserConfig(userConfig)
 
 	instances, err := storage.Load()
 	if err != nil {
@@ -89,37 +107,154 @@ func handleCostsSync(profile string) {
 		os.Exit(1)
 	}
 
-	var syncSessions []costs.SyncSession
-	for _, inst := range instances {
-		if inst.Tool != "claude" || inst.ClaudeSessionID == "" {
-			continue
-		}
-		syncSessions = append(syncSessions, costs.SyncSession{
-			InstanceID:      inst.ID,
-			ClaudeSessionID: inst.ClaudeSessionID,
-			ProjectPath:     inst.ProjectPath,
-			Tool:            inst.Tool,
-		})
+	discoveryConfig := buildCostDiscoveryConfig(storage.Profile(), userConfig, instances)
+	sources, warnings, err := costs.DiscoverTranscriptSources(discoveryConfig)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to discover usage transcripts: %v\n", err)
+		os.Exit(1)
 	}
-
-	if len(syncSessions) == 0 {
-		fmt.Println("No Claude sessions found to sync.")
+	if len(sources) == 0 {
+		fmt.Println("No Claude or Codex transcripts found to sync.")
+		printCostSyncWarnings(warnings)
 		return
 	}
 
-	fmt.Printf("Syncing cost data for %d Claude session(s)...\n", len(syncSessions))
-	result := costs.SyncFromTranscripts(costStore, pricer, syncSessions)
+	fmt.Printf("Syncing cost data from %d Claude/Codex transcript source(s)...\n", len(sources))
+	result := costs.Sync(context.Background(), costStore, pricer, sources)
+	result.Warnings = append(warnings, result.Warnings...)
 
 	fmt.Printf("\nResults:\n")
-	fmt.Printf("  Sessions scanned: %d\n", result.SessionsScanned)
+	fmt.Printf("  Sources scanned:  %d\n", result.SourcesScanned)
+	fmt.Printf("  Sources changed:  %d\n", result.SourcesChanged)
 	fmt.Printf("  Events imported:  %d\n", result.EventsImported)
 	fmt.Printf("  Events skipped:   %d (already tracked)\n", result.EventsSkipped)
+	fmt.Printf("  Events reconciled:%d\n", result.EventsReconciled)
+	printCostSyncWarnings(result.Warnings)
 	if len(result.Errors) > 0 {
 		fmt.Printf("  Errors:           %d\n", len(result.Errors))
 		for _, e := range result.Errors {
 			fmt.Printf("    - %s\n", e)
 		}
+		os.Exit(1)
 	}
+}
+
+func buildCostDiscoveryConfig(profile string, cfg *session.UserConfig, instances []*session.Instance) costs.DiscoveryConfig {
+	var config costs.DiscoveryConfig
+	addHome := func(provider, path, account string, required bool) {
+		if path == "" {
+			return
+		}
+		config.Homes = append(config.Homes, costs.ProviderHome{Provider: provider, Path: path, Account: account, Required: required})
+	}
+	selectedCodexRequired := strings.TrimSpace(os.Getenv("CODEX_HOME")) != ""
+	if cfg != nil {
+		selectedCodexRequired = selectedCodexRequired || cfg.GetProfileCodexConfigDir(profile) != "" || strings.TrimSpace(cfg.Codex.ConfigDir) != ""
+	}
+	selectedClaudeHome := session.GetClaudeConfigDir()
+	selectedCodexHome := session.GetCodexConfigDir()
+	addHome(costs.ProviderClaude, selectedClaudeHome, profile, session.IsClaudeConfigDirExplicit())
+	addHome(costs.ProviderCodex, selectedCodexHome, profile, selectedCodexRequired)
+	for _, inst := range instances {
+		if inst == nil {
+			continue
+		}
+		switch inst.Tool {
+		case "claude":
+			home := session.GetClaudeConfigDirForInstance(inst)
+			addHome(costs.ProviderClaude, home, inst.Account, session.IsClaudeConfigDirExplicitForInstance(inst))
+			if inst.ClaudeSessionID != "" {
+				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
+					Provider: costs.ProviderClaude, Home: home, NativeSessionID: inst.ClaudeSessionID,
+					SessionID: inst.ID, ParentSessionID: inst.ParentSessionID, Archived: !inst.ArchivedAt.IsZero(),
+				})
+			}
+		case "codex":
+			home := session.GetCodexConfigDirForInstance(inst)
+			addHome(costs.ProviderCodex, home, inst.Account, selectedCodexRequired || home != selectedCodexHome)
+			if inst.CodexSessionID != "" {
+				config.Attributions = append(config.Attributions, costs.TranscriptAttribution{
+					Provider: costs.ProviderCodex, Home: home, NativeSessionID: inst.CodexSessionID,
+					SessionID: inst.ID, ParentSessionID: inst.ParentSessionID, Archived: !inst.ArchivedAt.IsZero(),
+				})
+			}
+		}
+	}
+	return config
+}
+
+func printCostSyncWarnings(warnings []costs.CoverageWarning) {
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Printf("  Warnings:         %d\n", len(warnings))
+	for _, warning := range warnings {
+		fmt.Printf("    - %s %s: %s\n", warning.Provider, warning.Source, warning.Message)
+	}
+}
+
+type costSummaryStore interface {
+	CoveredTotalToday() (costs.CoveredSummary, error)
+	CoveredTotalYesterday() (costs.CoveredSummary, error)
+	CoveredTotalThisWeek() (costs.CoveredSummary, error)
+	CoveredTotalLastWeek() (costs.CoveredSummary, error)
+	CoveredTotalThisMonth() (costs.CoveredSummary, error)
+	CoveredTotalLastMonth() (costs.CoveredSummary, error)
+	CoveredProjectedMonthly() (int64, costs.Coverage, error)
+	CoveredCostByDay() ([]costs.CostBreakdown, error)
+	CoveredCostByProvider() ([]costs.CostBreakdown, error)
+	CoveredCostByModel() ([]costs.CostBreakdown, error)
+	CoveredCostBySession() ([]costs.CostBreakdown, error)
+	CoveredCostByRun() ([]costs.CostBreakdown, error)
+}
+
+type costSummaryReport struct {
+	today, yesterday, week, lastWeek, month, lastMonth costs.CoveredSummary
+	projected                                          int64
+	projectionCoverage                                 costs.Coverage
+	days, providers, models, sessions, runs            []costs.CostBreakdown
+}
+
+func loadCostSummary(store costSummaryStore) (costSummaryReport, error) {
+	var report costSummaryReport
+	var err error
+	if report.today, err = store.CoveredTotalToday(); err != nil {
+		return report, fmt.Errorf("query today: %w", err)
+	}
+	if report.yesterday, err = store.CoveredTotalYesterday(); err != nil {
+		return report, fmt.Errorf("query yesterday: %w", err)
+	}
+	if report.week, err = store.CoveredTotalThisWeek(); err != nil {
+		return report, fmt.Errorf("query this week: %w", err)
+	}
+	if report.lastWeek, err = store.CoveredTotalLastWeek(); err != nil {
+		return report, fmt.Errorf("query last week: %w", err)
+	}
+	if report.month, err = store.CoveredTotalThisMonth(); err != nil {
+		return report, fmt.Errorf("query this month: %w", err)
+	}
+	if report.lastMonth, err = store.CoveredTotalLastMonth(); err != nil {
+		return report, fmt.Errorf("query last month: %w", err)
+	}
+	if report.projected, report.projectionCoverage, err = store.CoveredProjectedMonthly(); err != nil {
+		return report, fmt.Errorf("query projection: %w", err)
+	}
+	if report.days, err = store.CoveredCostByDay(); err != nil {
+		return report, fmt.Errorf("query days: %w", err)
+	}
+	if report.providers, err = store.CoveredCostByProvider(); err != nil {
+		return report, fmt.Errorf("query providers: %w", err)
+	}
+	if report.models, err = store.CoveredCostByModel(); err != nil {
+		return report, fmt.Errorf("query models: %w", err)
+	}
+	if report.sessions, err = store.CoveredCostBySession(); err != nil {
+		return report, fmt.Errorf("query sessions: %w", err)
+	}
+	if report.runs, err = store.CoveredCostByRun(); err != nil {
+		return report, fmt.Errorf("query runs: %w", err)
+	}
+	return report, nil
 }
 
 func handleCostsSummary(profile string, args []string) {
@@ -133,58 +268,104 @@ func handleCostsSummary(profile string, args []string) {
 
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
+	handleCostsSummaryWithStore(costStore, *jsonOutput)
+}
 
-	today, _ := costStore.TotalToday()
-	yesterday, _ := costStore.TotalYesterday()
-	week, _ := costStore.TotalThisWeek()
-	lastWeek, _ := costStore.TotalLastWeek()
-	month, _ := costStore.TotalThisMonth()
-	lastMonth, _ := costStore.TotalLastMonth()
-	projected, _ := costStore.ProjectedMonthly()
+func handleCostsSummaryWithStore(costStore costSummaryStore, jsonOutput bool) {
+	report, err := loadCostSummary(costStore)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: failed to load cost summary: %v\n", err)
+		os.Exit(1)
+	}
+	today, yesterday, week := report.today, report.yesterday, report.week
+	lastWeek, month, lastMonth := report.lastWeek, report.month, report.lastMonth
+	projected, projectionCoverage := report.projected, report.projectionCoverage
+	days, providers, models := report.days, report.providers, report.models
+	sessions, runs := report.sessions, report.runs
+	allCoverage := costs.MergeCoverage(today.Coverage, yesterday.Coverage, week.Coverage, lastWeek.Coverage, month.Coverage, lastMonth.Coverage)
 
-	if *jsonOutput {
+	if jsonOutput {
 		// Wire shape mirrors costs.RemoteCostSummary so SSHRunner can json.Unmarshal directly.
-		payload := map[string]interface{}{
-			"cost_today_microdollars":      today.TotalCostMicrodollars,
-			"cost_yesterday_microdollars":  yesterday.TotalCostMicrodollars,
-			"cost_this_week_microdollars":  week.TotalCostMicrodollars,
-			"cost_last_week_microdollars":  lastWeek.TotalCostMicrodollars,
-			"cost_this_month_microdollars": month.TotalCostMicrodollars,
-			"cost_last_month_microdollars": lastMonth.TotalCostMicrodollars,
-			"cost_projected_microdollars":  projected,
-			"events_today":                 today.EventCount,
-			"events_this_week":             week.EventCount,
-			"events_this_month":            month.EventCount,
+		remote := costs.RemoteCostSummary{
+			CostTodayMicrodollars: today.TotalCostMicrodollars, CostYesterdayMicrodollars: yesterday.TotalCostMicrodollars,
+			CostThisWeekMicrodollars: week.TotalCostMicrodollars, CostLastWeekMicrodollars: lastWeek.TotalCostMicrodollars,
+			CostThisMonthMicrodollars: month.TotalCostMicrodollars, CostLastMonthMicrodollars: lastMonth.TotalCostMicrodollars,
+			CostProjectedMicrodollars: projected, EventsToday: today.EventCount, EventsThisWeek: week.EventCount, EventsThisMonth: month.EventCount,
+			CoverageKnown: allCoverage.CoverageKnown, CoverageComplete: allCoverage.Complete,
+			ProjectionComplete: projectionCoverage.CoverageKnown && projectionCoverage.Complete,
+			TodayCoverage:      today.Coverage, YesterdayCoverage: yesterday.Coverage, ThisWeekCoverage: week.Coverage,
+			LastWeekCoverage: lastWeek.Coverage, ThisMonthCoverage: month.Coverage, LastMonthCoverage: lastMonth.Coverage,
+			ProjectionCoverage: projectionCoverage, DateBasis: "UTC calendar dates", Timezone: "UTC",
 		}
+		payload := struct {
+			costs.RemoteCostSummary
+			Days      []costs.CostBreakdown `json:"days"`
+			Providers []costs.CostBreakdown `json:"providers"`
+			Models    []costs.CostBreakdown `json:"models"`
+			Sessions  []costs.CostBreakdown `json:"sessions"`
+			Runs      []costs.CostBreakdown `json:"runs"`
+		}{remote, days, providers, models, sessions, runs}
 		enc := json.NewEncoder(os.Stdout)
 		_ = enc.Encode(payload)
 		return
 	}
 
-	fmt.Printf("Cost Summary:\n")
-	fmt.Printf("  Today:      %s (%d events)\n", costs.FormatUSD(today.TotalCostMicrodollars), today.EventCount)
-	fmt.Printf("  This week:  %s (%d events)\n", costs.FormatUSD(week.TotalCostMicrodollars), week.EventCount)
-	fmt.Printf("  This month: %s (%d events)\n", costs.FormatUSD(month.TotalCostMicrodollars), month.EventCount)
-	fmt.Printf("  Projected:  %s/mo\n", costs.FormatUSD(projected))
-
-	top, _ := costStore.TopSessionsByCost(5)
-	if len(top) > 0 {
-		fmt.Printf("\nTop Sessions:\n")
-		for i, sc := range top {
-			title := sc.SessionTitle
-			if title == "" {
-				title = sc.SessionID
-			}
-			fmt.Printf("  %d. %-30s %s (%d events)\n", i+1, title, costs.FormatUSD(sc.CostMicrodollars), sc.EventCount)
-		}
+	fmt.Printf("Cost Summary (UTC calendar dates):\n")
+	printCoveredSummary("Today", today)
+	printCoveredSummary("This week", week)
+	printCoveredSummary("This month", month)
+	projectionSummary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: projected}, Coverage: projectionCoverage}
+	projectionStatus := costs.CostCoverageStatus(projectionSummary)
+	if projectionStatus == "price unknown" || projectionStatus == "coverage unknown" {
+		fmt.Printf("  Projected:  %s (incomplete)\n", projectionStatus)
+	} else if projectionCoverage.Complete {
+		fmt.Printf("  Projected:  %s/mo (%s)\n", costs.FormatUSD(projected), projectionStatus)
+	} else {
+		fmt.Printf("  Projected:  %s known subtotal/mo (incomplete)\n", costs.FormatUSD(projected))
 	}
 
-	byModel, _ := costStore.CostByModel()
-	if len(byModel) > 0 {
-		fmt.Printf("\nCost by Model:\n")
-		for model, cost := range byModel {
-			fmt.Printf("  %-30s %s\n", model, costs.FormatUSD(cost))
+	printCostBreakdowns("By day", days)
+	printCostBreakdowns("By provider", providers)
+	printCostBreakdowns("By model", models)
+	printCostBreakdowns("By session", sessions)
+	printCostBreakdowns("By run", runs)
+}
+
+func printCoveredSummary(label string, summary costs.CoveredSummary) {
+	status := costs.CostCoverageStatus(summary)
+	value := costs.FormatUSD(summary.TotalCostMicrodollars)
+	if status == "price unknown" || status == "coverage unknown" {
+		value = status
+	} else if status != "complete" {
+		value += " (" + status + ")"
+	}
+	fmt.Printf("  %-10s %s (%d events)\n", label+":", value, summary.EventCount)
+	if detail := costs.CoverageDetail(summary.Coverage); detail != "" {
+		fmt.Printf("               %s\n", detail)
+	}
+}
+
+func printCostBreakdowns(title string, items []costs.CostBreakdown) {
+	if len(items) == 0 {
+		return
+	}
+	fmt.Printf("\n%s:\n", title)
+	for _, item := range items {
+		summary := costs.CoveredSummary{CostSummary: costs.CostSummary{TotalCostMicrodollars: item.KnownCostMicrodollars, EventCount: item.Coverage.EventCount}, Coverage: item.Coverage}
+		status := costs.CostCoverageStatus(summary)
+		amount := costs.FormatUSD(item.KnownCostMicrodollars)
+		if status == "price unknown" || status == "coverage unknown" {
+			amount = status
+		} else if status != "complete" {
+			amount += " " + status
 		}
+		fmt.Printf("  %-24s %s | input %d cache-read %d cache-write %d (5m %d, 1h %d) output %d (reasoning subset %d)",
+			item.Key, amount, item.UncachedInputTokens, item.CacheReadInputTokens, item.CacheWriteInputTokens,
+			item.CacheWrite5mInputTokens, item.CacheWrite1hInputTokens, item.OutputTokens, item.ReasoningOutputTokens)
+		if detail := costs.CoverageDetail(item.Coverage); detail != "" {
+			fmt.Printf(" | %s", detail)
+		}
+		fmt.Println()
 	}
 }
 
@@ -197,8 +378,8 @@ func handleCostsRecompute(profile string, args []string) {
 		case "-h", "--help":
 			fmt.Println("Usage: agent-deck costs recompute [--dry-run]")
 			fmt.Println("\nRecalculate cost_microdollars for every cost_events row using current")
-			fmt.Println("pricing data (defaults + user overrides). Rows whose model is unknown to")
-			fmt.Println("the pricer are left untouched. Idempotent.")
+			fmt.Println("pricing data (defaults + user overrides). For unknown models, the prior amount is preserved")
+			fmt.Println("while any stale known status is demoted to unknown. Idempotent.")
 			return
 		default:
 			fmt.Fprintf(os.Stderr, "Unknown flag: %s\n", a)
@@ -207,9 +388,14 @@ func handleCostsRecompute(profile string, args []string) {
 		}
 	}
 
+	userConfig, err := session.LoadUserConfig()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error: failed to load user config")
+		os.Exit(1)
+	}
 	costStore, storage := openCostStore(profile)
 	defer storage.Close()
-	pricer := newPricerFromConfig()
+	pricer := newPricerFromUserConfig(userConfig)
 
 	if dryRun {
 		fmt.Println("Recomputing cost_events (dry-run, no rows will be modified)...")

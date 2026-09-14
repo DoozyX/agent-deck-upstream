@@ -68,13 +68,12 @@ func TestRemotePush_ChattyRemoteDoesNotStarveThePoll(t *testing.T) {
 
 	result := func(name, title string, other string) remoteSessionsFetchedMsg {
 		return remoteSessionsFetchedMsg{
-			gen:          round,
-			inRound:      true,
-			sessions:     map[string][]session.RemoteSessionInfo{name: {remoteInfo(name, name+"1", title, "running")}},
-			costs:        map[string]*costs.RemoteCostSummary{name: {CostTodayMicrodollars: 42}},
-			groups:       map[string][]string{name: {name + "-group"}},
-			failed:       map[string]bool{other: true},
-			groupsFailed: map[string]bool{other: true},
+			gen:       round,
+			inRound:   true,
+			sessions:  map[string][]session.RemoteSessionInfo{name: {remoteInfo(name, name+"1", title, "running")}},
+			costs:     map[string]*costs.RemoteCostSummary{name: {CostTodayMicrodollars: 42}},
+			groups:    map[string][]string{name: {name + "-group"}},
+			untouched: map[string]bool{other: true},
 		}
 	}
 	// The chatty remote's poll result is older than its push: rows stay
@@ -414,8 +413,8 @@ func TestRemotePush_EmptyRemoteKeepsHeaderAndGroups(t *testing.T) {
 
 	msg := home.pushedRemoteFetch(session.RemoteChange{Remote: "busy", HasData: true})
 	for _, name := range []string{"empty", "groupsonly", "costsonly"} {
-		if !msg.failed[name] || !msg.groupsFailed[name] {
-			t.Fatalf("a push must mark every other known remote failed; %s missing in %v / %v", name, msg.failed, msg.groupsFailed)
+		if !msg.untouched[name] || msg.failed[name] || msg.groupsFailed[name] {
+			t.Fatalf("a push must mark every other known remote untouched; %s missing in %v", name, msg.untouched)
 		}
 	}
 
@@ -577,8 +576,8 @@ func TestRemotePush_FollowsConfiguredRemotes(t *testing.T) {
 		t.Fatal("a push from a remote not in the config must not add it to the tree")
 	}
 	msg := h.pushedRemoteFetch(pushWithData("a", []session.RemoteSessionInfo{{ID: "s1", Title: "a-pushed"}}, nil).change)
-	if !msg.failed["c"] || !msg.groupsFailed["c"] {
-		t.Fatalf("configured remote c must be marked failed (kept) by a push from a; failed=%v", msg.failed)
+	if !msg.untouched["c"] || msg.failed["c"] || msg.groupsFailed["c"] {
+		t.Fatalf("configured remote c must be marked untouched by a push from a; untouched=%v", msg.untouched)
 	}
 	if msg.failed["a"] {
 		t.Fatal("the pusher itself is fresh, not failed")

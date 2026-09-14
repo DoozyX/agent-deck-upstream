@@ -269,6 +269,20 @@ func TestValidateTranscriptPath(t *testing.T) {
 	})
 }
 
+func TestValidateTranscriptPathAcceptsExplicitClaudeConfigHome(t *testing.T) {
+	home := t.TempDir()
+	configured := filepath.Join(home, "claude-account")
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", configured)
+	path := filepath.Join(configured, "projects", "p", "t.jsonl")
+	if cleaned, ok := ValidateTranscriptPath(path); !ok || cleaned != path {
+		t.Fatalf("explicit provider home path rejected: cleaned=%q ok=%v", cleaned, ok)
+	}
+	if _, ok := ValidateTranscriptPath(filepath.Join(home, "claude-account-spoof", "t.jsonl")); ok {
+		t.Fatal("sibling prefix of explicit provider home must be rejected")
+	}
+}
+
 func TestTranscriptTailLines_BoundsAndOrder(t *testing.T) {
 	var lines []string
 	for i := 0; i < 40; i++ {

@@ -563,7 +563,7 @@ body[data-rail="hidden"] .rightrail { display: none; }
 
 /* cost dashboard */
 .costs { padding: 14px; flex: 1; min-height: 0; overflow: auto; display: flex; flex-direction: column; gap: 12px; }
-.stat-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 10px; }
 .stat {
   background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-lg);
   padding: 14px 14px 12px; position: relative; overflow: hidden;
@@ -572,7 +572,8 @@ body[data-rail="hidden"] .rightrail { display: none; }
   content: ''; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--accent);
 }
 .stat .lab { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.08em; color: var(--muted); text-transform: uppercase; }
-.stat .val { font-size: 26px; font-weight: 700; color: var(--text-hi); font-family: var(--mono); margin-top: 4px; }
+.stat .val { font-size: 26px; font-weight: 700; color: var(--text-hi); font-family: var(--mono); margin-top: 4px; overflow-wrap: anywhere; }
+.stat.projected-stat .val { font-size: clamp(16px, 1.8vw, 22px); line-height: 1.2; }
 .stat .delta { font-size: 11px; color: var(--tn-green); margin-top: 3px; }
 
 .chart-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 14px; }

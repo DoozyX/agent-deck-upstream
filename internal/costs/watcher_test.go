@@ -48,7 +48,51 @@ func TestCostEventWatcher(t *testing.T) {
 		if ev.InputTokens != 1000 {
 			t.Errorf("input = %d, want 1000", ev.InputTokens)
 		}
+		time.Sleep(100 * time.Millisecond)
+		if _, err := os.Stat(finalPath); err != nil {
+			t.Fatalf("durable queue file removed before persistence acknowledgment: %v", err)
+		}
+		if err := ev.Ack(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(finalPath); !os.IsNotExist(err) {
+			t.Fatalf("acknowledged queue file still exists: %v", err)
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for cost event")
+	}
+}
+
+func TestCostEventWatcherDeliversQueueFilePresentAtStartup(t *testing.T) {
+	dir := t.TempDir()
+	queuePath := filepath.Join(dir, "predating.json")
+	data, err := json.Marshal(costs.RawCostEvent{
+		InstanceID: "inst-predating", Model: "claude-sonnet-5",
+		InputTokens: 7, Timestamp: time.Now().UnixNano(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(queuePath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := costs.NewCostEventWatcher(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(w.Stop)
+	go w.Start()
+
+	select {
+	case delivery := <-w.EventCh():
+		if delivery.InstanceID != "inst-predating" || delivery.InputTokens != 7 {
+			t.Fatalf("startup delivery=%+v", delivery.RawCostEvent)
+		}
+		if err := delivery.Ack(); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("startup did not deliver pre-existing durable queue file")
 	}
 }

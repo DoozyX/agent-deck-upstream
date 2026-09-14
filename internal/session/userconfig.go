@@ -5571,10 +5571,58 @@ type PricingSettings struct {
 }
 
 type PricingOverride struct {
-	InputPerMtok      float64 `toml:"input_per_mtok,omitzero"`
-	OutputPerMtok     float64 `toml:"output_per_mtok,omitzero"`
-	CacheReadPerMtok  float64 `toml:"cache_read_per_mtok,omitzero"`
-	CacheWritePerMtok float64 `toml:"cache_write_per_mtok,omitzero"`
+	InputPerMtok        float64 `toml:"input_per_mtok,omitzero"`
+	OutputPerMtok       float64 `toml:"output_per_mtok,omitzero"`
+	CacheReadPerMtok    float64 `toml:"cache_read_per_mtok,omitzero"`
+	CacheWritePerMtok   float64 `toml:"cache_write_per_mtok,omitzero"`
+	CacheWrite5mPerMtok float64 `toml:"cache_write_5m_per_mtok,omitzero"`
+	CacheWrite1hPerMtok float64 `toml:"cache_write_1h_per_mtok,omitzero"`
+	CacheWrite5mSet     bool    `toml:"-" json:"-"`
+	CacheWrite1hSet     bool    `toml:"-" json:"-"`
+}
+
+// UnmarshalTOML keeps duration-rate presence distinct from its numeric value.
+func (p *PricingOverride) UnmarshalTOML(data any) error {
+	values, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("pricing override must be a table, got %T", data)
+	}
+	set := func(key string, target *float64) error {
+		value, present := values[key]
+		if !present {
+			return nil
+		}
+		switch n := value.(type) {
+		case int64:
+			*target = float64(n)
+		case float64:
+			*target = n
+		default:
+			return fmt.Errorf("pricing override %s must be numeric", key)
+		}
+		return nil
+	}
+	if err := set("input_per_mtok", &p.InputPerMtok); err != nil {
+		return err
+	}
+	if err := set("output_per_mtok", &p.OutputPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_read_per_mtok", &p.CacheReadPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_per_mtok", &p.CacheWritePerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_5m_per_mtok", &p.CacheWrite5mPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_1h_per_mtok", &p.CacheWrite1hPerMtok); err != nil {
+		return err
+	}
+	_, p.CacheWrite5mSet = values["cache_write_5m_per_mtok"]
+	_, p.CacheWrite1hSet = values["cache_write_1h_per_mtok"]
+	return nil
 }
 
 func (c CostsSettings) GetRetentionDays() int {

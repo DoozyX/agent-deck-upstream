@@ -20,9 +20,12 @@ import (
 // stubFetchRunner answers FetchSessions once release is closed (or at once
 // when release is nil).
 type stubFetchRunner struct {
-	name     string
-	sessions []session.RemoteSessionInfo
-	release  chan struct{}
+	name       string
+	sessions   []session.RemoteSessionInfo
+	release    chan struct{}
+	sessionErr error
+	summary    *costs.RemoteCostSummary
+	costErr    error
 }
 
 func (s stubFetchRunner) FetchSessions(ctx context.Context) ([]session.RemoteSessionInfo, error) {
@@ -33,10 +36,19 @@ func (s stubFetchRunner) FetchSessions(ctx context.Context) ([]session.RemoteSes
 			return nil, ctx.Err()
 		}
 	}
+	if s.sessionErr != nil {
+		return nil, s.sessionErr
+	}
 	return append([]session.RemoteSessionInfo(nil), s.sessions...), nil
 }
 
 func (s stubFetchRunner) FetchCostSummary(context.Context) (*costs.RemoteCostSummary, error) {
+	if s.costErr != nil {
+		return nil, s.costErr
+	}
+	if s.summary != nil {
+		return s.summary, nil
+	}
 	return &costs.RemoteCostSummary{}, nil
 }
 
@@ -83,8 +95,11 @@ func TestRemoteFetch_SlowRemoteDoesNotDelayFastOne(t *testing.T) {
 	if _, ok := first.sessions["fast"]; !ok {
 		t.Fatalf("first result must be the fast remote's; got sessions=%v failed=%v", first.sessions, first.failed)
 	}
-	if !first.failed["slow"] {
-		t.Fatal("a per-remote result must mark the other remotes failed so the merge keeps their rows")
+	if first.failed["slow"] {
+		t.Fatal("a per-remote result must not mark an untouched peer as failed")
+	}
+	if !first.untouched["slow"] {
+		t.Fatal("a per-remote result must identify the peer it did not attempt")
 	}
 
 	model, _ = h.Update(first)
@@ -126,12 +141,12 @@ func TestRemoteFetch_StaleGuardIsPerRemote(t *testing.T) {
 	home := newTestHomeWithItems(100, 30, nil)
 	perRemote := func(gen uint64, name, title string, others ...string) remoteSessionsFetchedMsg {
 		msg := remoteSessionsFetchedMsg{
-			gen:      gen,
-			sessions: map[string][]session.RemoteSessionInfo{name: {{ID: name + "-1", Title: title}}},
-			failed:   map[string]bool{},
+			gen:       gen,
+			sessions:  map[string][]session.RemoteSessionInfo{name: {{ID: name + "-1", Title: title}}},
+			untouched: map[string]bool{},
 		}
 		for _, o := range others {
-			msg.failed[o] = true
+			msg.untouched[o] = true
 		}
 		return msg
 	}
@@ -157,8 +172,8 @@ func TestRemoteFetch_StaleGuardIsPerRemote(t *testing.T) {
 func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 	home := newTestHomeWithItems(100, 30, nil)
 	home.remoteCosts = map[string]*costs.RemoteCostSummary{
-		"a": {CostTodayMicrodollars: 1},
-		"b": {CostTodayMicrodollars: 2},
+		"a": {CostTodayMicrodollars: 1, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}},
+		"b": {CostTodayMicrodollars: 2, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}},
 	}
 	rows := func(name string) map[string][]session.RemoteSessionInfo {
 		return map[string][]session.RemoteSessionInfo{name: {{ID: name + "-1", Title: name}}}
@@ -166,27 +181,28 @@ func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 
 	// a answers with a fresh summary: b's figure must survive.
 	model, _ := home.Update(remoteSessionsFetchedMsg{
-		sessions: rows("a"),
-		costs:    map[string]*costs.RemoteCostSummary{"a": {CostTodayMicrodollars: 10}},
-		failed:   map[string]bool{"b": true},
+		sessions:  rows("a"),
+		costs:     map[string]*costs.RemoteCostSummary{"a": {CostTodayMicrodollars: 10, CoverageKnown: true, CoverageComplete: true, TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true}}},
+		untouched: map[string]bool{"b": true},
 	})
 	h := model.(*Home)
 	if h.remoteCosts["a"].CostTodayMicrodollars != 10 || h.remoteCosts["b"] == nil || h.remoteCosts["b"].CostTodayMicrodollars != 2 {
 		t.Fatalf("a per-remote cost update must not blank other remotes; got %+v", h.remoteCosts)
 	}
 
-	// a answers but its cost fetch failed: a contributes zero, b untouched.
+	// a answers but its cost fetch failed: both stale subtotals survive, but
+	// neither stale remote may continue claiming known/complete coverage.
 	model, _ = h.Update(remoteSessionsFetchedMsg{
-		sessions: rows("a"),
-		costs:    map[string]*costs.RemoteCostSummary{},
-		failed:   map[string]bool{"b": true},
+		sessions:  rows("a"),
+		costs:     map[string]*costs.RemoteCostSummary{},
+		untouched: map[string]bool{"b": true},
 	})
 	h = model.(*Home)
-	if _, ok := h.remoteCosts["a"]; ok {
-		t.Fatalf("a remote whose cost fetch failed must contribute zero; got %+v", h.remoteCosts)
+	if summary := h.remoteCosts["a"]; summary == nil || summary.CostTodayMicrodollars != 10 || summary.CoverageKnown || summary.TodayCoverage.CoverageKnown || summary.TodayCoverage.Complete {
+		t.Fatalf("reachable remote stale cost must be retained with unknown coverage; got %+v", h.remoteCosts)
 	}
-	if h.remoteCosts["b"] == nil {
-		t.Fatalf("a remote still marked failed must keep its last-good figure; got %+v", h.remoteCosts)
+	if summary := h.remoteCosts["b"]; summary == nil || summary.CostTodayMicrodollars != 2 || !summary.CoverageKnown || !summary.TodayCoverage.CoverageKnown || !summary.TodayCoverage.Complete {
+		t.Fatalf("untouched remote cost coverage must remain intact; got %+v", h.remoteCosts)
 	}
 
 	// b is no longer configured (absent from both lists): its figure goes.
@@ -201,6 +217,61 @@ func TestRemoteFetch_CostsMergePerRemote(t *testing.T) {
 	}
 }
 
+func TestRemoteFetch_CostCoverageIsOrderIndependentAndFailedPeersStayUnknown(t *testing.T) {
+	complete := func(amount int64) *costs.RemoteCostSummary {
+		return &costs.RemoteCostSummary{
+			CostTodayMicrodollars: amount, CoverageKnown: true, CoverageComplete: true,
+			TodayCoverage: costs.Coverage{EventCount: 1, KnownPriceEventCount: 1, CoverageKnown: true, Complete: true},
+		}
+	}
+	remotes := map[string]session.RemoteConfig{"a": {Host: "a@x"}, "b": {Host: "b@x"}}
+	for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
+		t.Run(order[0]+"-then-"+order[1], func(t *testing.T) {
+			home := newTestHomeWithItems(100, 30, nil)
+			home.newRemoteFetchRunner = func(name string, _ session.RemoteConfig) remoteFetchRunner {
+				amount := int64(10)
+				if name == "b" {
+					amount = 20
+				}
+				return stubFetchRunner{name: name, sessions: []session.RemoteSessionInfo{{ID: name}}, summary: complete(amount)}
+			}
+			for _, name := range order {
+				model, _ := home.Update(home.fetchOneRemote(1, name, remotes[name], []string{"a", "b"}))
+				home = model.(*Home)
+			}
+			for _, name := range []string{"a", "b"} {
+				summary := home.remoteCosts[name]
+				if summary == nil || !summary.CoverageKnown || !summary.CoverageComplete || !summary.TodayCoverage.Complete {
+					t.Fatalf("healthy peer %s lost complete coverage after %v: %+v", name, order, home.remoteCosts)
+				}
+			}
+		})
+	}
+
+	for _, order := range [][]string{{"a", "b"}, {"b", "a"}} {
+		t.Run("failed-"+order[0]+"-then-"+order[1], func(t *testing.T) {
+			home := newTestHomeWithItems(100, 30, nil)
+			home.newRemoteFetchRunner = func(name string, _ session.RemoteConfig) remoteFetchRunner {
+				if name == "b" {
+					return stubFetchRunner{name: name, sessionErr: errors.New("offline")}
+				}
+				return stubFetchRunner{name: name, sessions: []session.RemoteSessionInfo{{ID: name}}, summary: complete(10)}
+			}
+			for _, name := range order {
+				model, _ := home.Update(home.fetchOneRemote(1, name, remotes[name], []string{"a", "b"}))
+				home = model.(*Home)
+			}
+			failed := home.remoteCosts["b"]
+			if failed == nil || failed.CoverageKnown || failed.CoverageComplete || failed.TodayCoverage.CoverageKnown {
+				t.Fatalf("uncached failed peer must remain explicit unknown after %v: %+v", order, home.remoteCosts)
+			}
+			if healthy := home.remoteCosts["a"]; healthy == nil || !healthy.CoverageKnown || !healthy.CoverageComplete {
+				t.Fatalf("failed peer must not downgrade healthy peer after %v: %+v", order, home.remoteCosts)
+			}
+		})
+	}
+}
+
 func TestRemoteFetch_ActiveClearsWhenLastResultLands(t *testing.T) {
 	home := newTestHomeWithItems(100, 30, nil)
 	noop := func() tea.Msg { return nil }
@@ -208,10 +279,10 @@ func TestRemoteFetch_ActiveClearsWhenLastResultLands(t *testing.T) {
 	h := model.(*Home)
 	result := func(name string, other string) remoteSessionsFetchedMsg {
 		return remoteSessionsFetchedMsg{
-			gen:      1,
-			inRound:  true,
-			sessions: map[string][]session.RemoteSessionInfo{name: {}},
-			failed:   map[string]bool{other: true},
+			gen:       1,
+			inRound:   true,
+			sessions:  map[string][]session.RemoteSessionInfo{name: {}},
+			untouched: map[string]bool{other: true},
 		}
 	}
 	model, _ = h.Update(result("a", "b"))
@@ -261,10 +332,10 @@ func TestRemoteFetch_DeconfiguredRemoteDoesNotReturnFromOlderRound(t *testing.T)
 	}
 	// A slow result for "gone" from the older round 5 lands afterwards.
 	model, _ = h.Update(remoteSessionsFetchedMsg{
-		gen:      5,
-		inRound:  true,
-		sessions: map[string][]session.RemoteSessionInfo{"gone": {{ID: "g-2", Title: "gone-5"}}},
-		failed:   map[string]bool{"a": true},
+		gen:       5,
+		inRound:   true,
+		sessions:  map[string][]session.RemoteSessionInfo{"gone": {{ID: "g-2", Title: "gone-5"}}},
+		untouched: map[string]bool{"a": true},
 	})
 	h = model.(*Home)
 	if got := remoteTitles(h, "gone"); len(got) != 0 {
