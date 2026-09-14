@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 SKILL="$ROOT/skills/orchestrate/SKILL.md"
+MODES="$ROOT/skills/orchestrate/references/modes-and-prompts.md"
+PLANNING="$ROOT/skills/orchestrate/references/planning-and-role-selection.md"
 PLAN_PROMPT="$ROOT/skills/orchestrate/references/prompts/plan.md"
 
 assert_contains() {
@@ -23,13 +25,17 @@ assert_absent() {
   fi
 }
 
-assert_contains "$SKILL" 'design/spec document ──────→ focused-first gate'
-assert_contains "$SKILL" 'A design or specification defaults to one focused implementation worker.'
-assert_contains "$SKILL" 'Planning requires a recorded trigger'
-assert_contains "$SKILL" 'one review and at most one amendment'
-assert_contains "$SKILL" 'do not launch or rotate to another planner'
+assert_contains "$MODES" 'design/spec document ──────→ focused-first gate'
+assert_contains "$MODES" 'A design or specification defaults to one focused implementation worker.'
+assert_contains "$MODES" 'Planning requires a recorded trigger'
+assert_contains "$PLANNING" 'one review and at most one amendment'
+assert_contains "$PLANNING" 'do not launch or rotate to another planner'
 assert_absent "$SKILL" '**planning stage** below before any implementation'
 assert_absent "$SKILL" 'the plan stops being a suggestion and becomes **the spec'
+
+assert_contains "$SKILL" '[usage.policy]` remains a separate advisory'
+assert_contains "$SKILL" 'It never overrides explicit'
+assert_contains "$SKILL" 'choices or role precedence.'
 
 assert_contains "$PLAN_PROMPT" 'This is a coordination plan, not a shadow implementation.'
 assert_contains "$PLAN_PROMPT" 'Do not embed production code'

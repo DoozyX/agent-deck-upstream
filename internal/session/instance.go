@@ -546,6 +546,11 @@ type Instance struct {
 	// JSON structure: {"tool": "claude", "options": {...}}
 	ToolOptionsJSON json.RawMessage `json:"tool_options,omitempty"`
 
+	// OrchestrateLaunch is the sanitized role/model/loadout receipt for a
+	// child created through the role resolver. It is nil for existing sessions
+	// and contains no credentials or prompt content.
+	OrchestrateLaunch *ResolvedLaunch `json:"orchestrate_launch,omitempty"`
+
 	tmuxSession *tmux.Session // Internal tmux session
 
 	paneDeadExitStatusForTest func() (int, bool) // nil uses tmuxSession.PaneDeadExitStatus
@@ -1898,12 +1903,13 @@ func ValidateClaudeExtraArgToken(token string) error {
 // (or "--model=..." form) token. When present we must NOT also inject
 // [claude].default_model, or the launch command would carry two --model flags.
 func extraArgsSupplyModel(extraArgs []string) bool {
-	for _, tok := range extraArgs {
-		if tok == "--model" || strings.HasPrefix(tok, "--model=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("claude", extraArgs)
+	return selected.ModelSet
+}
+
+func extraArgsSupplyClaudeEffort(extraArgs []string) bool {
+	selected, _ := ParseLaunchExtraArgSelections("claude", extraArgs)
+	return selected.EffortSet
 }
 
 // buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
@@ -2017,7 +2023,7 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 		}
 	}
 
-	if opts != nil && strings.TrimSpace(opts.Effort) != "" {
+	if opts != nil && strings.TrimSpace(opts.Effort) != "" && !extraArgsSupplyClaudeEffort(i.ExtraArgs) {
 		flags = append(flags, "--effort "+shellescape.Quote(strings.TrimSpace(opts.Effort)))
 	}
 
@@ -2333,16 +2339,14 @@ func (i *Instance) resolveCodexModelFlag() string {
 }
 
 func hasCodexExtraArgModel(args []string) bool {
-	for _, arg := range args {
-		arg = strings.TrimSpace(arg)
-		if arg == "--model" || strings.HasPrefix(arg, "--model=") {
-			return true
-		}
-	}
-	return false
+	selected, _ := ParseLaunchExtraArgSelections("codex", args)
+	return selected.ModelSet
 }
 
 func (i *Instance) resolveCodexReasoningEffortFlag() string {
+	if hasCodexExtraArgReasoningEffort(i.ExtraArgs) {
+		return ""
+	}
 	opts := i.GetCodexOptions()
 	effort := ""
 	if opts != nil {
@@ -2361,6 +2365,11 @@ func (i *Instance) resolveCodexReasoningEffortFlag() string {
 		return " --config " + shellescape.Quote(value)
 	}
 	return ""
+}
+
+func hasCodexExtraArgReasoningEffort(args []string) bool {
+	selected, _ := ParseLaunchExtraArgSelections("codex", args)
+	return selected.EffortSet
 }
 
 func (i *Instance) resolveCodexExtraArgsFlag() string {

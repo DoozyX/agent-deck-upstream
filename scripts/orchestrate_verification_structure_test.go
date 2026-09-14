@@ -11,31 +11,23 @@ import (
 
 func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 	repoRoot := filepath.Clean("..")
-	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
-	skillBytes, err := os.ReadFile(skillPath)
-	if err != nil {
-		t.Fatalf("read orchestration skill: %v", err)
-	}
-	skill := string(skillBytes)
+	core := readNormalizedSkillDocs(t,
+		filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"),
+	)
+	modes := readNormalizedSkillDocs(t,
+		filepath.Join(repoRoot, "skills", "orchestrate", "references", "modes-and-prompts.md"),
+	)
+	verification := readNormalizedSkillDocs(t,
+		filepath.Join(repoRoot, "skills", "orchestrate", "references", "deployed-verification.md"),
+	)
+	startup := readNormalizedSkillDocs(t,
+		filepath.Join(repoRoot, "skills", "orchestrate", "references", "delivery-startup.md"),
+	)
+	principles := readNormalizedSkillDocs(t,
+		filepath.Join(repoRoot, "skills", "orchestrate", "references", "principles-and-permissions.md"),
+	)
 
-	entrance := strings.Index(skill, "- A **deployed-system verification** request")
-	verificationFlow := strings.Index(skill, "## Deployed-system verification")
-	deliveryPipeline := strings.Index(skill, "## Per-task pipeline")
-	if entrance < 0 || verificationFlow < 0 || deliveryPipeline < 0 {
-		t.Fatalf("missing orchestration sections: entrance=%d verification=%d delivery=%d", entrance, verificationFlow, deliveryPipeline)
-	}
-	if !(entrance < verificationFlow && verificationFlow < deliveryPipeline) {
-		t.Fatalf("verification entrance and flow must precede delivery: entrance=%d verification=%d delivery=%d", entrance, verificationFlow, deliveryPipeline)
-	}
-	verificationSection := skill[verificationFlow:deliveryPipeline]
-	normalizedVerificationSection := strings.Join(strings.Fields(verificationSection), " ")
-	requiresStart := strings.Index(skill, "**Requires:**")
-	requiresEnd := strings.Index(skill, "**Read `skills/fleet/SKILL.md` first.**")
-	if requiresStart < 0 || requiresEnd < 0 || requiresStart >= requiresEnd || requiresEnd >= entrance {
-		t.Fatalf("missing or misplaced orchestration prerequisites: requires=%d end=%d entrance=%d", requiresStart, requiresEnd, entrance)
-	}
-	requiresSection := strings.Join(strings.Fields(skill[requiresStart:requiresEnd]), " ")
-	if !strings.Contains(requiresSection, "Delivery/PR entrances additionally require an authenticated `gh` for the target repo; verification-only work does not.") {
+	if !strings.Contains(principles, "Delivery/PR entrances additionally require an authenticated `gh` for the target repo; verification-only work does not.") {
 		t.Error("verification-only entrance no longer documents that GitHub authentication is unnecessary")
 	}
 
@@ -48,7 +40,7 @@ func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 		"deployed-system verification",
 	}
 	for _, entranceName := range entrances {
-		if !strings.Contains(skill, entranceName) {
+		if !strings.Contains(modes, entranceName) {
 			t.Errorf("skill no longer documents existing entrance %q", entranceName)
 		}
 	}
@@ -59,13 +51,12 @@ func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 		"3. **Conductor validation and adjudication.**",
 		"4. **Consolidated report.**",
 	}
-	previous := verificationFlow
+	previous := -1
 	for _, phase := range phases {
-		position := strings.Index(skill[verificationFlow:deliveryPipeline], phase)
+		position := strings.Index(verification, phase)
 		if position < 0 {
 			t.Fatalf("verification flow missing phase %q", phase)
 		}
-		position += verificationFlow
 		if position <= previous {
 			t.Fatalf("verification phase %q is out of order", phase)
 		}
@@ -88,12 +79,16 @@ func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 		"verification-only `pass` and `inconclusive` outcomes stop before those stages",
 	}
 	for _, contract := range requiredContracts {
-		if !strings.Contains(normalizedVerificationSection, contract) {
+		if !strings.Contains(verification, contract) {
 			t.Errorf("skill missing deployed-verification contract %q", contract)
 		}
 	}
+	if !strings.Contains(core, "[usage.policy]` remains a separate advisory") ||
+		!strings.Contains(core, "never overrides explicit choices or role precedence") {
+		t.Error("orchestrate core no longer preserves usage-policy and explicit-setting precedence")
+	}
 
-	if !strings.Contains(skill, `cp <agent-deck-repo>/skills/orchestrate/references/rotate-conductor.sh "$RUN_DIR/"`) {
+	if !strings.Contains(startup, `cp <agent-deck-repo>/skills/orchestrate/references/rotate-conductor.sh "$RUN_DIR/"`) {
 		t.Error("run setup no longer installs the conductor rotation/handoff artifact")
 	}
 
@@ -105,7 +100,7 @@ func TestOrchestrationSkillDeployedVerificationStructure(t *testing.T) {
 	rotation := string(rotationBytes)
 	rotationContracts := []string{
 		`HANDOFF="$D/conductor-handoff.md"`,
-		`for f in "$MANIFEST" "$HANDOFF"; do`,
+		`for f in "$MANIFEST" "$HANDOFF" "$GOAL"; do`,
 		`if [ ! -s "$f" ]; then`,
 		"Re-read the orchestrate skill first",
 		"Recovery after compaction or rotation",

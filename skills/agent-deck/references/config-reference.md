@@ -5,7 +5,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 ## Table of Contents
 
 - [Top-Level](#top-level)
-- [[quick_create] Section](#quick_create-section)
+- [[quick_create] Section](#alternate-quick-create)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
 - [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
@@ -21,6 +21,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[fork] Section](#fork-section)
 - [[conductor] Section](#conductor-section)
 - [[orchestrate] Section](#orchestrate-section)
+- [[usage.policy] Section](#usagepolicy-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[interval_hooks.*] Section](#interval_hooks-section)
@@ -624,11 +625,18 @@ default_tool = "codex"
 
 [orchestrate]
 tool_strategy = "auto"
+
+[orchestrate.routine]
+codex_model = "gpt-5.6-terra"
+codex_effort = "medium"
+claude_model = "sonnet"
+claude_effort = "medium"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `tool_strategy` | string | `""` (legacy) | `"default"` uses the top-level `default_tool` for every non-explicit orchestrated launch. `"auto"` lets the conductor mix locally installed, non-hidden tools by role and task, falling back to `default_tool` when no connector is clearly better. An omitted value preserves the workflow's historical explicit choices. |
+| `routing.*`, `routine.*`, `architecture.*` | strings | built-in role defaults | Optional role-default tables. Supported keys are `codex_model`, `codex_effort`, `claude_model`, and `claude_effort`. They fill only missing launch settings after explicit session/provider choices, group settings, and root provider defaults. Unsupported values make the launch visibly parked; they never upgrade to a stronger model. |
 
 Inspect the policy and the locally available auto-selection candidates:
 
@@ -639,6 +647,34 @@ agent-deck config orchestrate
 Tool availability reuses Agent Deck's existing registry and command lookup.
 It detects installation, not provider authentication. Explicit workflow tool
 choices continue to override this strategy.
+
+## [usage.policy] Section
+
+Defines the separate availability-aware advisory used by `agent-deck usage
+recommend`. This policy never overwrites an explicit launch choice or the
+`[orchestrate.*]` role-resolution precedence above.
+
+```toml
+[usage.policy]
+exhausted_below = 10
+constrained_below = 30
+failover = ["claude", "codex"]
+
+[usage.policy.ladder.codex]
+cheap = "gpt-5.6-luna"
+mid = "gpt-5.6-terra"
+strong = "gpt-5.6-sol"
+frontier = "gpt-6-astra"
+
+[usage.policy.frontier_window]
+codex = "weekly"
+```
+
+Thresholds are remaining percentages from 0 through 100 and
+`exhausted_below` must not exceed `constrained_below`. Failover entries are
+tool names without whitespace. An omitted ladder tier inherits its default; an
+explicit empty tier marks it unavailable. The config loader validates shape,
+then the usage policy layer merges defaults and validates the resolved policy.
 
 ## [logs] Section
 
