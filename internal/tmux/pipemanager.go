@@ -1062,55 +1062,6 @@ func candidateSocketPath(pid int, cmdlineFields []string) (path string, ok bool)
 	return normalizeTmpPath(resolveTmuxSocketPath(lookupEnv, os.Getuid(), "", args)), true
 }
 
-// sameMountNamespace reports whether pid resolves filesystem paths the same way
-// this process does. Anything else — including a namespace that cannot be read —
-// is a no.
-//
-// This costs no reach that candidateSocketPath does not already need:
-// /proc/<pid>/ns/mnt and /proc/<pid>/environ are gated by the same
-// PTRACE_MODE_READ check, so a candidate whose environment is readable has a
-// readable namespace link too (verified on this host under yama
-// ptrace_scope=1, for a same-uid process that is not a descendant).
-func sameMountNamespace(pid int) bool {
-	theirs, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/mnt", pid))
-	if err != nil {
-		return false
-	}
-	ours, err := os.Readlink("/proc/self/ns/mnt")
-	if err != nil {
-		return false
-	}
-	return theirs == ours
-}
-
-// readProcessEnviron reads pid's environment out of procfs as a lookup function
-// shaped for resolveTmuxSocketPath.
-//
-// An empty read is an error, not an empty environment. Treating zero bytes as
-// "this process has no TMUX_TMPDIR" would leave every lookup returning "" and
-// resolve the candidate to the DEFAULT socket — a confident answer built from
-// nothing, which is then used to pick which server to judge it on. Measured
-// rather than assumed: a zombie does NOT reach here (its environ read fails),
-// and what does read back empty-and-successful is a live process exec'd with no
-// environment at all — never one of agent-deck's own clients, which inherit
-// os.Environ().
-func readProcessEnviron(pid int) (func(string) string, error) {
-	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
-	if err != nil {
-		return nil, err
-	}
-	if len(raw) == 0 {
-		return nil, fmt.Errorf("empty environment for pid %d", pid)
-	}
-	env := make(map[string]string, 32)
-	for _, entry := range strings.Split(string(raw), "\x00") {
-		if key, value, found := strings.Cut(entry, "="); found {
-			env[key] = value
-		}
-	}
-	return func(key string) string { return env[key] }, nil
-}
-
 // candidateSocketName extracts the -L <name> (or default) socket selector
 // from a poll-sweep candidate's OWN argv — cmdlineFields[0] is the program
 // name (e.g. "tmux"); a leading `-L <name>` may follow it, mirroring exactly

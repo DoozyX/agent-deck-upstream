@@ -145,3 +145,26 @@ func TestRenderCostLine_HideWhenZero_NilVars(t *testing.T) {
 		t.Errorf("nil vars hideWhenZero: got %q, want empty", got)
 	}
 }
+
+func TestRenderCoveredCostLineAddsCoverageVariablesWithoutChangingCostVariables(t *testing.T) {
+	vars := map[string]int64{"cost_today": 1_250_000}
+	coverage := costs.Coverage{UnknownPriceEventCount: 2, UnknownPriceTokens: 30, UnreconciledEventCount: 1, UnreconciledTokens: 9, CoverageKnown: true, Complete: false}
+	got := costs.RenderCoveredCostLine(
+		"{cost_today} {coverage_status}; {unpriced_events} unpriced/{unpriced_tokens} tokens; {unreconciled_events} unresolved/{unreconciled_tokens} tokens",
+		vars, coverage, false,
+	)
+	want := "$1.25 known subtotal; 2 unpriced/30 tokens; 1 unresolved/9 tokens"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestRenderCoveredCostLineUsesCanonicalKnownZeroStatus(t *testing.T) {
+	coverage := costs.Coverage{
+		EventCount: 2, KnownPriceEventCount: 2, KnownZeroEventCount: 2,
+		CoverageKnown: true, Complete: true,
+	}
+	if got := costs.RenderCoveredCostLine("{coverage_status}", nil, coverage, false); got != "verified" {
+		t.Fatalf("known-zero status = %q, want verified", got)
+	}
+}

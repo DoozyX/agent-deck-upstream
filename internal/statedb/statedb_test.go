@@ -1952,7 +1952,7 @@ func TestInsertInstanceRow_ArchivedAtRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMigrateV16PreClaimLifecycleSchemaToV17(t *testing.T) {
+func TestMigrateV16PreClaimLifecycleSchemaToCurrent(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "v16.db")
 	raw, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -1987,7 +1987,7 @@ func TestMigrateV16PreClaimLifecycleSchemaToV17(t *testing.T) {
 	if err := db.DB().QueryRow("SELECT value FROM metadata WHERE key='schema_version'").Scan(&version); err != nil {
 		t.Fatal(err)
 	}
-	if version != "17" {
+	if version != fmt.Sprintf("%d", SchemaVersion) {
 		t.Fatalf("schema version=%q", version)
 	}
 	intents, err := db.LifecycleIntents()

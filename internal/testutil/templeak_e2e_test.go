@@ -27,6 +27,7 @@ import (
 var leakPrefixes = []string{
 	// Generic helpers.
 	"ad-home-",                       // IsolateHome
+	"ad-capture-perm-",               // internal/tmux capture permission fixture
 	"ad-tmux-",                       // IsolateTmuxSocket
 	"ad-tmux-sentinel-",              // bootstrap leak sentinel's private base
 	"ad-sock-",                       // ShortTmuxSocket

@@ -92,8 +92,9 @@ type UserConfig struct {
 	// Default: true (nil = true)
 	SyncTitle *bool `toml:"sync_title,omitempty"`
 
-	// PushTitle passes the exact deck title via --name on supported Claude
-	// startup commands. Live renames take effect at the next start/restart.
+	// PushTitle derives a stable peer address from the deck title and immutable
+	// session id for --name on supported Claude startup commands. Live renames
+	// take effect at the next start/restart.
 	// Default: true (nil = true); unreadable config disables automatic naming.
 	PushTitle *bool `toml:"push_title,omitempty"`
 
@@ -284,7 +285,19 @@ type UserConfig struct {
 // OrchestrateSettings controls how the orchestrate workflow chooses tools for
 // child sessions. An empty strategy preserves the workflow's legacy defaults.
 type OrchestrateSettings struct {
-	ToolStrategy string `toml:"tool_strategy,omitempty"`
+	ToolStrategy string                 `toml:"tool_strategy,omitempty"`
+	Routing      OrchestrateRoleDefault `toml:"routing,omitempty"`
+	Routine      OrchestrateRoleDefault `toml:"routine,omitempty"`
+	Architecture OrchestrateRoleDefault `toml:"architecture,omitempty"`
+}
+
+// OrchestrateRoleDefault selectively overrides the built-in economical role
+// defaults. Empty values deliberately inherit the built-in value.
+type OrchestrateRoleDefault struct {
+	CodexModel   string `toml:"codex_model,omitempty"`
+	CodexEffort  string `toml:"codex_effort,omitempty"`
+	ClaudeModel  string `toml:"claude_model,omitempty"`
+	ClaudeEffort string `toml:"claude_effort,omitempty"`
 }
 
 // UsageSettings is the [usage] config block. It is a plain TOML mirror: the
@@ -3692,6 +3705,14 @@ func LoadUserConfig() (*UserConfig, error) {
 		userConfigCacheErr = err
 		return userConfigCache, userConfigCacheErr
 	}
+	if err := validateOrchestrateRoleDefaults(&config); err != nil {
+		fresh := cloneDefaultUserConfig()
+		userConfigCache = &fresh
+		userConfigCacheMtime = currentMtime
+		SetGroupSortMode(fresh.GetGroupSort())
+		userConfigCacheErr = err
+		return userConfigCache, userConfigCacheErr
+	}
 	if alternate := strings.TrimSpace(config.QuickCreate.AlternateTool); alternate != "" {
 		registryLog.Warn("ignored deprecated quick-create alternate_tool",
 			"configured_tool", alternate,
@@ -5551,10 +5572,58 @@ type PricingSettings struct {
 }
 
 type PricingOverride struct {
-	InputPerMtok      float64 `toml:"input_per_mtok,omitzero"`
-	OutputPerMtok     float64 `toml:"output_per_mtok,omitzero"`
-	CacheReadPerMtok  float64 `toml:"cache_read_per_mtok,omitzero"`
-	CacheWritePerMtok float64 `toml:"cache_write_per_mtok,omitzero"`
+	InputPerMtok        float64 `toml:"input_per_mtok,omitzero"`
+	OutputPerMtok       float64 `toml:"output_per_mtok,omitzero"`
+	CacheReadPerMtok    float64 `toml:"cache_read_per_mtok,omitzero"`
+	CacheWritePerMtok   float64 `toml:"cache_write_per_mtok,omitzero"`
+	CacheWrite5mPerMtok float64 `toml:"cache_write_5m_per_mtok,omitzero"`
+	CacheWrite1hPerMtok float64 `toml:"cache_write_1h_per_mtok,omitzero"`
+	CacheWrite5mSet     bool    `toml:"-" json:"-"`
+	CacheWrite1hSet     bool    `toml:"-" json:"-"`
+}
+
+// UnmarshalTOML keeps duration-rate presence distinct from its numeric value.
+func (p *PricingOverride) UnmarshalTOML(data any) error {
+	values, ok := data.(map[string]any)
+	if !ok {
+		return fmt.Errorf("pricing override must be a table, got %T", data)
+	}
+	set := func(key string, target *float64) error {
+		value, present := values[key]
+		if !present {
+			return nil
+		}
+		switch n := value.(type) {
+		case int64:
+			*target = float64(n)
+		case float64:
+			*target = n
+		default:
+			return fmt.Errorf("pricing override %s must be numeric", key)
+		}
+		return nil
+	}
+	if err := set("input_per_mtok", &p.InputPerMtok); err != nil {
+		return err
+	}
+	if err := set("output_per_mtok", &p.OutputPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_read_per_mtok", &p.CacheReadPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_per_mtok", &p.CacheWritePerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_5m_per_mtok", &p.CacheWrite5mPerMtok); err != nil {
+		return err
+	}
+	if err := set("cache_write_1h_per_mtok", &p.CacheWrite1hPerMtok); err != nil {
+		return err
+	}
+	_, p.CacheWrite5mSet = values["cache_write_5m_per_mtok"]
+	_, p.CacheWrite1hSet = values["cache_write_1h_per_mtok"]
+	return nil
 }
 
 func (c CostsSettings) GetRetentionDays() int {

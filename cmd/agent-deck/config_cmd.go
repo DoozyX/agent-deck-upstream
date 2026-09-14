@@ -13,6 +13,10 @@ import (
 )
 
 func handleConfig(args []string) {
+	if len(args) == 1 && (args[0] == "-h" || args[0] == "--help") {
+		printConfigUsage()
+		return
+	}
 	if len(args) == 0 {
 		printConfigUsage()
 		os.Exit(1)

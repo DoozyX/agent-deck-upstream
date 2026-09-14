@@ -72,7 +72,7 @@ func TestNativeSSHTUIRegistryLifecycle(t *testing.T) {
 	}
 	inner := fmt.Sprintf("nt-in-%d", time.Now().UnixNano())
 	outer := fmt.Sprintf("nt-out-%d", time.Now().UnixNano())
-	write(filepath.Join(remote, ".config", "agent-deck", "config.toml"), "[telemetry]\ndisabled = true\n[claude]\nhooks_enabled = false\n[tmux]\nsocket_name = '"+inner+"'\n[profiles.alice.claude]\nconfig_dir = '"+filepath.Join(remote, "claude-alice")+"'\n")
+	write(filepath.Join(remote, ".config", "agent-deck", "config.toml"), "[telemetry]\ndisabled = true\n[claude]\nhooks_enabled = false\n[hermes]\ncommand = '/nonexistent/agent-deck-test-hermes'\n[tmux]\nsocket_name = '"+inner+"'\n[profiles.alice.claude]\nconfig_dir = '"+filepath.Join(remote, "claude-alice")+"'\n")
 	proxy := startNativeSSH(t, remote, shim)
 	cli := func(args ...string) string {
 		t.Helper()

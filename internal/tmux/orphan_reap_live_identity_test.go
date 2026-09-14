@@ -410,18 +410,13 @@ func TestIsLiveTmuxClientOrServer_OneShotClient_NotLive(t *testing.T) {
 	}
 
 	// A successful signal syscall is not an acknowledgement that the child is
-	// stopped. Observe the stop without reaping it before releasing its queue.
+	// stopped. Observe the kernel process state without reaping it before
+	// releasing its queue. syscall.WaitStatus.Stopped cannot express SIGSTOP on
+	// BSD: Go reserves that encoding for Continued there.
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		var status syscall.WaitStatus
-		waited, err := syscall.Wait4(pid, &status, syscall.WUNTRACED|syscall.WNOHANG, nil)
-		if err != nil {
-			t.Fatalf("wait for one-shot client stop: %v", err)
-		}
-		if waited == pid {
-			if !status.Stopped() {
-				t.Fatalf("one-shot client exited before stop: %v", status)
-			}
+		state, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+		if err == nil && strings.HasPrefix(strings.TrimSpace(string(state)), "T") {
 			break
 		}
 		if time.Now().After(deadline) {

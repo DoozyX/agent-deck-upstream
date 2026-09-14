@@ -79,6 +79,8 @@ func TestParallelOrchestrateLoop(t *testing.T) {
 		}
 		round := render(t, "review-round",
 			"AGENT_DECK_REPO=/tmp/agent-deck", "BASE_REF=main", "BASELINE=baseline: none",
+			"ATTEMPT_ID=review-2", "BASE_HEAD=base-sha", "REVIEWED_HEAD=reviewed-sha",
+			"RUN_DIR=/tmp/orchestrate", "SPEC_ID=spec-1", "TASK_ID=task-1",
 			"FOCUSED_TESTS=go test ./internal/usage", "PREVIOUS_FINDINGS=One previous finding",
 			"REVIEWED_SHA=0123456789abcdef", "SPEC_BLOCK=Review requirements block",
 			"VERDICT_FILE=/tmp/orchestrate/review-r2.md")
@@ -99,6 +101,9 @@ func TestParallelOrchestrateLoop(t *testing.T) {
 
 	t.Run("fix rounds run focused tests", func(t *testing.T) {
 		fix := render(t, "fix", "FINDINGS=Fix this concrete finding", "ROUND=2",
+			"ATTEMPT_ID=fix-2", "BASE_HEAD=base-sha", "REVIEWED_HEAD=reviewed-sha",
+			"ORIGINATING_ATTEMPT=review-2", "RUN_DIR=/tmp/orchestrate",
+			"SPEC_ID=spec-1", "TASK_ID=task-1",
 			"FOCUSED_TESTS=go test ./internal/usage")
 		requireAll(t, "fix", fix, []string{"go test ./internal/usage", "the next reviewer runs the full suite"})
 		forbidAll(t, "fix", fix, []string{"Rerun the full test suite"})
@@ -110,23 +115,26 @@ func TestParallelOrchestrateLoop(t *testing.T) {
 	})
 
 	t.Run("orchestrate has one review track and minor never parks", func(t *testing.T) {
-		skill := readNormalized(t, "skills", "orchestrate", "SKILL.md")
-		requireAll(t, "orchestrate skill", skill, []string{
+		core := readNormalized(t, "skills", "orchestrate", "SKILL.md")
+		modes := readNormalized(t, "skills", "orchestrate", "references", "modes-and-prompts.md")
+		delivery := readNormalized(t, "skills", "orchestrate", "references", "task-delivery.md")
+		requireAll(t, "orchestrate modes", modes, []string{
 			// D1: the hand-off entrance.
 			"a session titled `conductor-<run-id>`",
-			// D2: any clean round is terminal; the template table names review-round.
-			"`VERDICT: clean` from **any** round is terminal",
+			// D2: the routed template table names the single review track.
 			"| `review-round` | `VERDICT_FILE` `SPEC_BLOCK` `BASE_REF` `REVIEWED_SHA` `PREVIOUS_FINDINGS` `BASELINE` `FOCUSED_TESTS` `AGENT_DECK_REPO` |",
 			"| `fix` | `ROUND` `FINDINGS` `FOCUSED_TESTS` |",
-			// D3: counted vs in-place rounds.
-			"**in-place round**",
-			"counted=<yes|no>",
-			"bounded at **3 per task**",
-			"Needs-attention is reserved for counted-cap exhaustion",
-			// D7: keep the host awake.
-			"caffeinate -i",
 		})
-		forbidAll(t, "orchestrate skill", skill, []string{
+		requireAll(t, "orchestrate task delivery", delivery, []string{
+			"`VERDICT: clean` from **any** round is terminal",
+			"Default cap: three completed reviews and two completed automatic fixes per epoch",
+			"Budget exhaustion with blocking findings or a user decision still open makes the task **needs-attention**",
+		})
+		requireAll(t, "orchestrate core", core, []string{
+			"[usage.policy]` remains a separate advisory",
+			"never overrides explicit choices or role precedence",
+		})
+		forbidAll(t, "orchestrate task delivery", delivery, []string{
 			"review-incremental",
 			"2 full-branch gate reviews",
 			"Full-branch end gate",

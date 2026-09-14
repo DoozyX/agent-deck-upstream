@@ -295,7 +295,7 @@ func TestCostsRecomputeHelpIsDetailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("costs recompute help failed: %v\n%s", err, out)
 	}
-	for _, want := range []string{"Usage: agent-deck costs recompute [--dry-run]", "unknown", "Idempotent"} {
+	for _, want := range []string{"Usage: agent-deck costs recompute [--dry-run]", "prior amount is preserved", "stale known status is demoted", "Idempotent"} {
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("missing %q from recompute help:\n%s", want, out)
 		}
