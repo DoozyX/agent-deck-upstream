@@ -414,3 +414,649 @@ func TestOrchestrationReviewRoundOverlap(t *testing.T) {
 		"pass threshold",
 	})
 }
+
+// TestUsageAwareLaunchContract pins the usage-aware launch contract the
+// orchestrate workflow gained once `agent-deck usage recommend` shipped. The
+// decision is made by a Go function behind a CLI, so what the documents owe is
+// the exact call, the exact place the answer is stored, the exact launch shape
+// it produces, and the exact manifest line it is recorded on — each of which a
+// later run reads back as a contract.
+func TestUsageAwareLaunchContract(t *testing.T) {
+	repoRoot := filepath.Clean("..")
+	normalize := func(s string) string { return strings.Join(strings.Fields(s), " ") }
+	read := func(parts ...string) string {
+		t.Helper()
+		b, err := os.ReadFile(filepath.Join(append([]string{repoRoot}, parts...)...))
+		if err != nil {
+			t.Fatalf("read %v: %v", parts, err)
+		}
+		return string(b)
+	}
+	requireAll := func(label, text string, rules []string) {
+		t.Helper()
+		flat := normalize(text)
+		for _, rule := range rules {
+			if !strings.Contains(flat, normalize(rule)) {
+				t.Errorf("%s missing %q", label, rule)
+			}
+		}
+	}
+
+	// The orchestrate entrypoint intentionally stays slim. Validate the complete
+	// contract through the routed documents that own these launch, manifest,
+	// planning, and tiering details.
+	skill := strings.Join([]string{
+		read("skills", "orchestrate", "SKILL.md"),
+		read("skills", "orchestrate", "references", "principles-and-permissions.md"),
+		read("skills", "orchestrate", "references", "delivery-startup.md"),
+		read("skills", "orchestrate", "references", "planning-and-role-selection.md"),
+	}, "\n")
+	configReference := read("skills", "agent-deck", "references", "config-reference.md")
+	requireAll("orchestrate skill", skill, []string{
+		// One call per distinct role+tier per wave, saved under $RUN_DIR.
+		// The pin is the WHOLE clause, not just the "once per distinct
+		// role+tier" fragment: that fragment alone left criterion 1's timing
+		// half unasserted, and a mutant rewriting the trigger to "Whenever it
+		// seems useful" — destroying both "Before each launch wave" and "in
+		// that wave" — stayed green.
+		"Before each launch wave, run `agent-deck usage recommend` **once per distinct role+tier** in that wave and save its JSON under `$RUN_DIR/usage/`:",
+		"$RUN_DIR/usage/<wave>-<role>-<tier>.json",
+		// The re-run rule, including the null-fetched_at case the CLI really
+		// emits: the SELECTED tool has no available snapshot, which happens even
+		// when snapshots were fetched for other candidates.
+		// Round-4 finding 4: the two pins below are both true of "Never reuse a
+		// saved decision; make a fresh call before every single launch", which
+		// is the exact OPPOSITE of criterion 1's re-run rule and stayed green.
+		// The opener carries the rule; pin it.
+		"**Re-run rule.** Reuse the saved decision for the rest of its wave.",
+		"`usage-limit` substate",
+		"older than five minutes",
+		"the command emits whenever the *selected* tool has no available snapshot, which happens even when snapshots were fetched for other candidates",
+		// Criterion 12: the CLI surface must match in the orchestrate skill too,
+		// not only in the config reference — this is the copy a conductor runs.
+		// The flag string and the exit-code sentence are pinned verbatim; a
+		// `--tier <tier>` collapse or an "exits 0 normally and 2 on error"
+		// paraphrase both used to survive here.
+		`agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> --json \
+  > "$RUN_DIR/usage/<wave>-<role>-<tier>.json"`,
+		// Round-5 finding 5: the exit-2 enumeration read as a CLOSED list and
+		// omitted `flag.Parse`'s own rejections, which
+		// cmd/agent-deck/usage_recommend_cmd.go:155-159 names as a fifth exit-2
+		// path and itself calls "wider than a bad flag value". Driven: `--bogus` ->
+		// EXIT=2 "flag provided but not defined: -bogus", and `--tier` with no
+		// value -> EXIT=2 "flag needs an argument: -tier". The open clause is
+		// pinned with the list so the list cannot re-close.
+		"exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional, and anything else `flag.Parse` rejects, which is wider than that list — an undefined flag such as `--bogus`, or a defined flag given no value — except the four help spellings `-h`, `--h`, `-help`, and `--help`, which print the usage line on stderr and exit 0.",
+		"It exits 0 for every decision — including `state: exhausted` and `state: unknown` —",
+		// Exit 1 was enumerated nowhere in the skill, though this section's own
+		// recipe redirects stdout into a file the shell creates either way — a
+		// conductor with no reason to check the code saves a zero-byte "decision".
+		// Round-5 finding 6: the skill's exit-1 clause omitted the JSON-encode
+		// path that config-reference.md carries, so two documents stated one
+		// contract with different content. The encode clause is pinned here.
+		"Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded — check the exit code before reading the saved file, because the `>` redirect creates that file even when nothing was written to it.",
+		// Criterion 4 and criterion 5, second halves: the exhausted pause owes a
+		// recorded, reported decision and the yield owes a recorded override.
+		// Both were deletable without turning this test red.
+		"record the decision, report it through the run's existing path",
+		"Record the override on that launch's manifest line.",
+		// Criterion 5's input: the yield rule scores a non-selected provider by
+		// re-running with --prefer. Where that provider's state then LANDS is
+		// strategy-dependent, and the round-2 wording ("makes it the selected
+		// tool ... do not look for it in `alternatives[]`") was false under
+		// `tool_strategy = "auto"`, where --prefer only ORDERS the candidates
+		// and a healthier tool still wins. Both halves are pinned, so neither
+		// can revert to the unqualified claim.
+		"Score that provider by re-running the call with `--prefer <that provider>`, then read its state from wherever the strategy in force puts it.",
+		"Under the default `tool_strategy` that provider is the only candidate, so the top-level `state` is its own and `alternatives[]` is empty.",
+		// Round-4 finding 1: the round-3 wording named ONE "auto" sub-case and
+		// then generalised from it. Driven, `--prefer codex` under "auto" with
+		// both providers at 5% selects codex itself — top-level `state` is its
+		// own and it is NOT in `alternatives[]` — and with codex hidden via
+		// `[ui] hidden_tools` the decision is claude/healthy with `alternatives`
+		// EMPTY, so codex appears in NEITHER place. `alternatives` is built by
+		// skipping the selected tool over the EVALUATED candidates only
+		// (internal/usage/recommend.go:569-572), so a provider filtered out
+		// before evaluation has no entry. Both halves of the three-way rule are
+		// pinned, and so is the membership rule that makes the third case
+		// readable: neither can revert to the two-way claim. The two triggers named
+		// are the two that were DRIVEN here (hidden via `[ui] hidden_tools`, and a
+		// miscased failover entry, both yielding `alternatives: []`); the
+		// not-installed path could not be driven on this machine, so the clause
+		// gives examples rather than closing the set.
+		"Under `tool_strategy = \"auto\"` `--prefer` only puts it FIRST among the candidates: a healthier tool can still be selected, so that provider's state lands in one of three places — the top-level `state` when `tool` names it, its entry in `alternatives[]` when a different tool was selected, and neither when it was never a candidate at all.",
+		"`alternatives[]` lists the non-selected candidates, so a provider filtered out before it was ever scored — hidden by `[ui] hidden_tools`, say, or dropped from the failover order by a miscased entry — is absent from both, and that absence is the only signal you get.",
+		// Finding 8: the probe is a SECOND recommend call for the same
+		// role+tier, so it must not overwrite the wave's one saved decision.
+		// Round-4 finding 7: the trailing clause was deletable while green.
+		// Strict superset of the string it replaces.
+		"The probe is diagnostic: do not save it over the wave's `$RUN_DIR/usage/<wave>-<role>-<tier>.json`, which the re-run rule reuses for the rest of the wave.",
+		// Finding 9: the manifest format criterion 3 fixes has no override
+		// field, so the override has to name where it actually goes.
+		"The format above has no override field, so it goes in `reason=`.",
+		// The launch shape the decision produces, and the empty-model rule.
+		`agent-deck launch <worktree-path> -c <tool> \
+  -t "impl-<task-slug>" \
+  --extra-arg --model --extra-arg <model> \
+  --message-file "$RUN_DIR/<task-slug>/impl-prompt.md"`,
+		"Omit the `--extra-arg --model --extra-arg <model>` flag entirely when `model` is empty",
+		// Exhausted pauses the wave and waits on the real reset time.
+		"do not launch that wave",
+		"earliest `resets_at` from `agent-deck usage --all --json`",
+		// Explicit choices yield only on exhausted, and the override is recorded.
+		"yield to the recommendation **only** when that provider's state is `exhausted`",
+		// The one guarantee that survives unchanged.
+		"never switches an account automatically",
+		// The frontier tier: its baseline-table row, its ladder entries, and
+		// the rule that it is never a baseline.
+		"| Implementer of a plan task tagged `tier: frontier` | frontier |",
+		"frontier is never a baseline",
+		// Criterion 7 requires these two to be the FRONTIER entries. The bare
+		// tokens "`fable`" and "`gpt-6-astra`" pinned presence, not rung:
+		// moving `fable` to the cheap rung, and swapping the codex frontier
+		// rung for `gpt-5.6-nova` while leaving the token in prose, both
+		// stayed green. Each string below contains the bare token it replaces.
+		"Claude: `haiku` / `sonnet` / `opus` / `fable`",
+		"`gpt-5.6-luna` / `gpt-5.6-terra` / `gpt-5.6-sol` / `gpt-6-astra`",
+		// Escalations now land on frontier, not on strong.
+		"escalate the reviewer to strong → frontier",
+		// The planner's tier vocabulary, restated in the skill. Criterion 9a
+		// names two sites, so both are pinned: a revert of either one alone
+		// leaves the skill contradicting the prompt it describes.
+		"It tags every task `tier: mid | strong | frontier`",
+		"the planner tags `mid`, `strong` or `frontier` for that reason — never below mid",
+		// Criterion 8 requires BOTH escalation bullets to land on frontier;
+		// pinning only the reviewer bullet let the implementer bullet revert.
+		"as a NEW session in the same worktree, escalated strong → frontier",
+		// Escalation is one-way to the tier actually reached, not to strong —
+		// the bullets above end on frontier, so the rule introducing them
+		// must not say the role "stays strong".
+		"once a role escalates, it stays at the escalated tier",
+		// Frontier's two entry points, without claiming every escalation
+		// starts from strong (the reviewer's baseline is mid).
+		"or by an escalation, which reaches it through strong",
+		// Round-5 finding 1 (major): the old guard here tested `tool == ""` and
+		// promised the remedy "reaches **stderr only**". Both fail on the
+		// surviving-name branch. Driven against a built binary with a fake
+		// `openusage` shadowing the real one:
+		//   failover = ["Codex","Claude"] under tool_strategy = "auto"
+		//     -> EXIT=0 {"tool":"Codex","provider":"","model":"", ...
+		//        "reason":"no candidate tools for tool strategy \"auto\""}
+		//        with STDERR EMPTY;
+		//   [ui] hidden_tools = ["codex","claude"] + failover = ["codex","claude"]
+		//     with `--tier strong`
+		//     -> EXIT=0 {"tool":"codex","provider":"codex",
+		//        "model":"gpt-5.6-sol", ...} — same reason, STDERR still EMPTY.
+		// So neither `tool == ""` NOR `provider == ""` discriminates; only the
+		// `reason` does. cmd/agent-deck/usage_recommend_cmd.go:238 gates the
+		// remedy on `if decision.Tool == ""`, which is why stderr is silent.
+		// The guard is pinned ahead of the launch block because `model` follows
+		// the applied tier's rung on that branch and can therefore be empty.
+		"A `reason` *beginning* `no candidate tools for tool strategy` means no candidate tool resolved at all, and nothing in that decision may be launched. Match on the prefix, not on the substring: that clause comes first, but a profile-miss clause, a tier floor or a model clause can follow it after a `;`, and a `--profile` name is interpolated into `reason` verbatim — so a substring match can fire on a launchable decision whose profile is named `no candidate tools`.",
+		"Do not use `tool == \"\"` as the test — `tool` is empty only when the strategy resolved no name either.",
+		"`tool` is that name, `provider` comes back filled in whenever it maps to a usage provider, `model` follows that provider's ladder and is empty when the applied tier's rung is empty, `state` is `unknown`, and **stderr is empty**",
+		"The remedy hint reaches stderr on the empty-`tool` branch only: capture stderr for that one, but never read a silent stderr as a launchable decision.",
+		// Round-4 finding 7: the two pins above hold the surrounding sentences
+		// but not the remedy itself, which survived replacement by "Launch
+		// without `-c` and let the connector default apply."
+		"On the empty-`tool` branch, re-run the call with `--prefer <tool>`, or set the top-level `default_tool` in `config.toml`, before launching anything for that wave. On the surviving-name branch, neither remedy makes the decision launchable: `--prefer` picks which name survives, and when `failover` is omitted `default_tool` supplies the default failover order and can change which name survives; an explicit `failover` controls that order instead. The `reason` still begins `no candidate tools for tool strategy`, so fix the environment instead: un-hide the tool in `[ui] hidden_tools`, install it, or correct a misspelled or miscased `failover` entry.",
+		// Round-5 finding 13: this clause inverted into a wrong operational
+		// action while green — a mutant reading "which is a failure: stop the
+		// wave and report it rather than launching" SURVIVED, so the operational
+		// outcome remains pinned here.
+		"A machine with no `openusage` binary gets `state: unknown` and the preferred tool when one resolves, which is an answer, not a failure; continue unchanged there.",
+		// Round-5 finding 14: the negative half of the re-run rule inverted
+		// while green — "Query it during ordinary polling, focused single
+		// tasks, and every-turn hooks as well." SURVIVED.
+		"Do not query it during ordinary polling, focused single tasks, or every-turn hooks.",
+		// Round-5 finding 15: the manifest cross-reference checks below cite
+		// this heading BY NAME, but nothing pinned the heading itself — a
+		// mutant renaming it to "**Launch bookkeeping** on one manifest line:"
+		// SURVIVED and left those references dangling.
+		"**Record every launch** on one manifest line:",
+		// Round-5 finding 17: the launch-time checklist bullet asserted the
+		// explicit-choice rule unqualified, naming the SAME example as the
+		// qualified rule above with no pointer between them and no pin. The
+		// bullet is NOT false — "the policy" there is the tool policy from
+		// `agent-deck config orchestrate`, a different object from the usage
+		// recommendation — and it is pre-existing, so only the missing pointer
+		// is added, and pinned.
+		"\"The policy\" here is the tool policy from `agent-deck config orchestrate` — a different object from the usage recommendation, which the same choice yields to only when that provider's state is `exhausted`, as \"Explicit workflow tool choices\" in [principles and permissions](principles-and-permissions.md) qualifies it.",
+	})
+	// Criterion 3: the manifest line is owed at three sites — the code block
+	// and both cross-references. A whole-file Contains passed with BOTH
+	// cross-references deleted, so count instead of testing presence.
+	const manifestLine = "role=<role> tool=<tool> model=<model> tier=<applied> state=<state> reason=<one line>"
+	if got := strings.Count(normalize(skill), manifestLine); got < 3 {
+		t.Errorf("orchestrate skill records the manifest line at %d sites, want >= 3 (the code block plus both cross-references)", got)
+	}
+	// The count alone fixes the QUANTITY of citations, not where they are:
+	// a mutant that replaced the "Then record per task:" citation with
+	// "(see the launch line above)" and added one inside the usage section
+	// kept the total at exactly 3 and stayed green. Criterion 3 names both
+	// cross-reference sites, so each is anchored to its own heading line.
+	skillLines := strings.Split(skill, "\n")
+	citedWithin := func(anchor string, window int) bool {
+		for i, line := range skillLines {
+			if !strings.Contains(line, anchor) {
+				continue
+			}
+			for j := i; j < len(skillLines) && j <= i+window; j++ {
+				if strings.Contains(normalize(skillLines[j]), manifestLine) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	for _, site := range []struct{ anchor string }{
+		{"Then record per task:"},
+		{"Record every session's connector + model in the manifest"},
+	} {
+		if !citedWithin(site.anchor, 6) {
+			t.Errorf("criterion 3's manifest line must be cited within 6 lines of %q; it is not", site.anchor)
+		}
+	}
+
+	// Round-5 finding 16: criterion 7 requires the frontier row to be IN the
+	// "Baseline tier per session" table, but its assertion was a whole-file
+	// Contains — a mutant that DELETED the row from that table and re-added it
+	// verbatim under an unrelated heading SURVIVED (deleting it outright
+	// KILLED, which is why the gap was invisible). The same test already
+	// enforces adjacency for the `usage recommend` command row and both
+	// manifest cross-references, so this was inconsistent rigor rather than a
+	// plain omission. The line-local scan below is anchored to the section's
+	// lead-in line.
+	const frontierBaselineRow = "| Implementer of a plan task tagged `tier: frontier` | frontier |"
+	parseMarkdownRow := func(line string) ([]string, bool) {
+		leadingSpaces := 0
+		for leadingSpaces < len(line) && line[leadingSpaces] == ' ' {
+			leadingSpaces++
+		}
+		if leadingSpaces >= 4 || leadingSpaces < len(line) && line[leadingSpaces] == '\t' {
+			return nil, false
+		}
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "|") || !strings.HasSuffix(line, "|") {
+			return nil, false
+		}
+		parts := strings.Split(strings.TrimSuffix(strings.TrimPrefix(line, "|"), "|"), "|")
+		for i := range parts {
+			parts[i] = strings.TrimSpace(parts[i])
+		}
+		return parts, true
+	}
+	frontierBaselineCells, ok := parseMarkdownRow(frontierBaselineRow)
+	if !ok || len(frontierBaselineCells) != 2 {
+		t.Fatalf("frontierBaselineRow must parse as a two-cell Markdown row; got cells=%q, ok=%t", frontierBaselineCells, ok)
+	}
+	markdownDelimiterCell := regexp.MustCompile(`^:?-{3,}:?$`)
+	// This check is line-local and does not establish Markdown block context.
+	// A fenced-code or raw-HTML wrapper around the same lines still satisfies it, while a table nested in a list item or blockquote is rejected even though GFM renders it.
+	frontierRowInTable := false
+	baselineTableLead := -1
+	for i, line := range skillLines {
+		if strings.TrimSpace(line) != "Baseline tier per session:" {
+			continue
+		}
+		if baselineTableLead >= 0 {
+			t.Errorf("criterion 7's \"Baseline tier per session\" lead-in must appear exactly once")
+			continue
+		}
+		baselineTableLead = i
+		j := i + 1
+		for j < len(skillLines) && strings.TrimSpace(skillLines[j]) == "" {
+			j++
+		}
+		if j >= len(skillLines) {
+			continue
+		}
+		headerCells, ok := parseMarkdownRow(skillLines[j])
+		if !ok || len(headerCells) != 2 || headerCells[0] != "Session" || headerCells[1] != "Tier" {
+			continue
+		}
+		j++
+		if j >= len(skillLines) {
+			continue
+		}
+		delimiterCells, ok := parseMarkdownRow(skillLines[j])
+		if !ok || len(delimiterCells) != 2 || !markdownDelimiterCell.MatchString(delimiterCells[0]) || !markdownDelimiterCell.MatchString(delimiterCells[1]) {
+			continue
+		}
+		for j++; j < len(skillLines); j++ {
+			cells, ok := parseMarkdownRow(skillLines[j])
+			if !ok {
+				break
+			}
+			if len(cells) == 2 && cells[0] == frontierBaselineCells[0] && cells[1] == frontierBaselineCells[1] {
+				frontierRowInTable = true
+			}
+		}
+	}
+	if !frontierRowInTable {
+		t.Errorf("criterion 7's frontier row %q must appear among the contiguous pipe-delimited rows following the two-cell header represented by \"| Session | Tier |\" and a two-cell Markdown delimiter represented by \"| --- | --- |\", under the \"Baseline tier per session\" lead-in; it does not", frontierBaselineRow)
+	}
+	// Round-4 finding 5: the third per-launch instruction carried the
+	// pre-existing THREE-field form while the code block and both
+	// cross-references mandate the six-field one, so the document gave two
+	// formats for one artifact and the short one omitted `model=`, `tier=` and
+	// `state=` — the field the exhausted pause and the final report both read.
+	// The count above uses the six-field string, so this site contributes
+	// nothing to it and a pointer added here would otherwise be
+	// revertible-green. Pin the pointer itself.
+	requireAll("orchestrate skill third manifest site", skill, []string{
+		"append the full manifest line defined under \"Record every launch\" in [principles and permissions](principles-and-permissions.md) — `role=`, `tool=`, `model=`, `tier=`, `state=` and `reason=`, all six fields — to `$RUN_DIR/manifest.md`",
+	})
+	// fold is deliberately LOCAL to the negative checks rather than folded into
+	// normalize: normalize backs every positive pin above, and making those
+	// case-insensitive and markup-blind would weaken the positive assertions to
+	// strengthen these. The negative checks need it because their whole content
+	// is a removal, and a bare Contains was case-sensitive and markup-blind
+	// — "Never blocks a launch.", "never **blocks a launch**" and "Overrides
+	// an explicit tool choice: never." all survived it.
+	// Backticks are stripped for the same reason as `*` and `_`: this document
+	// backticks `tool` everywhere, so "It overrides an explicit `tool` choice."
+	// and "It never `blocks a launch`." both revert the dead clauses while
+	// reading as ordinary prose, and both survived the emphasis-only fold.
+	//
+	// Round-5 finding 4: emphasis and backticks are still not enough, and
+	// round 4's patch killed only four of the five mutants its own finding
+	// listed. Inline HTML (`<em>`, `<strong>`, `<b>`, `<code>`), HTML comments,
+	// character entities and markdown link syntax each revert a dead clause
+	// while reading as ordinary prose. ORDER MATTERS: tags, comments and link
+	// wrappers collapse to nothing, but an entity must become a SPACE —
+	// stripping `&nbsp;` to nothing folds "blocks&nbsp;a launch" into
+	// "blocksa launch", which survives again.
+	htmlish := regexp.MustCompile(`<!--[\s\S]*?-->|</?[A-Za-z][^>]*>`)
+	entityish := regexp.MustCompile(`&(?:[A-Za-z]+|#[0-9]+|#[xX][0-9A-Fa-f]+);`)
+	linkish := regexp.MustCompile(`\[([^\]]*)\]\([^)]*\)`)
+	fold := func(s string) string {
+		s = htmlish.ReplaceAllString(s, "")
+		s = entityish.ReplaceAllString(s, " ")
+		s = linkish.ReplaceAllString(s, "${1}")
+		return strings.NewReplacer("*", "", "_", "", "`", "").Replace(strings.ToLower(normalize(s)))
+	}
+
+	// ...and the short form it replaced must not come back alongside it.
+	// Round-5 finding 3: this sibling used `normalize` with a BACKTICKED
+	// literal while the dead-clause loop below uses `fold` precisely because a
+	// bare Contains was found insufficient in round 4 — same commit, same
+	// defect class. Folded and unbackticked, it now also catches the
+	// unbackticked form, per-field backticks, the capitalised form and a
+	// reworded `reason=<reason>` variant.
+	if strings.Contains(fold(skill), fold("role=<role> tool=<tool> reason=")) {
+		t.Errorf("orchestrate skill still gives the three-field manifest form; the six-field form at \"Record every launch\" is the only one")
+	}
+
+	// Criterion 6a: the two clauses this change falsifies must not survive.
+	// A document asserting both the old rule and the new one is worse than one
+	// asserting only the old one, so this is checked over the whole file.
+	//
+	for _, document := range []struct {
+		name    string
+		content string
+	}{
+		{"orchestrate skill", skill},
+		{"config reference", configReference},
+	} {
+		for _, dead := range []string{
+			"never blocks a launch",
+			"overrides an explicit tool",
+			"An empty `tool` is different: the remedy reaches **stderr only**.",
+			"the decision then carries an empty `tool`, and a remedy hint goes to stderr",
+		} {
+			if strings.Contains(fold(document.content), fold(dead)) {
+				t.Errorf("%s still asserts the now-false clause %q", document.name, dead)
+			}
+		}
+	}
+
+	requireAll("plan prompt", read("skills", "orchestrate", "references", "prompts", "plan.md"), []string{
+		"`tier: mid | strong | frontier`",
+		"There is no tier below mid",
+		// Criterion 9's SECOND clause: the one-line frontier definition and the
+		// rule that it is never a baseline. The vocabulary and the floor sentence
+		// above both stayed green with the definition deleted.
+		"frontier only for a task no strong session should be asked to carry alone",
+		"Frontier is never a baseline: tag it deliberately or not at all.",
+	})
+
+	// Criterion 10's pointer, pinned as a SENTENCE. As two independent bare
+	// tokens ("agent-deck usage recommend", "skills/orchestrate/SKILL.md")
+	// nothing forced them into a pointer at all: a mutant reading "**Not
+	// fleet's business.** `agent-deck usage recommend` has nothing to do with
+	// fleet children; see `skills/orchestrate/SKILL.md` for teardown ordering."
+	// asserted the OPPOSITE of the criterion and stayed green. The string
+	// below contains both retired tokens.
+	requireAll("fleet skill", read("skills", "fleet", "SKILL.md"), []string{
+		"`agent-deck usage recommend --role <role> --tier <tier>` returns a read-only, advisory tool/model choice from live quota; `skills/orchestrate/SKILL.md` carries the full contract for using it.",
+	})
+
+	requireAll("config reference", configReference, []string{
+		"## [usage.policy] Section",
+		"- [[usage.policy] Section](#usagepolicy-section)",
+		"`exhausted_below`",
+		"`constrained_below`",
+		"`failover`",
+		"[usage.policy.ladder.claude]",
+		"[usage.policy.frontier_window]",
+		// The bare tokens above are all satisfied by the TOML example block
+		// and by cross-references, so each key-table ROW is anchored on text
+		// unique to that row. These also pin the corrections this round made:
+		// an exhausted provider is returned though never preferred; only the
+		// two usage providers may name a ladder; an empty non-frontier rung
+		// yields an empty model rather than falling back to strong; the
+		// default failover order excludes a non-provider `default_tool`; an
+		// empty failover list keeps the default; and a named-but-absent
+		// frontier window does not gate.
+		"| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`.",
+		"An exhausted provider is never *preferred*",
+		"it is still returned when no candidate is eligible, so read `state` on every decision",
+		// Round-4 finding 6 named the rejection LAYER on this row, the
+		// `constrained_below` row, the `failover` row and the `frontier_window`
+		// row, and the round-4 brief exempted that finding from the mutation
+		// standard — so all four clauses landed with no pin at all and were
+		// revertible-green, the same shape as round-3 finding 15 and round-4
+		// finding 3. Each is pinned below as a WHOLE sentence, because the
+		// discriminator lives in the tail: a pin stopping before "only when both
+		// keys are set explicitly" survives an inversion of exactly the clause
+		// that was expensive to find.
+		//
+		// Re-driven for this round against a built binary, a fake `openusage`
+		// first in PATH and a scratch HOME/XDG_CONFIG_HOME. Exit codes for
+		// `accounts --json` / `config orchestrate` / `usage --all --json` /
+		// `usage recommend`:
+		//   failover = ["cla ude"]                     1 1 1 1  LOAD
+		//   exhausted_below = 101                      1 1 1 1  LOAD
+		//   exhausted_below = 90, constrained unset    0 0 0 1  POLICY
+		//   exhausted_below = 90 + constrained_below   1 1 1 1  LOAD
+		//   constrained_below = 101                    1 1 1 1  LOAD
+		//   constrained_below = 10, exhausted unset    0 0 0 1  POLICY
+		//   frontier_window.cluade                     0 0 0 1  POLICY
+		//   ladder.cluade (control)                    0 0 0 1  POLICY
+		// The last two rows print `invalid [usage.policy].frontier_window.cluade:
+		// unknown usage provider` and the ladder equivalent, so the doc's
+		// `<name>` template is the real message and not an inference from the
+		// ladder row. The two `constrained_below` rows are NEW: round 4 drove the
+		// ordering rule only from the `exhausted_below` side, so that row's
+		// "reject at the same two layers" was an untested symmetry claim until
+		// now. It holds — one key explicit is policy-layer from either side.
+		"The 0–100 range check is a config-LOAD rejection — `exhausted_below = 101` drives `accounts --json`, `config orchestrate` and `usage --all --json` to exit 1 as well — while the `<= constrained_below` comparison rejects at the load layer **only** when both keys are set explicitly; with `constrained_below` left at its default, `exhausted_below = 90` is a policy-layer rejection that only `usage recommend` reports, and the other three commands stay at exit 0.",
+		"| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`:",
+		// The delegated half of the same finding: this row asserts its own range
+		// check and its own side of the ordering comparison by reference. Both
+		// halves were driven directly (rows 5 and 6 above) rather than taken on
+		// the strength of the word "same".
+		"Its 0–100 range check and its half of the ordering comparison reject at the same two layers as `exhausted_below` above.",
+		"| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = \"codex\"` |",
+		"A `default_tool` that is not itself a usage provider does not enter the order at all.",
+		// Round-4 finding 7: round 3 added this block to the TOML example
+		// because round-2 finding 2 asked for it, and criterion 11 owes "a TOML
+		// example matching the design's block" — yet the block survived
+		// deletion. It is pinned for CONTENT here; its blank line and its
+		// position are held by the raw whole-block check below, because
+		// `normalize` collapses `\n\n` and cannot hold either (round-5
+		// finding 7).
+		"[orchestrate] tool_strategy = \"auto\" [usage.policy]",
+		"An explicitly empty list is treated exactly like an omitted key and keeps the default order",
+		// The failover row was entirely rewritten and gained ZERO pins: the
+		// three above are context lines that rewrite never touched, so the
+		// "auto"-only scoping, the silent-drop behaviour and both verbatim
+		// reason strings could all be reverted while this test stayed green.
+		// Each corrected claim is now held, and each was driven against a
+		// built binary rather than read off the source.
+		// Round-4 finding 3: three clauses written in cd175e91 carried no pin
+		// and were invertible while green. All three are true today, each
+		// driven against a built binary. The first string below is a strict
+		// superset of the one it replaces — it adds the "no other tool it could
+		// change to" clause; the two after it are new.
+		"The ORDER is consulted **only** under `[orchestrate] tool_strategy = \"auto\"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool — that strategy has at most one candidate to choose from, so there is no other tool it could change to.",
+		"Either way cross-provider failover does not happen there: no second provider is queried and `alternatives` comes back empty.",
+		"`--prefer` is checked against the tool registry rather than the installed set, so a registry name that is not installed passes the flag check and is then dropped here like any other entry.",
+		"there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy \"\"`",
+		"Under `\"auto\"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order",
+		"a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed",
+		// Finding 6 on the failover row. The contrast half carries the point —
+		// without "unlike an unknown `ladder` or `frontier_window` table key" the
+		// sentence says only "this one exits 1", which is true of every rejection
+		// in the table and so distinguishes nothing.
+		"That shape check is a config-LOAD rejection, not a policy-layer one: `failover = [\"cla ude\"]` fails the load itself, so `accounts --json`, `config orchestrate` and `usage --all --json` each exit 1 alongside `recommend` — unlike an unknown `ladder` or `frontier_window` table key, which only `recommend` rejects.",
+		"the decision then carries the `--prefer` tool, or the first entry when `--prefer` was omitted, as its `tool`, with `state: unknown` and the reason `no candidate tools for tool strategy \"auto\"`",
+		// Driven discriminator: an uninstalled name that IS a usage provider
+		// keeps a non-empty `provider` and a model here, so the round-2 "with an
+		// empty `provider`, no model" clause was false and is not re-pinned.
+		"`provider` comes back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way; `model` follows that provider's ladder, and is empty when the applied tier's rung is empty or when there is no provider",
+		"| `[usage.policy.ladder.<claude\\|codex>]` | table of strings |",
+		"Only `claude` and `codex` are accepted, and the rejection is not a startup error",
+		"`usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1",
+		"an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged",
+		"| `[usage.policy.frontier_window]` | table of strings | `{ claude = \"fable\" }` |",
+		"a window that is named here but absent from the snapshot the provider actually returned",
+		// Finding 6 on the frontier_window row. The ladder row's identical
+		// sentence has been pinned since criterion 11; this one had nothing, so
+		// the two rows could disagree about the layer while the suite stayed
+		// green.
+		"This table's KEYS share the ladder's closed provider set and reject at the same layer: an unknown name is accepted by the load, and `usage recommend` alone rejects it, printing `invalid [usage.policy].frontier_window.<name>: unknown usage provider` and exiting 1 while every other command keeps working.",
+		"`null` whenever the selected tool has no available snapshot",
+		// The round-2 wording closed an enumeration that is not closed and
+		// attached a guarantee a third case falsifies: `--profile` naming a
+		// label with no snapshot is queried, succeeds, and still yields
+		// `fetched_at: null` with an EMPTY `account`. The sibling pin above
+		// ("`null` whenever the selected tool has no available snapshot") is
+		// true and is kept.
+		"because it was never queried at all, because its own query failed, or because `--profile` named no snapshot for it; among those, only the failed-query case still reports a non-empty `account` alongside the `null`",
+		"agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]",
+		// Criterion 12: all ten JSON keys, named in order. Nine of them had no
+		// assertion at all — only the `fetched_at` sub-clause was anchored.
+		"`--json` prints the decision as ten snake_case keys: `tool`, `provider`, `model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`, `alternatives` (each entry `tool` / `state` / `remaining_percent`), and `fetched_at`",
+		// Round-5 finding 9: the read-only claim was invertible while green — a
+		// mutant asserting the command persists its decision into `config.toml`
+		// as the new `default_tool` SURVIVED.
+		"The command is read-only: it queries usage and prints a decision, and writes no configuration, session or account.",
+		// Round-5 finding 10: this clause inverted while green — a mutant
+		// asserting `-1` "always means the reading was not available, so it
+		// never reflects a real provider response" SURVIVED. That is the exact
+		// claim the lead drove FALSE: `-5`/`-7` are real readings reported with
+		// `state: exhausted`.
+		"A `remaining_percent` of `-1` covers both a reading that was not available and a provider that genuinely reported a negative remaining; read `state` to tell those apart.",
+		// Round-5 finding 11: only the key NAMES were pinned (inside the
+		// ten-keys string), so the tier-movement sentence inverted in BOTH
+		// directions while green — floor lowering `strong` to `mid`, gate
+		// raising `strong` to `frontier`. The direction is now held.
+		"a role floor raises `cheap` to `mid` for an implementer or reviewer, and an empty `frontier` ladder rung or a fired frontier-window gate lowers `frontier` to `strong`",
+		// Round-5 finding 12: the whole deferred-48 "Known limitation"
+		// paragraph was DELETABLE while green, and it is the one documentation
+		// item this unit owns outright.
+		"Known limitation: `agent-deck usage <session>` dispatches on the literal word `recommend` before it looks a session up, so a session titled exactly `recommend` is unreachable that way — pass the flag first (`agent-deck usage --json recommend`) to reach the session instead.",
+		"exits 0 for every decision",
+		"Exit 2 is reserved for a bad flag",
+		// ...and the whole exit contract as one sentence. The two fragments
+		// above are kept, but neither held the exit-1 clause, so the config
+		// reference could drop it while the skill side stayed pinned.
+		// Round-5 finding 2 (major): the sentence pinned here asserted "the
+		// decision then carries an empty `tool`, and a remedy hint goes to
+		// stderr" — FALSE for the surviving-name branch, and contradicted by
+		// this same file 13 lines above (":679", the `failover` row). A pin on
+		// a false claim freezes the falsehood, so prose and pin changed in the
+		// same commit. Same driven evidence as finding 1 above.
+		"That last case is not always an empty `tool`: it always carries a `reason` beginning `no candidate tools for tool strategy`, but only when the strategy resolved no name either does `tool` come back empty with a remedy hint on stderr; when a name survives, as the `failover` row above describes, `tool` is that name, `provider` is filled in whenever it maps to a usage provider, `model` follows that provider's ladder and is empty when the applied tier's rung is empty, and stderr stays silent. Read the `reason`, not the emptiness of `tool`.",
+		// Round-5 finding 5, config-reference half: the same closed exit-2
+		// enumeration as the skill's, widened to `flag.Parse` and pinned.
+		"It exits 0 for every decision — including `exhausted`, `unknown`, and the case where no candidate tool could be chosen at all — so a caller reads `state`, not the exit code.",
+		"Exit 2 is reserved for a bad flag: a missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray positional argument, or anything else `flag.Parse` rejects — an undefined flag, or a defined flag given no value — except the four help spellings `-h`, `--h`, `-help`, and `--help`, which print the usage line on stderr and exit 0. Exit 1 means the configuration could not be loaded or validated, or the JSON could not be encoded.",
+	})
+	// Round-5 findings 7 and 8, checked RAW — no normalize — so whitespace,
+	// position and every VALUE are held together.
+	//
+	// Finding 7: the comment on the `[orchestrate]` pin above claimed it held
+	// the trailing blank line "so it also holds its position immediately ahead
+	// of `[usage.policy]`". It did not: `normalize` collapses `\n\n`. Driven,
+	// [M1-drop-blank-line] SURVIVED against [M2-delete-orchestrate-block] and
+	// [M3-auto-to-default] KILLED.
+	//
+	// Finding 8: criterion 11's TOML example pinned only section HEADERS, never
+	// values — a mutant setting exhausted_below = 99, constrained_below = 1,
+	// failover = ["Codex","Claud"], cheap = "fable", claude frontier = "haiku"
+	// and codex frontier = "gpt-5.6-nova" SURVIVED with the headers intact, so
+	// the round-3 fix held only against wholesale deletion. Criterion 11 owes
+	// "a TOML example matching the design's block", and the values are part of
+	// that block.
+	const usagePolicyTOMLBlock = "```toml\n" +
+		"[orchestrate]\ntool_strategy = \"auto\"\n\n" +
+		"[usage.policy]\nexhausted_below = 15\nconstrained_below = 35\nfailover = [\"codex\", \"claude\"]\n\n" +
+		"[usage.policy.ladder.claude]\ncheap = \"haiku\"\nmid = \"sonnet\"\nstrong = \"opus\"\nfrontier = \"fable\"\n\n" +
+		"[usage.policy.ladder.codex]\ncheap = \"gpt-5.6-luna\"\nmid = \"gpt-5.6-terra\"\nstrong = \"gpt-5.6-sol\"\nfrontier = \"gpt-6-astra\"\n\n" +
+		"[usage.policy.frontier_window]\nclaude = \"fable\"\n```"
+	if !strings.Contains(configReference, usagePolicyTOMLBlock) {
+		t.Errorf("config reference: the [usage.policy] TOML example must appear verbatim — every section in order, every value, and the blank line that puts [orchestrate] immediately ahead of [usage.policy]")
+	}
+
+	// The section is placed where its table-of-contents entry says it is.
+	orchestrateSection := strings.Index(configReference, "\n## [orchestrate] Section")
+	usagePolicySection := strings.Index(configReference, "\n## [usage.policy] Section")
+	logsSection := strings.Index(configReference, "\n## [logs] Section")
+	if orchestrateSection < 0 || usagePolicySection < 0 || logsSection < 0 {
+		t.Fatalf("config reference sections: orchestrate=%d usage.policy=%d logs=%d", orchestrateSection, usagePolicySection, logsSection)
+	}
+	if !(orchestrateSection < usagePolicySection && usagePolicySection < logsSection) {
+		t.Errorf("[usage.policy] must sit between [orchestrate] and [logs]: orchestrate=%d usage.policy=%d logs=%d", orchestrateSection, usagePolicySection, logsSection)
+	}
+	// Criterion 11: the TOC entry sits in the SAME position as the section.
+	// Presence alone let the entry be moved anywhere in the list while the
+	// section-body ordering above stayed green.
+	orchestrateTOC := strings.Index(configReference, "- [[orchestrate] Section](#orchestrate-section)")
+	usagePolicyTOC := strings.Index(configReference, "- [[usage.policy] Section](#usagepolicy-section)")
+	logsTOC := strings.Index(configReference, "- [[logs] Section](#logs-section)")
+	if orchestrateTOC < 0 || usagePolicyTOC < 0 || logsTOC < 0 {
+		t.Fatalf("config reference TOC entries: orchestrate=%d usage.policy=%d logs=%d", orchestrateTOC, usagePolicyTOC, logsTOC)
+	}
+	if !(orchestrateTOC < usagePolicyTOC && usagePolicyTOC < logsTOC) {
+		t.Errorf("the [usage.policy] TOC entry must sit between the [orchestrate] and [logs] entries, matching the section order: orchestrate=%d usage.policy=%d logs=%d", orchestrateTOC, usagePolicyTOC, logsTOC)
+	}
+
+	// Criterion 11a: the command row goes IMMEDIATELY after the `usage --all`
+	// row. A plain Contains let it be moved anywhere in the table.
+	agentDeckSkill := read("skills", "agent-deck", "references", "session-operations.md")
+	requireAll("agent-deck skill command table", agentDeckSkill, []string{
+		// The whole row, not just its command cell: criterion 11a owes the
+		// read-only, advisory purpose too, and dropping those two words left
+		// both the command-cell pin and the adjacency check below green.
+		"| `agent-deck usage recommend --role <role> --tier <tier>` | Read-only, advisory connector + model pick for that role and tier from live quota; add `--json` for the decision object |",
+	})
+	agentDeckLines := strings.Split(agentDeckSkill, "\n")
+	usageAllRow, recommendRow := -1, -1
+	for i, line := range agentDeckLines {
+		switch {
+		case strings.HasPrefix(line, "| `agent-deck usage --all [--json]` |"):
+			usageAllRow = i
+		case strings.HasPrefix(line, "| `agent-deck usage recommend --role <role> --tier <tier>` |"):
+			recommendRow = i
+		}
+	}
+	if usageAllRow < 0 || recommendRow < 0 {
+		t.Fatalf("agent-deck skill command table rows: usage --all=%d usage recommend=%d", usageAllRow, recommendRow)
+	}
+	if recommendRow != usageAllRow+1 {
+		t.Errorf("the `usage recommend` row must sit immediately after the `usage --all` row: usage --all on line %d, usage recommend on line %d", usageAllRow+1, recommendRow+1)
+	}
+}

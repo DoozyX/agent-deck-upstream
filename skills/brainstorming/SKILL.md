@@ -270,7 +270,7 @@ After approval, size the work and take exactly one exit:
 
 - **Orchestrated** — several independent tasks, non-obvious decomposition, a
   dedicated PR pipeline, or separate executor/reviewer sessions are needed →
-  launch a **detached conductor** on `$SPEC_PATH` and hand this session back
+  launch a **background conductor** on `$SPEC_PATH` and hand this session back
   to the user. Do not run `orchestrate` in this session: a conductor lives
   for hours and would hold the user's session hostage for the whole run —
   the user's next feature waits on this one's review rounds. Do not write
@@ -306,21 +306,20 @@ After approval, size the work and take exactly one exit:
   cat > "$RUN_ROOT/design/conductor-prompt.md" <<EOF
   The approved design for this feature is at $SPEC_PATH — read it there by
   absolute path; it is git-ignored on purpose. Run the \`orchestrate\` skill
-  on that path. You are the conductor and the root of your own session tree;
+  on that path. You are the conductor and own this run's orchestration subtree;
   the design is approved, so never re-open it, and never brainstorm. The
   run's goal is already frozen at $RUN_ROOT/orchestrate/goal.md — read it,
   keep it, and append to it only for scope changes the user approves.
   EOF
-  agent-deck launch "$ROOT_WT" -c "$TOOL" -t "conductor-$RUN_ID" --no-parent \
+  agent-deck launch "$ROOT_WT" -c "$TOOL" -t "conductor-$RUN_ID" --conductor --inherit-group \
     --message-file "$RUN_ROOT/design/conductor-prompt.md" --json \
     | jq -r '(.data // .) | (.id // .session_id)' > "$RUN_ROOT/design/.conductor-id"
   ```
 
-  `--no-parent` is the same mechanism `rotate-conductor.sh` uses for
-  successor conductors: the conductor is nobody's child, so the SessionStart
-  hook gives it the interactive preamble rather than the executor one, and
-  its questions never land in this session. Then print exactly one line and
-  end the turn — `conductor-<run-id> <id> launched; this session is free.
+  `--conductor` gives the parented session the conductor SessionStart role;
+  parentage remains available for group inheritance and completion routing.
+  The conductor owns its workers without blocking this session. Then print
+  exactly one line and end the turn — `conductor-<run-id> <id> launched; this session is free.
   The run's questions surface as that session going \`waiting\` plus a
   banner; attach to answer.` — and do not poll it. The user can start the
   next brainstorm here immediately; each feature gets its own conductor.

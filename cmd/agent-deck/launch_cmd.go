@@ -191,6 +191,7 @@ func handleLaunch(profile string, args []string) {
 	parent := fs.String("parent", "", "Parent session (creates sub-session; group is cwd-derived by default — auto-inherits the parent's group for git worktree children or with --inherit-group)")
 	parentShort := fs.String("p", "", "Parent session (short)")
 	noParent := fs.Bool("no-parent", false, "Disable automatic parent linking")
+	conductor := fs.Bool("conductor", false, "Mark this session as a conductor rather than an executor when parented")
 	// Keep a fanned-out child in the parent's group instead of the cwd-derived
 	// group. Without this, a child launched into a worktree (.worktrees/<branch>)
 	// derives its group from that leaf folder and lands in a per-branch group
@@ -759,6 +760,9 @@ func handleLaunch(profile string, args []string) {
 
 	// Preserve the slot validated before any worktree setup effects.
 	newInstance.Account = selectedAccount
+	if *conductor {
+		newInstance.IsConductor = true
+	}
 
 	if parentInstance != nil {
 		newInstance.SetParentWithPath(parentInstance.ID, parentInstance.ProjectPath)
