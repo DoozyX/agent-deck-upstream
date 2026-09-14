@@ -344,10 +344,11 @@ func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
 	log := filepath.Join(dir, "args")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s' \"$1\" \"$CLAUDE_CONFIG_DIR\" > \"$OPENUSAGE_LOG\"\nprintf '{\\\"limits\\\":{\\\"weekly\\\":{\\\"remaining_percent\\\":55}}}'\n"), 0755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '{\\\"limits\\\":{\\\"weekly\\\":{\\\"remaining_percent\\\":55}}}'\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OPENUSAGE_LOG", log)
+	t.Setenv("TELEGRAM_TOKEN", "must-not-reach-openusage")
 	// This test verifies argv/environment wiring, not the timeout boundary. Give
 	// the tiny helper enough scheduling room when every package runs in parallel;
 	// TestRunTimeoutIsUnavailable below retains the bounded-timeout coverage.
@@ -356,7 +357,7 @@ func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := os.ReadFile(log); string(got) != "claude|/tmp/claude" {
+	if got, _ := os.ReadFile(log); string(got) != "claude|/tmp/claude|" {
 		t.Fatalf("arguments/environment = %q", got)
 	}
 	if s.Windows.Weekly == nil || s.Windows.Weekly.RemainingPercent != 55 {

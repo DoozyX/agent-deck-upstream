@@ -210,10 +210,10 @@ func applyBudgetCoverage(result BudgetResult, coverage Coverage, used, limit int
 }
 
 func budgetCoverageTx(tx *sql.Tx, where string, args ...any) (Coverage, error) {
-	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
+	usageTotalSQL := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
 	query := `SELECT
-		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0)
 		FROM cost_events WHERE ` + where + ` AND reconciliation_status <> ?`

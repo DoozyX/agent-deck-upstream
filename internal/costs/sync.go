@@ -246,7 +246,7 @@ func sourceFingerprint(path string, boundary int64) (string, error) {
 	}
 	var device, inode uint64
 	if stat, ok := info.Sys().(*syscall.Stat_t); ok {
-		device, inode = uint64(stat.Dev), uint64(stat.Ino)
+		device, inode = uint64(stat.Dev), uint64(stat.Ino) // #nosec G115 -- kernel-provided device identity is non-negative.
 	}
 	return fmt.Sprintf("v2:%d:%d:%d:%s", device, inode, boundary, hex.EncodeToString(hash.Sum(nil))), nil
 }
@@ -255,36 +255,4 @@ func applyEventPrice(event *UsageEvent, pricer *Pricer) {
 	quote := pricer.Quote(event.Model, event.Usage)
 	event.PricingStatus = quote.Status
 	event.CostMicrodollars = quote.CostMicrodollars
-}
-
-func overlappingLegacyEventIDs(ctx context.Context, store *Store, sessionID string, events []UsageEvent) ([]string, error) {
-	from := events[0].Timestamp
-	to := events[0].Timestamp
-	for _, event := range events[1:] {
-		if event.Timestamp.Before(from) {
-			from = event.Timestamp
-		}
-		if event.Timestamp.After(to) {
-			to = event.Timestamp
-		}
-	}
-	rows, err := store.db.QueryContext(ctx, `
-		SELECT id FROM cost_events
-		WHERE session_id = ? AND timestamp >= ? AND timestamp <= ?
-			AND reconciliation_status = ?`,
-		sessionID, from.UTC().Format(time.RFC3339Nano), to.UTC().Format(time.RFC3339Nano),
-		ReconciliationLegacyUnreconciled)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		ids = append(ids, id)
-	}
-	return ids, rows.Err()
 }
