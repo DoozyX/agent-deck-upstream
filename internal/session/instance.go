@@ -1693,11 +1693,11 @@ func (i *Instance) ensureSessionTempEnv() {
 // interactive session by reading the environment alone — no DB lookup, and it
 // works from any shell inside the session.
 //
-// A parented session carries AGENTDECK_ROLE=child and AGENTDECK_PARENT_ID
-// (the parent's instance id). An unparented session carries neither: the vars
-// are actively removed rather than left alone, so a session that was
-// un-parented (ClearParent, or re-homed elsewhere) and then restarted stops
-// announcing itself as a child.
+// A parented session carries AGENTDECK_PARENT_ID (the parent's instance id)
+// and AGENTDECK_ROLE=child, unless IsConductor selects the explicit conductor
+// role. An unparented session carries neither: the vars are actively removed
+// rather than left alone, so a session that was un-parented (ClearParent, or
+// re-homed elsewhere) and then restarted stops announcing a role.
 //
 // Called alongside ensureProfileEnv at every spawn and respawn site, because
 // each respawn-pane branch in Restart() returns before the fallback recreate
@@ -1755,7 +1755,11 @@ func (i *Instance) publishRoleEnv(expectLive bool) {
 		}
 		sessionLog.Debug(msg, slog.String("error", err.Error()))
 	}
-	if err := i.tmuxSession.SetEnvironment("AGENTDECK_ROLE", "child"); err != nil {
+	role := "child"
+	if i.IsConductor {
+		role = "conductor"
+	}
+	if err := i.tmuxSession.SetEnvironment("AGENTDECK_ROLE", role); err != nil {
 		logFailure("set_role_failed", err)
 	}
 	if err := i.tmuxSession.SetEnvironment("AGENTDECK_PARENT_ID", i.ParentSessionID); err != nil {

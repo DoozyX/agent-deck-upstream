@@ -91,6 +91,36 @@ func TestStart_ParentedSession_ExportsChildRoleEnv(t *testing.T) {
 	}
 }
 
+func TestStart_ParentedConductor_ExportsConductorRoleEnv(t *testing.T) {
+	skipIfNoTmuxBinary(t)
+	isolateUserHomeForShellRestart(t)
+
+	inst := newShellInstance(t, "ConductorRoleEnv")
+	inst.IsConductor = true
+	const parentID = "brainstorm-parent-instance-id"
+	inst.SetParentWithPath(parentID, t.TempDir())
+
+	if err := inst.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+	t.Cleanup(func() { cleanupShellSessions(inst.Title) })
+
+	if !waitForTmuxSession(inst.tmuxSession.Name, time.Second) {
+		t.Fatalf("tmux session %q never appeared after Start", inst.tmuxSession.Name)
+	}
+
+	role, err := inst.tmuxSession.GetEnvironment("AGENTDECK_ROLE")
+	if err != nil {
+		t.Fatalf("GetEnvironment(AGENTDECK_ROLE) failed: %v", err)
+	}
+	if role != "conductor" {
+		t.Errorf("AGENTDECK_ROLE = %q, want %q", role, "conductor")
+	}
+	if got, err := inst.tmuxSession.GetEnvironment("AGENTDECK_PARENT_ID"); err != nil || got != parentID {
+		t.Errorf("AGENTDECK_PARENT_ID = %q (err %v), want %q", got, err, parentID)
+	}
+}
+
 func TestStart_UnparentedSession_HasNoChildRoleEnv(t *testing.T) {
 	skipIfNoTmuxBinary(t)
 	isolateUserHomeForShellRestart(t)
