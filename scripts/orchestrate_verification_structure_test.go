@@ -290,11 +290,34 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 	// The guard is only useful if it actually fails when the primary moves.
 	repo := t.TempDir()
 	runDir := t.TempDir()
+	gitCommand := func(args ...string) *exec.Cmd {
+		cmd := exec.Command("git", args...)
+		env := make([]string, 0, len(os.Environ())+2)
+		for _, entry := range os.Environ() {
+			if strings.HasPrefix(entry, "GIT_AUTHOR_") || strings.HasPrefix(entry, "GIT_COMMITTER_") {
+				continue
+			}
+			env = append(env, entry)
+		}
+		cmd.Env = append(env,
+			"GIT_CONFIG_GLOBAL="+os.DevNull,
+			"GIT_CONFIG_NOSYSTEM=1",
+		)
+		return cmd
+	}
 	for _, args := range [][]string{
 		{"init", "-q", repo},
+		{"-C", repo, "config", "user.name", "Agent Deck Test"},
+		{"-C", repo, "config", "user.email", "agent-deck-test@example.invalid"},
+	} {
+		if out, err := gitCommand(args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	for _, args := range [][]string{
 		{"-C", repo, "commit", "-q", "--allow-empty", "-m", "init"},
 	} {
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+		if out, err := gitCommand(args...).CombinedOutput(); err != nil {
 			t.Fatalf("git %v: %v: %s", args, err, out)
 		}
 	}
@@ -306,7 +329,7 @@ func TestOrchestrationSkillRetroHardenedRules(t *testing.T) {
 	if out, err := verify.CombinedOutput(); err != nil {
 		t.Fatalf("guard verify on an untouched primary must pass: %v: %s", err, out)
 	}
-	if out, err := exec.Command("git", "-C", repo, "commit", "-q", "--allow-empty", "-m", "moved").CombinedOutput(); err != nil {
+	if out, err := gitCommand("-C", repo, "commit", "-q", "--allow-empty", "-m", "moved").CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v: %s", err, out)
 	}
 	moved := exec.Command("sh", guardPath, "verify", "--repo", repo, "--run-dir", runDir, "--label", "deploy")

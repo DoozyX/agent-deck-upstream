@@ -344,7 +344,7 @@ func TestRunUsesFixedProviderAndHome(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
 	log := filepath.Join(dir, "args")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s|%s' \"$1\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '{\\\"limits\\\":{\\\"weekly\\\":{\\\"remaining_percent\\\":55}}}'\n"), 0755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/usr/bin/env dash\nprintf '%s|%s|%s' \"$1\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '%s\\n' '{\"limits\":{\"weekly\":{\"remaining_percent\":55}}}'\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OPENUSAGE_LOG", log)
@@ -369,7 +369,7 @@ func TestRunCodexUsesSelectedHomeAndIsolatesChildEnvironment(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "openusage")
 	log := filepath.Join(dir, "args")
-	if err := os.WriteFile(bin, []byte("#!/bin/sh\nprintf '%s|%s|%s|%s' \"$1\" \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '{\\\"limits\\\":{\\\"weekly\\\":{\\\"remaining_percent\\\":55}}}'\n"), 0755); err != nil {
+	if err := os.WriteFile(bin, []byte("#!/usr/bin/env dash\nprintf '%s|%s|%s|%s' \"$1\" \"$CODEX_HOME\" \"$CLAUDE_CONFIG_DIR\" \"$TELEGRAM_TOKEN\" > \"$OPENUSAGE_LOG\"\nprintf '%s\\n' '{\"limits\":{\"weekly\":{\"remaining_percent\":55}}}'\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("OPENUSAGE_LOG", log)

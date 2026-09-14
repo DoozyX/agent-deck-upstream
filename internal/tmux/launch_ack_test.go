@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -360,6 +361,53 @@ func TestStartRollsBackCreatedSessionWhenIdentityCaptureFails(t *testing.T) {
 	}
 	if raw, readErr := os.ReadFile(killLog); readErr != nil || len(strings.TrimSpace(string(raw))) == 0 {
 		t.Fatalf("created session was not rolled back: log=%q readErr=%v", raw, readErr)
+	}
+}
+
+func TestStartHandlesImmediateExitWhenIdentityCaptureIsIndeterminate(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		exitCode         int
+		allowInitialExit bool
+		wantErr          string
+	}{
+		{name: "clean exit is retained for allowed one-shot", exitCode: 0, allowInitialExit: true},
+		{name: "clean exit fails an interactive launch", exitCode: 0, wantErr: "exit status 0"},
+		{name: "nonzero exit fails", exitCode: 7, wantErr: "exit status 7"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			killLog := filepath.Join(dir, "kill.log")
+			writeFakeTmux(t, dir, "case \" $* \" in\n"+
+				"  *' has-session '*) exit 1 ;;\n"+
+				"  *' new-session '*) echo '$created'; exit 0 ;;\n"+
+				"  *' list-sessions '*) exit 1 ;;\n"+
+				"  *' list-panes '*) printf '1|"+strconv.Itoa(tc.exitCode)+"\\n'; exit 0 ;;\n"+
+				"  *' kill-session '*) echo killed >> "+shellQuote(killLog)+"; exit 0 ;;\n"+
+				"  *) exit 0 ;;\n"+
+				"esac\n")
+
+			sess := NewSession("immediate-exit-identity-race", t.TempDir())
+			sess.RunCommandAsInitialProcess = true
+			sess.AllowInitialProcessExit = tc.allowInitialExit
+			err := sess.Start("exit " + strconv.Itoa(tc.exitCode))
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Start() = %v, want clean one-shot acceptance", err)
+				}
+				code, ok := sess.PaneDeadExitStatus()
+				if !ok || code != tc.exitCode {
+					t.Fatalf("PaneDeadExitStatus() = (%d, %t), want (%d, true)", code, ok, tc.exitCode)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Start() = %v, want %s", err, tc.wantErr)
+			}
+			if raw, readErr := os.ReadFile(killLog); readErr != nil || strings.TrimSpace(string(raw)) == "" {
+				t.Fatalf("failed immediate launch was not rolled back: log=%q readErr=%v", raw, readErr)
+			}
+		})
 	}
 }
 
