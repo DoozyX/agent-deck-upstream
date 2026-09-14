@@ -3154,6 +3154,13 @@ func launchAckProgress(ackPath, marker string) string {
 // retry policy also ends without consuming the marker, preserving it for
 // diagnosis rather than treating uncertainty as a launch failure.
 func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback func(exitCode int, diagnostic string)) {
+	s.watchInitialProcessCompletion(cancel, callback, nil)
+}
+
+// watchInitialProcessCompletion is the watcher implementation. done is used
+// by package tests to observe that the watcher has fully stopped; production
+// callers use WatchInitialProcessCompletion and leave it nil.
+func (s *Session) watchInitialProcessCompletion(cancel <-chan struct{}, callback func(exitCode int, diagnostic string), done chan<- struct{}) {
 	ackPath := s.launchAckPath
 	sessionName := s.Name
 	sessionID := s.createdSessionID
@@ -3166,6 +3173,9 @@ func (s *Session) WatchInitialProcessCompletion(cancel <-chan struct{}, callback
 		return
 	}
 	go func() {
+		if done != nil {
+			defer close(done)
+		}
 		preserveAck := false
 		defer func() {
 			if !preserveAck {

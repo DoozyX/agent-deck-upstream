@@ -4,26 +4,39 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
 
 func waitForProbeCount(path string, want int, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
+	var last string
 	for {
 		calls, err := os.ReadFile(path)
-		if err != nil {
-			return 0, err
+		if err == nil {
+			probes, parseErr := strconv.Atoi(strings.TrimSpace(string(calls)))
+			if parseErr == nil && probes >= want {
+				return probes, nil
+			}
+			last = fmt.Sprintf("%q (%v)", calls, parseErr)
+		} else {
+			last = err.Error()
 		}
-		var probes int
-		if _, err := fmt.Sscanf(string(calls), "%d", &probes); err != nil {
-			return 0, err
-		}
-		if probes >= want || !time.Now().Before(deadline) {
-			return probes, nil
+		if !time.Now().Before(deadline) {
+			return 0, fmt.Errorf("probe count did not reach %d before deadline (last read %s)", want, last)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+func readProbeCount(path string) (int, error) {
+	calls, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.Atoi(strings.TrimSpace(string(calls)))
 }
 
 func TestIssue1793_WatcherPreservesMarkerAfterPersistentIndeterminateIdentity(t *testing.T) {
@@ -34,7 +47,7 @@ func TestIssue1793_WatcherPreservesMarkerAfterPersistentIndeterminateIdentity(t 
 	}
 	writeFakeTmux(t, dir, "if [ \"$1\" = \"-u\" ]; then shift; fi\n"+
 		"if [ \"$1\" = \"-L\" ]; then shift 2; fi\n"+
-		"if [ \"$1\" = \"display-message\" ]; then n=$(cat "+shellQuote(countPath)+"); n=$((n+1)); echo $n > "+shellQuote(countPath)+"; echo 'server busy' >&2; exit 1; fi\n"+"exit 1\n")
+		"if [ \"$1\" = \"display-message\" ]; then n=$(cat "+shellQuote(countPath)+"); n=$((n+1)); printf '%s\\n' \"$n\" > "+shellQuote(countPath+".next")+" && mv "+shellQuote(countPath+".next")+" "+shellQuote(countPath)+"; echo 'server busy' >&2; exit 1; fi\n"+"exit 1\n")
 
 	ackPath := filepath.Join(t.TempDir(), "ack")
 	if err := os.WriteFile(ackPath, []byte("exit:7\nPERSIST THIS EVIDENCE\n"), 0o600); err != nil {
@@ -42,14 +55,20 @@ func TestIssue1793_WatcherPreservesMarkerAfterPersistentIndeterminateIdentity(t 
 	}
 	sess := &Session{Name: "indeterminate-watcher", createdSessionID: "$owned", launchAckPath: ackPath}
 	called := make(chan struct{}, 1)
-	sess.WatchInitialProcessCompletion(make(chan struct{}), func(int, string) { called <- struct{}{} })
+	done := make(chan struct{})
+	sess.watchInitialProcessCompletion(make(chan struct{}), func(int, string) { called <- struct{}{} }, done)
 
 	// The watcher backs off between probes and starts an external tmux process
 	// for each one. Poll for its observable terminal count instead of sampling
 	// it at a fixed wall-clock instant under a loaded test run.
-	probes, err := waitForProbeCount(countPath, launchAckIdentityMaxRetries, 5*time.Second)
+	_, err := waitForProbeCount(countPath, launchAckIdentityMaxRetries, 5*time.Second)
 	if err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistent indeterminate watcher did not quiesce")
 	}
 	select {
 	case <-called:
@@ -58,6 +77,10 @@ func TestIssue1793_WatcherPreservesMarkerAfterPersistentIndeterminateIdentity(t 
 	}
 	if marker, err := os.ReadFile(ackPath); err != nil || string(marker) == "" {
 		t.Fatalf("persistent indeterminate identity must preserve marker evidence: marker=%q err=%v", marker, err)
+	}
+	probes, err := readProbeCount(countPath)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if probes != launchAckIdentityMaxRetries {
 		t.Fatalf("persistent indeterminate watcher probes=%d, want bounded %d", probes, launchAckIdentityMaxRetries)
