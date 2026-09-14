@@ -114,7 +114,7 @@ setup_case() {
   printf '%s\n' '# Goal' 'Ship the widget: user asked for `X` with "quotes" and $dollars.' 'Done means: PR merged to develop.' > "$RUN/goal.md"
   # The gen-1 conductor of the incident: claude, in group ignitech/baba.
   cat > "$TMP/self.json" <<'JSON'
-{"id":"self-gen1","title":"orchestrate-c1","path":"/repo","group":"ignitech/baba","status":"running","tool":"claude"}
+{"id":"self-gen1","title":"orchestrate-c1","path":"/repo","group":"ignitech/baba","parent_session_id":"brainstorm-parent","status":"running","tool":"claude"}
 JSON
   cat > "$TMP/children.json" <<'JSON'
 {"children":[{"id":"kid-1","status":"running"},{"id":"kid-2","status":"waiting"},{"id":"kid-3","status":"archived"}]}
@@ -204,14 +204,34 @@ else
   fail "happy: successor prompt names goal.md as the durable copy"
 fi
 
-# Defect 2 regression: the predecessor's group must reach the launch. The old
-# code read .group_path, which `session show --json` has never emitted, so
-# GROUP was always empty and -g was never passed — in the incident the gen-1
-# conductor was in ignitech/baba and its successor landed in doozyx.
-if log_has "$TMP/launch.log" "-g ignitech/baba"; then
-  echo "ok   happy: predecessor group passed to launch"
+# Defect 2 regression: a parented successor inherits the original parent's
+# group instead of guessing one from the repository path.
+if log_has "$TMP/launch.log" "--parent brainstorm-parent --inherit-group"; then
+  echo "ok   happy: predecessor group inherited through the original parent"
 else
-  fail "happy: predecessor group passed to launch" "$(cat "$TMP/launch.log" 2>/dev/null)"
+  fail "happy: predecessor group inherited through the original parent" "$(cat "$TMP/launch.log" 2>/dev/null)"
+fi
+if log_has "$TMP/launch.log" "--conductor --parent brainstorm-parent --inherit-group" &&
+   ! log_has "$TMP/launch.log" "--no-parent"; then
+  echo "ok   happy: successor preserves the original parent and conductor role"
+else
+  fail "happy: successor preserves the original parent and conductor role" "$(cat "$TMP/launch.log" 2>/dev/null)"
+fi
+
+# A legacy root conductor has no original parent to preserve. Its successor
+# must stay root-level and carry the predecessor's group explicitly, while
+# still receiving the conductor role marker.
+setup_case
+cat > "$TMP/self.json" <<'JSON'
+{"id":"self-gen1","title":"orchestrate-c1","path":"/repo","group":"ignitech/baba","status":"running","tool":"claude"}
+JSON
+printf '%s\n' '{"id":"new-claude","status":"running","substate":"running"}' > "$TMP/plan_new-claude"
+run_rotate
+check_rc "root: exit 0" 0
+if log_has "$TMP/launch.log" "--conductor --no-parent -g ignitech/baba"; then
+  echo "ok   root: successor remains root-level in the predecessor group"
+else
+  fail "root: successor remains root-level in the predecessor group" "$(cat "$TMP/launch.log" 2>/dev/null)"
 fi
 
 # ---------------------------------------------------------------------------
