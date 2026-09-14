@@ -40,7 +40,7 @@ esac
 
 mkdir -p "$(dirname "$OUT")"
 TPL="$TPL" OUT="$OUT" DIR="$DIR" python3 - "$@" <<'PY'
-import os, re, sys
+import os, re, sys, tempfile
 
 tpl_path, out_path, inc_dir = os.environ["TPL"], os.environ["OUT"], os.environ["DIR"]
 
@@ -80,8 +80,17 @@ if leftover:
     # improvises around it, and the run finds out one review round later.
     sys.exit("render.sh: unfilled placeholders: " + ", ".join(leftover))
 
-with open(out_path, "w", encoding="utf-8") as fh:
-    fh.write(text if text.endswith("\n") else text + "\n")
+os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=os.path.basename(out_path) + ".", suffix=".tmp", dir=os.path.dirname(os.path.abspath(out_path)))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, out_path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
 print(f"rendered {out_path} ({len(text)} chars)")
 
 # A child prompt this large is almost always a spec or findings list pasted in
