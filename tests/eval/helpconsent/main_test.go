@@ -10,7 +10,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	code := m.Run()
-	harness.RemoveBuildArtifacts()
-	os.Exit(code)
+	os.Exit(runTestMain(m))
+}
+
+func runTestMain(m *testing.M) int {
+	defer harness.RemoveBuildArtifacts()
+	return m.Run()
 }

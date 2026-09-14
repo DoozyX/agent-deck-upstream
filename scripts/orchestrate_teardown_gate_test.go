@@ -13,23 +13,32 @@ import (
 // the failure this gate exists to prevent).
 func TestOrchestrationSkillTeardownGateOrdering(t *testing.T) {
 	repoRoot := filepath.Clean("..")
-	skillBytes, err := os.ReadFile(filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md"))
+	skillPath := filepath.Join(repoRoot, "skills", "orchestrate", "SKILL.md")
+	skillBytes, err := os.ReadFile(skillPath)
 	if err != nil {
 		t.Fatalf("read orchestration skill: %v", err)
 	}
-	skill := string(skillBytes)
+	core := string(skillBytes)
+	cleanupAndGate := readLinkedSkillDoc(t, skillPath, "failure, cleanup, and stopping")
+	reporting := readLinkedSkillDoc(t, skillPath, "reporting")
+	startup := readLinkedSkillDoc(t, skillPath, "delivery startup")
 
-	cleanup := strings.Index(skill, "## Cleanup (successful tasks only)")
-	gate := strings.Index(skill, "## Teardown gate")
-	report := strings.Index(skill, "## Final report")
+	cleanup := strings.Index(cleanupAndGate, "## Cleanup (successful tasks only)")
+	gate := strings.Index(cleanupAndGate, "## Teardown gate")
+	report := strings.Index(reporting, "## Final report")
 	if cleanup < 0 || gate < 0 || report < 0 {
 		t.Fatalf("missing sections: cleanup=%d gate=%d report=%d", cleanup, gate, report)
 	}
-	if !(cleanup < gate && gate < report) {
-		t.Fatalf("teardown gate must sit between cleanup and the final report: cleanup=%d gate=%d report=%d", cleanup, gate, report)
+	if cleanup >= gate {
+		t.Fatalf("teardown gate must follow cleanup: cleanup=%d gate=%d", cleanup, gate)
+	}
+	normalizedCore := strings.Join(strings.Fields(core), " ")
+	orderContract := "Before reporting, follow [failure, cleanup, and stopping](references/failure-cleanup-and-stopping.md), run the read-only teardown gate, then use [reporting](references/reporting.md)."
+	if !strings.Contains(normalizedCore, orderContract) {
+		t.Fatal("core must route cleanup and teardown before reporting")
 	}
 
-	section := skill[gate:report]
+	section := cleanupAndGate[gate:]
 	for _, required := range []string{
 		`bash "$RUN_DIR/teardown-gate.sh" --repo`, // the conductor runs it from the run dir
 		".agent-deck/tmp/<session-id>",            // the leak no other collector sees
@@ -45,8 +54,7 @@ func TestOrchestrationSkillTeardownGateOrdering(t *testing.T) {
 	}
 
 	// A script the run directory never receives cannot be run from it.
-	setup := skill[:cleanup]
-	if !strings.Contains(setup, `references/teardown-gate.sh "$RUN_DIR/"`) {
+	if !strings.Contains(startup, `references/teardown-gate.sh "$RUN_DIR/"`) {
 		t.Error("run setup must copy teardown-gate.sh into the run directory")
 	}
 
