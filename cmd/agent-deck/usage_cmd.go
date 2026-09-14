@@ -11,6 +11,8 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
 	"github.com/asheshgoplani/agent-deck/internal/usage"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 func configuredUsageAccounts(config *session.UserConfig) []usage.Account {
@@ -147,7 +149,7 @@ func handleUsage(profile string, args []string) {
 			fmt.Printf("%s %s: unavailable (%s)\n", s.Provider, s.Account, s.Error)
 			continue
 		}
-		parts := []string{fmt.Sprintf("%s %s", strings.Title(string(s.Provider)), s.Account)}
+		parts := []string{fmt.Sprintf("%s %s", cases.Title(language.English).String(string(s.Provider)), s.Account)}
 		if s.Windows.Session5H != nil {
 			parts = append(parts, fmt.Sprintf("5h %d%% left", s.Windows.Session5H.RemainingPercent))
 		}

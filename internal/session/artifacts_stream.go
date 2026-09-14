@@ -76,6 +76,7 @@ func (r *SSHRunner) OpenExecStream(ctx context.Context, args ...string) (*ExecSt
 	}
 	_ = os.MkdirAll(sshControlDir, 0700)
 
+	// #nosec G204 -- Literal ssh executable; validated host and shell-quoted remote arguments.
 	cmd := exec.CommandContext(ctx, "ssh", r.sshBaseArgs(r.buildRemoteCommand(args...))...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
