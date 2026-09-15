@@ -2,24 +2,33 @@
 name: session-share
 description: Share Claude Code sessions between developers. Use when user mentions "share session", "export session", "import session", "send session to", "continue from colleague", or needs to (1) export current session to file, (2) import session from another developer, (3) hand off work context. Enables private, secure session transfer via direct file sharing.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Session Share
 
 Share Claude Code sessions between developers through portable file export/import.
 
+Claude, Codex, or Cursor can run these helpers, but the supported transcript
+format is Claude Code only. Do not use them to export or import Codex or
+Cursor transcripts. From another host, pass the Claude session explicitly
+with `--session <id>` rather than trying to export the current host's session.
+
 **Version:** 1.0 | **Privacy:** Files are never uploaded to cloud unless you choose to share them
 
 ## Script Path Resolution (IMPORTANT)
 
-This skill includes helper scripts in its `scripts/` subdirectory. When Claude Code loads this skill, it shows a line like:
+This skill includes helper scripts in its `scripts/` subdirectory. Resolve
+that directory from the path of this loaded `SKILL.md`. Some hosts also
+provide a base-directory line:
 
 ```
 Base directory for this skill: /path/to/.../skills/session-share
 ```
 
-**You MUST use that base directory path to resolve all script references.** Store it as `SKILL_DIR`:
+Use the directory containing the loaded `SKILL.md` (or the supplied base
+directory) to resolve all script references. Do not resolve them from the
+user's repository or shell cwd. Store it as `SKILL_DIR`:
 
 ```bash
 # Set SKILL_DIR to the base directory shown when this skill was loaded

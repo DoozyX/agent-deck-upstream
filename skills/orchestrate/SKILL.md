@@ -2,7 +2,7 @@
 name: orchestrate
 description: End-to-end delivery and deployed-system verification pipeline. Use it to verify a deployed system through independent evidence arms and a terminal pass, defect, or inconclusive report, or to take tasks/issues through dedicated implementation, tests, review, PR, and green CI. Also use it for approved designs/specs and implementation plans that should be executed in dedicated child sessions. For plain fan-out-and-supervise work, use the fleet skill instead.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Orchestrate
