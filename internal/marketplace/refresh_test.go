@@ -25,11 +25,16 @@ func TestNativeRefreshOnlyAddsEnabledSelectors(t *testing.T) {
 	if err := RefreshProfile(context.Background(), dir, []string{bin}, Checkout{Path: "/clone", Revision: "0123456789012345678901234567890123456789"}); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(log)
-	if err != nil {
-		t.Fatal(err)
+	if _, err := os.Stat(log); !os.IsNotExist(err) {
+		t.Fatalf("unproven basename ran native command: %v", err)
 	}
-	if string(b) != "plugin add agent-deck@agent-deck --json\n" {
-		t.Fatalf("native argv = %q", b)
+}
+
+func TestNativeRefreshAcceptsOnlyTaskOneRuntimeIdentities(t *testing.T) {
+	if !supportedRuntime([]string{"/Applications/ChatGPT.app/Contents/Resources/codex", "--disable", "apps"}) {
+		t.Fatal("approved ChatGPT runtime rejected")
+	}
+	if supportedRuntime([]string{"/Users/doozyx/.codex/packages/standalone/releases/0.154.0-aarch64-apple-darwin/bin/codex", "--disable", "apps"}) {
+		t.Fatal("unproven standalone runtime accepted")
 	}
 }
