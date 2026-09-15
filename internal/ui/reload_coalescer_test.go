@@ -6,6 +6,29 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
+func loadSessionsMsgFromCmd(cmd tea.Cmd) (loadSessionsMsg, bool) {
+	if cmd == nil {
+		return loadSessionsMsg{}, false
+	}
+	return loadSessionsMsgFromMsg(cmd())
+}
+
+func loadSessionsMsgFromMsg(msg tea.Msg) (loadSessionsMsg, bool) {
+	if load, ok := msg.(loadSessionsMsg); ok {
+		return load, true
+	}
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		return loadSessionsMsg{}, false
+	}
+	for _, cmd := range batch {
+		if load, ok := loadSessionsMsgFromCmd(cmd); ok {
+			return load, true
+		}
+	}
+	return loadSessionsMsg{}, false
+}
+
 func TestReloadCoalescerRunsOneFollowupForBurst(t *testing.T) {
 	var c reloadCoalescer
 
@@ -54,7 +77,7 @@ func TestStorageReloadMessagesCoalesceWhileLoadIsInFlight(t *testing.T) {
 	if _, ok := firstMsg.(loadSessionsMsg); !ok {
 		t.Fatalf("first load message type = %T, want loadSessionsMsg", firstMsg)
 	}
-	followupMsg, ok := followupCmd().(loadSessionsMsg)
+	followupMsg, ok := loadSessionsMsgFromCmd(followupCmd)
 	if !ok {
 		t.Fatalf("follow-up command message type = %T, want loadSessionsMsg", followupMsg)
 	}

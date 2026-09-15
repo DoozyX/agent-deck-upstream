@@ -135,3 +135,16 @@ func TestFullRepaint_NonWheelMouseDoesNotClear_Issue607(t *testing.T) {
 		t.Fatalf("expected NO tea.ClearScreen for non-wheel mouse (click) under fullRepaint — would cause click-flicker")
 	}
 }
+
+func TestStorageReloadClearsStaleFrame(t *testing.T) {
+	h := newTestHomeWithItems(100, 30, scrollTestItems())
+	h.initialLoading = false
+
+	_, cmd := h.Update(loadSessionsMsg{instances: []*session.Instance{
+		{ID: "reloaded", Title: "Reloaded"},
+	}})
+
+	if !containsClearScreen(cmd) {
+		t.Fatal("storage reload must clear the previous frame so removed rows cannot remain until navigation")
+	}
+}
