@@ -636,21 +636,21 @@ func (s *Store) coveredBreakdown(expression, filter string, filterArgs []any) ([
 	if !allowed[expression] {
 		return nil, fmt.Errorf("unsupported cost breakdown %q", expression)
 	}
-	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
-	// #nosec G201 -- expression is selected from the fixed allowlist above.
+	usageTotalSQL := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
+	// #nosec G201,G202 -- expression is selected from the fixed allowlist above.
 	query := `SELECT ` + expression + `,
 		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN cost_microdollars ELSE 0 END), 0),
 		COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cache_read_tokens), 0),
 		COALESCE(SUM(cache_write_tokens), 0), COALESCE(SUM(cache_write_5m_tokens), 0),
 		COALESCE(SUM(cache_write_1h_tokens), 0), COALESCE(SUM(output_tokens), 0),
-		COALESCE(SUM(reasoning_tokens), 0), COUNT(*), COALESCE(SUM(` + tokens + `), 0),
+		COALESCE(SUM(reasoning_tokens), 0), COUNT(*), COALESCE(SUM(` + usageTotalSQL + `), 0),
 		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + tokens + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
 		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
-		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0)
+		COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0)
 		FROM cost_events WHERE reconciliation_status <> ?` + filter + ` GROUP BY ` + expression + ` ORDER BY 1`
 	args := []any{
 		PricingKnown, PricingKnownZero,
@@ -764,18 +764,18 @@ func (s *Store) TopSessionsByCost(limit int) ([]SessionCost, error) {
 // known-price subtotal. Unknown and unreconciled events remain in the event
 // count so callers can report their coverage; superseded events are excluded.
 func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
-	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
+	usageTotalSQL := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
 	rows, err := s.db.Query(`
 		SELECT ce.session_id, COALESCE(i.title, ce.session_id), COALESCE(i.group_path, ''),
 			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
-			COUNT(*), COALESCE(SUM(`+tokens+`), 0),
+			COUNT(*), COALESCE(SUM(`+usageTotalSQL+`), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+usageTotalSQL+` ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+usageTotalSQL+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+usageTotalSQL+` ELSE 0 END), 0)
 		FROM cost_events ce
 		LEFT JOIN instances i ON ce.session_id = i.id
 		WHERE ce.reconciliation_status <> ?
@@ -818,18 +818,18 @@ func (s *Store) CoveredTopSessionsByCost(limit int) ([]SessionCost, error) {
 // one query. It is intentionally unbounded: group totals must not depend on a
 // top-sessions presentation limit.
 func (s *Store) CoveredCostByGroup() ([]GroupCost, error) {
-	tokens := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
+	usageTotalSQL := `(ce.input_tokens + ce.cache_read_tokens + ce.cache_write_tokens + ce.output_tokens)`
 	rows, err := s.db.Query(`
 		SELECT COALESCE(NULLIF(i.group_path, ''), '(ungrouped)'),
 			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN ce.cost_microdollars ELSE 0 END), 0),
-			COUNT(*), COUNT(DISTINCT ce.session_id), COALESCE(SUM(`+tokens+`), 0),
+			COUNT(*), COUNT(DISTINCT ce.session_id), COALESCE(SUM(`+usageTotalSQL+`), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+tokens+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status IN (?, ?) THEN `+usageTotalSQL+` ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+tokens+` ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+tokens+` ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? THEN `+usageTotalSQL+` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN ce.pricing_status = ? OR ce.reconciliation_status = ? THEN `+usageTotalSQL+` ELSE 0 END), 0)
 		FROM cost_events ce
 		LEFT JOIN instances i ON ce.session_id = i.id
 		WHERE ce.reconciliation_status <> ?
@@ -1021,7 +1021,7 @@ func (s *Store) querySum(where string, args ...any) (CostSummary, error) {
 
 func (s *Store) queryCovered(where string, args ...any) (CoveredSummary, error) {
 	var summary CoveredSummary
-	tokens := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
+	usageTotalSQL := `(input_tokens + cache_read_tokens + cache_write_tokens + output_tokens)`
 	query := `
 		SELECT
 			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN cost_microdollars ELSE 0 END), 0),
@@ -1030,14 +1030,14 @@ func (s *Store) queryCovered(where string, args ...any) (CoveredSummary, error) 
 			COALESCE(SUM(cache_read_tokens), 0),
 			COALESCE(SUM(cache_write_tokens), 0),
 			COUNT(*),
-			COALESCE(SUM(` + tokens + `), 0),
+			COALESCE(SUM(` + usageTotalSQL + `), 0),
 			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + tokens + ` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status IN (?, ?) THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN pricing_status = ? THEN 1 ELSE 0 END), 0),
 			COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN 1 ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + tokens + ` ELSE 0 END), 0),
-			COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + tokens + ` ELSE 0 END), 0)
+			COALESCE(SUM(CASE WHEN pricing_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN pricing_status = ? OR reconciliation_status = ? THEN ` + usageTotalSQL + ` ELSE 0 END), 0)
 		FROM cost_events ` + where + ` AND reconciliation_status <> ?`
 	queryArgs := []any{
 		PricingKnown, PricingKnownZero,

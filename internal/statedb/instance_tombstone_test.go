@@ -3,6 +3,7 @@ package statedb
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -11,6 +12,58 @@ import (
 
 func tombstoneTestRow(id string) *InstanceRow {
 	return &InstanceRow{ID: id, Title: id, ProjectPath: "/tmp", GroupPath: "my-sessions", Tool: "shell", Status: "stopped", CreatedAt: time.Now()}
+}
+
+// TestPrepareLifecycleIntentSerializesParallelWriters reproduces the
+// multi-process `agent-deck rm` preparation collision. A deferred SQLite
+// transaction reads both the instance and intent before it inserts. When
+// several removers do that together, the read-to-write upgrade returns BUSY
+// immediately in WAL mode rather than waiting for the writer to finish.
+func TestPrepareLifecycleIntentSerializesParallelWriters(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	seed, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer seed.Close()
+	if err := seed.Migrate(); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 14
+	dbs := make([]*StateDB, writers)
+	for i := range dbs {
+		db, err := Open(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		db.db.SetMaxOpenConns(1)
+		dbs[i] = db
+		t.Cleanup(func() { _ = db.Close() })
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, writers)
+	var wg sync.WaitGroup
+	for i, db := range dbs {
+		wg.Add(1)
+		go func(i int, db *StateDB) {
+			defer wg.Done()
+			<-start
+			_, errs[i] = db.PrepareLifecycleIntent(LifecycleIntent{
+				InstanceID: fmt.Sprintf("parallel-preparation-%02d", i),
+				Kind:       "remove",
+			})
+		}(i, db)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("writer %d: PrepareLifecycleIntent: %v", i, err)
+		}
+	}
 }
 
 func TestWithInstancesAbsentRetriesSQLiteWriterContention(t *testing.T) {

@@ -7,6 +7,8 @@ import (
 
 	"github.com/asheshgoplani/agent-deck/internal/usage"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 const usageRefreshInterval = 30 * time.Second
@@ -37,7 +39,7 @@ func renderUsageBar(snapshots []usage.Snapshot, width int) string {
 		if label == "" {
 			label = string(s.Provider)
 		}
-		provider := strings.Title(string(s.Provider))
+		provider := cases.Title(language.English).String(string(s.Provider))
 		prefix := ""
 		if s.Stale {
 			prefix = "~"
@@ -60,7 +62,6 @@ func renderUsageBar(snapshots []usage.Snapshot, width int) string {
 		if lipgloss.Width(part) > width {
 			if line != "" {
 				lines = append(lines, line)
-				line = ""
 			}
 			wrapped := hardWrapUsagePart(part, width)
 			lines = append(lines, wrapped[:len(wrapped)-1]...)

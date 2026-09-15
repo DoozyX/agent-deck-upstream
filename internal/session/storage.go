@@ -955,22 +955,6 @@ func (s *Storage) createSingleInstance(row *statedb.InstanceRow) error {
 	return nil
 }
 
-// saveSingleInstance persists a targeted update while respecting durable
-// deletion tombstones. Recovery and update paths must use this helper so a
-// stale captured row cannot recreate a session deleted after capture.
-func (s *Storage) saveSingleInstance(row *statedb.InstanceRow) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.db == nil {
-		return fmt.Errorf("storage database not initialized")
-	}
-	if err := s.db.SaveInstance(row); err != nil {
-		return fmt.Errorf("failed to save instance %s: %w", row.ID, err)
-	}
-	_ = s.db.Touch()
-	return nil
-}
-
 // PersistRevivedInstances durably persists the status heal from a revive sweep
 // WITHOUT the full-table rewrite that SaveWithGroups performs and WITHOUT a
 // full-row INSERT OR REPLACE.

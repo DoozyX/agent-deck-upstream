@@ -436,12 +436,12 @@ func TestLaunchOrchestrateRole_FakeConnectorArgvMatchesReceiptOnFreshAndRestart(
 		t.Fatalf("parse launch response: id=%q err=%v\nstdout: %s", launched.ID, err, stdout)
 	}
 	receipt := readOrchestrateReceiptFromShow(t, home, launched.ID)
-	lines := waitForOrchestrateArgvLines(t, argvLog, 1)
+	waitForOrchestrateArgvLines(t, argvLog, 1)
 	stdout, stderr, code = runAgentDeckWithEnv(t, home, env, "session", "restart", launched.ID, "--force", "--json")
 	if code != 0 {
 		t.Fatalf("restart failed (exit %d)\nstdout: %s\nstderr: %s", code, stdout, stderr)
 	}
-	lines = waitForOrchestrateArgvLines(t, argvLog, 2)
+	lines := waitForOrchestrateArgvLines(t, argvLog, 2)
 	for idx, line := range lines[:2] {
 		if !strings.Contains(line, "\t-m\t"+receipt.Model) || !strings.Contains(line, "\t-c\tmodel_reasoning_effort=\""+receipt.Effort+"\"") {
 			t.Fatalf("argv %d diverges from receipt %#v:\n%s", idx+1, receipt, line)

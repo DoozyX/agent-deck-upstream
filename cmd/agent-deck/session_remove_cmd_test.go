@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/asheshgoplani/agent-deck/internal/session"
+	"github.com/asheshgoplani/agent-deck/internal/statedb"
 )
 
 func assertHelperPersistedLiveSessions(t *testing.T, profile string, ids ...string) {
@@ -798,7 +799,7 @@ func TestFinalizeCommittedBulkRemovalsPersistentResurrectionExhaustsAllPasses(t 
 	probe.Release()
 }
 
-func TestBulkRemoveFinalSweepDeletesRowsResurrectedAfterPerItemVerification(t *testing.T) {
+func TestBulkRemoveRejectsStaleWriterAfterPerItemVerification(t *testing.T) {
 	t.Setenv("XDG_DATA_HOME", filepath.Join(t.TempDir(), "data"))
 	storage, err := session.NewStorageWithProfile("_test_bulk_final_sweep")
 	if err != nil {
@@ -821,14 +822,16 @@ func TestBulkRemoveFinalSweepDeletesRowsResurrectedAfterPerItemVerification(t *t
 	}
 
 	originalPersist := bulkSessionRemovePersist
+	var staleWriterErr error
 	bulkSessionRemovePersist = func(s *session.Storage, id string, remaining []*session.Instance, groupTree *session.GroupTree, token string) error {
 		if err := s.RemoveSessionAndVerify(id, remaining, groupTree, token); err != nil {
 			return err
 		}
 		if id == second.ID {
-			// Simulate a stale full-table writer landing after both per-item
-			// verification windows but before bulk removal returns.
-			return s.SaveWithGroups(instances, tree)
+			// A concurrent writer is a separate actor: its rejection must not be
+			// returned as if the bulk remover's own persistence failed. Durable
+			// tombstones now reject this stale full-table resurrection attempt.
+			staleWriterErr = s.SaveWithGroups(instances, tree)
 		}
 		return nil
 	}
@@ -837,6 +840,9 @@ func TestBulkRemoveFinalSweepDeletesRowsResurrectedAfterPerItemVerification(t *t
 	removed := bulkRemoveSessions(NewCLIOutput(false, true), storage, instances, nil, instances, false)
 	if len(removed) != 2 {
 		t.Fatalf("removed rows = %#v", removed)
+	}
+	if !errors.Is(staleWriterErr, statedb.ErrInstanceTombstoned) {
+		t.Fatalf("stale writer error = %v, want durable tombstone rejection", staleWriterErr)
 	}
 	rows, _, err := storage.LoadWithGroups()
 	if err != nil || len(rows) != 0 {
