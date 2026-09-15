@@ -23,12 +23,11 @@ func TestIssue2046_ModelPickerEscPerLevelAndVisibleHints(t *testing.T) {
 		t.Fatalf("passive model list does not advertise Esc back:\n%s", view)
 	}
 
-	// ↓ descends into the navigable model list (Enter accepts the field and
-	// advances; see newdialog_flow_test.go); Esc returns exactly one level to
-	// the model field without closing the session form.
-	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyDown})
+	// Enter descends into the navigable model list; Esc returns exactly one
+	// level to the model field without closing the session form.
+	d, _ = d.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if !d.IsModelSuggestionsActive() {
-		t.Fatal("↓ did not enter the nested model list")
+		t.Fatal("Enter did not enter the nested model list")
 	}
 	if view = stripAnsi(d.View()); !strings.Contains(view, "Esc back") {
 		t.Fatalf("nested model list does not advertise Esc back:\n%s", view)

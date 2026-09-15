@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -59,12 +58,6 @@ func runTestMain(m *testing.M) int {
 		testutil.HomeAlreadyIsolated()
 
 	if !isHelperProcess {
-		// Build shared CLI fixture before HOME/XDG isolation so Go caches never
-		// become read-only debris inside a per-test directory.
-		if err := ensureChannelsCLIBinary(); err != nil {
-			fmt.Fprintf(os.Stderr, "prepare CLI fixture: %v\n", err)
-			return 1
-		}
 		// Isolate HOME+XDG so agent-deck path resolution lands in a temp dir,
 		// never the real ~/.agent-deck (2026-06-04 data-loss incident, S5).
 		// Must run before anything resolves a path. See internal/testutil/homeenv.go.
@@ -77,8 +70,6 @@ func runTestMain(m *testing.M) int {
 		cleanupHome := testutil.IsolatePackageHome("agent-deck-cmd-tests-home-*")
 		defer cleanupHome()
 	}
-	os.Unsetenv("AGENTDECK_INSTANCE_ID")
-	os.Unsetenv("AGENT_DECK_SESSION_ID")
 
 	// Git hooks export GIT_DIR/GIT_WORK_TREE; clear them so test subprocess git
 	// commands operate on their temp repos instead of the real repository.

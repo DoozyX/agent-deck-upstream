@@ -5,7 +5,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -72,9 +71,6 @@ func TestCandidateSocketName(t *testing.T) {
 // leaks a server plus its ptys (the 2026-07-18 incident class).
 func orphanLiveTestSocket(t *testing.T) string {
 	t.Helper()
-	if runtime.GOOS != "linux" {
-		t.Skip("live orphan classification requires Linux procfs")
-	}
 	socket := "ad-orphlive-" + strings.NewReplacer("/", "-", " ", "-").Replace(t.Name())
 	if len(socket) > 40 {
 		socket = socket[:40]
