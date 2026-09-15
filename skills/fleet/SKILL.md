@@ -2,7 +2,7 @@
 name: fleet
 description: Fan out a fleet of independent agent-deck child sessions from inside a session and check their progress non-blockingly. Use when the user wants to "launch several/N sessions", "fan out", "run agents in parallel", "spin up a fleet", "kick off background agents", or "check progress from the main session" without blocking — covers launching parented children, polling status + completion via `session children`, and collecting results via `session output`.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Fleet
@@ -66,6 +66,8 @@ Spell out the long form: **never use the short `-p` to set a parent** (see the
 ## The loop
 
 ### 1. Fan out (one `launch` per child; loop it)
+
+Use the user's connector: `-c claude`, `-c codex`, or `-c cursor` (examples use Claude).
 
 ```bash
 agent-deck launch <path> -c claude --inherit-group -m "<task for this child>"
@@ -384,7 +386,8 @@ All read-only / on-demand — none of them block your session:
 Claude child rows include `peer_messaging_candidate` and `peer_name`. For a
 short status question, dependency handoff, review finding, or unblock answer:
 
-1. Call Claude Code's `ListAgents` and match the child's exact `peer_name`.
+1. With `ListAgents` and `SendMessage` available, match the child's exact
+   `peer_name` via `ListAgents`; otherwise go to step 3.
 2. When exactly one reachable peer matches, prefer `SendMessage`; it delivers
    between tool calls and does not interfere with the child's terminal composer.
 3. Fall back to `agent-deck session send <id> "<msg>"` when the peer is absent

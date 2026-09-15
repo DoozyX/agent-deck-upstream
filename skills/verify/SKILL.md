@@ -2,7 +2,7 @@
 name: verify
 description: Evidence gate before any completion claim — every "it works", "tests pass", "fixed", or "done" must be backed by a command run in this message with its output shown. Use before committing, opening a PR, reporting a task complete, or telling the user something is working.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Verify

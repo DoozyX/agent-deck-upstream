@@ -2,7 +2,7 @@
 name: tdd
 description: Red/green/refactor discipline for implementing any feature or bug fix — write the failing test first, watch it fail for the right reason, write the minimum code to pass, then refactor. Use before writing production code for a new behavior or a fix, and whenever tests are being added after the fact.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # TDD
@@ -38,8 +38,8 @@ metadata:
    are part of the change.
 
 5. **REFACTOR — now, while it is green.** Check the result against
-   `${CLAUDE_PLUGIN_ROOT}/skills/review/references/principles.md` (relative to
-   the installed plugin, not to the repo you are working in). Re-run the suite
+   `../review/references/principles.md`, resolved from the directory containing
+   this loaded `SKILL.md`, not from the user's repository or shell cwd. Re-run the suite
    after.
 
 ## Gate 1 — before writing a test

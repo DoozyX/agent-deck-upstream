@@ -2,7 +2,7 @@
 name: review
 description: Multi-layer code review — an adversarial pass, a mechanical edge-case path trace, and a verification-gap check, merged into one deduplicated, severity-graded, triaged findings list with a machine-readable verdict. Use when the user asks to "review this", "review my changes", "review this diff/PR/branch", wants a second opinion on a change before committing or merging, or when an orchestrated reviewer child is told to run the shared review layers.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Review
@@ -41,9 +41,8 @@ State the target you resolved, in one line, before dispatching.
 
 When an Agent/subagent tool is available, dispatch one subagent per layer, all
 in one message so they run in parallel. Each subagent's prompt: read its layer
-file under this skill's own directory (`${CLAUDE_PLUGIN_ROOT}/skills/review/`
-when installed as a plugin — never a path relative to the user's repo, which
-is the cwd and does not contain these files) — `references/adversarial.md`,
+file under the directory containing this loaded `SKILL.md` — never a path
+relative to the user's repository or shell cwd — `references/adversarial.md`,
 `references/edge-cases.md`, `references/verification-gap.md`, or
 `references/deletion-check.md` — and execute it against the resolved target,
 plus its inputs, plus any `also consider` text. Otherwise run the layers
@@ -69,7 +68,7 @@ orchestrated reviewer prompt is the usual source — does not override this.
 | `deletion-check` | diff + full post-change content of touched files + repo read access |
 
 Shared vocabulary: the adversarial layer checks the diff against
-`${CLAUDE_PLUGIN_ROOT}/skills/review/references/principles.md` (DRY / KISS /
+`references/principles.md` in this skill's directory (DRY / KISS /
 YAGNI / SOLID and their violation smells), so a subagent dispatched for that
 layer gets that file too.
 
