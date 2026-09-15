@@ -1,18 +1,14 @@
-.PHONY: build run install clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
+.PHONY: build run install install-user clean dev release-local test test-perf bench fmt lint ci css tools css-verify test-web test-web-unit test-web-e2e test-web-install
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
-# Local builds use the newest reachable stable release tag as their semver
-# base. Restrict the match to release tags so backup tags cannot become an
-# invalid update-check version. The local commit count and SHA make fork builds
-# identifiable without claiming an upstream patch release.
+# Local builds use the release version declared in the source. The short
+# commit SHA makes builds from unreleased local commits identifiable without
+# depending on which Git tag references are available in the checkout.
 CODE_VERSION=$(shell sed -n 's/^var Version = "\([^"]*\)".*/\1/p' cmd/agent-deck/main.go)
-UPSTREAM_TAG=$(shell git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null)
-BASE_VERSION=$(if $(UPSTREAM_TAG),$(shell echo $(UPSTREAM_TAG) | sed 's/^v//'),$(CODE_VERSION))
-LOCAL_COMMITS=$(shell if [ -n "$(UPSTREAM_TAG)" ]; then git rev-list --count "$(UPSTREAM_TAG)..HEAD" 2>/dev/null; else echo 0; fi)
 GIT_REV=$(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_DIRTY=$(shell git diff --quiet 2>/dev/null || echo '-dirty')
-VERSION=$(BASE_VERSION)$(if $(GIT_REV),+local.$(LOCAL_COMMITS).g$(GIT_REV)$(GIT_DIRTY),)
+VERSION=$(CODE_VERSION)$(if $(GIT_REV),+local.g$(GIT_REV)$(GIT_DIRTY),)
 LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
 
 # Tailwind v4 standalone CLI (PERF-01)

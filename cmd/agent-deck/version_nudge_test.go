@@ -106,36 +106,47 @@ func TestVersionOutput_LocalBuildMetadataIsCurrent(t *testing.T) {
 	}
 }
 
-func TestMakefileVersion_UsesLatestTagWithLocalBuildMetadata(t *testing.T) {
-	repoRoot := filepath.Clean(filepath.Join("..", ".."))
-	tagOutput, err := exec.Command("git", "-C", repoRoot, "describe", "--tags", "--match", "v[0-9]*", "--abbrev=0").Output()
+func TestMakefileVersion_UsesSourceVersionWithoutGitTags(t *testing.T) {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
 	if err != nil {
-		t.Fatalf("find latest stable tag: %v", err)
+		t.Fatalf("resolve repository root: %v", err)
 	}
-	base := strings.TrimPrefix(strings.TrimSpace(string(tagOutput)), "v")
+	source, err := os.ReadFile(filepath.Join(repoRoot, "cmd", "agent-deck", "main.go"))
+	if err != nil {
+		t.Fatalf("read source version: %v", err)
+	}
+	const marker = `var Version = "`
+	start := strings.Index(string(source), marker)
+	if start == -1 {
+		t.Fatalf("source does not declare Version")
+	}
+	sourceVersionStart := start + len(marker)
+	sourceVersionEnd := strings.IndexByte(string(source)[sourceVersionStart:], '"')
+	if sourceVersionEnd == -1 {
+		t.Fatalf("source Version is not terminated")
+	}
+	codeVersion := string(source)[sourceVersionStart : sourceVersionStart+sourceVersionEnd]
 
-	cmd := exec.Command("make", "--no-print-directory", "-n", "-f", filepath.Join(repoRoot, "Makefile"), "build")
+	cmd := exec.Command("make", "--no-print-directory", "-n", "-f", filepath.Join(repoRoot, "Makefile"), "install-user")
+	cmd.Dir = repoRoot
 	output, err := cmd.Output()
 	if err != nil {
 		t.Fatalf("evaluate Makefile VERSION: %v", err)
 	}
 	const versionMarker = "-X main.Version="
-	versionStart := strings.Index(string(output), versionMarker)
-	if versionStart == -1 {
+	outputVersionStart := strings.Index(string(output), versionMarker)
+	if outputVersionStart == -1 {
 		t.Fatalf("Makefile build output does not inject main.Version:\n%s", output)
 	}
-	rest := string(output)[versionStart+len(versionMarker):]
-	versionEnd := strings.Index(rest, "\"")
-	if versionEnd == -1 {
+	rest := string(output)[outputVersionStart+len(versionMarker):]
+	outputVersionEnd := strings.Index(rest, "\"")
+	if outputVersionEnd == -1 {
 		t.Fatalf("cannot parse injected VERSION from Makefile output: %q", rest)
 	}
-	got := rest[:versionEnd]
-	wantPrefix := base + "+local."
+	got := rest[:outputVersionEnd]
+	wantPrefix := codeVersion + "+local.g"
 	if !strings.HasPrefix(got, wantPrefix) {
 		t.Fatalf("Makefile VERSION = %q, want prefix %q", got, wantPrefix)
-	}
-	if !strings.Contains(got, ".g") {
-		t.Fatalf("Makefile VERSION = %q, want Git revision metadata", got)
 	}
 }
 
