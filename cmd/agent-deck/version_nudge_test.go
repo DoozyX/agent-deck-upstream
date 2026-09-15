@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +85,57 @@ func TestVersionOutput_NoAnnotationWhenUpToDate(t *testing.T) {
 	want := "Agent Deck v1.7.58\n"
 	if got != want {
 		t.Fatalf("version output mismatch:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestVersionOutput_LocalBuildMetadataIsCurrent(t *testing.T) {
+	isolateVersionUpdatePaths(t)
+
+	cache := &update.UpdateCache{
+		CheckedAt:     time.Now(),
+		LatestVersion: "1.7.58",
+	}
+	if err := writeTestCache(t, cache); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	var buf bytes.Buffer
+	writeVersionOutput(&buf, "1.7.58+local.12.gabc1234")
+	if got, want := buf.String(), "Agent Deck v1.7.58+local.12.gabc1234\n"; got != want {
+		t.Fatalf("version output mismatch:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestMakefileVersion_UsesLatestTagWithLocalBuildMetadata(t *testing.T) {
+	repoRoot := filepath.Clean(filepath.Join("..", ".."))
+	tagOutput, err := exec.Command("git", "-C", repoRoot, "describe", "--tags", "--match", "v[0-9]*", "--abbrev=0").Output()
+	if err != nil {
+		t.Fatalf("find latest stable tag: %v", err)
+	}
+	base := strings.TrimPrefix(strings.TrimSpace(string(tagOutput)), "v")
+
+	cmd := exec.Command("make", "--no-print-directory", "-n", "-f", filepath.Join(repoRoot, "Makefile"), "build")
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("evaluate Makefile VERSION: %v", err)
+	}
+	const versionMarker = "-X main.Version="
+	versionStart := strings.Index(string(output), versionMarker)
+	if versionStart == -1 {
+		t.Fatalf("Makefile build output does not inject main.Version:\n%s", output)
+	}
+	rest := string(output)[versionStart+len(versionMarker):]
+	versionEnd := strings.Index(rest, "\"")
+	if versionEnd == -1 {
+		t.Fatalf("cannot parse injected VERSION from Makefile output: %q", rest)
+	}
+	got := rest[:versionEnd]
+	wantPrefix := base + "+local."
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("Makefile VERSION = %q, want prefix %q", got, wantPrefix)
+	}
+	if !strings.Contains(got, ".g") {
+		t.Fatalf("Makefile VERSION = %q, want Git revision metadata", got)
 	}
 }
 
