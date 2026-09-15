@@ -298,6 +298,7 @@ type OrchestrateRoleDefault struct {
 	CodexEffort  string `toml:"codex_effort,omitempty"`
 	ClaudeModel  string `toml:"claude_model,omitempty"`
 	ClaudeEffort string `toml:"claude_effort,omitempty"`
+	CursorModel  string `toml:"cursor_model,omitempty"`
 }
 
 // UsageSettings is the [usage] config block. It is a plain TOML mirror: the
@@ -2515,6 +2516,7 @@ type DeepSeekSettings struct {
 
 // CursorSettings defines Cursor Agent CLI integration configuration (Issue #1672).
 type CursorSettings struct {
+	DefaultModel string `toml:"default_model,omitempty"`
 	// Command overrides the default binary/invocation for Cursor sessions.
 	// Supports flags (e.g., "agent --force", "cursor agent"). When empty,
 	// DefaultCursorCommand() prefers `agent` when present on PATH, else

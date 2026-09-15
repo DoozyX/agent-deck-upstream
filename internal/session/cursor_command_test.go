@@ -143,3 +143,21 @@ func TestBuildCursorCommand_ResolvesDefaultEntrypoint(t *testing.T) {
 		t.Fatalf("custom command = %q, want agent --model x --continue", got)
 	}
 }
+
+func TestBuildCursorCommand_UsesPersistedModelAndConversation(t *testing.T) {
+	inst := NewInstanceWithTool("cursor-model", "/tmp/cursor-model", "cursor")
+	inst.CursorSessionID = "chat-123"
+	if err := inst.SetCursorOptions(&CursorOptions{Model: "gpt-5"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := inst.buildCursorCommand("agent", true)
+	for _, want := range []string{"agent", "--resume chat-123", "--model gpt-5"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("buildCursorCommand() = %q, want %q", got, want)
+		}
+	}
+	if strings.Contains(got, "--continue") {
+		t.Fatalf("buildCursorCommand() = %q, must prefer exact --resume over --continue", got)
+	}
+}
