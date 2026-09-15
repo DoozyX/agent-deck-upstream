@@ -2,17 +2,17 @@
 
 BINARY_NAME=agent-deck
 BUILD_DIR=./build
-# Base the injected version on the authoritative `var Version` in main.go
-# (kept in lockstep with release tags by the check-version target), NOT on
-# `git describe --tags` — the latter matches ANY reachable tag (incl. backup
-# tags like backup/…-2026-07-13), yielding a non-semver string the updater
-# parses as 0.0.0 and flags "update available" forever. Append the short
-# commit (+g<hash>[-dirty]) as semver build-metadata so dev builds stay
-# identifiable while still parsing as a real version.
+# Local builds use the newest reachable stable release tag as their semver
+# base. Restrict the match to release tags so backup tags cannot become an
+# invalid update-check version. The local commit count and SHA make fork builds
+# identifiable without claiming an upstream patch release.
 CODE_VERSION=$(shell sed -n 's/^var Version = "\([^"]*\)".*/\1/p' cmd/agent-deck/main.go)
+UPSTREAM_TAG=$(shell git describe --tags --match 'v[0-9]*' --abbrev=0 2>/dev/null)
+BASE_VERSION=$(if $(UPSTREAM_TAG),$(shell echo $(UPSTREAM_TAG) | sed 's/^v//'),$(CODE_VERSION))
+LOCAL_COMMITS=$(shell if [ -n "$(UPSTREAM_TAG)" ]; then git rev-list --count "$(UPSTREAM_TAG)..HEAD" 2>/dev/null; else echo 0; fi)
 GIT_REV=$(shell git rev-parse --short HEAD 2>/dev/null)
 GIT_DIRTY=$(shell git diff --quiet 2>/dev/null || echo '-dirty')
-VERSION=$(CODE_VERSION)$(if $(GIT_REV),+g$(GIT_REV)$(GIT_DIRTY),)
+VERSION=$(BASE_VERSION)$(if $(GIT_REV),+local.$(LOCAL_COMMITS).g$(GIT_REV)$(GIT_DIRTY),)
 LDFLAGS=-ldflags "-X main.Version=$(VERSION)"
 
 # Tailwind v4 standalone CLI (PERF-01)
@@ -100,7 +100,7 @@ css-verify: css
 
 # Run in development
 run:
-	go run ./cmd/agent-deck
+	go run $(LDFLAGS) ./cmd/agent-deck
 
 # Install to /usr/local/bin (requires sudo)
 install: build
