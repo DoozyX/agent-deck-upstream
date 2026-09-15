@@ -621,6 +621,132 @@ func TestManagedCheckoutCoalescedCallbackFailureBackoff(t *testing.T) {
 	}
 }
 
+func TestManagedCheckoutAdmits33rdProfileWithoutEarlyRetry(t *testing.T) {
+	f := newFixture(t)
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	dir := StateDir(f.home)
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	success := state.LastSuccess
+	// All 32 failures are still in backoff, with tied earliest deadlines.
+	// Reusing a slot immediately would let its failed profile retry early.
+	deadline := time.Now().UTC().Add(2 * time.Second)
+	state.CallbackRetries = make(map[string]callbackRetry)
+	victim := ""
+	for i := 0; i < callbackRetryLimit; i++ {
+		key := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("failed-profile-%d", i))))
+		nextAttempt := deadline
+		if i >= 2 {
+			nextAttempt = deadline.Add(time.Minute)
+		}
+		state.CallbackRetries[key] = callbackRetry{Failures: 5, NextAttempt: nextAttempt}
+		if i < 2 && (victim == "" || key < victim) {
+			victim = key
+		}
+	}
+	if err := saveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", filepath.Join(f.home, "profile-33"))
+	key, err := callbackProfileKey(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("profile 33 cache failed")
+	err = WithManagedCheckout(context.Background(), f.home, func(c Checkout) error {
+		if time.Now().Before(deadline) {
+			t.Fatal("evicted a profile before its retry deadline")
+		}
+		reserved, err := loadState(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := reserved.CallbackRetries[victim]; exists {
+			t.Fatal("did not evict lexically first profile at the earliest deadline")
+		}
+		if len(reserved.CallbackRetries) != callbackRetryLimit || reserved.CallbackRetries[key].Failures != 1 || !reserved.CallbackRetries[key].NextAttempt.After(time.Now()) {
+			t.Fatalf("new callback lacks bounded crash-safe reservation: %+v", reserved)
+		}
+		for oldKey, oldRetry := range state.CallbackRetries {
+			if oldKey != victim && reserved.CallbackRetries[oldKey] != oldRetry {
+				t.Fatal("eviction changed another profile's retry")
+			}
+		}
+		if c.Updated || c.Revision != state.Revision || !reserved.LastSuccess.Equal(success) {
+			t.Fatal("admission lost fetch coalescing")
+		}
+		writeTest(t, filepath.Join(f.home, "profile-33-cache"), c.Revision)
+		return sentinel
+	})
+	if err != sentinel {
+		t.Fatalf("33rd profile was not admitted: %v", err)
+	}
+	cache, err := os.ReadFile(filepath.Join(f.home, "profile-33-cache"))
+	if err != nil || string(cache) != state.Revision {
+		t.Fatalf("33rd profile did not consume checkout: %q %v", cache, err)
+	}
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error {
+		t.Fatal("33rd profile retried before its backoff")
+		return nil
+	}); !errors.Is(err, ErrBackoff) {
+		t.Fatalf("new profile lost retry safety: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "checkout.json"))
+	if err != nil || info.Size() > stateLimit {
+		t.Fatalf("retry state exceeded disk bound: %v %v", info, err)
+	}
+	fetches, err := os.ReadFile(filepath.Join(f.home, "fetches"))
+	if err != nil || string(fetches) != "fetch\n" {
+		t.Fatalf("admission fetched again: %q %v", fetches, err)
+	}
+}
+
+func TestManagedCheckoutFullRetryAdmissionCancellationPreservesState(t *testing.T) {
+	f := newFixture(t)
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	dir := StateDir(f.home)
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.CallbackRetries = make(map[string]callbackRetry)
+	for i := 0; i < callbackRetryLimit; i++ {
+		key := fmt.Sprintf("%064x", i)
+		state.CallbackRetries[key] = callbackRetry{Failures: 5, NextAttempt: time.Now().UTC().Add(maxBackoff)}
+	}
+	if err := saveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "checkout.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = WithManagedCheckout(ctx, f.home, func(Checkout) error {
+		t.Fatal("callback ran despite active retry deadlines and cancellation")
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("admission did not honor cancellation: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "checkout.json"))
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("cancellation destroyed retry state: %v", err)
+	}
+	lock, err := acquireLock(context.Background(), filepath.Join(dir, "update.lock"))
+	if err != nil {
+		t.Fatalf("cancelled admission retained host lock: %v", err)
+	}
+	lock.release()
+}
+
 func TestManagedCheckoutGitChildUsesSafePATH(t *testing.T) {
 	dir := t.TempDir()
 	shim := filepath.Join(dir, "trusted-git")

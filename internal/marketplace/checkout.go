@@ -107,7 +107,31 @@ func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout
 		}
 	}
 	if _, exists := state.CallbackRetries[profile]; !exists && len(state.CallbackRetries) >= callbackRetryLimit {
-		return errors.New("marketplace: callback retry capacity reached")
+		// Reuse the earliest due slot, with a stable tie-break independent of
+		// map iteration. Never forget an active backoff: wait for its deadline
+		// under the host lock before eviction. This background-only wait is
+		// cancellable and bounded by maxBackoff, just like retry eligibility.
+		victim := ""
+		var deadline time.Time
+		for key, pending := range state.CallbackRetries {
+			if victim == "" || pending.NextAttempt.Before(deadline) || pending.NextAttempt.Equal(deadline) && key < victim {
+				victim, deadline = key, pending.NextAttempt
+			}
+		}
+		if delay := time.Until(deadline); delay > 0 && delay <= maxBackoff {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		delete(state.CallbackRetries, victim)
+		now = time.Now().UTC()
 	}
 	retry.Failures = min(state.CallbackRetries[profile].Failures+1, 5)
 	retry.NextAttempt = now.Add(retryDelay(retry.Failures))
