@@ -40,11 +40,10 @@ func RefreshProfile(ctx context.Context, codexHome string, codexArgv []string, c
 }
 
 func supportedRuntime(argv []string) bool {
-	if len(argv) == 0 {
-		return false
-	}
-	b := filepath.Base(argv[0])
-	return b == "codex" || b == "codex.real"
+	// Task 01 proved these two exact runtime identities only. A basename is not
+	// an identity: standalone updates may change native plugin semantics.
+	return (len(argv) == 3 && argv[0] == "/Applications/ChatGPT.app/Contents/Resources/codex" && argv[1] == "--disable" && argv[2] == "apps") ||
+		(len(argv) == 1 && argv[0] == "/opt/homebrew/Caskroom/codex/0.154.0/bin/codex.real")
 }
 
 func nativeList(ctx context.Context, home string, argv []string) (map[string]bool, error) {
