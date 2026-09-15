@@ -801,6 +801,16 @@ func (s *StateDB) Migrate() error {
 	`); err != nil {
 		return fmt.Errorf("statedb: create cost event source identity index: %w", err)
 	}
+	// Alias reconciliation joins usage_event_aliases to cost_events by this
+	// pair. The partial unique index above cannot service that join because
+	// SQLite cannot prove the alias value is non-empty, so large ledgers fell
+	// back to a full cost_events scan for every alias during `costs sync`.
+	if _, err := tx.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_cost_events_provider_source_identity
+		ON cost_events(provider, source_identity)
+	`); err != nil {
+		return fmt.Errorf("statedb: create cost event provider/source identity index: %w", err)
+	}
 
 	// Set schema version only when missing or changed.
 	// Avoiding a write on every open reduces lock contention between CLI processes.

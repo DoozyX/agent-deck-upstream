@@ -1069,6 +1069,22 @@ func TestMigrate_OldSchema_NewTablesCreated(t *testing.T) {
 	}
 }
 
+func TestMigrateCreatesCostEventProviderSourceIdentityIndex(t *testing.T) {
+	db := newTestDB(t)
+
+	var count int
+	err := db.DB().QueryRow(`
+		SELECT COUNT(*)
+		FROM sqlite_master
+		WHERE type = 'index' AND name = 'idx_cost_events_provider_source_identity'`).Scan(&count)
+	if err != nil {
+		t.Fatalf("look up cost event provider/source identity index: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("cost event provider/source identity index count = %d, want 1", count)
+	}
+}
+
 // TestMigrate_OldSchema_NewInstanceCreation verifies that creating a NEW instance works
 // on a migrated v1 database. This catches issues where INSERT statements reference
 // columns that don't exist in the upgraded schema.
