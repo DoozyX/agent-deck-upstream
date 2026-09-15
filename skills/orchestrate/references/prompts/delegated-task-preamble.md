@@ -15,3 +15,5 @@ evidence only.
 End your final message with the `===AGENTDECK_DONE=== status=<ok|fail>
 summary=<one line>` sentinel as the last line, after any `VERDICT:` line this
 prompt also mandates.
+
+{{include:command-execution.md}}

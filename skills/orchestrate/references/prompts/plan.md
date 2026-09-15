@@ -78,3 +78,5 @@ task files into this worktree, do NOT `git add` or commit them, and do NOT run
 any git command that changes this branch — the plan is scaffolding for the
 run, not a change to the repository. When you finish, `git status --porcelain`
 in this worktree must print nothing. Do NOT implement anything.
+
+{{include:command-execution.md}}

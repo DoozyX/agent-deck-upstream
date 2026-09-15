@@ -4,14 +4,16 @@
 
 Stable review identity: run={{RUN_DIR}} task={{TASK_ID}} attempt={{ATTEMPT_ID}} base={{BASE_HEAD}} reviewed={{REVIEWED_HEAD}} spec={{SPEC_ID}}. This identity and its reserved budget survive session title/model/context rotation; do not launch or rename another attempt to replace it.
 
-Start the full suite FIRST, detached, before you read anything: the
-full-suite command from the verification contract in the block above (or
-the repo's documented suite command if the block has none), output to
-{{VERDICT_FILE}}.suite.log, 600 s ceiling, last line `SUITE_EXIT=<code>`.
-Claude: one Bash call with `run_in_background: true` and `timeout: 600000`
-running `( <suite-cmd>; echo SUITE_EXIT=$? ) > {{VERDICT_FILE}}.suite.log 2>&1`.
-Other connectors: `nohup sh -c '<suite-cmd>; echo SUITE_EXIT=$?' > {{VERDICT_FILE}}.suite.log 2>&1 &`.
-Do not wait for it and do not poll it; the layers below fill that time.
+Resolve suite ownership FIRST from the verification contract. If you are the
+assigned owner and no matching run/result exists, start the documented suite
+once with the connector's managed background execution, a 600 s deadline,
+and output at {{VERDICT_FILE}}.suite.log. Retain the command handle and record
+its terminal exit code, duration, worktree, HEAD and relevant environment in
+the verdict. Review the code while it runs. Otherwise use the assigned owner's
+log/result for the same revision and environment; do not launch another suite.
+A missing assignment or unavailable result must be resolved with the conductor
+before a clean verdict. Pass this ownership and command-tracking contract to
+every review layer; layers may run focused checks but never duplicate the suite.
 
 Review the full branch diff: git diff $(git merge-base {{BASE_BRANCH}} HEAD)...HEAD
 
@@ -52,11 +54,16 @@ mechanical, `[decision-needed]` when closing it needs a product call. Report
 the real number. Never round up to the threshold, and never let clean code
 elsewhere lift a score above what the screen shows.
 
-After every layer has reported, read the suite result: `tail -n 40` of
-{{VERDICT_FILE}}.suite.log plus its `SUITE_EXIT=` line. If that line is
-missing, wait once with the harness's blocking wait on the background task;
-if it is still missing, record `SUITE_EXIT=timeout` and report it as a
-finding, never as clean. Judge whether the tests actually cover the change.
+After every layer has reported, collect the owner's terminal suite result and
+read its log with `tail -n 40` plus failure lines. If your command is still
+running, poll its retained handle until exit or the 600 s deadline. If another
+child owns it, obtain its completed receipt through the conductor. Missing
+exit evidence is unverified, never clean; a deadline is not proof the process
+stopped. Do not fabricate a successful exit or relaunch a still-running suite.
+Confirm the tested worktree, HEAD, clean-tree state and relevant environment
+still match; changes invalidate reuse. Cite the owner and result/log path in
+your verdict. Never run the suite twice in a round. Judge whether the tests
+actually cover the change.
 
 Known pre-existing test failures (the implementer's recorded baseline):
 {{BASELINE}}. These are NOT findings — only failures new against this
