@@ -1704,61 +1704,57 @@ func (s *StateDB) PrepareLifecycleIntent(intent LifecycleIntent) (LifecycleInten
 	}
 	var prepared LifecycleIntent
 	err := withBusyRetry(func() error {
-		tx, err := s.db.Begin()
-		if err != nil {
-			return err
-		}
-		defer func() { _ = tx.Rollback() }()
-		var liveGeneration int64
-		liveErr := tx.QueryRow(`SELECT COALESCE((SELECT generation FROM instance_tombstones WHERE id=instances.id), 0)
-			FROM instances WHERE id = ?`, intent.InstanceID).Scan(&liveGeneration)
-		if liveErr == nil && liveGeneration == 0 {
-			// Legacy rows predate durable incarnation records. Their first live
-			// incarnation is generation 1; binding without an eager backfill
-			// avoids a read-to-write upgrade race among parallel removers.
-			liveGeneration = 1
-		} else if liveErr != nil && !errors.Is(liveErr, sql.ErrNoRows) {
-			return liveErr
-		}
-		var current LifecycleIntent
-		err = tx.QueryRow(`SELECT instance_id, kind, payload, phase, token, generation, created_at, updated_at
-			FROM lifecycle_intents WHERE instance_id=?`, intent.InstanceID).
-			Scan(&current.InstanceID, &current.Kind, &current.Payload, &current.Phase, &current.Token, &current.Generation, &current.CreatedAt, &current.UpdatedAt)
-		if err == nil {
-			if current.Kind != intent.Kind || current.Payload != intent.Payload || (intent.Generation != 0 && current.Generation != intent.Generation) || (liveErr == nil && current.Generation != liveGeneration) {
-				return ErrLifecycleIntentConflict
+		return s.withImmediateWrite(func(tx lifecycleWriteExecutor) error {
+			var liveGeneration int64
+			liveErr := tx.QueryRow(`SELECT COALESCE((SELECT generation FROM instance_tombstones WHERE id=instances.id), 0)
+				FROM instances WHERE id = ?`, intent.InstanceID).Scan(&liveGeneration)
+			if liveErr == nil && liveGeneration == 0 {
+				// Legacy rows predate durable incarnation records. Their first live
+				// incarnation is generation 1; binding without an eager backfill
+				// avoids a read-to-write upgrade race among parallel removers.
+				liveGeneration = 1
+			} else if liveErr != nil && !errors.Is(liveErr, sql.ErrNoRows) {
+				return liveErr
 			}
-			if current.Token == "" {
-				current.Token = uuid.NewString()
-				if _, err := tx.Exec("UPDATE lifecycle_intents SET token=?, updated_at=? WHERE instance_id=?", current.Token, time.Now().Unix(), current.InstanceID); err != nil {
-					return err
+			var current LifecycleIntent
+			err := tx.QueryRow(`SELECT instance_id, kind, payload, phase, token, generation, created_at, updated_at
+				FROM lifecycle_intents WHERE instance_id=?`, intent.InstanceID).
+				Scan(&current.InstanceID, &current.Kind, &current.Payload, &current.Phase, &current.Token, &current.Generation, &current.CreatedAt, &current.UpdatedAt)
+			if err == nil {
+				if current.Kind != intent.Kind || current.Payload != intent.Payload || (intent.Generation != 0 && current.Generation != intent.Generation) || (liveErr == nil && current.Generation != liveGeneration) {
+					return ErrLifecycleIntentConflict
 				}
+				if current.Token == "" {
+					current.Token = uuid.NewString()
+					if _, err := tx.Exec("UPDATE lifecycle_intents SET token=?, updated_at=? WHERE instance_id=?", current.Token, time.Now().Unix(), current.InstanceID); err != nil {
+						return err
+					}
+				}
+				prepared = current
+				return nil
 			}
-			prepared = current
-			return tx.Commit()
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		now := time.Now().Unix()
-		targetGeneration := intent.Generation
-		if liveErr == nil {
-			if targetGeneration != 0 && targetGeneration != liveGeneration {
-				return ErrLifecycleIntentConflict
+			if !errors.Is(err, sql.ErrNoRows) {
+				return err
 			}
-			targetGeneration = liveGeneration
-		} else if !errors.Is(liveErr, sql.ErrNoRows) {
-			return liveErr
-		} else if targetGeneration == 0 {
-			_ = tx.QueryRow("SELECT COALESCE((SELECT generation FROM instance_tombstones WHERE id = ?), 0)", intent.InstanceID).Scan(&targetGeneration)
-		}
-		prepared = LifecycleIntent{InstanceID: intent.InstanceID, Kind: intent.Kind, Payload: intent.Payload, Phase: "prepared", Token: uuid.NewString(), Generation: targetGeneration, CreatedAt: now, UpdatedAt: now}
-		_, err = tx.Exec(`INSERT INTO lifecycle_intents(instance_id, kind, payload, phase, token, generation, created_at, updated_at)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, prepared.InstanceID, prepared.Kind, prepared.Payload, prepared.Phase, prepared.Token, prepared.Generation, prepared.CreatedAt, prepared.UpdatedAt)
-		if err != nil {
-			return err
-		}
-		return tx.Commit()
+			now := time.Now().Unix()
+			targetGeneration := intent.Generation
+			if liveErr == nil {
+				if targetGeneration != 0 && targetGeneration != liveGeneration {
+					return ErrLifecycleIntentConflict
+				}
+				targetGeneration = liveGeneration
+			} else if !errors.Is(liveErr, sql.ErrNoRows) {
+				return liveErr
+			} else if targetGeneration == 0 {
+				_ = tx.QueryRow("SELECT COALESCE((SELECT generation FROM instance_tombstones WHERE id = ?), 0)", intent.InstanceID).Scan(&targetGeneration)
+			}
+			prepared = LifecycleIntent{InstanceID: intent.InstanceID, Kind: intent.Kind, Payload: intent.Payload, Phase: "prepared", Token: uuid.NewString(), Generation: targetGeneration, CreatedAt: now, UpdatedAt: now}
+			if _, err := tx.Exec(`INSERT INTO lifecycle_intents(instance_id, kind, payload, phase, token, generation, created_at, updated_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, prepared.InstanceID, prepared.Kind, prepared.Payload, prepared.Phase, prepared.Token, prepared.Generation, prepared.CreatedAt, prepared.UpdatedAt); err != nil {
+				return err
+			}
+			return nil
+		})
 	})
 	return prepared, err
 }
