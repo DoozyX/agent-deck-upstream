@@ -21,3 +21,5 @@ environment, or licensing. Permit at most one clean rerun by default. Preserve
 the first failure after that rerun; a second failure ends the measurement and
 must be classified as a product defect or an inconclusive harness,
 environment, or licensing result. Never retry indefinitely.
+
+{{include:command-execution.md}}

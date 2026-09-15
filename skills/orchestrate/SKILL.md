@@ -132,11 +132,11 @@ verification obligation.
 
 ## Verification
 
-Every implementation/fix must use the repository's required test discipline,
-commit its scoped change, and report fresh command evidence. A conductor must
-verify the VCS diff, immutable HEAD, supported launch/receipt path, and required
-remote state before accepting a child's sentinel. Artifact existence or a
-worker's success claim is not evidence.
+Implementers/fixers follow the repository's test discipline, commit scoped
+changes, and report command evidence. Before accepting a sentinel, verify the
+VCS diff, immutable HEAD, launch receipt and required remote state. Assign one
+full-suite owner per worktree/revision; children retain command handles and
+collect terminal exits (see task delivery).
 
 For deployed verification, use independent arms, validate each producer's
 completion/provenance/freshness/schema, adjudicate contradictions, and end with

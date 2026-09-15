@@ -26,3 +26,5 @@ was not, and the only reason it was caught is that the next reviewer diffed
 the commit against the report line by line instead of reading the report.
 If you did not fix something you were asked to fix, say which and why; that
 is a normal outcome and is far cheaper than a claim that has to be disproved.
+
+{{include:command-execution.md}}
