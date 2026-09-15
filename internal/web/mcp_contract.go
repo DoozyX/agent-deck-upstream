@@ -18,15 +18,10 @@ const MCPRoute = "/mcp"
 type MCPDependencies struct {
 	Loader           MenuDataLoader
 	Mutator          SessionMutator
-	OutputReader     SessionOutputReader
 	RemoteFleet      RemoteFleetLoader
 	Authorize        func(*http.Request) bool
 	MutationsAllowed func() bool
 	AllowMutation    func() bool
-}
-
-type SessionOutputReader interface {
-	SessionOutput(sessionID string) (string, error)
 }
 
 // MCP tool / result contracts (stable JSON field names for Tasks 02–03).
@@ -38,15 +33,6 @@ type MCPSessionIDInput struct {
 type MCPSendToSessionInput struct {
 	SessionID string `json:"sessionId"`
 	Message   string `json:"message"`
-}
-
-type MCPCreateSessionInput struct {
-	Title           string `json:"title"`
-	Tool            string `json:"tool,omitempty"`
-	ProjectPath     string `json:"projectPath"`
-	GroupPath       string `json:"groupPath,omitempty"`
-	ModelID         string `json:"modelId,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 type MCPFleetStatusResult struct {
@@ -89,11 +75,6 @@ type MCPSessionDetailsResult struct {
 type MCPMutationResult struct {
 	SessionID string `json:"sessionId"`
 	OK        bool   `json:"ok"`
-}
-
-type MCPSessionOutputResult struct {
-	SessionID string `json:"sessionId"`
-	Content   string `json:"content"`
 }
 
 // MCPErrorKind distinguishes protocol/API failure classes for Task 02 mapping.
@@ -194,12 +175,10 @@ type MCPToolSpec struct {
 	InputSchema map[string]any
 }
 
-// MCPToolCatalog returns the nine fixed remote-MCP tools and their input schemas.
+// MCPToolCatalog returns the six approved remote-MCP tools and their input schemas.
 // Task 02 registers these on the Streamable HTTP server; this catalog is the
 // authoritative contract for names, required fields, and read-only hints.
 func MCPToolCatalog() []MCPToolSpec {
-	notDestructive := false
-	destructive := true
 	sessionIDProps := map[string]any{
 		"sessionId": map[string]any{
 			"type":        "string",
@@ -284,48 +263,8 @@ func MCPToolCatalog() []MCPToolSpec {
 				"additionalProperties": false,
 			},
 		},
-		{
-			Name:        "create_session",
-			Description: "Create, start, and persist a new Agent Deck session.",
-			Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &notDestructive},
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"title":           map[string]any{"type": "string", "minLength": 1},
-					"tool":            map[string]any{"type": "string"},
-					"projectPath":     map[string]any{"type": "string", "minLength": 1},
-					"groupPath":       map[string]any{"type": "string"},
-					"modelId":         map[string]any{"type": "string"},
-					"reasoningEffort": map[string]any{"type": "string"},
-				},
-				"required":             []string{"title", "projectPath"},
-				"additionalProperties": false,
-			},
-		},
-		{
-			Name:        "delete_session",
-			Description: "Delete one existing session through Agent Deck's recoverable deletion path.",
-			Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: false, DestructiveHint: &destructive},
-			InputSchema: map[string]any{
-				"type":                 "object",
-				"properties":           sessionIDProps,
-				"required":             []string{"sessionId"},
-				"additionalProperties": false,
-			},
-		},
-		{
-			Name:        "session_output",
-			Description: "Return the latest assistant response from one local Agent Deck session. Read-only.",
-			Annotations: &mcpsdk.ToolAnnotations{ReadOnlyHint: true},
-			InputSchema: map[string]any{
-				"type":                 "object",
-				"properties":           sessionIDProps,
-				"required":             []string{"sessionId"},
-				"additionalProperties": false,
-			},
-		},
 	}
 }
 
 // NewMCPHandler is implemented in mcp.go (Task 02): Streamable HTTP transport,
-// auth gate, and the nine tool registrations against MCPDependencies.
+// auth gate, and the six tool registrations against MCPDependencies.
