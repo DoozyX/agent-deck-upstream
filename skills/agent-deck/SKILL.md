@@ -2,7 +2,7 @@
 name: agent-deck
 description: Terminal session manager for AI coding agents. Use when user mentions "agent-deck", "session", "sub-agent", "MCP attach", "git worktree", or needs to create, supervise, configure, share, or troubleshoot agent sessions and worktree sessions.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Agent Deck

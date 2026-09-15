@@ -2,7 +2,7 @@
 name: brainstorming
 description: Collaborative design and brainstorming before any code is written — explores project context, asks clarifying questions one frontier round at a time through the connector's native question tool, offers 2–3 approaches with trade-offs, and writes and self-reviews a complete design file for the user to read before approving it. Designs live in the repository-local `.agent-deck/DATE-SLUG/design/` directory (git-ignored, never committed). Use before building a feature, adding functionality, or changing behavior, and whenever the user says "let's build", "I want to add", "how should we do X", or asks for a design or spec. Hard-gates implementation until the user explicitly approves the design file.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Brainstorming
@@ -47,10 +47,13 @@ whose prerequisites are already settled; a question whose answer depends on
 another question still open belongs to a later round. Ask the whole frontier
 in one round, wait for the answers, then ask the next frontier.
 
-Deliver each round through the connector's native question tool — Claude:
-`AskUserQuestion` (up to four questions per call, each with 2–4 options, the
-recommended option first and labelled `(Recommended)`); Codex:
-`request_user_input`. The tool gives every question its own answer slot, so
+Deliver each round through an available native question tool permitted in
+the current mode — Claude: `AskUserQuestion`; Codex:
+`request_user_input_async` or `request_user_input` when available; Cursor:
+the question tool exposed by the current session, if any. Follow the tool's
+actual schema and limits, with the recommended option first and labelled
+`(Recommended)` where supported. Do not assume a tool exists from the
+connector name alone. The tool gives every question its own answer slot, so
 one merged reply can no longer swallow half the round. A frontier larger
 than one call is two calls, never a prose list. Without a native tool,
 number the questions in one message, put a recommended answer under each,
@@ -104,8 +107,8 @@ not state, and say what you cut.
 ## 4. Principles pass
 
 Before presenting the chosen architecture, check it against
-`${CLAUDE_PLUGIN_ROOT}/skills/review/references/principles.md` (that path is
-relative to the installed plugin, not to the repo you are working in). The
+`../review/references/principles.md`, resolved from the directory containing
+this loaded `SKILL.md`, not from the user's repository or shell cwd. The
 question to answer out loud:
 *does any component here exist for a requirement nobody stated?* Cut or
 justify each one.
