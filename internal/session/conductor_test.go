@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/BurntSushi/toml"
+	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 // --- Systemd template generation tests ---
@@ -3125,4 +3126,55 @@ func TestSetupConductorWithAgent_PreAcceptsCodexTrust(t *testing.T) {
 	if entry["trust_level"] != "trusted" {
 		t.Fatalf("trust_level = %v, want trusted", entry["trust_level"])
 	}
+}
+
+// A caller's Codex profile must survive tests that replace only HOME.
+func TestSetupConductorWithAgent_IsolatesInheritedCodexHome(t *testing.T) {
+	callerHome := t.TempDir()
+	callerConfig := filepath.Join(callerHome, "config.toml")
+	sentinel := []byte("# caller config must remain unchanged\n")
+	if err := os.WriteFile(callerConfig, sentinel, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", callerHome)
+	cleanup := testutil.IsolateHome()
+	defer cleanup()
+
+	t.Run("temporary home", func(t *testing.T) {
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		if err := SetupConductorWithAgent("isolated-codex", "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(callerConfig)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != string(sentinel) {
+			t.Error("conductor trust escaped HOME and modified caller CODEX_HOME")
+		}
+		isolated, err := os.ReadFile(filepath.Join(home, ".codex", "config.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(isolated), `trust_level = "trusted"`) {
+			t.Fatal("isolated Codex config lacks conductor trust")
+		}
+	})
+	t.Run("explicit Codex home", func(t *testing.T) {
+		t.Setenv("HOME", t.TempDir())
+		override := t.TempDir()
+		t.Setenv("CODEX_HOME", override)
+		if err := SetupConductorWithAgent("explicit-codex", "default", ConductorAgentCodex, true, true, "", "", "", "", nil, ""); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(override, "config.toml"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(string(data), `trust_level = "trusted"`) {
+			t.Fatal("explicit Codex home lacks conductor trust")
+		}
+	})
+
 }
