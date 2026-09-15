@@ -15,6 +15,7 @@ Complete reference for all agent-deck CLI commands.
 - [Group Commands](#group-commands)
 - [Profile Commands](#profile-commands)
 - [Remote Commands](#remote-commands)
+- [Artifacts Commands](#artifacts-commands)
 - [Codex Hook Commands](#codex-hook-commands)
 - [DeepSeek Commands](#deepseek-commands)
 - [Conductor Commands](#conductor-commands)
@@ -80,18 +81,26 @@ Examples:
 ```bash
 agent-deck launch . -c claude -m "Review this module"
 agent-deck launch . -c claude --account work -m "Review this module"
-agent-deck launch . -c claude --model claude-opus-5 --effort high   # the dialog's Model / Reasoning effort rows
 agent-deck launch . -g ard -c claude -m "Review dataset"
 agent-deck launch . -c "codex --dangerously-bypass-approvals-and-sandbox"
 agent-deck launch -g book-keeper -c claude   # no path: lands on the group's default_path
+agent-deck launch . -w feature/a -b --base dev -c claude  # new branch explicitly based on dev
+agent-deck launch . -c codex -m "Task" --confirm-alive --json  # fail if the session dies on arrival
 ```
 
 Notes:
 - `[path]` omitted: resolves the target group's `default_path`, then the global `default_path` config key, then cwd — the same chain as `add` (#1303). An explicit `.` always means the current directory.
+- `--base <revision>` requires `-w/--worktree` and `-b/--new-branch`. It resolves the revision to an immutable commit before creating the worktree and prints the verified base revision and sha.
 - `--account <name>` selects a named slot from `[profiles.<name>.claude].config_dir` for this session, matching `add --account`.
-- `--model <id>` and `--effort <level>` are the per-session overrides behind the TUI's Model ID and Reasoning effort rows (also on `add`). Effort levels: claude `low|medium|high|xhigh|max`, codex `minimal|low|medium|high|xhigh`; other tools refuse the flag. Both are echoed in `--json` output (`model`, `effort`) and by `session show --json`.
+- `--conductor` marks the launched session as a conductor instead of an executor when it is parented. Parent linkage and group inheritance remain active.
 - `--account` requires an explicit name. If the next token is another launch flag, launch stops with an error before resolving a fallback account or creating a session; use `--account=<name>` when a name intentionally begins with a dash.
-- `--no-identity` (also on `add`): skip the harness identity injection for this session only. By default every spawn tells the model it runs inside agent-deck, its session metadata and how to use the CLI (`[launch] inject_identity` in config-reference.md, `documentation/HARNESS_IDENTITY.md`). Persisted, so restarts honour it.
+- `--confirm-alive` watches the new session for `--alive-window` (default `5s`) before reporting. Use it in any script that acts on the result, because without it `launch` can report `"success": true, "delivery": "submitted"` for a session that is dead seconds later — a fresh `-c codex -m …` launch embeds the prompt in the command and returns as soon as tmux accepts the spawn, before the agent's first turn, so nothing in the default output observes the agent at all.
+  - On a death: exit 1, `"success": false`, `"alive": false`, `"code": "SESSION_DOA"`, plus `doa_reason` and — when the tool printed one — `doa_detail` carrying the tool's own error text (a codex usage limit, a crash). The session `id`/`session_id` stay in the payload so the caller can remove the row.
+  - On survival: exit 0 and `"alive": true`. This means **"did not die within the window"**, not "is healthy" — `liveness_window_ms` and `liveness_observed_ms` are published next to it so the claim cannot be read as more than it is. A death after the window is not caught, and neither is a tool that prints a terminal error and keeps its pane up.
+  - `liveness_observed_ms` counts from the *first liveness poll*, not from the spawn — the session save runs in between. On a death, `doa_elapsed_ms` gives the spawn-relative age when agent-deck's own fast-death record measured it.
+  - A launch that lands in a group at its concurrency cap returns `"status": "queued"` and exit 0 with **no `alive` key**: nothing was spawned, so there was nothing to observe. Check for the key rather than indexing it blindly.
+  - Waiting also lets agent-deck's fast-death watcher record the failure, so `session show --json` carries `spawn_failure` (with the tool's dying output) for these sessions instead of a bare `stopped`.
+  - Off by default: without the flag the JSON keys are exactly what they have always been. A one-shot invocation (`codex exec`, the DeepSeek headless profile) is not reported DOA for exiting normally, but a non-zero exit still fails. `--alive-window` without `--confirm-alive` is an error.
 
 ### accounts - List named account slots
 
@@ -136,24 +145,6 @@ agent-deck migrate-paths [--dry-run] [--force]
 ```
 
 Copies known legacy `~/.agent-deck` files into the split XDG layout (config under `~/.config/agent-deck`, durable data under `~/.local/share/agent-deck`, cache under `~/.cache/agent-deck`) without deleting the legacy directory. Use `--dry-run` to preview what would be copied.
-
-### update - Check for and install a new release
-
-```bash
-agent-deck update                      # check GitHub, show changelog, Y/n, install
-agent-deck update --check              # only check
-agent-deck update --check --json       # {"current","latest","available","publishing","auto_install","auto_restart","timer":{...}}
-agent-deck update --version 1.7.3      # install a specific release (may downgrade)
-agent-deck update --unattended         # no prompts, no changelog, no stdin
-agent-deck update --unattended --trigger timer|tui|manual
-agent-deck update --install-timer [--dry-run]
-agent-deck update --uninstall-timer [--dry-run]
-agent-deck update --timer-status
-```
-
-- `--unattended` is what the daily timer and the TUI's `auto_install` run. It honours `[updates] auto_install` (off means "nothing installed", exit 0), never runs Homebrew (prints the `brew` command, exit 2), takes `<cache dir>/update.lock` so two runs never replace the binary at once (busy means exit 0), skips the remotes prompt, and exits 1 when the install or the macOS launchd hygiene failed. `--trigger` (default `$AGENTDECK_UPDATE_TRIGGER`, then `manual`) only tags the debug log lines.
-- `--install-timer` writes `~/Library/LaunchAgents/com.agentdeck.autoupdate.plist` (macOS, daily at 07:MM with a random minute, program `/bin/sh`) or `~/.config/systemd/user/agent-deck-autoupdate.{service,timer}` (Linux, `OnCalendar=daily`, `RandomizedDelaySec=1h`) and loads it. Installing over an existing timer replaces it; `--dry-run` prints the exact files and commands and executes nothing. The timer's output goes to `<log dir>/auto-update.log` on macOS and the journal on Linux.
-- On macOS every install (interactive, `--version`, the TUI prompt and `--unattended`) re-registers the `com.agentdeck.*` launch agents whose program is the replaced binary (`launchctl bootout` then `bootstrap`, then a `state = running` check for KeepAlive/RunAtLoad agents). Without this they crash-loop with `EX_CONFIG` (exit 78) because macOS ties a launch agent's identity to the file at its program path. If an agent does not come back the command exits 1 and prints the two `launchctl` commands to run by hand; the binary is already updated at that point.
 
 ## Web Command
 
@@ -279,12 +270,8 @@ agent-deck session current -q
 
 # JSON
 agent-deck session current --json
-# {"session":"test","title":"test","profile":"work","id":"c5bfd4b4","tool":"claude",
-#  "group":"projects","account":"","parent_session_id":"","path":"/...","status":"running",
-#  "tmux_session":"agentdeck_test_...","identity_file":"/.../runtime/identity/c5bfd4b4/identity.md"}
+# {"session":"test","profile":"work","id":"c5bfd4b4",...}
 ```
-
-The JSON form is the machine-readable identity a session fetches from inside: `tool`, `account` and `parent_session_id` are always present (empty when unset); `group`, `tmux_session`, `is_conductor`, `worktree_branch` and `identity_file` appear when set. The injected identity block (`[launch] inject_identity`) points the model here for the live record.
 
 **Profile auto-detection priority:**
 1. `AGENTDECK_PROFILE` env var
@@ -336,10 +323,25 @@ approval: that path sends composer text followed by Enter.
 ### session output
 
 ```bash
-agent-deck session output [id|title] [--json] [-q]
+agent-deck session output [id|title] [--json] [-q] [--require-fresh]
 ```
 
 Get the last response from a session. Transcript-backed extraction is tool-dependent; use `--pane` for a raw tmux capture when structured output is unavailable.
+
+**Staleness.** "Last response" is only an answer to your last message if it is
+newer than it. When the newest response predates the last message delivered to
+the session (the `last_sent_at` clock `session send` stamps), the content
+belongs to a previous turn — the session has not answered you yet. That case is
+reported rather than left for you to infer:
+
+- `--json` → `"stale": true` plus `"last_sent_at"`
+- human/`-q` → a warning on stderr (stdout stays byte-identical for pipes)
+- `--require-fresh` → exit code 3 instead of returning the old turn
+
+```bash
+agent-deck session send worker "next task" && \
+  agent-deck session output worker -q --require-fresh   # exits 3 until it answers
+```
 
 ### session set-parent / unset-parent
 
@@ -660,11 +662,11 @@ Removes a remote from configuration.
 ### remote list / ls
 
 ```bash
-agent-deck remote list [--json] [--check]
-agent-deck remote ls [--json] [--check]
+agent-deck remote list [--json]
+agent-deck remote ls [--json]
 ```
 
-Lists all configured remotes. The VERSION column shows the agent-deck version each remote last reported (learned by the TUI poll, `remote update`, or `--check`), with `↑` when it is older than this controller; `-` means never checked. `--check` asks every remote now (one SSH call each) and refreshes that cache. Use `--json` for scripting (`version`, `version_checked_at`, `outdated`).
+Lists all configured remotes. Use `--json` for scripting.
 
 ### remote sessions
 
@@ -719,10 +721,10 @@ Renames a session on a remote instance.
 ### remote update
 
 ```bash
-agent-deck remote update [name | --all]
+agent-deck remote update [name]
 ```
 
-Downloads and installs the correct agent-deck binary (detected platform/arch) on a specific remote, or with `--all` (or no name) on every configured remote whose version is older than this controller's. Remotes run one at a time and each is reported as updated, already current, or failed with the reason; a remote that fails stays on its version (the archive is checksum-verified before deploy and the remote is re-checked afterwards, never a partial binary). Exit status is 1 when any remote failed. Remotes follow the controller's version automatically unless `[updates] auto_update_remotes = false` is set (see the config reference). When the remote user cannot write the install directory (a root-owned `/usr/local/bin`), the deploy runs through `sudo -n` if the remote allows passwordless sudo; otherwise it fails with `install path <path> is not writable by <user>` and the remedy (move the binary to `~/.local/bin` behind a symlink at the old path, or run the update with sudo). `agent-deck update` on the remote itself reports the same error for that case. The deploy first resolves the install path through symlinks on the remote (`readlink` style), so the documented "symlink at the old path to `~/.local/bin/agent-deck`" layout works: the file behind the link is replaced, its owner and mode are kept (then made readable and executable for everyone), sudo is used only when the resolved file's directory is unwritable, and a symlink is never replaced by a regular file. When `command -v agent-deck` on the remote resolves to a different file than `agent_deck_path`, both are updated and the report names both, unless the `$PATH` binary is already at that version or newer, in which case it is left alone and the report says so. A file owned by another user is replaced through sudo so its owner is kept, and a non-root deploy keeps the file's group; if owner or group cannot be restored the deploy aborts with the original in place. If the remote cannot say what it runs (the `command -v`, resolve or version probe fails or answers ambiguously) nothing is written and the remote is reported as skipped with the probe error. After the deploy, `command -v agent-deck` must resolve to the deployed file's inode and report the new version. When `agent_deck_path` is set explicitly and that entry is verified by inode to be the deployed file (reporting the new version) but sits off the remote's non-interactive `$PATH`, the update counts as a success with a warning in the report (sessions started via SSH may need PATH); without an explicit `agent_deck_path` the controller itself relies on `$PATH`, so that case stays a failure. The deploy stages to a temp file unique to that run, takes a lock directory next to the binary (`<path>.lock`, treated as abandoned after 15 minutes) so two controllers cannot interleave writes; a remote whose lock another deploy holds is reported as skipped, not failed. While a sweep from this controller is still running (the TUI's startup sweep, say), `remote update --all` waits for it up to two minutes and then reports the remotes it covers as `sweep already in progress, remote <name> is being updated by <pid>` with exit status 0. The version cache is refreshed after each remote's deploy, so `remote list` shows the new version right away.
+Downloads and installs the correct agent-deck binary (detected platform/arch) on all remotes, or on a specific remote if `name` is provided. Prompts for confirmation before updating.
 
 ### Examples
 
@@ -733,11 +735,57 @@ agent-deck remote list
 agent-deck remote sessions dev
 agent-deck remote attach dev my-session
 agent-deck remote rename dev my-session new-name
-agent-deck remote update --all    # update every remote older than this controller
+agent-deck remote update          # update all remotes
 agent-deck remote update dev      # update specific remote
 ```
 
 SSH uses OpenSSH host-key verification and `BatchMode=yes`; unknown or changed hosts fail instead of prompting. Authenticate with an SSH agent or configured key and establish trust in `known_hosts` before registering a remote. `remote update` verifies the downloaded archive against the release checksums before deployment.
+
+## Artifacts Commands
+
+Sync **run artifacts** — `<main-worktree>/.agent-deck/<run-id>/` and `.agent-deck/handoff/<session-id>/` — between machines over the same registered-remote SSH path `remote drain` uses.
+
+Those files are project artifacts kept out of git on purpose (see `docs/data-locations.md`), so nothing else carries them across hosts: a run recorded on one machine is invisible on every other one.
+
+### artifacts sync
+
+```bash
+agent-deck artifacts sync <remote|user@host> [--all] [--dry-run] [--json]
+```
+
+| Option | Description |
+| --- | --- |
+| `--all` | Every project root in the session registry, not just the current one. Roots are folded to their main worktree, so two worktrees of one repo count once |
+| `--dry-run` | Report the plan; transfer nothing |
+| `--json` | Emit `{remote, repos[], pulled, pushed, conflicts, dry_run}` |
+
+A **union**, not a mirror: it pulls what is missing here, pushes what is missing there, and **never deletes and never overwrites**. Divergence between two machines running the same work is almost purely additive, so adding is the whole operation.
+
+- **Conflicts are reported, not resolved.** A path that exists on both sides with different content moves in neither direction and the command exits `4`. Everything not in conflict still transfers.
+- **A root the remote does not have is skipped with a reason**, never treated as an empty remote tree — pushing a whole local history into a path that is not that repo on the far side is the failure that would cause.
+- **Remote paths are the local path remapped through `$HOME`.** `~alice/src/app` on this machine is `~bob/src/app` on the remote. A root outside `$HOME` has no mapping and is skipped.
+- **`tmp/` and `skills.toml` are never synced**: a session's TMPDIR and a checkout's skill attachments are machine-local by design.
+- **Symlinks, devices and permission bits are out of scope**; regular files and the directories holding them are what move.
+- Exit codes: `0` synced (an already-converged pair says so explicitly), `2` usage or unknown remote, `3` remote unreachable or unable to read its own manifest, `4` conflicts found.
+
+### artifacts manifest / pack / unpack / home
+
+```bash
+agent-deck artifacts manifest --root <absolute-path>   # JSON manifest; read-only
+agent-deck artifacts pack --root <absolute-path>       # file list on stdin, tar on stdout
+agent-deck artifacts unpack --root <absolute-path>     # tar on stdin; skips paths that exist
+agent-deck artifacts home                              # this machine's home directory
+```
+
+These are the primitives `artifacts sync` runs on the far side over SSH; they are plain local operations, so the transport carries no logic of its own. `unpack` refuses any member that is absolute, contains `..`, or falls outside `.agent-deck/<top-level-dir>/` — a tar arriving from another host is not trusted. A remote running a build without the `artifacts` verb is reported as a version error naming `agent-deck remote update`.
+
+### Examples
+
+```bash
+agent-deck artifacts sync m1                     # this repo, both directions
+agent-deck artifacts sync m1 --all --dry-run     # every known root, plan only
+agent-deck artifacts sync worker@box-b --json    # unregistered destination, scriptable
+```
 
 ## Codex Hook Commands
 

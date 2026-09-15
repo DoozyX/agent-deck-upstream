@@ -37,15 +37,17 @@ type StorageData struct {
 
 // InstanceData represents the serializable session data
 type InstanceData struct {
-	ID                 string `json:"id"`
-	Title              string `json:"title"`
-	ProjectPath        string `json:"project_path"`
-	GroupPath          string `json:"group_path"`
-	Order              int    `json:"order"`
-	ParentSessionID    string `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
-	IsConductor        bool   `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
-	NoTransitionNotify bool   `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
-	TitleLocked        bool   `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
+	OrchestrateLaunch     *ResolvedLaunch `json:"orchestrate_launch,omitempty"`
+	PersistenceGeneration int64           `json:"persistence_generation,omitempty"`
+	ID                    string          `json:"id"`
+	Title                 string          `json:"title"`
+	ProjectPath           string          `json:"project_path"`
+	GroupPath             string          `json:"group_path"`
+	Order                 int             `json:"order"`
+	ParentSessionID       string          `json:"parent_session_id,omitempty"`    // Links to parent session (sub-session support)
+	IsConductor           bool            `json:"is_conductor,omitempty"`         // True if this session is a conductor orchestrator
+	NoTransitionNotify    bool            `json:"no_transition_notify,omitempty"` // Suppress transition event dispatch
+	TitleLocked           bool            `json:"title_locked,omitempty"`         // #697: block Claude session-name sync into Title
 	// SubcommandPassthrough mirrors Instance.SubcommandPassthrough (#1821).
 	// Persisted via the tool_data extras zone (see
 	// WriteSubcommandPassthroughToToolData), not a dedicated SQL column, so
@@ -77,8 +79,6 @@ type InstanceData struct {
 	// active).
 	LastActivityAt time.Time `json:"last_activity_at,omitempty"`
 	ArchivedAt     time.Time `json:"archived_at,omitempty"`
-	SupersededBy   string    `json:"superseded_by,omitempty"`
-	Supersedes     string    `json:"supersedes,omitempty"`
 	TmuxSession    string    `json:"tmux_session"`
 	// TmuxSocketName is the tmux -L selector captured at Instance creation
 	// (issue #687, v1.7.50). Empty for pre-v1.7.50 rows — those keep hitting
@@ -175,10 +175,6 @@ type InstanceData struct {
 	// IdleTimeoutSecs mirrors Instance.IdleTimeoutSecs (#1143). 0 = disabled.
 	IdleTimeoutSecs int64 `json:"idle_timeout_secs,omitempty"`
 
-	// IdentityInjectionDisabled mirrors Instance.IdentityInjectionDisabled.
-	// Lives in the tool_data extras zone (identity_injection_persist.go).
-	IdentityInjectionDisabled bool `json:"identity_injection_disabled,omitempty"`
-
 	// DeepSeekTask mirrors Instance.DeepSeekTask (PR #1942 review, P1c).
 	// Persisted via the tool_data extras zone (see deepseek_task_persist.go).
 	// Empty for every profile but headless.
@@ -204,11 +200,14 @@ type GroupData struct {
 // Thread-safe with mutex protection for concurrent access within a single process.
 // Multiple processes share data via SQLite WAL mode.
 type Storage struct {
-	db      *statedb.StateDB
-	dbPath  string     // Path to state.db (for change detection)
-	profile string     // The profile this storage is for
-	mu      sync.Mutex // Protects operations during transition
+	db                    *statedb.StateDB
+	dbPath                string     // Path to state.db (for change detection)
+	profile               string     // The profile this storage is for
+	restrictGroupCreation bool       // Managed-session manual_creation_only guard.
+	mu                    sync.Mutex // Protects operations during transition
 }
+
+var ErrManualGroupCreationOnly = errors.New("group creation is restricted to the user")
 
 // NewStorageWithProfile creates a storage instance for a specific profile.
 // If profile is empty, uses the effective profile (from env var or config).
@@ -284,10 +283,17 @@ func NewStorageWithProfile(profile string) (*Storage, error) {
 		}
 	}
 
+	restrictGroupCreation := false
+	if cfg, cfgErr := LoadUserConfig(); cfgErr == nil && cfg != nil && cfg.GroupDefaults.ManualCreationOnly {
+		restrictGroupCreation = strings.TrimSpace(os.Getenv("AGENTDECK_INSTANCE_ID")) != "" ||
+			strings.TrimSpace(os.Getenv("AGENT_DECK_SESSION_ID")) != ""
+	}
+
 	return &Storage{
-		db:      db,
-		dbPath:  dbPath,
-		profile: effectiveProfile,
+		db:                    db,
+		dbPath:                dbPath,
+		profile:               effectiveProfile,
+		restrictGroupCreation: restrictGroupCreation,
 	}, nil
 }
 
@@ -323,6 +329,12 @@ func (s *Storage) Path() string {
 // GetDB returns the underlying StateDB for direct access (status writes, heartbeat, etc.)
 func (s *Storage) GetDB() *statedb.StateDB {
 	return s.db
+}
+
+// SetGroupCreationRestricted lets command-layer tmux detection enable the
+// persistence backstop when a managed child scrubbed its injected identity.
+func (s *Storage) SetGroupCreationRestricted(restricted bool) {
+	s.restrictGroupCreation = restricted
 }
 
 // Close closes the underlying database connection.
@@ -387,6 +399,12 @@ func (s *Storage) saveWithGroups(instances []*Instance, groupTree *GroupTree) ([
 	if s.db == nil {
 		return nil, fmt.Errorf("storage database not initialized")
 	}
+	if err := s.rejectNewGroups(instances, groupTree); err != nil {
+		return nil, err
+	}
+
+	// Enforce one Claude conversation owner across persisted sessions.
+	// This protects CLI-only flows as well (the TUI already applies this in-memory).
 	UpdateClaudeSessionsWithDedup(instances)
 	updates := make([]statedb.InstanceSnapshot, len(instances))
 	clearIntents := make([]bool, len(instances))
@@ -446,98 +464,6 @@ func (s *Storage) rememberInstanceSnapshot(inst *Instance, original, stored *sta
 	}
 }
 
-// CommitNativeHarnessSwitch persists a same-harness switch after its lifecycle
-// work has completed. Unlike SaveWithGroups, it does not replay a full stale
-// registry snapshot: it compare-and-swaps the source identity and writes only
-// account, tool, and native-ID fields. Monitor status changes and unrelated
-// sessions/edits therefore survive, while a changed account, command, path, or
-// native ID refuses recovery rather than overwriting a newer operation.
-func (s *Storage) CommitNativeHarnessSwitch(inst *Instance, result *HarnessSwitchResult) error {
-	if s == nil || s.db == nil {
-		return fmt.Errorf("storage database not initialized")
-	}
-	if inst == nil || result == nil || !result.Committed || result.nativeSource.InstanceID == "" || result.nativeTarget.InstanceID == "" {
-		return fmt.Errorf("native harness switch commit is incomplete")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	source := nativeSwitchStorageIdentity(result.nativeSource)
-	target := nativeSwitchStorageIdentity(result.nativeTarget)
-	var (
-		committed *statedb.InstanceRow
-		err       error
-	)
-	if result.nativeStorageAcknowledgement {
-		// The CAS already succeeded, but writing its journal acknowledgement
-		// failed. A reloaded target can only confirm that exact durable target;
-		// it must not retry the source-bound CAS or replay lifecycle work.
-		committed, err = s.db.ConfirmNativeHarnessSwitchTarget(target)
-	} else {
-		committed, err = s.db.CommitNativeHarnessSwitch(source, target)
-	}
-	if err != nil {
-		return fmt.Errorf("commit native harness switch: %w", err)
-	}
-	// A completed-journal retry starts from the old registry row. Reconcile the
-	// exact already-executed mutation here; no stop/start/prompt lifecycle work
-	// is replayed merely to repair storage.
-	inst.Tool, inst.Account = result.nativeTarget.Tool, result.nativeTarget.Account
-	inst.ClaudeSessionID, inst.CodexSessionID = result.nativeTarget.ClaudeID, result.nativeTarget.CodexID
-	desired, err := instanceToRow(inst)
-	if err != nil {
-		return err
-	}
-	s.rememberInstanceSnapshot(inst, desired, committed)
-	if err := completeNativeHarnessSwitchJournal(result); err != nil {
-		return err
-	}
-	_ = s.db.Touch()
-	return nil
-}
-
-// FinalizeCrossHarnessSupersession is the durable replacement boundary for a
-// ready fresh target. It updates only the exact source and target rows in one
-// SQLite transaction: source becomes archived with a reversible successor ID,
-// and target becomes active with its predecessor ID. No transcript/runtime is
-// deleted or overwritten, and a failed CAS leaves the source visible.
-func (s *Storage) FinalizeCrossHarnessSupersession(source, target *Instance) error {
-	if s == nil || s.db == nil || source == nil || target == nil {
-		return fmt.Errorf("cross-harness supersession storage is incomplete")
-	}
-	if source.ID == "" || target.ID == "" || source.ID == target.ID {
-		return fmt.Errorf("cross-harness supersession has invalid source/target IDs")
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sourceIdentity := statedb.NativeHarnessSwitchIdentity{
-		ID: source.ID, Tool: source.Tool, Account: source.Account, ProjectPath: source.ProjectPath, Command: source.Command,
-		ClaudeSessionID: source.ClaudeSessionID, CodexSessionID: source.CodexSessionID, ParentSessionID: source.ParentSessionID,
-	}
-	targetIdentity := statedb.NativeHarnessSwitchIdentity{
-		ID: target.ID, Tool: target.Tool, Account: target.Account, ProjectPath: target.ProjectPath, Command: target.Command,
-		ClaudeSessionID: target.ClaudeSessionID, CodexSessionID: target.CodexSessionID, ParentSessionID: target.ParentSessionID,
-	}
-	_, _, err := s.db.CommitCrossHarnessSupersession(sourceIdentity, targetIdentity, time.Now().UTC())
-	if err != nil {
-		return fmt.Errorf("commit cross-harness supersession: %w", err)
-	}
-	_ = s.db.Touch()
-	return nil
-}
-
-func nativeSwitchStorageIdentity(identity switchIdentity) statedb.NativeHarnessSwitchIdentity {
-	tool := identity.StorageTool
-	if tool == "" { // version-2 journals stored only the canonical harness.
-		tool = identity.Tool
-	}
-	return statedb.NativeHarnessSwitchIdentity{
-		ID: identity.InstanceID, Tool: tool, Account: identity.Account,
-		ProjectPath: identity.ProjectPath, Command: identity.Command,
-		ClaudeSessionID: identity.ClaudeID, CodexSessionID: identity.CodexID,
-	}
-}
-
 // UpdateTitleIfUnlocked sets an instance's title with a single conditional
 // UPDATE that only applies while the row is still unlocked at write time —
 // see StateDB.UpdateTitleIfUnlocked for why this must be a targeted write
@@ -562,7 +488,7 @@ func (s *Storage) UpdateTitleIfUnlocked(id, title string) (applied bool, err err
 
 // DeleteInstance removes a single instance from the database by ID.
 // This ensures the row is immediately removed, preventing resurrection on reload.
-func (s *Storage) DeleteInstance(id string) error {
+func (s *Storage) DeleteInstance(id string, lifecycleToken ...string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -570,7 +496,7 @@ func (s *Storage) DeleteInstance(id string) error {
 		return fmt.Errorf("storage database not initialized")
 	}
 
-	if err := s.db.DeleteInstance(id); err != nil {
+	if err := s.db.DeleteInstance(id, lifecycleToken...); err != nil {
 		return fmt.Errorf("failed to delete instance %s: %w", id, err)
 	}
 
@@ -630,6 +556,17 @@ func (s *Storage) InstanceExists(id string) (bool, error) {
 	return s.db.InstanceExists(id)
 }
 
+// WithInstancesAbsent atomically tombstones and deletes all ids, commits that
+// durable barrier, then runs confirmed cleanup. See statedb.StateDB.
+func (s *Storage) WithInstancesAbsent(ids []string, confirmed func() error, lifecycleTokens ...string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return false, fmt.Errorf("storage database not initialized")
+	}
+	return s.db.WithInstancesAbsent(ids, confirmed, lifecycleTokens...)
+}
+
 // ErrRemovalNotPersistent is returned by RemoveSessionAndVerify when, after
 // retries, the row is still observed in the database. The most likely cause
 // is a concurrent SaveInstances rewrite from another agent-deck process
@@ -675,14 +612,20 @@ var (
 // remainingInstances is the post-removal session list, used only to
 // compute group sort_order / membership for SaveGroupsOnly. groupTree may
 // be nil if the caller doesn't care to persist groups.
-func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instance, groupTree *GroupTree) error {
-	if err := s.DeleteInstance(id); err != nil {
-		return err
+func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instance, groupTree *GroupTree, lifecycleToken ...string) error {
+	s.mu.Lock()
+	if s.db == nil {
+		s.mu.Unlock()
+		return fmt.Errorf("storage database not initialized")
 	}
-	if groupTree != nil {
-		if err := s.SaveGroupsOnly(groupTree); err != nil {
-			return fmt.Errorf("failed to save groups during rm: %w", err)
-		}
+	groupRows := groupTreeRows(groupTree)
+	err := s.db.DeleteInstanceAndSaveGroups(id, groupRows, lifecycleToken...)
+	if err == nil {
+		_ = s.db.Touch()
+	}
+	s.mu.Unlock()
+	if err != nil {
+		return fmt.Errorf("delete session and save groups: %w", err)
 	}
 
 	for attempt := 0; attempt < rmVerifyAttempts; attempt++ {
@@ -698,7 +641,7 @@ func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instan
 		}
 		// Re-issue the targeted DELETE; this races against the resurrecting
 		// writer but eventually wins because every retry shrinks the window.
-		if err := s.DeleteInstance(id); err != nil {
+		if err := s.DeleteInstance(id, lifecycleToken...); err != nil {
 			return err
 		}
 	}
@@ -717,22 +660,106 @@ func (s *Storage) RemoveSessionAndVerify(id string, remainingInstances []*Instan
 // before verification. Do not retry the insertion over a deliberate deletion.
 var ErrInsertNotPersistent = errors.New("insert not persistent: row dropped by concurrent writer")
 
-// InsertSessionAndVerify inserts one new snapshot and verifies its presence.
-// The insert and optional groups commit together. Missing rows are reported to
-// the caller; retrying an UPSERT here would undo another writer's deletion.
+// insertVerifyAttempts and insertVerifyBackoff control the post-commit
+// verify loop inside InsertSessionAndVerify. The defaults absorb the
+// bounded window in which a competing rewriter can DELETE this row
+// before its own SaveInstances commits (parallel xargs -P N launches).
+// Tests override via the package-private setters so they don't sit
+// through the production backoff schedule.
+var (
+	insertVerifyAttempts = 6
+	insertVerifyBackoff  = []time.Duration{
+		20 * time.Millisecond,
+		40 * time.Millisecond,
+		80 * time.Millisecond,
+		160 * time.Millisecond,
+		320 * time.Millisecond,
+	}
+)
+
+// InsertSessionAndVerify performs a durable single-row session insert.
+//
+// Flow (v1.9.x issue #1031 fix, parallel to #909's RemoveSessionAndVerify):
+//
+//  1. CreateInstance(row) — targeted INSERT OR REPLACE on the single new
+//     row only, NOT a full-table rewrite. This is the sole creation path with
+//     authority to clear a prior deletion tombstone, and sidesteps the
+//     load-modify-write race where a sibling launch's
+//     `DELETE FROM instances WHERE id NOT IN (...)` inside
+//     SaveInstances would silently delete this row.
+//  2. SaveGroupsOnly(groupTree) — persist any group structure changes
+//     WITHOUT rewriting the instances table. Rewriting (SaveWithGroups)
+//     is the load-modify-write pattern that lets a concurrent launch
+//     drop this row; skipping it eliminates the structural race for
+//     our own write.
+//  3. Verify InstanceExists(id) is true. If not (some other process
+//     issued a SaveInstances rewrite that excluded this row because it
+//     loaded the instances slice pre-INSERT), re-issue the targeted
+//     INSERT and loop with linear backoff.
+//  4. After exhausting attempts, return ErrInsertNotPersistent so the
+//     caller can fail loudly instead of returning success on a row
+//     that's not actually there.
+//
+// instances is the post-insert session list, used only to compute group
+// sort_order / membership for SaveGroupsOnly. groupTree may be nil if
+// the caller doesn't care to persist groups.
 func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *GroupTree) error {
 	if newInstance == nil {
 		return fmt.Errorf("nil instance")
 	}
-	rows, err := s.saveWithGroups([]*Instance{newInstance}, groupTree)
+	if err := s.rejectNewGroups([]*Instance{newInstance}, groupTree); err != nil {
+		return err
+	}
+	row, err := instanceToRow(newInstance)
 	if err != nil {
 		return err
 	}
-	s.refreshCommittedGroupTitles([]*Instance{newInstance}, rows)
-	// Issue #2209: the post-start save merges with a concurrent detector's
-	// committed liveness observation instead of aborting. The instance the
-	// launch goes on to report must describe that merged row.
-	adoptCommittedLiveness(newInstance, rows[0])
+
+	if err := s.createSingleInstance(row); err != nil {
+		return err
+	}
+	newInstance.PersistenceGeneration = row.PersistenceGeneration
+	// Consume one-shot clear intent after the first successful write, so
+	// verify-retries do not re-emit the explicit empty generic_session_id
+	// snapshot. A concurrent WriteGenericSessionBinding re-bind between
+	// attempts must be preserved by sticky merge (omission), not clobbered by
+	// a stale pre-consume row (CodeRabbit #1885). The retry loop below rebuilds
+	// the row from the instance each pass, so there is nothing to rebuild here
+	// — an extra conversion at this point would be written by no one (CodeQL
+	// go/useless-assignment-to-local).
+	consumeGenericSessionIDCleared(newInstance)
+
+	if groupTree != nil {
+		if err := s.SaveGroupsOnly(groupTree); err != nil {
+			return fmt.Errorf("failed to save groups during insert: %w", err)
+		}
+	}
+
+	for attempt := 0; attempt < insertVerifyAttempts; attempt++ {
+		exists, err := s.InstanceExists(newInstance.ID)
+		if err != nil {
+			return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
+		}
+		if exists {
+			return nil
+		}
+		if attempt < len(insertVerifyBackoff) {
+			time.Sleep(insertVerifyBackoff[attempt])
+		}
+		// Re-issue the targeted INSERT; races against the concurrent
+		// rewriter but eventually wins because every retry shrinks the
+		// window. Rebuild row each retry so we never replay a stale
+		// intentional-clear snapshot after a concurrent re-bind.
+		row, err = instanceToRow(newInstance)
+		if err != nil {
+			return err
+		}
+		if err := s.createSingleInstance(row); err != nil {
+			return err
+		}
+		newInstance.PersistenceGeneration = row.PersistenceGeneration
+	}
+
 	exists, err := s.InstanceExists(newInstance.ID)
 	if err != nil {
 		return fmt.Errorf("verify insert of %s: %w", newInstance.ID, err)
@@ -743,34 +770,54 @@ func (s *Storage) InsertSessionAndVerify(newInstance *Instance, groupTree *Group
 	return nil
 }
 
-// adoptCommittedLiveness copies the liveness values the snapshot merge may
-// have resolved in favour of a concurrent writer (statedb liveness_merge.go)
-// back onto the in-memory instance: pane-derived status, activity time, and
-// the detection stamps. Everything else was written as submitted.
-func adoptCommittedLiveness(inst *Instance, row *statedb.InstanceRow) {
-	if inst == nil || row == nil {
-		return
+func (s *Storage) rejectNewGroups(candidateInstances []*Instance, groupTree *GroupTree) error {
+	if !s.restrictGroupCreation || s.db == nil {
+		return nil
 	}
-	inst.Status = Status(row.Status)
-	inst.LastAccessedAt = row.LastAccessed
-	var stamps struct {
-		Claude   int64 `json:"claude_detected_at"`
-		Gemini   int64 `json:"gemini_detected_at"`
-		OpenCode int64 `json:"opencode_detected_at"`
-		Codex    int64 `json:"codex_detected_at"`
+
+	existing := make(map[string]struct{})
+	groups, err := s.db.LoadGroups()
+	if err != nil {
+		return fmt.Errorf("load groups for creation policy: %w", err)
 	}
-	if len(row.ToolData) == 0 || json.Unmarshal(row.ToolData, &stamps) != nil {
-		return
+	for _, group := range groups {
+		existing[group.Path] = struct{}{}
 	}
-	adopt := func(dst *time.Time, unix int64) {
-		if unix > 0 && dst.Unix() != unix {
-			*dst = time.Unix(unix, 0)
+	instances, err := s.db.LoadInstances()
+	if err != nil {
+		return fmt.Errorf("load sessions for creation policy: %w", err)
+	}
+	for _, inst := range instances {
+		path := inst.GroupPath
+		if path == "" {
+			path = DefaultGroupPath
+		}
+		existing[path] = struct{}{}
+	}
+
+	candidates := make(map[string]struct{})
+	for _, inst := range candidateInstances {
+		if inst == nil {
+			continue
+		}
+		path := inst.GroupPath
+		if path == "" {
+			path = DefaultGroupPath
+		}
+		candidates[path] = struct{}{}
+	}
+	if groupTree != nil {
+		for path := range groupTree.Groups {
+			candidates[path] = struct{}{}
 		}
 	}
-	adopt(&inst.ClaudeDetectedAt, stamps.Claude)
-	adopt(&inst.GeminiDetectedAt, stamps.Gemini)
-	adopt(&inst.OpenCodeDetectedAt, stamps.OpenCode)
-	adopt(&inst.CodexDetectedAt, stamps.Codex)
+
+	for path := range candidates {
+		if _, ok := existing[path]; !ok {
+			return fmt.Errorf("%w; group %q must be created outside an Agent Deck-managed session", ErrManualGroupCreationOnly, path)
+		}
+	}
+	return nil
 }
 
 // SyncInstanceCwd swaps the persisted project_path for id to newCwd, but ONLY
@@ -890,6 +937,24 @@ func swapAdditionalPath(toolData json.RawMessage, oldCwd, newCwd string) (json.R
 	return out, nil
 }
 
+// createSingleInstance explicitly creates one row via CreateInstance. This is
+// the only normal creation path allowed to clear a durable deletion tombstone.
+// It is targeted (no DELETE-NOT-IN sweep) and wraps the
+// statedb call in the storage mutex and the nil-db guard so callers
+// stay symmetric with DeleteInstance.
+func (s *Storage) createSingleInstance(row *statedb.InstanceRow) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return fmt.Errorf("storage database not initialized")
+	}
+	if err := s.db.CreateInstance(row); err != nil {
+		return fmt.Errorf("failed to save instance %s: %w", row.ID, err)
+	}
+	_ = s.db.Touch()
+	return nil
+}
+
 // PersistRevivedInstances durably persists the status heal from a revive sweep
 // WITHOUT the full-table rewrite that SaveWithGroups performs and WITHOUT a
 // full-row INSERT OR REPLACE.
@@ -954,6 +1019,20 @@ func (s *Storage) PersistRecoveredInstances(instances []*Instance) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// consumeGenericSessionIDCleared clears the one-shot "operator cleared the
+// generic session id" intent after a write has landed.
+//
+// Must run only after the DB write succeeds: consuming before Upsert would
+// let a failed save + retry omit the key and sticky-merge resurrect the
+// pre-clear id when write-through (GetGlobal / Persist) was not used.
+func consumeGenericSessionIDCleared(insts ...*Instance) {
+	for _, inst := range insts {
+		if inst != nil {
+			inst.genericSessionIDCleared = false
+		}
+	}
 }
 
 // instanceToRow converts a session.Instance into the statedb row shape.
@@ -1026,9 +1105,6 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// never silently re-enable claude/codex account-routing treatment for a
 	// command that was never explicitly validated as one.
 	toolData = WriteSubcommandPassthroughToToolData(toolData, inst.SubcommandPassthrough)
-	// Identity-injection opt-out lives in the same extras zone so a restart
-	// from any process honours `--no-identity`.
-	toolData = WriteIdentityInjectionDisabledToToolData(toolData, inst.IdentityInjectionDisabled)
 	// #1815: the resume-identity taint travels with the id it describes, so a
 	// writer that saves a discovered conversation id without ever passing
 	// through the resume builder (e.g. `switch-account --no-restart`) cannot
@@ -1069,35 +1145,36 @@ func instanceToRow(inst *Instance) (*statedb.InstanceRow, error) {
 	// zone. For a one-shot the task IS the invocation, so a row that forgets it
 	// can only ever be "restarted" into dsh's usage error.
 	toolData = WriteDeepSeekTaskToToolData(toolData, inst.DeepSeekTask)
-	toolData = WriteCrossHarnessLineageToToolData(toolData, inst.SupersededBy, inst.Supersedes)
+	toolData = WriteOrchestrateLaunchToToolData(toolData, inst.OrchestrateLaunch)
 
 	return &statedb.InstanceRow{
-		ID:                  inst.ID,
-		Title:               inst.Title,
-		ProjectPath:         inst.ProjectPath,
-		GroupPath:           inst.GroupPath,
-		Order:               inst.Order,
-		Command:             inst.Command,
-		Wrapper:             inst.Wrapper,
-		Tool:                inst.Tool,
-		Status:              string(inst.Status),
-		TmuxSession:         tmuxName,
-		TmuxSocketName:      inst.TmuxSocketName,
-		CreatedAt:           inst.CreatedAt,
-		LastAccessed:        inst.LastAccessedAt,
-		ParentSessionID:     inst.ParentSessionID,
-		IsConductor:         inst.IsConductor,
-		NoTransitionNotify:  inst.NoTransitionNotify,
-		TitleLocked:         inst.TitleLocked,
-		AutoName:            inst.GetAutoName(),
-		AutoNameDescription: inst.GetAutoNameDescription(),
-		WorktreePath:        inst.WorktreePath,
-		WorktreeRepo:        inst.WorktreeRepoRoot,
-		WorktreeBranch:      inst.WorktreeBranch,
-		Account:             inst.Account,
-		ArchivedAt:          inst.ArchivedAt,
-		Pin:                 string(inst.Pin),
-		ToolData:            toolData,
+		PersistenceGeneration: inst.PersistenceGeneration,
+		ID:                    inst.ID,
+		Title:                 inst.Title,
+		ProjectPath:           inst.ProjectPath,
+		GroupPath:             inst.GroupPath,
+		Order:                 inst.Order,
+		Command:               inst.Command,
+		Wrapper:               inst.Wrapper,
+		Tool:                  inst.Tool,
+		Status:                string(inst.Status),
+		TmuxSession:           tmuxName,
+		TmuxSocketName:        inst.TmuxSocketName,
+		CreatedAt:             inst.CreatedAt,
+		LastAccessed:          inst.LastAccessedAt,
+		ParentSessionID:       inst.ParentSessionID,
+		IsConductor:           inst.IsConductor,
+		NoTransitionNotify:    inst.NoTransitionNotify,
+		TitleLocked:           inst.TitleLocked,
+		AutoName:              inst.GetAutoName(),
+		AutoNameDescription:   inst.GetAutoNameDescription(),
+		WorktreePath:          inst.WorktreePath,
+		WorktreeRepo:          inst.WorktreeRepoRoot,
+		WorktreeBranch:        inst.WorktreeBranch,
+		Account:               inst.Account,
+		ArchivedAt:            inst.ArchivedAt,
+		Pin:                   string(inst.Pin),
+		ToolData:              toolData,
 	}, nil
 }
 
@@ -1116,6 +1193,8 @@ func (s *Storage) SaveGroupsOnly(groupTree *GroupTree) error {
 		return nil
 	}
 
+	// Snapshot-aware, like SaveWithGroups: a group-only save must not push a
+	// field this tree never read over a newer value another writer committed.
 	batch, err := s.prepareGroupSave(groupTree)
 	if err != nil {
 		return err
@@ -1127,6 +1206,24 @@ func (s *Storage) SaveGroupsOnly(groupTree *GroupTree) error {
 	s.finishGroupSave(batch, result.Groups)
 
 	return nil
+}
+
+func groupTreeRows(groupTree *GroupTree) []*statedb.GroupRow {
+	if groupTree == nil {
+		return nil
+	}
+	groupRows := make([]*statedb.GroupRow, 0, len(groupTree.GroupList))
+	for _, g := range groupTree.GroupList {
+		groupRows = append(groupRows, &statedb.GroupRow{
+			Path:          g.Path,
+			Name:          g.Name,
+			Expanded:      g.Expanded,
+			Order:         g.Order,
+			DefaultPath:   g.DefaultPath,
+			MaxConcurrent: g.MaxConcurrent,
+		})
+	}
+	return groupRows
 }
 
 // Load reads instances from SQLite
@@ -1232,7 +1329,6 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			Color:                     color2,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
-			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1242,8 +1338,7 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
-			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
-			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
+			OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
 		}
 	}
 
@@ -1264,13 +1359,166 @@ func (s *Storage) LoadLite() ([]*InstanceData, []*GroupData, error) {
 }
 
 // LoadWithGroups reads instances and groups from SQLite, reconnects tmux sessions.
+// Both tables come from ONE read snapshot: a concurrent committed rename between
+// two reads would otherwise hand callers instances and groups that describe
+// different databases.
 func (s *Storage) LoadWithGroups() ([]*Instance, []*GroupData, error) {
 	instances, groups, _, err := s.LoadWithGroupsSnapshot()
 	return instances, groups, err
 }
 
-// LoadWithGroupsSnapshot carries the exact persisted snapshot for reload acknowledgement.
+// LoadActiveWithGroups reads only non-archived sessions and reconnects their
+// tmux sessions. Use it for active-list views so a large archive does not pay
+// the reconstruction or status-polling cost.
+func (s *Storage) LoadActiveWithGroups() ([]*Instance, []*GroupData, error) {
+	return s.loadWithGroups(true, false)
+}
+
+// LoadChildInstances loads only a parent's direct children. Follow-mode CLI
+// monitors use this narrow path so a large unrelated fleet is not rebuilt on
+// every poll.
+func (s *Storage) LoadChildInstances(parentID string) ([]*Instance, bool, error) {
+	return s.loadChildInstances(parentID, false)
+}
+
+// LoadChildInstancesIncludingArchived loads every direct child for explicit
+// inspection. Ordinary fleet polling must use LoadChildInstances.
+func (s *Storage) LoadChildInstancesIncludingArchived(parentID string) ([]*Instance, bool, error) {
+	return s.loadChildInstances(parentID, true)
+}
+
+func (s *Storage) loadChildInstances(parentID string, includeArchived bool) ([]*Instance, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		return nil, false, nil
+	}
+	parent, err := s.db.LoadInstanceByID(parentID)
+	if err != nil {
+		return nil, false, fmt.Errorf("load parent instance: %w", err)
+	}
+	if parent == nil {
+		return nil, false, nil
+	}
+	var rows []*statedb.InstanceRow
+	if includeArchived {
+		rows, err = s.db.LoadInstanceChildrenIncludingArchived(parentID)
+	} else {
+		rows, err = s.db.LoadInstanceChildren(parentID)
+	}
+	if err != nil {
+		return nil, true, fmt.Errorf("load child instances: %w", err)
+	}
+
+	data := &StorageData{Instances: make([]*InstanceData, len(rows))}
+	for idx, row := range rows {
+		data.Instances[idx] = instanceDataFromRow(row)
+	}
+	instances, _, err := s.convertToInstances(data)
+	if err != nil {
+		return nil, true, err
+	}
+	return instances, true, nil
+}
+
+func instanceDataFromRow(r *statedb.InstanceRow) *InstanceData {
+	claudeSID, claudeAt,
+		geminiSID, geminiAt,
+		geminiYolo, geminiModel,
+		opencodeSID, opencodeAt,
+		codexSID, codexAt,
+		latestPrompt, notes, loadedMCPs,
+		toolOpts,
+		sandboxJSON, sandboxContainer,
+		sshHost, sshRemotePath,
+		mrEnabled, addPaths,
+		mrTempDir, mrWorktrees,
+		channels,
+		extraArgs,
+		plugins,
+		pluginChannelLinkDisabled,
+		autoLinkedChannels,
+		color := statedb.UnmarshalToolData(r.ToolData)
+
+	return &InstanceData{
+		ID: r.ID, Title: r.Title, ProjectPath: r.ProjectPath, GroupPath: r.GroupPath,
+		Order: r.Order, ParentSessionID: r.ParentSessionID, IsConductor: r.IsConductor,
+		NoTransitionNotify: r.NoTransitionNotify, TitleLocked: r.TitleLocked, AutoName: r.AutoName,
+		AutoNameDescription: r.AutoNameDescription, Command: r.Command, Wrapper: r.Wrapper,
+		Tool: r.Tool, Status: Status(r.Status), CreatedAt: r.CreatedAt, LastAccessedAt: r.LastAccessed,
+		ArchivedAt: r.ArchivedAt, TmuxSession: r.TmuxSession, TmuxSocketName: r.TmuxSocketName,
+		WorktreePath: r.WorktreePath, WorktreeRepoRoot: r.WorktreeRepo, WorktreeBranch: r.WorktreeBranch,
+		Account: r.Account, Pin: PinMode(r.Pin), ClaudeSessionID: claudeSID, ClaudeDetectedAt: claudeAt,
+		GeminiSessionID: geminiSID, GeminiDetectedAt: geminiAt, GeminiYoloMode: geminiYolo,
+		GeminiModel: geminiModel, OpenCodeSessionID: opencodeSID, OpenCodeDetectedAt: opencodeAt,
+		CodexSessionID: codexSID, CodexDetectedAt: codexAt, LatestPrompt: latestPrompt, Notes: notes,
+		ToolOptionsJSON: toolOpts, LoadedMCPNames: loadedMCPs, Sandbox: decodeSandboxConfig(sandboxJSON),
+		SandboxContainer: sandboxContainer, SSHHost: sshHost, SSHRemotePath: sshRemotePath,
+		MultiRepoEnabled: mrEnabled, AdditionalPaths: addPaths, MultiRepoTempDir: mrTempDir,
+		MultiRepoWorktrees: mrWorktrees, Channels: channels, ExtraArgs: extraArgs, Plugins: plugins,
+		PluginChannelLinkDisabled: pluginChannelLinkDisabled, AutoLinkedChannels: autoLinkedChannels,
+		Color: color, IdleTimeoutSecs: ReadIdleTimeoutSecsFromToolData(r.ToolData),
+		OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
+		SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
+		ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
+		LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
+	}
+}
+
+// LoadArchivedWithGroups reads only archived sessions and reconnects their
+// tmux sessions for explicit archive views.
+func (s *Storage) LoadArchivedWithGroups() ([]*Instance, []*GroupData, error) {
+	return s.loadWithGroups(true, true)
+}
+
+func (s *Storage) loadWithGroups(filterArchive, archived bool) ([]*Instance, []*GroupData, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.db == nil {
+		storageLog.Debug("load_db_not_initialized", slog.String("profile", s.profile))
+		return []*Instance{}, nil, nil
+	}
+
+	// Load from SQLite
+	var (
+		dbRows []*statedb.InstanceRow
+		err    error
+	)
+	if filterArchive {
+		dbRows, err = s.db.LoadInstancesByArchive(archived)
+	} else {
+		dbRows, err = s.db.LoadInstances()
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load instances: %w", err)
+	}
+
+	dbGroups, err := s.db.LoadGroups()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to load groups: %w", err)
+	}
+
+	return s.hydrateRegistry(dbRows, dbGroups)
+}
+
+// LoadWithGroupsSnapshot reads instances and groups from one SQLite snapshot and
+// hands the raw result back alongside the hydrated model. The TUI's storage
+// watcher compares that raw snapshot against the next one to decide whether a
+// reload is even needed, so it must be the exact rows this load observed.
 func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
+	return s.loadWithGroupsSnapshot(false, false)
+}
+
+// LoadWithGroupsSnapshotForArchive reads exactly one archive partition. The
+// TUI keeps the active partition in memory for its normal path and requests
+// archived rows only when the archive filter is opened.
+func (s *Storage) LoadWithGroupsSnapshotForArchive(archived bool) ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
+	return s.loadWithGroupsSnapshot(true, archived)
+}
+
+func (s *Storage) loadWithGroupsSnapshot(filterArchive, archived bool) ([]*Instance, []*GroupData, *statedb.RegistrySnapshotResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1279,12 +1527,24 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		return []*Instance{}, nil, nil, nil
 	}
 
-	// Load from SQLite
-	snapshot, err := s.db.LoadRegistrySnapshot()
+	var snapshot *statedb.RegistrySnapshotResult
+	var err error
+	if filterArchive {
+		snapshot, err = s.db.LoadRegistrySnapshotByArchive(archived)
+	} else {
+		snapshot, err = s.db.LoadRegistrySnapshot()
+	}
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	dbRows, dbGroups := snapshot.Instances, snapshot.Groups
+	instances, groups, err := s.hydrateRegistry(snapshot.Instances, snapshot.Groups)
+	return instances, groups, snapshot, err
+}
+
+// hydrateRegistry converts loaded rows into live instances and groups and
+// records the per-row storage snapshots that saveWithGroups needs to tell an
+// edit apart from a field that simply went unread. Callers already hold s.mu.
+func (s *Storage) hydrateRegistry(dbRows []*statedb.InstanceRow, dbGroups []*statedb.GroupRow) ([]*Instance, []*GroupData, error) {
 
 	// Convert to InstanceData for the existing convertToInstances pipeline
 	data := &StorageData{
@@ -1311,6 +1571,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		sandboxCfg := decodeSandboxConfig(sandboxJSON)
 
 		data.Instances[i] = &InstanceData{
+			PersistenceGeneration:     r.PersistenceGeneration,
 			ID:                        r.ID,
 			Title:                     r.Title,
 			ProjectPath:               r.ProjectPath,
@@ -1366,7 +1627,6 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			Color:                     color,
 			IdleTimeoutSecs:           ReadIdleTimeoutSecsFromToolData(r.ToolData),
 			SubcommandPassthrough:     ReadSubcommandPassthroughFromToolData(r.ToolData),
-			IdentityInjectionDisabled: ReadIdentityInjectionDisabledFromToolData(r.ToolData),
 			ClaudeSessionIDUnverified: ReadClaudeSessionUnverifiedFromToolData(r.ToolData),
 			LastStartedAt:             ReadLastStartedAtFromToolData(r.ToolData),
 			GenericSessionID:          ReadGenericSessionIDFromToolData(r.ToolData),
@@ -1376,8 +1636,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 			GenericSessionLocation:    genericScopeLocation(r.ToolData),
 			LastActivityAt:            ReadLastActivityAtFromToolData(r.ToolData),
 			DeepSeekTask:              ReadDeepSeekTaskFromToolData(r.ToolData),
-			SupersededBy:              ReadCrossHarnessSupersededByFromToolData(r.ToolData),
-			Supersedes:                ReadCrossHarnessSupersedesFromToolData(r.ToolData),
+			OrchestrateLaunch:         ReadOrchestrateLaunchFromToolData(r.ToolData),
 		}
 	}
 
@@ -1403,7 +1662,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		for _, inst := range instances {
 			original, convertErr := instanceToRow(inst)
 			if convertErr != nil {
-				return nil, nil, nil, convertErr
+				return nil, nil, convertErr
 			}
 			stored := byID[inst.ID]
 			if stored != nil && stored.GroupPath == DefaultGroupName {
@@ -1419,7 +1678,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 		}
 		if legacy := groupsByPath[DefaultGroupName]; legacy != nil {
 			if groupsByPath[DefaultGroupPath] != nil {
-				return nil, nil, nil, fmt.Errorf("legacy default group migration conflicts with existing %q group", DefaultGroupPath)
+				return nil, nil, fmt.Errorf("legacy default group migration conflicts with existing %q group", DefaultGroupPath)
 			}
 			groupsByPath[DefaultGroupPath] = legacy
 		}
@@ -1433,7 +1692,7 @@ func (s *Storage) LoadWithGroupsSnapshot() ([]*Instance, []*GroupData, *statedb.
 				original: original, stored: statedb.CloneGroupRow(stored)}
 		}
 	}
-	return instances, groups, snapshot, err
+	return instances, groups, err
 }
 
 // SaveRecentSession captures a deleted session's config for quick re-creation.
@@ -1621,6 +1880,7 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 		projectPath := ExpandPath(fixMalformedTildePath(instData.ProjectPath))
 
 		inst := &Instance{
+			PersistenceGeneration:        instData.PersistenceGeneration,
 			ID:                           instData.ID,
 			Title:                        instData.Title,
 			ProjectPath:                  projectPath,
@@ -1639,8 +1899,6 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			CreatedAt:                    instData.CreatedAt,
 			LastAccessedAt:               instData.LastAccessedAt,
 			ArchivedAt:                   instData.ArchivedAt,
-			SupersededBy:                 instData.SupersededBy,
-			Supersedes:                   instData.Supersedes,
 			WorktreePath:                 instData.WorktreePath,
 			WorktreeRepoRoot:             instData.WorktreeRepoRoot,
 			WorktreeBranch:               instData.WorktreeBranch,
@@ -1669,9 +1927,9 @@ func (s *Storage) convertToInstances(data *StorageData) ([]*Instance, []*GroupDa
 			AutoLinkedChannels:           instData.AutoLinkedChannels,
 			Color:                        instData.Color,
 			IdleTimeoutSecs:              instData.IdleTimeoutSecs,
+			OrchestrateLaunch:            instData.OrchestrateLaunch,
 			DeepSeekTask:                 instData.DeepSeekTask,
 			SubcommandPassthrough:        instData.SubcommandPassthrough,
-			IdentityInjectionDisabled:    instData.IdentityInjectionDisabled,
 			LastStartedAt:                instData.LastStartedAt,
 			GenericSessionID:             instData.GenericSessionID,
 			GenericDetectedAt:            instData.GenericDetectedAt,
