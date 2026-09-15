@@ -2,6 +2,7 @@ package marketplace
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -103,11 +104,37 @@ const logLimit = 64 * 1024
 
 // checkoutState is shared by every profile. Cache task state belongs in profiles/.
 type checkoutState struct {
-	SchemaVersion int       `json:"schema_version"`
-	Revision      string    `json:"revision"`
-	LastSuccess   time.Time `json:"last_success"`
-	NextAttempt   time.Time `json:"next_attempt"`
-	Failures      int       `json:"failures"`
+	SchemaVersion   int                      `json:"schema_version"`
+	Revision        string                   `json:"revision"`
+	LastSuccess     time.Time                `json:"last_success"`
+	NextAttempt     time.Time                `json:"next_attempt"`
+	Failures        int                      `json:"failures"`
+	CallbackRetries map[string]callbackRetry `json:"callback_retries,omitempty"`
+}
+
+// Bound profile retry metadata inside the existing 8 KiB state file.
+const callbackRetryLimit = 32
+
+type callbackRetry struct {
+	Failures    int       `json:"failures"`
+	NextAttempt time.Time `json:"next_attempt"`
+}
+
+func callbackProfileKey(home string) (string, error) {
+	profile := os.Getenv("CODEX_HOME")
+	if profile == "" {
+		profile = filepath.Join(home, ".codex")
+	}
+	profile, err := filepath.Abs(profile)
+	if err != nil {
+		return "", errors.New("marketplace: invalid profile path")
+	}
+	if canonical, err := filepath.EvalSymlinks(profile); err == nil {
+		profile = canonical
+	} else if !os.IsNotExist(err) {
+		return "", errors.New("marketplace: profile path unavailable")
+	}
+	return fmt.Sprintf("%x", sha256.Sum256([]byte(profile))), nil
 }
 
 func loadState(dir string) (checkoutState, error) {
@@ -122,6 +149,14 @@ func loadState(dir string) (checkoutState, error) {
 	if state.SchemaVersion != 1 || state.Failures < 0 || state.Failures > 5 || state.Revision != "" && !validRevision(state.Revision) {
 		return state, errors.New("marketplace: invalid checkout state")
 	}
+	if len(state.CallbackRetries) > callbackRetryLimit {
+		return state, errors.New("marketplace: too many callback retries")
+	}
+	for key, retry := range state.CallbackRetries {
+		if len(key) != 64 || !validRevision(key) || retry.Failures < 1 || retry.Failures > 5 || retry.NextAttempt.IsZero() {
+			return state, errors.New("marketplace: invalid callback retry")
+		}
+	}
 	return state, nil
 }
 
@@ -130,7 +165,7 @@ func loadState(dir string) (checkoutState, error) {
 func saveState(dir string, state checkoutState) error {
 	state.SchemaVersion = 1
 	data, err := json.Marshal(state)
-	if err != nil {
+	if err != nil || len(data) > stateLimit {
 		return errors.New("marketplace: encode state")
 	}
 	path := filepath.Join(dir, "checkout.json")

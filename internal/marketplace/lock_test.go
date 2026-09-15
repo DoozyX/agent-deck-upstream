@@ -17,6 +17,7 @@ func TestManagedCheckoutProcessHelper(t *testing.T) {
 	if home == "" {
 		return
 	}
+	trustedGitPath = filepath.Join(home, "bin", "git")
 	id := os.Getenv("MARKETPLACE_TEST_ID")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -121,6 +122,10 @@ func TestManagedCheckoutCrashReleasesLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	state.NextAttempt = time.Now().Add(-time.Second)
+	for key, retry := range state.CallbackRetries {
+		retry.NextAttempt = time.Now().Add(-time.Second)
+		state.CallbackRetries[key] = retry
+	}
 	if err = saveState(StateDir(f.home), state); err != nil {
 		t.Fatal(err)
 	}
