@@ -148,7 +148,7 @@ func registeredClone(config nativeConfig, clone string) bool {
 
 func supportedRuntime(argv []string) bool { return runtimeIdentity(argv) != "" }
 
-// The SHA-256 binds the version string to the exact Task 01 executable, without
+// The SHA-256 binds the version string to a disposable-proof executable, without
 // running an unproven binary to ask it for its own identity. Never cache by path.
 var nativeBinaryHash = hashNativeBinary
 
@@ -253,22 +253,31 @@ func nativeOutput(ctx context.Context, home string, argv []string, args ...strin
 }
 
 func runtimeIdentity(argv []string) string {
-	var fingerprint, version string
+	var version string
+	var fingerprints []string
 	switch {
 	case len(argv) == 3 && argv[0] == "/Applications/ChatGPT.app/Contents/Resources/codex" && argv[1] == "--disable" && argv[2] == "apps":
-		fingerprint = "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb"
 		version = "codex-cli 0.154.0-alpha.6.2"
+		fingerprints = []string{
+			"ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb", // Task 01.
+			"a1d2f191e70023ed7afd619bc70530f26067a085926e03bae50cf5c0f8298bcf", // Task 03 primary candidate proof.
+		}
 	case len(argv) == 1 && argv[0] == "/opt/homebrew/Caskroom/codex/0.154.0/bin/codex.real":
-		fingerprint = "4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc"
 		version = "codex-cli 0.154.0"
+		fingerprints = []string{"4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc"}
 	default:
 		return ""
 	}
 	actual, err := nativeBinaryHash(argv[0])
-	if err != nil || actual != fingerprint {
+	if err != nil {
 		return ""
 	}
-	return strings.Join(argv, "\x00") + "\x00" + version + "\x00sha256:" + fingerprint
+	for _, fingerprint := range fingerprints {
+		if actual == fingerprint {
+			return strings.Join(argv, "\x00") + "\x00" + version + "\x00sha256:" + fingerprint
+		}
+	}
+	return ""
 }
 
 // Only selected cache roots belong to the rollback write set. Config is backed

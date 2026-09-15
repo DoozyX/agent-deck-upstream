@@ -295,7 +295,7 @@ func TestNativeRefreshDisposableReplay(t *testing.T) {
 	if err := saveState(StateDir(host), checkoutState{Revision: revision, LastSuccess: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}
-	report := map[string]any{"revision": revision, "runtime_argv": approvedTestArgv, "status": "fail"}
+	report := map[string]any{"revision": revision, "runtime_argv": approvedTestArgv, "runtime_identity": runtimeIdentity(approvedTestArgv), "status": "fail"}
 	var commands []map[string]any
 	defer func() {
 		report["commands"] = commands
@@ -686,10 +686,21 @@ func TestNativeRefreshBindsEligibilityToBackup(t *testing.T) {
 }
 
 func TestNativeRefreshRuntimeIdentityIncludesProvenBinary(t *testing.T) {
-	testProvenRuntime(t)
-	id := runtimeIdentity(approvedTestArgv)
-	if !strings.Contains(id, "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb") || !strings.Contains(id, "codex-cli 0.154.0-alpha.6.2") {
-		t.Fatalf("runtime identity lacks proven fingerprint/version: %q", id)
+	previous := nativeBinaryHash
+	defer func() { nativeBinaryHash = previous }()
+	for _, proof := range []struct {
+		argv          []string
+		hash, version string
+	}{
+		{approvedTestArgv, "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb", "codex-cli 0.154.0-alpha.6.2"},
+		{approvedTestArgv, "a1d2f191e70023ed7afd619bc70530f26067a085926e03bae50cf5c0f8298bcf", "codex-cli 0.154.0-alpha.6.2"},
+		{[]string{"/opt/homebrew/Caskroom/codex/0.154.0/bin/codex.real"}, "4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc", "codex-cli 0.154.0"},
+	} {
+		nativeBinaryHash = func(string) (string, error) { return proof.hash, nil }
+		id := runtimeIdentity(proof.argv)
+		if !strings.Contains(id, proof.hash) || !strings.Contains(id, proof.version) {
+			t.Fatalf("proven runtime rejected or identity lost: %q", id)
+		}
 	}
 }
 
