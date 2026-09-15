@@ -1,3 +1,30 @@
+## Test ownership and command completion
+
+Before a verification wave, the conductor records in the manifest's verification
+contract one full-suite owner for the worktree, immutable HEAD, clean-tree state
+and relevant environment (test command/configuration and required services).
+Default to the current top-level reviewer for review verification; implementation
+or integration workers own their required suites in their respective stages.
+Pass the assignment and result/log path in the spec/task block of every child.
+Reviewers must pass them on to layer subagents, including execution rules for
+the spec-blind adversarial layer without revealing the spec.
+
+An existing run for that identity is collected, not duplicated. Completed
+results may be reused only when revision, tree state, environment and required
+checks match and the log, terminal exit code and duration are available. Do not
+certify a dirty or changing tree by HEAD alone. A changed revision or environment
+requires new evidence; finish or explicitly stop the old owned run before
+starting its replacement in the same worktree. Reassign ownership explicitly
+when the owner exits; an idle/waiting session status does not prove its jobs
+have stopped. Preserve independent static review and necessary focused checks.
+
+Every rendered child carries `prompts/command-execution.md`. Preserve the full
+command result, retain live handles, and poll until terminal exit or deadline.
+For externally owned runs, the conductor routes the completed receipt. Missing
+or expired evidence blocks acceptance; it does not authorize overlapping retries.
+Use repository-specific targeted-test commands; do not copy a package-manager
+argument separator without checking which files the runner actually selects.
+
 ## Per-task pipeline
 
 ### 1. Implement
@@ -160,20 +187,16 @@ fix round that touched the screen the implementer recaptures the pair and the
 judge runs again; a UI task's loop ends only on a clean full-branch verdict
 **and** a reveal with `regressions=0`.
 
-The rendered prompt starts the full suite detached into
-`<verdict-file>.suite.log` before the reviewer reads anything and runs the
-layers as parallel subagents while it runs — measured over six rounds, the
-suite (2–6 min) and the serial in-context layers (2.5–6 min) were the whole
-cost of an 8-minute round, and overlapping them is what brings a round to
-~4 min. It makes the reviewer read-only with exactly two permitted
-writes (the verdict file and that log, both outside the repo), forbids every working-tree-rewriting
-command in a worktree it may share with a live implementer, runs the review
-layers with `adversarial` **first and spec-blind**, threads spec compliance
-through the other layers, hands over the implementer's baseline as
-not-a-finding, makes the reviewer reproduce user-visible criteria itself
-(`Seen:` lines) and score any `## Quality bar` anchors (`Scored:` lines,
-below-threshold = `major`), and demands the `## Merged findings` anchor plus
-a machine-readable `VERDICT:` line.
+The rendered prompt resolves suite ownership before testing. The assigned
+owner starts at most one managed background suite and retains its command
+handle; other children reuse its matching result. All layers receive the
+ownership/execution rules. Static review proceeds while the suite runs, then
+the reviewer collects terminal exit evidence before issuing a clean verdict. The prompt
+keeps review read-only, forbids working-tree rewrites, runs adversarial review
+spec-blind, threads spec compliance through the other layers, and compares
+failures with the recorded baseline. It still requires user-visible `Seen:`
+and `Scored:` evidence where applicable, the `## Merged findings` anchor,
+and a machine-readable `VERDICT:` line.
 
 **The verdict-file interface (the conductor owns the path).** `VERDICT_FILE` is
 always `$RUN_DIR/<task-slug>/review-r<n>.md` — the same run
@@ -306,7 +329,8 @@ bash "$RUN_DIR/prompts/render.sh" review-round "$RUN_DIR/<slug>/review-r<n+1>-pr
 ```
 
   It carries the same read-only contract and verdict format as the full
-  review: the full suite starts detached first, the layers take `git diff
+  review: the full suite is started or reused under the ownership contract;
+  the layers take `git diff
   <reviewed-sha>...HEAD` as their focus and `git diff <base-ref>...HEAD` as
   their scope, the focused tests run in the foreground, every unfixed prior
   finding is a new finding, and already-dispositioned items are not
@@ -319,7 +343,8 @@ bash "$RUN_DIR/prompts/render.sh" review-round "$RUN_DIR/<slug>/review-r<n+1>-pr
   superseded reviewer** (see "Deleting finished sessions").
 - **`VERDICT: clean` from **any** round is terminal for the task** — round 1
   or any later round — because every round reviews the whole branch with the
-  full suite run fresh. Proceed to the PR. A repeated in-scope defect across
+  full suite verified for the current revision and environment. Proceed to the
+  PR. A repeated in-scope defect across
   rounds is reviewer oscillation and escalates the reviewer tier; preventive
   or adjacent scope is never smuggled into the branch merely because a late
   round mentioned it — such findings get a one-line disposition in the

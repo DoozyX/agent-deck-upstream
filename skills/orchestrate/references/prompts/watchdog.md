@@ -81,3 +81,5 @@ If a later wake shows the same stall, escalate instead of nudging again.
 `terminal-notifier -title "agent-deck orchestrate" -message "<why, one line>"`
 — and append the reason plus a short pane excerpt to
 `{{RUN_DIR}}/watchdog.log`. The prompt stays unanswered for the user.
+
+{{include:command-execution.md}}

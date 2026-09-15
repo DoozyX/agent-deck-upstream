@@ -10,3 +10,5 @@ Use `tdd`, `debug` and `verify` as you work. Do not spawn your own review
 loop — a fresh reviewer runs after you. End your final message with the
 `===AGENTDECK_DONE=== status=<ok|fail> summary=<one line>` sentinel as the
 last line, after any `VERDICT:` line your prompt also mandates.
+
+{{include:command-execution.md}}
