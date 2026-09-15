@@ -5,7 +5,6 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 ## Table of Contents
 
 - [Top-Level](#top-level)
-- [[quick_create] Section](#quick_create-section)
 - [[shell] Section](#shell-section)
 - [[claude] Section](#claude-section)
 - [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides)
@@ -20,8 +19,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[worktree] Section](#worktree-section)
 - [[fork] Section](#fork-section)
 - [[conductor] Section](#conductor-section)
-- [[orchestrate] Section](#orchestrate-section)
-- [[usage.policy] Section](#usagepolicy-section)
+- [[launch] Section](#launch-section)
 - [[logs] Section](#logs-section)
 - [[updates] Section](#updates-section)
 - [[interval_hooks.*] Section](#interval_hooks-section)
@@ -30,7 +28,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[global_search] Section](#global_search-section)
 - [[notifications] Section](#notifications-section)
 - [[performance] Section](#performance-section)
-- [[desktop_notifications] Section](#desktop_notifications-section)
+- [[tmux] Section](#tmux-section)
 - [Skills Registry (Outside config.toml)](#skills-registry-outside-configtoml)
 - [[mcp_pool] Section](#mcp_pool-section)
 - [[mcps.*] Section](#mcps-section)
@@ -43,7 +41,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 default_tool = "claude"   # Pre-selected tool when creating sessions
 default_path = ""         # Fallback project directory for add/launch without a path
 sync_title   = true       # Let agents rename sessions from their session-name
-push_title   = true       # Derive a stable Claude peer address from title + id
+push_title   = true       # Use the exact deck title at supported Claude startup
 group_sort   = "creation" # within-group order: "creation" (default) or "actionable"
 ```
 
@@ -52,47 +50,16 @@ group_sort   = "creation" # within-group order: "creation" (default) or "actiona
 | `default_tool` | string | `"claude"` | Pre-selected tool when creating sessions. |
 | `default_path` | string | `""` | Fallback project directory for `add` and `launch` when no path argument is given (#1303). Resolution chain: explicit path arg (including `.`, which always means the current directory) → target group's `default_path` (DB-resident, set via `group update` or the TUI) → this key → cwd. Supports `~` and `$VAR` expansion; silently skipped if the directory doesn't exist. |
 | `sync_title` | bool | `true` | When `true`, agent-deck overwrites a session's title with the agent's own session-name (e.g. Claude's `--name` / `/rename`, issues #572/#697). Set `false` to keep the title you gave the session — globally, for every tool. A title you supply explicitly is already exempt: `add -t`, `launch -t`, the TUI New Session dialog, an explicit fork title, and `rename` all lock the title on creation (#1615/#1715), so only auto-derived folder-name titles follow the agent. The per-session title-lock (`agent-deck session set-title-lock <id> on|off`) remains as a finer-grained override. Also toggleable in the TUI Settings panel (`S`) under **SESSIONS**. |
-| `push_title` | bool | `true` | Derive a stable, collision-resistant Claude peer address from the deck title plus immutable session id and pass it as `--name <address>` on supported start/restart/resume commands. The address is ASCII-safe and bounded; invalid UTF-8, control/bidirectional-control characters and line separators omit the default. An explicit `--name`/`-n` override wins. Missing settings default to enabled; configuration read/parse errors disable automatic naming. A deck rename applies on the next supported startup. No running prompt receives input. |
+| `push_title` | bool | `true` | Pass the exact deck title as `--name <title>` on supported Claude start/restart/resume commands. Case, punctuation, Unicode and long names are preserved; invalid UTF-8, control/bidirectional-control characters and line separators omit the default. An explicit `--name`/`-n` override wins. Missing settings default to enabled; configuration read/parse errors disable automatic naming. A deck rename applies on the next supported startup. No running prompt receives input. |
 | `group_sort` | string | `"creation"` | Order of sessions within a group. `"creation"` (default) keeps the order sessions were created in, and respects the `K`/`J` manual reorder. `"actionable"` restores the issue #857 sort that surfaces the most recently actionable sessions (error → waiting → running → idle → stopped, then recency) to the top of each group. Pin and Maestro rows are unaffected by this setting. |
 
-## [desktop_notifications] Section
+### Startup naming boundaries
 
-macOS-only actionable desktop notifications. This feature is disabled unless explicitly enabled. Agent Deck emits only completion, attention-needed, and error events; clicking a banner focuses and attaches the referenced session through the normal `session focus <id> --attach` command.
+Claude Code 2.1.261 documents `-n, --name <name>` in its installed CLI help. The normal Claude command builder, including configured Claude command aliases that forward the same arguments, passes the name to the same startup process as its conversation ID and account environment. Forks receive the child's title. Existing account and worker-scratch selection remains in the startup builder; naming does not consult any account's session registry.
 
-```toml
-[desktop_notifications]
-enabled = true
-```
+Automatic names are omitted for other agents, arbitrary per-session custom commands, unbound continue/resume-picker modes, and extra arguments that override conversation selection. Custom commands and older Claude versions must support their own explicit naming arguments; agent-deck does not probe or emulate them through a running prompt. Configure `push_title = false` for a Claude version without `--name` support. Configured aliases must forward Claude's documented arguments and preserve their intended account selection.
 
-Run `agent-deck desktop-notifications helper` from the logged-in GUI session, then use `agent-deck desktop-notifications doctor` to verify the private helper socket and action routing. Existing Claude hooks, `terminal-notifier` scripts, and LaunchAgents are never modified automatically.
-
-| Key | Type | Default | Description |
-| --- | --- | --- | --- |
-| `enabled` | bool | `false` | Enable the macOS desktop-notification transport. |
-
-## Alternate quick-create
-
-Configures an optional second, no-dialog quick-create action. Normal
-quick-create (`N` by default) keeps its existing contextual behavior.
-
-```toml
-default_tool = "claude"
-
-[hotkeys]
-quick_create_alternate = "ctrl+n"
-```
-
-`quick_create_alternate` is unbound by default. Binding `ctrl+n` replaces the
-overview's Emacs-style move-down chord; Down Arrow and `j` continue to navigate.
-The primary is `default_tool` (Claude when unset). The alternate is inferred as
-the first visible, installed, non-shell entry in the existing picker order that
-differs from the primary. If the context is already the alternate, the action
-selects the primary. It reuses contextual path, group, and automatic naming,
-clears inherited tool-specific options, never opens the new-session dialog, and
-is local-only.
-
-The deprecated `[quick_create].alternate_tool` key remains parseable but is
-ignored and produces a warning.
+Safe live rename remains a separate deliverable requiring an agent-side acknowledgement protocol. This startup behavior does not establish full naming parity or resolve every concern in #2088; that issue remains open. Existing inbound title reconciliation is unchanged.
 
 ## [shell] Section
 
@@ -216,7 +183,7 @@ env_file   = "~/.agent-deck/groups/work.env"
 command    = "claude-wrapper"        # Per-group claude command/wrapper
 model      = "claude-sonnet-4-6"     # Model default for sessions in this group
 env        = { AGENT_ROLE = "work", CLAUDE_CODE_EFFORT_LEVEL = "high" }
-skills     = ["my-store/loom"]       # Managed CLAUDE_CONFIG_DIR/skills entries
+skills     = ["my-store/loom"]       # Managed project-skill symlinks
 plugins    = ["octopus"]             # Top-level [plugins.X] catalog keys
 mcps       = ["memory"]              # Declarative loadout ([mcps.X] catalog names)
 
@@ -231,7 +198,7 @@ mcps       = ["memory"]              # Declarative loadout ([mcps.X] catalog nam
 | `command` | string | Claude command/wrapper for these sessions. Resolution: conductor > group (ancestor-walking) > `[claude].command` > `"claude"`. Like the global `command`, a non-`"claude"` value suppresses the `CLAUDE_CONFIG_DIR=` spawn prefix (the wrapper is assumed to handle it). |
 | `model` | string | Model default for these sessions. Resolution: explicit per-session model (`--model`, dialog) > conductor > group (ancestor-walking) > no flag (Claude's own default). Empty falls through — the global `default_model` remains a new-session-dialog prefill only. Resolved at every start/restart, so config edits apply without re-creating sessions. |
 | `env` | inline table | Env vars exported in the spawn command AFTER the `env_file` source — an inline key deterministically wins over the same key from the file. Merge order per key: ancestor groups (root-first) → exact group → conductor. Parent-only keys persist through the merge. |
-| `skills` | array | Declarative Claude-home skills (`"<source>/<name>"` entries against the skill-source registry). Materialized under the effective `CLAUDE_CONFIG_DIR/skills` at session create and re-asserted before every start/restart. Attach-only floor: config removal never detaches and foreign targets are never clobbered. |
+| `skills` | array | Declarative project skills (`"<source>/<name>"` entries against the skill-source registry). Materialized at session create and re-asserted before every start/restart. Attach-only floor: config removal never detaches and foreign targets are never clobbered. Workspace trust is seeded only after an attachment succeeds. |
 | `plugins` | array | Top-level `[plugins.X]` catalog keys appended to `Instance.Plugins`. Existing manual plugin selections are preserved. Catalog refusal and validation rules remain authoritative. |
 | `mcps` | array | Declarative MCP loadout (`[mcps.X]` catalog names appended to the session's local `.mcp.json`). Same attach-only floor semantics; unknown catalog names skip with a warning. |
 
@@ -243,137 +210,18 @@ agent-deck group show work --resolved
 agent-deck group show work --resolved --json
 ```
 
-Claude group and conductor skill ownership is recorded at
-`<CLAUDE_CONFIG_DIR>/.agent-deck/skills.toml`; declarative skills do not modify
-repositories. Explicit `agent-deck skill attach` remains project-scoped at
-`<project>/.claude/skills` with its project ownership manifest. Any groups or
-conductors sharing one physical Claude home must resolve the same declarative
-skill set; otherwise agent-deck blocks launch and requires standardized skills
-or a distinct `config_dir`. Symlink and case-insensitive filesystem aliases
-count as one home, missing case-only paths are treated conservatively as one
-prospective home, and a path containing `..` is rejected.
-
-## Per-group Codex loadouts
-
-Codex groups can select an isolated `CODEX_HOME`, declaratively materialize
-group skills into that home's `skills` directory, or append catalog MCPs to
-that home's `config.toml`:
-
-```toml
-[groups."work".codex]
-config_dir = "~/.agent-deck/codex/work"
-env_file = "~/.agent-deck/groups/work-codex.env"
-command = "codex"
-model = "gpt-5.6-terra"
-reasoning_effort = "medium"
-skills = ["team/review"]
-mcps = ["context7"]
-plugins = ["agent-deck@team"]
-```
-
-Native Codex plugins are deliberately not installed during session startup.
-After configuring the group's Codex marketplace, sync them explicitly:
-
-```bash
-agent-deck group codex sync work
-```
-
-The command runs `codex plugin add` with the group's `CODEX_HOME`; repeated
-syncs are safe to run and any marketplace/authentication errors are reported.
-
-Codex group skills are reconciled automatically at session create and before
-start/restart. Their ownership manifest lives at
-`<CODEX_HOME>/.agent-deck/skills.toml`; repositories are not modified. Explicit
-`agent-deck skill attach` remains project-scoped at `<project>/.agents/skills`.
-If a child group needs additional skills, give it a distinct `config_dir`.
-Agent-deck rejects divergent skill sets that resolve to one shared home rather
-than leaking child-only tools into sibling sessions, and rejects a command-level
-`CODEX_HOME` that differs from the configured home. Symlink and case-insensitive
-filesystem aliases count as the same physical home for these checks. Homes
-containing a `..` path component are rejected. Existing repo-local links from
-older versions are left intact because their original manual versus
-declarative intent is unknown; detach those explicitly after verifying the
-home-scoped copy.
-
-## Global loadout floors
-
-Entries that belong in every group can be declared once on `[claude]` or
-`[codex]` instead of repeated in each group stanza:
-
-```toml
-[claude]
-skills = ["shared/port-registry"]
-plugins = ["agent-deck"]
-mcps = ["context7"]
-
-[codex]
-skills = ["shared/port-registry"]
-marketplaces = ["/srv/marketplaces/team"]
-plugins = ["andrej-karpathy-skills@karpathy-skills"]
-```
-
-The global list resolves as the **outermost ancestor**, so the effective
-loadout is `(global ∪ root group ∪ … ∪ leaf group)`, root-first and
-deduplicated. Two consequences worth knowing:
-
-- Sessions with **no group at all** still receive the floor. That is the point
-  of a floor, and it is the one way a loadout reaches an ungrouped session.
-- A group **cannot subtract** from the floor. Omitting an entry from a group
-  list does not remove it, matching the existing attach-only rule that removing
-  an entry from config.toml never detaches it.
-
-Codex home skills still require an isolated `config_dir`. When only the global
-floor contributes skills and no group in the chain declares a `config_dir`, the
-skills are skipped quietly rather than failing the spawn — there would be no
-per-group home to materialize them into, and writing them to the shared default
-home would leak the floor across unrelated sessions.
-
-## Diagnosing drift: `config doctor`
-
-`config.toml` declares; the agent homes on disk contain. Those diverge silently,
-because provisioning is an attach-only floor applied at session create/start:
-a new entry does not materialize until the next session in that group starts,
-and a removed entry is never detached. `agent-deck config doctor` reports the
-gap:
-
-```bash
-agent-deck config doctor              # human-readable, grouped by check
-agent-deck config doctor --json       # machine-readable
-agent-deck config doctor --quiet      # errors and warnings only
-agent-deck config doctor --check tool-asymmetry
-```
-
-Checks, by severity:
-
-| Check | Severity | Catches |
-|---|---|---|
-| `codex-notify-missing` | error | A Codex home with no root-level `notify`, so sessions never report turn completion. Also catches a `notify` key nested inside another table (`[tui]`), which parses as `tui.notify` and silently never fires — grep cannot see TOML table scope. |
-| `unknown-catalog-ref` | error | A loadout naming an `[mcps.X]` / `[plugins.X]` key that does not exist. |
-| `home-unreadable` | error | A configured home that is missing or unparseable. An *inferred* `~/.claude` that does not exist is not reported — that just means Claude is unused here. |
-| `declared-not-materialized` | warn | Declared for a group but absent from the home. Expected right after a config edit; converges on next session start or `agent-deck group codex sync`. |
-| `tool-asymmetry` | warn | Declared for one tool but not the other in a group that declares both. A group declaring only one side has expressed no opinion about the other and stays quiet. |
-| `marketplace-source-conflict` | warn | One marketplace name resolving to different sources across homes, so the same plugin selector means different code. |
-| `undeclared-in-home` | info | Present in a home but declared nowhere. Hand-installing is legitimate; the doctor makes it visible rather than forbidding it. |
-
-The command is read-only and never repairs. Exit status is 1 when any
-error-severity finding is present, so it can gate a sync script; warnings and
-info never fail the run.
-
 ## [group_defaults] Section
 
-Defaults for **newly-created** groups plus policy controlling who may create
-them. Existing groups are unaffected by creation defaults.
+Defaults stamped onto **newly-created** groups. Existing groups are unaffected.
 
 ```toml
 [group_defaults]
-max_concurrent = 3          # new groups cap at 3 concurrent sessions
-manual_creation_only = true # managed agent sessions may use existing groups only
+max_concurrent = 3   # new groups cap at 3 concurrent sessions
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `max_concurrent` | int | `1` (serial) | `max_concurrent` for new groups created via `group create`, the TUI/web create dialogs, and the launch/session auto-create paths. `0` = unlimited, `1` = serial, `N` = cap. Unset keeps the built-in serial default. An explicit `group create --max-concurrent N` flag overrides this per group; existing groups keep their stored value. |
-| `manual_creation_only` | bool | `false` | When `true`, CLI commands run inside an Agent Deck-managed session may target existing groups but fail if they would create a group explicitly or automatically. Create groups from the main TUI, web UI, declarative `[groups]` config, or a normal terminal outside Agent Deck. |
 
 ## [gemini] Section
 
@@ -421,24 +269,16 @@ Codex CLI integration settings.
 [codex]
 command = "codex"  # Codex CLI command or alias
 yolo_mode = true   # Enable --yolo (bypass approvals and sandbox)
-default_model = "gpt-5.6"               # Used unless a session/group overrides it
-default_reasoning_effort = "high"       # Used unless a session/group overrides it
 env_file = "~/.codex.env"
-
-[codex.tui]
-status_line = ["model-with-reasoning", "context-used", "git-branch"]
-status_line_use_colors = true
+command = "codex"
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `command` | string | `codex` | Codex CLI command or alias to launch built-in Codex sessions. Examples: `codex-v2`, `CODEX_HOME=~/.codex-work codex`. |
 | `yolo_mode` | bool | `false` | Maps to `codex --yolo` (`--dangerously-bypass-approvals-and-sandbox`). Can be overridden per-session. |
-| `default_model` | string | `""` | Default passed to Codex as `--model` when no explicit session or group model is set. Agent Deck reconciles it into the selected group `CODEX_HOME/config.toml`. |
-| `default_reasoning_effort` | string | `""` | Default passed as `--config model_reasoning_effort=…` when no explicit session or group value is set. Agent Deck reconciles it into the selected group home. |
 | `env_file` | string | `""` | A .env file sourced for Codex sessions only. See [Path Resolution](#path-resolution). |
-| `tui.status_line` | array | unset | Ordered footer items merged into every resolved group `CODEX_HOME/config.toml`. Set `[]` to hide the footer. |
-| `tui.status_line_use_colors` | bool | unset | Enables or disables status-line colors in every resolved group home. |
+| `command` | string | `"codex"` | Override the binary/invocation. |
 
 ## [copilot] Section
 
@@ -505,6 +345,7 @@ cpu_limit = ""                 # CPU limit, e.g. "2.0"
 memory_limit = ""              # Memory limit, e.g. "4g"
 mount_ssh = false              # Mount ~/.ssh read-only into container
 auto_cleanup = true            # Remove containers on session kill
+seed_credentials_from_keychain = false  # macOS: copy the Keychain Claude token into a new sandbox once (forks the host login, see sandbox.md)
 environment = []               # Host env vars to pass into container
 volume_ignores = []            # Directories to exclude from project mount
 ```
@@ -517,6 +358,7 @@ volume_ignores = []            # Directories to exclude from project mount
 | `memory_limit` | string | `""` | Container memory limit (e.g. `"4g"`). |
 | `mount_ssh` | bool | `false` | Bind-mount `~/.ssh` read-only for git access inside containers. |
 | `auto_cleanup` | bool | `true` | Remove sandbox containers when sessions are killed. |
+| `seed_credentials_from_keychain` | bool | `false` | macOS only. Copy the Claude Code Keychain token into a sandbox that has no `.credentials.json` yet. Off, the sandbox logs in on its own (`/login` inside the sandbox). On, the one-time copy forks the host's OAuth refresh chain once; see the single-owner rule in the sandbox reference. |
 | `environment` | array | `[]` | Host environment variable names to forward into containers. |
 | `volume_ignores` | array | `[]` | Directories to exclude from the project bind mount (e.g. `["node_modules", ".git"]`). |
 
@@ -533,7 +375,6 @@ branch_prefix = "feature/"                           # Prefix for branch names (
 auto_cleanup = true                                  # Remove worktree when session is deleted
 setup_timeout_seconds = 60                           # Timeout for .agent-deck/worktree-setup.sh
 sparse_checkout = "off"                              # "inherit" to copy the source worktree's sparse checkout
-session_cwd = "worktree"                             # "repo-root" to share the repo's resume history
 ```
 
 | Key | Type | Default | Description |
@@ -544,7 +385,6 @@ session_cwd = "worktree"                             # "repo-root" to share the 
 | `branch_prefix` | string | `"feature/"` | Prefix prepended to branch names. Supports environment variable expansion (e.g., `"$USER/"`). Set to `""` to disable. Won't double-prepend if the branch already starts with the prefix. |
 | `auto_cleanup` | bool | `false` | Remove worktree directory when the session is deleted. |
 | `setup_timeout_seconds` | int | `60` | Max seconds for `.agent-deck/worktree-setup.sh` to run. Set to `0` for unlimited. |
-| `session_cwd` | string | `"worktree"` | Working directory a NEW worktree session starts in. Claude Code buckets conversation history by startup cwd (`~/.claude/projects/<slug-of-cwd>/`), so a session started inside the worktree gets a private `claude --resume` history that is invisible from the repo root — one throwaway bucket per worktree. `"repo-root"` starts the session in the base repository instead, so every session in the repo shares one resume history; the worktree is still created and is handed to the agent via `--add-dir` plus an appended system-prompt directive telling it to work there and never commit in the main checkout. Applied at creation and baked into the session's project path, so changing it never moves an existing session's transcripts. |
 | `sparse_checkout` | string | `"off"` | Sparse-checkout inheritance (#1708). `"inherit"` captures the mode (cone / non-cone, sparse index) and patterns of the worktree you create the session from, creates the new worktree with `git worktree add --no-checkout`, and materializes it with those patterns, so a sparse monorepo never checks out the full tree first. `"off"` / unset / any other value keeps git's normal checkout. A non-sparse source is also left unchanged. `.worktreeinclude` and the setup script still run afterwards. Requires git 2.32+ (`sparse-checkout set --[no-]sparse-index`). |
 
 ### Path template examples
@@ -615,117 +455,30 @@ dir = ""   # Override the base conductor directory (default: <data-dir>/conducto
 
 > **Note:** The Telegram/Slack/Discord bridge daemon (`bridge.py`) now honors `[conductor].dir`: the Go side injects the resolved override into the daemon environment as `AGENT_DECK_CONDUCTOR_DIR`, and the bridge prefers it over its XDG/legacy resolver (#1350). Caveat: the daemon's environment is frozen at install time, so if you change `[conductor].dir` after the bridge is set up, regenerate the bridge daemon (re-run conductor setup, or the planned `conductor migrate-dir`) for the daemon to pick up the new directory.
 
-## [orchestrate] Section
+## [launch] Section
 
-Controls how the `agent-deck:orchestrate` workflow chooses tools for child
-sessions.
+Tool-agnostic spawn settings.
 
 ```toml
-default_tool = "codex"
-
-[orchestrate]
-tool_strategy = "auto"
+[launch]
+inject_identity = true   # Default: true
 ```
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `tool_strategy` | string | `""` (legacy) | `"default"` uses the top-level `default_tool` for every non-explicit orchestrated launch. `"auto"` lets the conductor mix locally installed, non-hidden tools by role and task, falling back to `default_tool` when no connector is clearly better. An omitted value preserves the workflow's historical explicit choices. |
+| `inject_identity` | bool | `true` | Tell every spawned session, through its harness's own instruction mechanism, that it runs inside agent-deck: its session id, title, tool, group, profile, account, parent session and project path, the six most useful `agent-deck` commands, `session current --json` as the way to fetch the live record, and the `===AGENTDECK_DONE===` completion sentinel. The block (under 40 lines) is regenerated from the session record on every start/restart and written to `<data-dir>/agent-deck/runtime/identity/<session-id>/identity.md`; its path is exported as `AGENTDECK_IDENTITY_FILE`. Nothing is written into the project directory. Per-session opt-out: `agent-deck add|launch --no-identity`. |
 
-Inspect the policy and the locally available auto-selection candidates:
+How each harness receives the block (`documentation/HARNESS_IDENTITY.md` has the details):
 
-```bash
-agent-deck config orchestrate
-```
+| Tool | Mechanism | Notes |
+|------|-----------|-------|
+| `claude` | `--append-system-prompt-file <file>` | fresh, `--resume` and fork spawns; custom `[claude].command` wrappers and `claude <subcommand>` passthrough get the env var only |
+| `codex` | `-c developer_instructions="..."` (block inlined as a TOML basic string) | appends to the developer message; a configured `developer_instructions` in that `CODEX_HOME/config.toml` is merged in first; the built-in instructions are never replaced; custom codex commands get the env var only |
+| `pi` | `--append-system-prompt <file>` | also on `session fork` |
+| `gemini` | `--include-directories <dir>` (dir holds `GEMINI.md`) | only when gemini's folder trust is off or a `TRUST_FOLDER` rule in `~/.gemini/trustedFolders.json` covers `<data-dir>/agent-deck/runtime/identity`; otherwise the flag is withheld (the trust dialog would swallow `launch -m`), the pane prints the rule to add, and only the env var is set |
+| anything else (`--cmd`, opencode, cursor, ...) | `AGENTDECK_IDENTITY_FILE` env var only | the file is still written and current |
 
-Tool availability reuses Agent Deck's existing registry and command lookup.
-It detects installation, not provider authentication. Explicit workflow tool
-choices continue to override this strategy.
-
-## [usage.policy] Section
-
-Defines the separate availability-aware advisory used by `agent-deck usage
-recommend`. This policy never overwrites an explicit launch choice or the
-`[orchestrate.*]` role-resolution precedence above. Its thresholds,
-cross-provider failover order, and per-provider model ladder are optional; an
-omitted block uses the defaults below.
-
-```toml
-[orchestrate]
-tool_strategy = "auto"
-
-[usage.policy]
-exhausted_below = 15
-constrained_below = 35
-failover = ["codex", "claude"]
-
-[usage.policy.ladder.claude]
-cheap = "haiku"
-mid = "sonnet"
-strong = "opus"
-frontier = "fable"
-
-[usage.policy.ladder.codex]
-cheap = "gpt-5.6-luna"
-mid = "gpt-5.6-terra"
-strong = "gpt-5.6-sol"
-frontier = "gpt-6-astra"
-
-[usage.policy.frontier_window]
-claude = "fable"
-```
-
-| Key | Type | Default | Description |
-|-----|------|---------|-------------|
-| `exhausted_below` | integer 0–100 | `15` | Remaining percent below which a provider is `exhausted`. An exhausted provider is never *preferred* — unlike a constrained one it does not win the `strong` and `frontier` tiers — but it is still returned when no candidate is eligible, so read `state` on every decision. Must be `<= constrained_below`. The 0–100 range check is a config-LOAD rejection — `exhausted_below = 101` drives `accounts --json`, `config orchestrate` and `usage --all --json` to exit 1 as well — while the `<= constrained_below` comparison rejects at the load layer **only** when both keys are set explicitly; with `constrained_below` left at its default, `exhausted_below = 90` is a policy-layer rejection that only `usage recommend` reports, and the other three commands stay at exit 0. |
-| `constrained_below` | integer 0–100 | `35` | Remaining percent below which a provider is `constrained`: avoided while a healthy candidate exists, but a constrained *preferred* tool still wins for the `strong` and `frontier` tiers. Its 0–100 range check and its half of the ordering comparison reject at the same two layers as `exhausted_below` above. |
-| `failover` | array of strings | `[claude, codex]`, or `[codex, claude]` when `default_tool = "codex"` | Tool-name failover order. The ORDER is consulted **only** under `[orchestrate] tool_strategy = "auto"`; under the default strategy the list still decides whether an unknown-state tool counts as eligible, which shows up in `reason` but never changes the selected tool — that strategy has at most one candidate to choose from, so there is no other tool it could change to. With the shipped default — that key unset, as the `tool_strategy` row above documents — there is at most one candidate, the `--prefer` tool when one was passed and otherwise `default_tool`, and none at all when neither is set: the decision then carries an empty `tool` and the reason `no candidate tools for tool strategy ""`. Either way cross-provider failover does not happen there: no second provider is queried and `alternatives` comes back empty. Under `"auto"` the candidate order is the `--prefer` tool first when one was passed, followed by the failover entries in their configured order; when `--prefer` is omitted the first entry also *becomes* the preferred tool, so setting this key replaces `default_tool` in the order rather than being tried after it. A `default_tool` that is not itself a usage provider does not enter the order at all. An explicitly empty list is treated exactly like an omitted key and keeps the default order. Entries are validated by shape only and are never matched against the set of known tools, but under `"auto"` every entry is filtered against the locally installed, non-hidden tools, so a misspelled or miscased entry is silently dropped — never queried, absent from `alternatives`, with nothing in the decision to reveal that the configured order changed. That shape check is a config-LOAD rejection, not a policy-layer one: `failover = ["cla ude"]` fails the load itself, so `accounts --json`, `config orchestrate` and `usage --all --json` each exit 1 alongside `recommend` — unlike an unknown `ladder` or `frontier_window` table key, which only `recommend` rejects. Only when the candidate list ends up empty — every entry dropped, and the `--prefer` tool dropped or never passed — does a name survive verbatim: the decision then carries the `--prefer` tool, or the first entry when `--prefer` was omitted, as its `tool`, with `state: unknown` and the reason `no candidate tools for tool strategy "auto"`. `provider` comes back filled in when that surviving name maps to a usage provider and empty when it does not, even though nothing was queried either way; `model` follows that provider's ladder, and is empty when the applied tier's rung is empty or when there is no provider. `--prefer` is checked against the tool registry rather than the installed set, so a registry name that is not installed passes the flag check and is then dropped here like any other entry. |
-| `[usage.policy.ladder.<claude\|codex>]` | table of strings | Claude `haiku`/`sonnet`/`opus`/`fable`; Codex `gpt-5.6-luna`/`gpt-5.6-terra`/`gpt-5.6-sol`/`gpt-6-astra` | Model per tier (`cheap`, `mid`, `strong`, `frontier`) for that provider. Only `claude` and `codex` are accepted, and the rejection is not a startup error: loading the config accepts an unknown table name and every other command keeps working — `usage recommend` is the one thing that rejects it, printing `invalid [usage.policy].ladder.<name>: unknown usage provider` and exiting 1, so a ladder named for a non-usage tool breaks every `recommend` call rather than being ignored. An explicitly empty `frontier` rung marks that tier unavailable and the recommendation falls back to `strong`; an explicitly empty `cheap`, `mid` or `strong` rung yields an empty `model` with the tier unchanged, which tells the caller to launch the connector's own default; an absent rung keeps the default. |
-| `[usage.policy.frontier_window]` | table of strings | `{ claude = "fable" }` | Per-provider name of the separate OpenUsage consumption window that gates the `frontier` tier. When that window is present in the snapshot and below `constrained_below`, `frontier` is applied as `strong`. A window that is unset gates nothing — and so does a window that is named here but absent from the snapshot the provider actually returned, which leaves `frontier` applied in full. This table's KEYS share the ladder's closed provider set and reject at the same layer: an unknown name is accepted by the load, and `usage recommend` alone rejects it, printing `invalid [usage.policy].frontier_window.<name>: unknown usage provider` and exiting 1 while every other command keeps working. |
-
-Read the current decision for a role and tier:
-
-```bash
-agent-deck usage recommend --role <role> --tier <cheap|mid|strong|frontier> [--prefer <tool>] [--profile <name>] [--json]
-```
-
-The command is read-only: it queries usage and prints a decision, and writes no
-configuration, session or account. It exits 0 for every decision — including
-`exhausted`, `unknown`, and the case where no candidate tool could be chosen at
-all — so a caller reads `state`, not the exit code. That last case is not always
-an empty `tool`: it always carries a `reason` beginning `no candidate tools for
-tool strategy`, but only when the strategy resolved no name either does `tool`
-come back empty with a remedy hint on stderr; when a name survives, as the
-`failover` row above describes, `tool` is that name, `provider` is filled in
-whenever it maps to a usage provider, `model` follows that provider's ladder and
-is empty when the applied tier's rung is empty, and stderr stays silent. Read
-the `reason`, not the emptiness of `tool`. Exit 2 is reserved for a bad flag: a
-missing `--role`, an unknown `--tier`, an unknown `--prefer` tool, a stray
-positional argument, or anything else `flag.Parse` rejects — an undefined flag,
-or a defined flag given no value — except the four help spellings `-h`, `--h`,
-`-help`, and `--help`, which print the usage line on stderr and exit 0. Exit 1
-means the configuration could not be loaded or validated, or the JSON could not
-be encoded.
-
-`--json` prints the decision as ten snake_case keys: `tool`, `provider`,
-`model`, `tier_requested`, `tier_applied`, `account`, `state`, `reason`,
-`alternatives` (each entry `tool` / `state` / `remaining_percent`), and
-`fetched_at` (`null` whenever the selected tool has no available snapshot —
-because it was never queried at all, because its own query
-failed, or because `--profile` named no snapshot for it; among those,
-only the failed-query case still reports a non-empty `account` alongside the
-`null`; an RFC 3339 timestamp otherwise). A
-`remaining_percent` of `-1` covers both a reading that was not available and a
-provider that genuinely reported a negative remaining; read
-`state` to tell those apart. `tier_requested` and `tier_applied` differ whenever
-the recommendation moved the tier: a role floor raises `cheap` to `mid` for an
-implementer or reviewer, and an empty `frontier` ladder rung or a fired
-frontier-window gate lowers `frontier` to `strong`. The `reason` line says which
-happened.
-
-Known limitation: `agent-deck usage <session>` dispatches on the literal word
-`recommend` before it looks a session up, so a session titled exactly
-`recommend` is unreachable that way — pass the flag first
-(`agent-deck usage --json recommend`) to reach the session instead.
+SSH (`--ssh`) and Docker-sandboxed sessions are skipped: the file lives on the controller host.
 
 ## [logs] Section
 
@@ -752,7 +505,10 @@ Auto-update settings.
 
 ```toml
 [updates]
-auto_update = false           # Auto-install updates
+auto_update = false           # Offer to install on TUI startup
+auto_update_remotes = true    # Keep older remotes on the controller's version (false opts out)
+auto_install = true           # Install unattended (TUI check + timer)
+auto_restart = true           # Restart in place after an install
 check_enabled = true          # Check on startup
 check_interval_hours = 24     # Check frequency
 notify_in_cli = true          # Show in CLI commands
@@ -760,10 +516,19 @@ notify_in_cli = true          # Show in CLI commands
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `auto_update` | bool | `false` | Install updates without prompting. |
+| `auto_update_remotes` | bool | `true` | Keep configured remotes on the controller's version: after a successful `agent-deck update`, and in the background on TUI startup (at most once per `check_interval_hours`), every remote whose `agent-deck version` is older than the controller's gets the same verified binary deploy as `agent-deck remote update --all`. Never prompts, never blocks the TUI; a remote that fails stays on its version and is logged. Remotes without a reachable binary, or whose `agent-deck version` is not a version string, are skipped (install them once with `agent-deck remote update <name>`), and a release that is not newer than what the remote runs is never deployed, so the fallback from a tag without a release to the latest release cannot downgrade a remote. A pre-release controller (`1.16.4-preview.abc`) counts as older than release `1.16.4`, so it never pushes onto a remote already on that release. Set `auto_update_remotes = false` to opt out and be prompted after `agent-deck update` instead. |
+| `auto_update` | bool | `false` | Offer to install an available update (Y/n prompt) before the TUI opens. |
+| `auto_install` | bool | `true` | Install an available update unattended, from the TUI's periodic check and from the `agent-deck update --install-timer` job (launchd on macOS, systemd on Linux). `false` opts out; `agent-deck update` then only runs by hand. |
+| `auto_restart` | bool | `true` | Once a newer binary is on disk, re-exec the running process in place (TUI: from the home screen when no dialog or session action is in flight; `web --no-tui` and daemons: at an idle point). `false` keeps the "installed, press ctrl+t to restart" notice instead. |
 | `check_enabled` | bool | `true` | Enable startup update checks. |
 | `check_interval_hours` | int | `24` | Hours between checks. |
 | `notify_in_cli` | bool | `true` | Show updates in CLI (not just TUI). |
+
+**Timer.** `agent-deck update --install-timer` schedules `agent-deck update --unattended --trigger timer` once a day: a launchd agent (`~/Library/LaunchAgents/com.agentdeck.autoupdate.plist`, 07:MM local time with a minute drawn at random at install time, since launchd has no `RandomizedDelaySec`) on macOS, or a systemd user timer (`agent-deck-autoupdate.timer`, `OnCalendar=daily`, `RandomizedDelaySec=1h`, `Persistent=true`) on Linux. The unattended run honours `auto_install`, never runs Homebrew, takes `<cache dir>/update.lock` so it cannot collide with the TUI's own install, and afterwards runs the same no-prompt remote sweep as an interactive update when `auto_update_remotes` is on (with it off, remotes are left alone). `--timer-status`, `--uninstall-timer` and `--dry-run` round it out; `agent-deck update --check --json` reports the timer state alongside these settings.
+
+**When the automatic paths stay quiet.** `auto_install` and `auto_restart` are for a person's deck. Neither fires, whatever the config says, when the process runs under `go test`, when `AGENTDECK_SKIP_UPDATE_CHECK` is set, when `CI` is truthy, when an `AGENTDECK_TEST_*` marker is in the environment, or (TUI only) when stdin or stdout is not a terminal. Headless daemons (`web --no-tui`, `remote-agent`) keep their idle-point restart for real deployments but honour the same environment markers. The reason is logged once at startup (`auto_update_suppressed`), the banner then offers the keys instead of promising a restart, and `ctrl+y` / `ctrl+t` and the explicit `agent-deck update` commands keep working. Scripts that drive `agent-deck` and must never see an unattended install set `AGENTDECK_SKIP_UPDATE_CHECK=1`; the repository's CI workflows do so once per workflow.
+
+**macOS launchd hygiene.** macOS ties a launch agent's code identity to the file at its program path, so any `com.agentdeck.*` agent that runs the agent-deck binary (for example `notify-daemon` or `web --no-tui`) crash-loops with `EX_CONFIG` after that file is replaced. Every install path therefore boots those agents out and bootstraps them again, then checks they are running; a failure exits 1 and prints the `launchctl` commands to run by hand. The timer's own plist runs `/bin/sh` and is never touched. The unattended flow refuses to install at all when `launchctl print gui/<uid>` does not work, so the binary is never replaced without the follow-up.
 
 ## [interval_hooks.*] Section
 
@@ -842,7 +607,7 @@ attach_on_create = true                       # Opt IN: instantly attach to a ne
 | `footer` | string | `"full"` | Style of the bottom hint bar: `"full"` (default, the historic verbose bar), `"curated"`, `"compact"`, or `"minimal"`. (v1.9.49) |
 | `hidden_tools` | []string | `[]` | Tool names to hide from the new-session picker. `shell` is always shown and cannot be hidden. Unknown names log a warning and are ignored. Edit via TUI **Settings (`S`) → Visible tools…** or by hand in `config.toml`. |
 | `show_only_installed_tools` | bool | `false` | When `true`, hides built-in and custom tools whose command does not resolve on the host `PATH`. `shell` stays visible. If nothing else resolves, the picker falls back to showing all tools with a one-line hint. Toggle in TUI Settings under **TOOL PICKER**. |
-| `new_session_enter_advances` | bool | `true` | Controls what **Enter** does on the free-text **Name** / **Branch** fields of the new-session dialog. Default `true`: Enter **advances** to the next field, so typing a name and pressing Enter no longer silently creates a session with all defaults. **Ctrl+S** is the explicit "create now" shortcut and submits from any field in both modes. Set `false` to restore the legacy behavior where Enter on Name/Branch submits the form. |
+| `new_session_enter_advances` | bool | `true` | Controls what **Enter** does in the new-session dialog. Default `true`: Enter **advances** to the next field on every row (Name, Tool, Model, Reasoning effort, Path, checkboxes, and each Claude Options row) and only the trailing **[ Create session ]** button creates, so walking the form with Enter never launches a session early. **Ctrl+S** is the explicit "create now" shortcut and submits from any field in both modes. Set `false` to restore the legacy behavior where Enter creates from any row. |
 | `attach_on_create` | bool | `false` | When `true`, creating a session in the TUI (`n` new-session dialog) **immediately attaches** to the new session's pane instead of only moving the cursor to it — "instantly open". Default `false`: today's select-only behavior (press **Enter** to attach). Does not affect the CLI; `agent-deck add` / `session start` attach only with an explicit `--attach`. |
 
 Filters compose: `hidden_tools` is applied first, then `show_only_installed_tools` (when enabled).
@@ -1027,12 +792,11 @@ agent-deck skill source remove team
 ```
 
 **Declarative per-group/per-conductor loadout:** `[groups.X.claude].skills`,
-`.plugins`, and `.mcps` (and the conductor mirror) list entries that agent-deck
-attaches automatically at session create (`add` / `launch`) and re-asserts
-before every start/restart. Claude skills use the selected
-`CLAUDE_CONFIG_DIR`, Codex group skills use the selected `CODEX_HOME`, and
-explicit attachments remain project-scoped. The loadout is an attach-only
-floor:
+`.plugins`, and `.mcps` (and the conductor mirror) list entries that agent-deck attaches
+automatically — at session create (`add` / `launch`) and re-asserted before
+every start/restart — through this same registry and attach machinery,
+exactly as if `skill attach` / `mcp attach` had been run by hand. The
+loadout is an attach-only floor:
 
 - already attached and healthy → no-op; a deleted symlink re-materializes
 - a real directory or foreign symlink at the target → skip + warning,
@@ -1042,10 +806,8 @@ floor:
   deliberate `skill detach`
 
 Skill-store entries may be plain directory skills (`SKILL.md`) or full Claude
-Code plugins (`.claude-plugin/plugin.json`). Declarative skills materialize in
-the selected agent home; explicit attachments materialize in the project. SSH
-sessions are skipped because the local process cannot safely modify a remote
-home or project. See
+Code plugins (`.claude-plugin/plugin.json`); both materialize as project
+skills. SSH sessions are skipped (no local project path). See
 [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides).
 
 ## [mcp_pool] Section
@@ -1318,3 +1080,4 @@ description = "GitHub access"
 | `AGENTDECK_PROFILE` | Override default profile |
 | `CLAUDE_CONFIG_DIR` | Override Claude config dir |
 | `AGENTDECK_DEBUG=1` | Enable debug logging |
+| `AGENTDECK_IDENTITY_FILE` | Set in every spawned session: path of the model-readable identity block for that session (see `[launch] inject_identity`) |

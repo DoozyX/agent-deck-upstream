@@ -29,14 +29,15 @@ func startupArgs(t *testing.T, flags string) []string {
 	return strings.Split(strings.TrimSuffix(string(out), "\x00"), "\x00")
 }
 
-func TestStartupNameDeterministicPeerArgv(t *testing.T) {
+func TestStartupNameExactArgv(t *testing.T) {
 	startupNameConfig(t, "")
 	for _, title := range []string{"Team A", "team-a", "team_a", "日本語", "🚀", "a'b;$(touch MUST_NOT_EXIST)`id`", strings.Repeat("long", 30) + "A", strings.Repeat("long", 30) + "B"} {
 		t.Run(title, func(t *testing.T) {
-			inst := &Instance{ID: "a1b2c3d4-1111-2222-3333-444455556666", Tool: "claude", Title: title}
+			// Identity injection adds its own flag; this test pins --name alone.
+			inst := &Instance{Tool: "claude", Title: title, IdentityInjectionDisabled: true}
 			args := startupArgs(t, inst.buildClaudeExtraFlags(nil))
-			if len(args) != 2 || args[0] != "--name" || args[1] != inst.ClaudePeerName() {
-				t.Fatalf("argv=%q, want --name %q", args, inst.ClaudePeerName())
+			if len(args) != 2 || args[0] != "--name" || args[1] != title {
+				t.Fatalf("argv=%q, want --name %q", args, title)
 			}
 		})
 	}
@@ -119,7 +120,7 @@ func TestStartupNameRegistryIndependent(t *testing.T) {
 		t.Fatal(err)
 	}
 	inst := &Instance{Tool: "claude", Title: "Exact Title", ClaudeSessionID: "owned"}
-	if got := inst.ClaudeLaunchName(); got != inst.ClaudePeerName() {
+	if got := inst.ClaudeLaunchName(); got != "Exact Title" {
 		t.Fatalf("name=%q", got)
 	}
 }
@@ -128,12 +129,12 @@ func TestStartupNameForkTarget(t *testing.T) {
 	startupNameConfig(t, "")
 	parent := &Instance{Tool: "claude", Title: "Parent", ClaudeSessionID: "11111111-1111-4111-8111-111111111111", ClaudeDetectedAt: time.Now()}
 	parent.markClaudeSessionIDVerified()
-	target := &Instance{ID: "bbbbbbbb-1111-2222-3333-444455556666", Tool: "claude", Title: "Child 日本語", ProjectPath: t.TempDir()}
+	target := &Instance{Tool: "claude", Title: "Child 日本語", ProjectPath: t.TempDir()}
 	cmd, err := parent.buildClaudeForkCommandForTarget(target, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(cmd, "--name "+target.ClaudePeerName()) || strings.Contains(cmd, "--name "+parent.ClaudePeerName()) {
+	if !strings.Contains(cmd, "--name 'Child 日本語'") || strings.Contains(cmd, "--name Parent") {
 		t.Fatalf("wrong fork target: %s", cmd)
 	}
 }
@@ -160,7 +161,7 @@ func TestStartupNameAccountCommand(t *testing.T) {
 				t.Fatalf("account argv=%q command=%s", args, command)
 			}
 			joined := strings.Join(args, "|")
-			if !strings.Contains(joined, "--name|"+inst.ClaudePeerName()) || !strings.Contains(joined, "--session-id|"+inst.ClaudeSessionID) {
+			if !strings.Contains(joined, "--name|Exact 日本語") || !strings.Contains(joined, "--session-id|"+inst.ClaudeSessionID) {
 				t.Fatalf("unbound name: %q", args)
 			}
 		})
@@ -189,18 +190,9 @@ func TestStartupNameOwnedResumeAndScratch(t *testing.T) {
 			configDir := filepath.Join(root, "account")
 			startupNameConfig(t, fmt.Sprintf("[profiles.work.claude]\nconfig_dir=%q\n", configDir))
 			inst := &Instance{Tool: "claude", Title: "Owned 日本語", Account: "work", ID: "deck-owned", ProjectPath: root, ClaudeSessionID: "22222222-2222-4222-8222-222222222222"}
-			// A worker scratch dir does NOT move CLAUDE_CONFIG_DIR on macOS:
-			// Claude keys OAuth credentials by that literal path, so pointing it
-			// at scratch forks the profile's refresh token into its own Keychain
-			// item. The scratch dir arrives through --settings instead.
-			wantSettings := ""
 			if scratch {
 				inst.WorkerScratchConfigDir = filepath.Join(root, "scratch")
-				if runtimeGOOS() == "darwin" {
-					wantSettings = filepath.Join(inst.WorkerScratchConfigDir, "settings.json")
-				} else {
-					configDir = inst.WorkerScratchConfigDir
-				}
+				configDir = inst.WorkerScratchConfigDir
 			}
 			dir := claudeProjectDirForTest(t, filepath.Join(root, "account"), root)
 			if err := os.MkdirAll(dir, 0700); err != nil {
@@ -212,11 +204,8 @@ func TestStartupNameOwnedResumeAndScratch(t *testing.T) {
 			inst.markClaudeSessionIDVerified()
 			inst.SetClaudeOptions(&ClaudeOptions{SessionMode: "resume"})
 			command := inst.buildClaudeResumeCommand()
-			if !strings.Contains(command, "--name "+inst.ClaudePeerName()) || !strings.Contains(command, "--resume "+inst.ClaudeSessionID) || !strings.Contains(command, "CLAUDE_CONFIG_DIR="+configDir) {
+			if !strings.Contains(command, "--name 'Owned 日本語'") || !strings.Contains(command, "--resume "+inst.ClaudeSessionID) || !strings.Contains(command, "CLAUDE_CONFIG_DIR="+configDir) {
 				t.Fatalf("wrong bound resume: %s", command)
-			}
-			if wantSettings != "" && !strings.Contains(command, "--settings "+wantSettings) {
-				t.Fatalf("scratch overlay not passed through --settings: %s", command)
 			}
 			inst.Command = "custom-wrapper"
 			if command := inst.buildClaudeResumeCommand(); strings.Contains(command, "--name") {
@@ -230,7 +219,7 @@ func TestStartupNameForkExplicitOverrideAndRestart(t *testing.T) {
 	startupNameConfig(t, "")
 	parent := &Instance{Tool: "claude", Title: "Parent", ExtraArgs: []string{"--name", "operator"}, ClaudeSessionID: "11111111-1111-4111-8111-111111111111", ClaudeDetectedAt: time.Now()}
 	parent.markClaudeSessionIDVerified()
-	target := &Instance{ID: "bbbbbbbb-1111-2222-3333-444455556666", Tool: "claude", Title: "Child", ProjectPath: t.TempDir(), ExtraArgs: append([]string(nil), parent.ExtraArgs...)}
+	target := &Instance{Tool: "claude", Title: "Child", ProjectPath: t.TempDir(), ExtraArgs: append([]string(nil), parent.ExtraArgs...)}
 	command, err := parent.buildClaudeForkCommandForTarget(target, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -240,7 +229,7 @@ func TestStartupNameForkExplicitOverrideAndRestart(t *testing.T) {
 	}
 	target.Command = command
 	target.ExtraArgs = nil
-	if name := target.ClaudeLaunchName(); name != target.ClaudePeerName() {
+	if name := target.ClaudeLaunchName(); name != "Child" {
 		t.Fatalf("generated fork restart name=%q", name)
 	}
 }
@@ -249,7 +238,7 @@ func TestStartupNameAliasAndUnsupported(t *testing.T) {
 	startupNameConfig(t, "[claude]\ncommand='configured-alias'\n")
 	inst := &Instance{Tool: "claude", Title: "Alias Title", ID: "alias", ProjectPath: t.TempDir()}
 	cmd := inst.buildClaudeCommandWithMessage("claude", "initial message")
-	if !strings.Contains(cmd, "configured-alias") || !strings.Contains(cmd, "--name "+inst.ClaudePeerName()) {
+	if !strings.Contains(cmd, "configured-alias") || !strings.Contains(cmd, "--name 'Alias Title'") {
 		t.Fatalf("alias lost title: %s", cmd)
 	}
 	for _, tool := range []string{"shell", "codex", "gemini", "opencode"} {

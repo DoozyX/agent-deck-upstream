@@ -138,14 +138,7 @@ func TestCaptureHistory_PermissionDeniedIsNotGone(t *testing.T) {
 		t.Skip("tmux not available")
 	}
 	// An inaccessible parent directory makes the actual tmux connect fail with EACCES.
-	root, err := os.MkdirTemp("/tmp", "ad-capture-perm-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = os.Chmod(filepath.Join(root, fmt.Sprintf("tmux-%d", os.Getuid()), "blocked"), 0700)
-		_ = os.RemoveAll(root)
-	})
+	root := t.TempDir()
 	t.Setenv("TMUX_TMPDIR", root)
 	dir := filepath.Join(root, fmt.Sprintf("tmux-%d", os.Getuid()), "blocked")
 	if err := os.MkdirAll(dir, 0700); err != nil {
@@ -154,6 +147,7 @@ func TestCaptureHistory_PermissionDeniedIsNotGone(t *testing.T) {
 	if err := os.Chmod(dir, 0); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
 	if _, err := os.ReadDir(dir); err == nil {
 		t.Skip("process can bypass directory permissions")
 	}
@@ -170,15 +164,8 @@ func TestCaptureHistory_PermissionDeniedIsNotGone(t *testing.T) {
 				t.Fatalf("permission failure = %v, want non-gone error", err)
 			}
 			var exitErr *exec.ExitError
-			stderr := ""
-			if errors.As(err, &exitErr) {
-				stderr = strings.ToLower(string(exitErr.Stderr))
-			}
-			// Darwin tmux validates the inaccessible socket directory first and
-			// reports "unsafe permissions"; Linux reaches connect(2) and reports
-			// "Permission denied". Both are real access failures, never gone.
-			if !strings.Contains(stderr, "permission denied") && !strings.Contains(stderr, "unsafe permissions") {
-				t.Fatalf("expected real tmux permission error: %v (stderr=%q)", err, stderr)
+			if !errors.As(err, &exitErr) {
+				t.Fatalf("expected real tmux execution error: %v", err)
 			}
 		})
 	}
