@@ -1,7 +1,6 @@
-Command execution. Preserve the tool's command handle (`session_id` or task id),
-exit code and output. In Codex orchestration code, expose the full result
-(`text(result)`), not only `text(result.output)`. A wrapper returning or saying
-“Script completed” does not establish that its subprocess exited. If a handle
+Command execution. Preserve and expose the full command result: its process
+or task handle, exit code and output. A wrapper returning or reporting
+completion does not establish that its subprocess exited. If a handle
 is returned without a terminal exit code, use the tool's wait/poll operation
 on that handle until completion or the verification deadline. Never launch a
 replacement merely because the first call yielded. On deadline, report the
