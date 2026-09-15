@@ -84,6 +84,17 @@ func TestResolveOrchestrateLaunch_UsesConfiguredRoleDefaults(t *testing.T) {
 	}
 }
 
+func TestResolveOrchestrateLaunch_CursorUsesConfiguredModel(t *testing.T) {
+	cfg := &UserConfig{Orchestrate: OrchestrateSettings{Routine: OrchestrateRoleDefault{CursorModel: "gpt-5"}}}
+	got, err := ResolveOrchestrateLaunch(OrchestrateRoleRoutine, "cursor", OrchestrateLaunchExplicit{}, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Provider != "cursor" || got.Model != "gpt-5" || got.Effort != "" || got.Parked {
+		t.Fatalf("Cursor resolution = %#v", got)
+	}
+}
+
 func TestInstanceApplyResolvedOrchestrateLaunch_PersistsSanitizedReceipt(t *testing.T) {
 	inst := NewInstanceWithTool("role-receipt", t.TempDir(), "codex")
 	resolved, err := inst.ApplyResolvedOrchestrateLaunch(OrchestrateRoleRoutine, OrchestrateLaunchExplicit{}, &UserConfig{})
