@@ -3100,7 +3100,7 @@ func TestStartCommandSpec_UserScope(t *testing.T) {
 	assert.Equal(t, []string{"--user", "--scope", "--quiet", "--collect"}, args[:4])
 	assert.Equal(t, "--unit", args[4])
 	assert.Equal(t, "agentdeck-tmux-agentdeck-test-session-1234abcd", args[5])
-	assert.Equal(t, []string{"--property=KillMode=none", "tmux", "-u", "new-session", "-d", "-s", "agentdeck_test-session_1234abcd", "-c", "/tmp/project",
+	assert.Equal(t, []string{"tmux", "-u", "new-session", "-d", "-s", "agentdeck_test-session_1234abcd", "-c", "/tmp/project",
 		"-x", "173", "-y", "41"}, args[6:])
 }
 

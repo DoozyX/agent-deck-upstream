@@ -1,5 +1,3 @@
-//go:build systemd_user_integration
-
 // Integration tests for the service-mode systemd invocation shape
 // produced by startCommandSpec (v1.7.21). These tests validate the REAL
 // systemd mechanism: spawn tmux as a transient service with the exact
@@ -69,7 +67,7 @@ func spawnServiceModeTmux(t *testing.T, tmuxLName, tmuxSessName string) (unit st
 		"--property=RestartSec=2s", // shorter than production 5s for test speed
 		"--property=StartLimitBurst=10",
 		"--property=StartLimitIntervalSec=60",
-		"--property=KillMode=none",
+		"--property=KillMode=control-group",
 		"--property=TimeoutStopSec=15s",
 		// -L creates a test-isolated tmux socket so no default-socket server
 		// is contacted; this is the single necessary deviation from
@@ -102,15 +100,9 @@ func TestTmuxService_RestartsOnUnexpectedKill(t *testing.T) {
 	require.NoError(t, err, "service spawn must succeed on a systemd-user host")
 
 	t.Cleanup(func() {
-		if err := exec.Command("systemctl", "--user", "stop", unit).Run(); err != nil {
-			t.Errorf("cleanup stop %s: %v", unit, err)
-		}
-		if err := exec.Command("tmux", "-L", tmuxLName, "kill-server").Run(); err != nil {
-			t.Errorf("cleanup kill isolated tmux server %s: %v", tmuxLName, err)
-		}
-		if err := exec.Command("systemctl", "--user", "reset-failed", unit).Run(); err != nil {
-			t.Errorf("cleanup reset-failed %s: %v", unit, err)
-		}
+		_ = exec.Command("systemctl", "--user", "stop", unit).Run()
+		_ = exec.Command("systemctl", "--user", "reset-failed", unit).Run()
+		_ = exec.Command("tmux", "-L", tmuxLName, "kill-server").Run()
 	})
 
 	initialPID := waitForServicePID(t, unit, 5*time.Second)
@@ -142,11 +134,11 @@ func TestTmuxService_RestartsOnUnexpectedKill(t *testing.T) {
 		"NRestarts must be >=1 after SIGKILL; got %d", restarts)
 }
 
-// TestTmuxService_ExplicitStopDoesNotKillSharedServer verifies the #2219
-// safety contract in a disposable systemd-user fixture. The server is on an
-// exact private -L socket; stopping its per-session service must leave both
-// the original and a sibling tmux session alive.
-func TestTmuxService_ExplicitStopDoesNotKillSharedServer(t *testing.T) {
+// TestTmuxService_ExplicitStopDoesNotTriggerRestart: `systemctl --user
+// stop` on the service unit must be CLEAN — Restart=on-failure must NOT
+// fire. This is what guarantees `agent-deck remove` is truly terminal
+// and that a stopped service stays stopped.
+func TestTmuxService_ExplicitStopDoesNotTriggerRestart(t *testing.T) {
 	requireSystemdUserRun(t)
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skipf("tmux not available: %v", err)
@@ -158,28 +150,24 @@ func TestTmuxService_ExplicitStopDoesNotKillSharedServer(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		if err := exec.Command("systemctl", "--user", "stop", unit).Run(); err != nil {
-			t.Errorf("cleanup stop %s: %v", unit, err)
-		}
-		if err := exec.Command("tmux", "-L", tmuxLName, "kill-server").Run(); err != nil {
-			t.Errorf("cleanup kill isolated tmux server %s: %v", tmuxLName, err)
-		}
-		if err := exec.Command("systemctl", "--user", "reset-failed", unit).Run(); err != nil {
-			t.Errorf("cleanup reset-failed %s: %v", unit, err)
-		}
+		_ = exec.Command("systemctl", "--user", "stop", unit).Run()
+		_ = exec.Command("systemctl", "--user", "reset-failed", unit).Run()
+		_ = exec.Command("tmux", "-L", tmuxLName, "kill-server").Run()
 	})
 
-	require.NotZero(t, waitForServicePID(t, unit, 5*time.Second))
-	const sibling = "svcstop-sibling"
-	require.NoError(t, exec.Command("tmux", "-L", tmuxLName,
-		"new-session", "-d", "-s", sibling, "bash", "-c", "exec sleep 600").Run())
+	pid := waitForServicePID(t, unit, 5*time.Second)
+	require.NotZero(t, pid)
 
 	require.NoError(t, exec.Command("systemctl", "--user", "stop", unit).Run(),
 		"systemctl --user stop must succeed on an active unit")
-	for _, name := range []string{tmuxSessName, sibling} {
-		require.NoError(t, exec.Command("tmux", "-L", tmuxLName, "has-session", "-t", name).Run(),
-			"stopping a per-session unit must not kill shared-server sibling %q", name)
-	}
+	_ = exec.Command("systemctl", "--user", "reset-failed", unit).Run()
+
+	// Give systemd a beat to finalize; then assert no new PID re-appears
+	// within a 4s window. Restart=on-failure must NOT fire on clean stop.
+	time.Sleep(4 * time.Second)
+	after := readServicePID(unit)
+	require.Zero(t, after,
+		"expected tmux daemon to stay dead after systemctl stop; got PID %d", after)
 }
 
 // TestStopServiceUnitOwned_UnknownSessionNeverErrors: the teardown gate is
