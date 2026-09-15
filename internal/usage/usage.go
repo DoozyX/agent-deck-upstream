@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/asheshgoplani/agent-deck/internal/childenv"
 )
 
 type Provider string
@@ -107,10 +109,11 @@ func (r Runner) Query(ctx context.Context, account Account) (Snapshot, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, string(account.Provider))
-	cmd.Env = append([]string{}, os.Environ()...)
-	key := "CLAUDE_CONFIG_DIR="
-	if account.Provider == Codex {
-		key = "CODEX_HOME="
+	cmd.Env = childenv.ForLaunch("")
+	key := "CODEX_HOME="
+	if account.Provider == Claude {
+		cmd.Env = childenv.ForLaunch(account.Home)
+		key = "CLAUDE_CONFIG_DIR="
 	}
 	filtered := cmd.Env[:0]
 	for _, entry := range cmd.Env {
@@ -118,7 +121,9 @@ func (r Runner) Query(ctx context.Context, account Account) (Snapshot, error) {
 			filtered = append(filtered, entry)
 		}
 	}
-	cmd.Env = append(filtered, key+account.Home)
+	if account.Provider == Codex {
+		cmd.Env = append(filtered, key+account.Home)
+	}
 	out, err := cmd.Output()
 	if ctx.Err() != nil {
 		return Snapshot{}, fmt.Errorf("openusage timeout: %w", ctx.Err())

@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -372,11 +374,53 @@ func KillTmuxServersUnder(dir string) {
 			if err != nil || info.Mode()&os.ModeSocket == 0 {
 				continue
 			}
+			pid := tmuxServerPID(socket)
 			cmd := exec.Command("tmux", "-S", socket, "kill-server")
 			cmd.Env = envWithoutTmuxVars()
 			_ = cmd.Run()
+			waitForTmuxServerExit(pid)
 		}
 	}
+}
+
+// tmuxServerPID reads the PID from the same absolute socket that cleanup will
+// kill. It is deliberately advisory: a failed probe must not prevent a
+// kill-server attempt, and cleanup never sends a signal to the reported PID.
+func tmuxServerPID(socket string) int {
+	cmd := exec.Command("tmux", "-S", socket, "display-message", "-p", "#{pid}")
+	cmd.Env = envWithoutTmuxVars()
+	out, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
+// waitForTmuxServerExit closes the teardown acknowledgement gap: tmux accepts
+// kill-server before its server process has necessarily exited. Removing its
+// socket directory during that gap strands the still-live server. This only
+// waits for a PID previously reported by that exact socket; it never signals
+// the PID, preserving socket-based process ownership safety.
+func waitForTmuxServerExit(pid int) {
+	if pid <= 0 {
+		return
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for tmuxProcessAlive(pid) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func tmuxProcessAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	return proc.Signal(syscall.Signal(0)) == nil
 }
 
 // envWithoutTmuxVars returns the process environment with every TMUX*

@@ -61,12 +61,6 @@ func openCostStore(profile string) (*costs.Store, *session.Storage) {
 	return costs.NewStore(db.DB()), storage
 }
 
-// newPricerFromConfig creates a Pricer using the user's config overrides.
-func newPricerFromConfig() *costs.Pricer {
-	cfg, _ := session.LoadUserConfig()
-	return newPricerFromUserConfig(cfg)
-}
-
 func newPricerFromUserConfig(cfg *session.UserConfig) *costs.Pricer {
 	return costs.NewPricer(pricerConfigFromUserConfig(cfg))
 }

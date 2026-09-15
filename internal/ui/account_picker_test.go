@@ -341,6 +341,11 @@ func TestEditSessionDialogClearingAccountIsNotASwitch(t *testing.T) {
 	home.width, home.height = 120, 40
 
 	inst := session.NewInstanceWithTool("acct-clear", t.TempDir(), "claude")
+	t.Cleanup(func() {
+		if err := inst.KillAndWait(); err != nil {
+			t.Errorf("clean up account-clear session: %v", err)
+		}
+	})
 	inst.Account = "work"
 	home.instancesMu.Lock()
 	home.instances = []*session.Instance{inst}
