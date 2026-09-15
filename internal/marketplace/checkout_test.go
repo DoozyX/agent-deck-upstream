@@ -19,6 +19,7 @@ import (
 )
 
 var testGitPath, _ = exec.LookPath("git")
+var testPythonPath, _ = exec.LookPath("python3")
 
 const testOrigin = "https://github.com/DoozyX/agent-deck-upstream.git"
 
@@ -68,7 +69,9 @@ func newFixture(t *testing.T) fixture {
 	gitTest(t, f.path, "remote", "set-url", "origin", testOrigin)
 	f.mark(t)
 	// Only the fixed read-only URL is redirected; all Git operations are real.
-	script := fmt.Sprintf(`#!/usr/bin/env python3
+	// Pin the fixture interpreter too: production's safe PATH must not select
+	// a different Python runtime (or a slow platform launcher) for the shim.
+	script := fmt.Sprintf(`#!%s
 import os, sys, time, subprocess
 mode_path = %q
 mode = open(mode_path).read() if os.path.exists(mode_path) else ""
@@ -92,13 +95,19 @@ if "merge" in args and mode == "merge-fail":
     with open("marker", "w") as out: out.write("partial checkout")
     sys.exit(1)
 args = ["file://" + %q if a == %q else a for a in args]
+if "merge" in args and mode == "cleanup-fail":
+    result = subprocess.run([%q, "-c", "protocol.file.allow=always"] + args)
+    os.chmod(os.path.join(os.path.dirname(mode_path), ".local/state/agent-deck/marketplace-update"), 0o500)
+    sys.exit(result.returncode)
 os.execv(%q, [%q, "-c", "protocol.file.allow=always"] + args)
-`, filepath.Join(f.home, "git-mode"), filepath.Join(f.home, "fetches"), f.source, testOrigin, f.realGit, f.realGit)
+`, testPythonPath, filepath.Join(f.home, "git-mode"), filepath.Join(f.home, "fetches"), f.source, testOrigin, f.realGit, f.realGit, f.realGit)
 	writeTest(t, filepath.Join(f.bin, "git"), script)
 	if err := os.Chmod(filepath.Join(f.bin, "git"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", f.bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	oldGit := trustedGitPath
+	trustedGitPath = filepath.Join(f.bin, "git")
+	t.Cleanup(func() { trustedGitPath = oldGit })
 	return f
 }
 
@@ -461,5 +470,296 @@ func TestManagedCheckoutRevalidatesUnchangedFetch(t *testing.T) {
 	data, _ := os.ReadFile(filepath.Join(f.path, "marker"))
 	if string(data) != "concurrent edit" {
 		t.Fatal("concurrent edit overwritten")
+	}
+}
+
+func TestManagedCheckoutIgnoresInheritedGitPATH(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "executed")
+	shim := filepath.Join(dir, "git")
+	writeTest(t, shim, "#!/bin/sh\n/usr/bin/touch '"+marker+"'\nexit 1\n")
+	if err := os.Chmod(shim, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	out, err := runGit(context.Background(), dir, "--version")
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatal("inherited PATH shim executed")
+	}
+	if err != nil || !strings.HasPrefix(out, "git version ") {
+		t.Fatalf("trusted Git unavailable: output=%q err=%v", out, err)
+	}
+}
+
+func TestManagedCheckoutCleanupFailureRestoresWorktree(t *testing.T) {
+	f := newFixture(t)
+	old := gitTest(t, f.path, "rev-parse", "HEAD")
+	index, err := os.ReadFile(filepath.Join(f.path, ".git/index"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.advance(t, "next")
+	dir := StateDir(f.home)
+	t.Cleanup(func() { _ = os.Chmod(dir, 0700) })
+	writeTest(t, filepath.Join(f.home, "git-mode"), "cleanup-fail")
+	err = WithManagedCheckout(context.Background(), f.home, func(Checkout) error {
+		t.Fatal("callback after recovery cleanup failure")
+		return nil
+	})
+	if err == nil {
+		t.Fatal("cleanup write failure accepted")
+	}
+	if got := gitTest(t, f.path, "rev-parse", "HEAD"); got != old {
+		t.Fatalf("cleanup failure advanced HEAD: got %s want %s", got, old)
+	}
+	data, err := os.ReadFile(filepath.Join(f.path, "marker"))
+	if err != nil || string(data) != "initial" {
+		t.Fatalf("worktree not restored: %q %v", data, err)
+	}
+	restoredIndex, err := os.ReadFile(filepath.Join(f.path, ".git/index"))
+	if err != nil || string(restoredIndex) != string(index) {
+		t.Fatalf("index not restored: %v", err)
+	}
+	if got := gitTest(t, f.path, "status", "--porcelain"); got != "" {
+		t.Fatalf("dirty restored checkout: %s", got)
+	}
+	journal := filepath.Join(dir, "recovery.json")
+	evidence, err := os.ReadFile(journal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Persistent cleanup failure must preserve the journal for inspection.
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	err = WithManagedCheckout(context.Background(), f.home, func(Checkout) error { t.Fatal("callback before inspection"); return nil })
+	if err == nil || !strings.Contains(err.Error(), "recovery inspection") {
+		t.Fatalf("lost recovery gate: %v", err)
+	}
+	after, err := os.ReadFile(journal)
+	if err != nil || string(after) != string(evidence) {
+		t.Fatalf("recovery evidence changed: %v", err)
+	}
+}
+
+func TestManagedCheckoutCoalescedCallbackFailureBackoff(t *testing.T) {
+	f := newFixture(t)
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("private callback failure")
+	calls := 0
+	failing := func(Checkout) error { calls++; return sentinel }
+	t.Setenv("CODEX_HOME", filepath.Join(f.home, "profile-a"))
+	if err := WithManagedCheckout(context.Background(), f.home, failing); err != sentinel {
+		t.Fatalf("callback identity: %v", err)
+	}
+	if err := WithManagedCheckout(context.Background(), f.home, failing); !errors.Is(err, ErrBackoff) || calls != 1 {
+		t.Fatalf("coalesced failure retried: calls=%d err=%v", calls, err)
+	}
+	t.Setenv("CODEX_HOME", filepath.Join(f.home, "profile-b"))
+	caughtUp := false
+	if err := WithManagedCheckout(context.Background(), f.home, func(c Checkout) error {
+		caughtUp = true
+		if c.Updated {
+			t.Fatal("coalesced profile fetched again")
+		}
+		return nil
+	}); err != nil || !caughtUp {
+		t.Fatalf("other profile suppressed: %v", err)
+	}
+	t.Setenv("CODEX_HOME", filepath.Join(f.home, "profile-a"))
+	if err := WithManagedCheckout(context.Background(), f.home, failing); !errors.Is(err, ErrBackoff) || calls != 1 {
+		t.Fatalf("other profile cleared failure: calls=%d err=%v", calls, err)
+	}
+	key, err := callbackProfileKey(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := loadState(StateDir(f.home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	success := state.LastSuccess
+	retry := state.CallbackRetries[key]
+	if retry.Failures != 1 || time.Until(retry.NextAttempt) <= 0 || time.Until(retry.NextAttempt) > minBackoff {
+		t.Fatalf("first callback retry=%+v", retry)
+	}
+	retry.NextAttempt = time.Now().Add(-time.Second)
+	state.CallbackRetries[key] = retry
+	if err := saveState(StateDir(f.home), state); err != nil {
+		t.Fatal(err)
+	}
+	failedAt := time.Now()
+	if err := WithManagedCheckout(context.Background(), f.home, failing); err != sentinel || calls != 2 {
+		t.Fatalf("expired retry did not run: calls=%d err=%v", calls, err)
+	}
+	state, err = loadState(StateDir(f.home))
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry = state.CallbackRetries[key]
+	if retry.Failures != 2 || retry.NextAttempt.Before(failedAt.Add(2*minBackoff)) || !state.LastSuccess.Equal(success) {
+		t.Fatalf("failed retry accounting: %+v", state)
+	}
+	retry.NextAttempt = time.Now().Add(-time.Second)
+	state.CallbackRetries[key] = retry
+	if err := saveState(StateDir(f.home), state); err != nil {
+		t.Fatal(err)
+	}
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	state, err = loadState(StateDir(f.home))
+	if err != nil || len(state.CallbackRetries) != 0 || !state.LastSuccess.Equal(success) {
+		t.Fatalf("successful callback did not clear only retry state: %+v %v", state, err)
+	}
+
+	fetches, err := os.ReadFile(filepath.Join(f.home, "fetches"))
+	if err != nil || string(fetches) != "fetch\n" {
+		t.Fatalf("coalescing lost: %q %v", fetches, err)
+	}
+}
+
+func TestManagedCheckoutAdmits33rdProfileWithoutEarlyRetry(t *testing.T) {
+	f := newFixture(t)
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	dir := StateDir(f.home)
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	success := state.LastSuccess
+	// All 32 failures are still in backoff, with tied earliest deadlines.
+	// Reusing a slot immediately would let its failed profile retry early.
+	deadline := time.Now().UTC().Add(2 * time.Second)
+	state.CallbackRetries = make(map[string]callbackRetry)
+	victim := ""
+	for i := 0; i < callbackRetryLimit; i++ {
+		key := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("failed-profile-%d", i))))
+		nextAttempt := deadline
+		if i >= 2 {
+			nextAttempt = deadline.Add(time.Minute)
+		}
+		state.CallbackRetries[key] = callbackRetry{Failures: 5, NextAttempt: nextAttempt}
+		if i < 2 && (victim == "" || key < victim) {
+			victim = key
+		}
+	}
+	if err := saveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", filepath.Join(f.home, "profile-33"))
+	key, err := callbackProfileKey(f.home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sentinel := errors.New("profile 33 cache failed")
+	err = WithManagedCheckout(context.Background(), f.home, func(c Checkout) error {
+		if time.Now().Before(deadline) {
+			t.Fatal("evicted a profile before its retry deadline")
+		}
+		reserved, err := loadState(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, exists := reserved.CallbackRetries[victim]; exists {
+			t.Fatal("did not evict lexically first profile at the earliest deadline")
+		}
+		if len(reserved.CallbackRetries) != callbackRetryLimit || reserved.CallbackRetries[key].Failures != 1 || !reserved.CallbackRetries[key].NextAttempt.After(time.Now()) {
+			t.Fatalf("new callback lacks bounded crash-safe reservation: %+v", reserved)
+		}
+		for oldKey, oldRetry := range state.CallbackRetries {
+			if oldKey != victim && reserved.CallbackRetries[oldKey] != oldRetry {
+				t.Fatal("eviction changed another profile's retry")
+			}
+		}
+		if c.Updated || c.Revision != state.Revision || !reserved.LastSuccess.Equal(success) {
+			t.Fatal("admission lost fetch coalescing")
+		}
+		writeTest(t, filepath.Join(f.home, "profile-33-cache"), c.Revision)
+		return sentinel
+	})
+	if err != sentinel {
+		t.Fatalf("33rd profile was not admitted: %v", err)
+	}
+	cache, err := os.ReadFile(filepath.Join(f.home, "profile-33-cache"))
+	if err != nil || string(cache) != state.Revision {
+		t.Fatalf("33rd profile did not consume checkout: %q %v", cache, err)
+	}
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error {
+		t.Fatal("33rd profile retried before its backoff")
+		return nil
+	}); !errors.Is(err, ErrBackoff) {
+		t.Fatalf("new profile lost retry safety: %v", err)
+	}
+	info, err := os.Stat(filepath.Join(dir, "checkout.json"))
+	if err != nil || info.Size() > stateLimit {
+		t.Fatalf("retry state exceeded disk bound: %v %v", info, err)
+	}
+	fetches, err := os.ReadFile(filepath.Join(f.home, "fetches"))
+	if err != nil || string(fetches) != "fetch\n" {
+		t.Fatalf("admission fetched again: %q %v", fetches, err)
+	}
+}
+
+func TestManagedCheckoutFullRetryAdmissionCancellationPreservesState(t *testing.T) {
+	f := newFixture(t)
+	if err := WithManagedCheckout(context.Background(), f.home, func(Checkout) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	dir := StateDir(f.home)
+	state, err := loadState(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.CallbackRetries = make(map[string]callbackRetry)
+	for i := 0; i < callbackRetryLimit; i++ {
+		key := fmt.Sprintf("%064x", i)
+		state.CallbackRetries[key] = callbackRetry{Failures: 5, NextAttempt: time.Now().UTC().Add(maxBackoff)}
+	}
+	if err := saveState(dir, state); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(filepath.Join(dir, "checkout.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	err = WithManagedCheckout(ctx, f.home, func(Checkout) error {
+		t.Fatal("callback ran despite active retry deadlines and cancellation")
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("admission did not honor cancellation: %v", err)
+	}
+	after, err := os.ReadFile(filepath.Join(dir, "checkout.json"))
+	if err != nil || string(after) != string(before) {
+		t.Fatalf("cancellation destroyed retry state: %v", err)
+	}
+	lock, err := acquireLock(context.Background(), filepath.Join(dir, "update.lock"))
+	if err != nil {
+		t.Fatalf("cancelled admission retained host lock: %v", err)
+	}
+	lock.release()
+}
+
+func TestManagedCheckoutGitChildUsesSafePATH(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "trusted-git")
+	writeTest(t, shim, "#!/bin/sh\nprintf '%s' \"$PATH\"\n")
+	if err := os.Chmod(shim, 0700); err != nil {
+		t.Fatal(err)
+	}
+	previous := trustedGitPath
+	trustedGitPath = shim
+	t.Cleanup(func() { trustedGitPath = previous })
+	t.Setenv("PATH", dir)
+	got, err := runGit(context.Background(), dir, "--version")
+	if err != nil || got != "/usr/bin:/bin" {
+		t.Fatalf("unsafe child PATH: %q %v", got, err)
 	}
 }
