@@ -26,6 +26,8 @@ var ErrBackoff = errors.New("marketplace: retry backoff")
 
 // WithManagedCheckout is synchronous and must be invoked by a background worker,
 // never the session foreground path. The callback may update the caller's cache.
+// CODEX_HOME (default hostHome/.codex) identifies its profile for callback backoff;
+// it never selects the managed clone or host lock. Callers must keep it stable.
 func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout) error) error {
 	home, err := canonicalHome(hostHome)
 	if err != nil {
@@ -57,6 +59,15 @@ func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout
 		return err
 	}
 	now := time.Now().UTC()
+	profile, err := callbackProfileKey(home)
+	if err != nil {
+		return err
+	}
+	retry := state.CallbackRetries[profile]
+	if retry.NextAttempt.After(now) && retry.NextAttempt.Sub(now) <= maxBackoff {
+		logEvent(dir, "backoff", revision)
+		return ErrBackoff
+	}
 	if state.NextAttempt.After(now) && state.NextAttempt.Sub(now) <= maxBackoff {
 		logEvent(dir, "backoff", revision)
 		return ErrBackoff
@@ -84,20 +95,69 @@ func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if err = use(Checkout{Path: path, Revision: next, Updated: next != revision}); err != nil {
-		if !recent {
-			state.NextAttempt = time.Now().UTC().Add(retryDelay(state.Failures))
-			// A callback error must retain its original identity/classification.
-			_ = saveState(dir, state)
+	// Reserve this profile's retry before calling it, including coalesced calls
+	// and process death. A cache failure must not back off other profiles.
+	now = time.Now().UTC()
+	if state.CallbackRetries == nil {
+		state.CallbackRetries = make(map[string]callbackRetry)
+	}
+	for key, pending := range state.CallbackRetries {
+		if pending.NextAttempt.Add(maxBackoff).Before(now) {
+			delete(state.CallbackRetries, key)
 		}
+	}
+	if _, exists := state.CallbackRetries[profile]; !exists && len(state.CallbackRetries) >= callbackRetryLimit {
+		// Reuse the earliest due slot, with a stable tie-break independent of
+		// map iteration. Never forget an active backoff: wait for its deadline
+		// under the host lock before eviction. This background-only wait is
+		// cancellable and bounded by maxBackoff, just like retry eligibility.
+		victim := ""
+		var deadline time.Time
+		for key, pending := range state.CallbackRetries {
+			if victim == "" || pending.NextAttempt.Before(deadline) || pending.NextAttempt.Equal(deadline) && key < victim {
+				victim, deadline = key, pending.NextAttempt
+			}
+		}
+		if delay := time.Until(deadline); delay > 0 && delay <= maxBackoff {
+			timer := time.NewTimer(delay)
+			defer timer.Stop()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		delete(state.CallbackRetries, victim)
+		now = time.Now().UTC()
+	}
+	retry.Failures = min(state.CallbackRetries[profile].Failures+1, 5)
+	retry.NextAttempt = now.Add(retryDelay(retry.Failures))
+	state.CallbackRetries[profile] = retry
+	state.NextAttempt = time.Time{}
+	state.Failures = 0
+	if err = saveState(dir, state); err != nil {
+		return err
+	}
+	if err = use(Checkout{Path: path, Revision: next, Updated: next != revision}); err != nil {
+		retry.NextAttempt = time.Now().UTC().Add(retryDelay(retry.Failures))
+		state.CallbackRetries[profile] = retry
+		// A callback error must retain its original identity/classification.
+		_ = saveState(dir, state)
 		logEvent(dir, "callback_failure", next)
 		return err
 	}
+	delete(state.CallbackRetries, profile)
 	if !recent {
-		state = checkoutState{SchemaVersion: 1, Revision: next, LastSuccess: time.Now().UTC()}
-		if err = saveState(dir, state); err != nil {
-			return err
-		}
+		state.Revision = next
+		state.LastSuccess = time.Now().UTC()
+	}
+	if err = saveState(dir, state); err != nil {
+		return err
+	}
+	if !recent {
 		logEvent(dir, "success", next)
 	} else {
 		logEvent(dir, "coalesced", next)
@@ -206,6 +266,11 @@ func validRevision(s string) bool {
 }
 
 const outputLimit = 64 * 1024
+const gitSafePATH = "/usr/bin:/bin"
+
+// Both supported hosts provide Git here. Never resolve it from caller PATH.
+// Kept private so package tests can inject a disposable transport.
+var trustedGitPath = "/usr/bin/git"
 
 // cappedOutput drains the pipe but never retains unbounded Git output.
 type cappedOutput struct {
@@ -229,7 +294,7 @@ func runGit(ctx context.Context, path string, args ...string) (string, error) {
 	defer cancel()
 	prefix := []string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.allow=never", "-c", "protocol.https.allow=always", "-c", "credential.helper=", "-c", "gc.auto=0"}
 	// #nosec G204 -- fixed executable, internal argv, validated owned path/revisions; no shell.
-	cmd := exec.CommandContext(ctx, "git", append(prefix, args...)...)
+	cmd := exec.CommandContext(ctx, trustedGitPath, append(prefix, args...)...)
 	cmd.Dir = path
 	// An orphaned Git child must keep the same lock if its updater is killed.
 	// Normal cancellation kills and waits for the process group before unlocking.
@@ -238,7 +303,7 @@ func runGit(ctx context.Context, path string, args ...string) (string, error) {
 	}
 	// Explicit environment prevents inherited GIT_DIR, config injection, prompts,
 	// SSH fallback and profile credentials from changing this read-only operation.
-	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/usr/bin/false", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C"}
+	cmd.Env = []string{"PATH=" + gitSafePATH, "HOME=" + os.Getenv("HOME"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "GIT_ASKPASS=/usr/bin/false", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -348,6 +413,12 @@ func updateCheckout(ctx context.Context, dir, path, previous string) (string, er
 		return "", err
 	}
 	if err = os.Remove(filepath.Join(dir, "recovery.json")); err != nil {
+		// Cleanup is part of this transaction: an error must leave the previous
+		// usable revision, just like a failed merge. Retain the journal for
+		// inspection while its directory remains unwritable.
+		if restoreErr := restoreRecovery(path, journal); restoreErr != nil {
+			return "", restoreErr
+		}
 		return "", errors.New("marketplace: recovery cleanup failed")
 	}
 
