@@ -2921,6 +2921,7 @@ func newTestHomeWithItems(width, height int, items []session.Item) *Home {
 }
 
 func TestMouseYToItemIndex(t *testing.T) {
+	withUpdateChecksEnabled(t)
 	// Standard layout: header(1) + filter(1) + panelTitle(2) = startY 4
 	// No banners, no scroll offset
 	items := []session.Item{
