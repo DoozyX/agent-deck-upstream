@@ -11,13 +11,10 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(runTestMain(m))
-}
-
-func runTestMain(m *testing.M) int {
-	cleanupHome := testutil.IsolateHome()
-	defer cleanupHome()
-	return m.Run()
+	restore := testutil.IsolateHome()
+	code := m.Run()
+	restore()
+	os.Exit(code)
 }
 
 func TestParseCronNext(t *testing.T) {
@@ -439,13 +436,10 @@ func TestCheckHealthDistinguishesUnknownFromDown(t *testing.T) {
 }
 
 func TestCheckHealthFreshAndStale(t *testing.T) {
-	now := time.Now()
 	dir := t.TempDir()
 	seen := filepath.Join(dir, "seen.db")
 	writeTestFile(t, seen, "x")
-	if err := os.Chtimes(seen, now, now); err != nil {
-		t.Fatalf("Chtimes fresh fixture: %v", err)
-	}
+	now := time.Now()
 
 	fresh := CheckHealth("gmail", "mail", dir, 30*time.Minute, now)
 	if fresh.State != HealthOK {

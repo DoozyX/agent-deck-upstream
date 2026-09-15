@@ -8,8 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os/exec"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/asheshgoplani/agent-deck/internal/costs"
@@ -25,11 +26,6 @@ type Config struct {
 	ReadOnly     bool
 	WebMutations bool // When false, POST/PATCH/DELETE endpoints return 403
 	Token        string
-	// MCPNoAuth explicitly disables bearer authentication for the dedicated
-	// /mcp endpoint. It does not affect the web/API routes, which continue to
-	// use Token. This is intended only for short-lived local testing because
-	// the MCP tools include session-mutating operations.
-	MCPNoAuth bool
 	// InsecureBind explicitly acknowledges binding a non-loopback address
 	// with no auth token (an unauthenticated RCE surface). Without it the
 	// server refuses to start in that configuration. See bind.go / report #1.
@@ -48,12 +44,6 @@ type Config struct {
 	PushVAPIDSubject    string
 	PushTestInterval    time.Duration
 	RemoteFleet         RemoteFleetLoader
-	// RemoteAttachCommand builds the ssh argv for GET /ws/remote/{remote}/session/{id}.
-	// nil (the production default) shells out to real ssh via
-	// defaultRemoteAttachCommand. Tests and the JS e2e fixture (a separate
-	// `main` package with no access to unexported seams) swap this in to
-	// avoid spawning real ssh — mirrors SSHRunner's own openStreamFn seam.
-	RemoteAttachCommand func(name string, cfg session.RemoteConfig, sessionID string) *exec.Cmd
 }
 
 // confirmLinkOpen resolves Config.ConfirmLinkOpen, defaulting to true so an
@@ -130,10 +120,6 @@ type SessionMutator interface {
 	StartSession(sessionID string) error
 	StopSession(sessionID string) error
 	RestartSession(sessionID string) error
-	// SendToSession delivers a user message to an existing session (MCP /
-	// remote control). Implementations must not accept shell commands or
-	// arbitrary HTTP targets — only sessionID + message text.
-	SendToSession(sessionID, message string) error
 	DeleteSession(sessionID string) error
 	// CloseSession stops the session process while keeping its metadata
 	// in storage (TUI Shift+D — non-destructive close).
@@ -180,7 +166,7 @@ type Server struct {
 	menuSubscribersMu sync.Mutex
 	menuSubscribers   map[chan struct{}]struct{}
 
-	costStore       costStore
+	costStore       *costs.Store
 	mutator         SessionMutator
 	skills          SkillsService
 	mcpMgr          MCPManager
@@ -191,25 +177,11 @@ type Server struct {
 	// whose hook file is present on disk. Defaults to defaultLoadHookStatuses
 	// (which reads ~/.agent-deck/hooks/) but is injectable for tests.
 	hookStatusLoader func() map[string]*session.HookStatus
-}
 
-type costStore interface {
-	CoveredTotalToday() (costs.CoveredSummary, error)
-	CoveredTotalThisWeek() (costs.CoveredSummary, error)
-	CoveredTotalThisMonth() (costs.CoveredSummary, error)
-	CoveredProjectedMonthly() (int64, costs.Coverage, error)
-	CoveredCostByDay() ([]costs.CostBreakdown, error)
-	CoveredCostByDayRange(time.Time, time.Time) ([]costs.CostBreakdown, error)
-	CoveredCostByProvider() ([]costs.CostBreakdown, error)
-	CoveredCostByModel() ([]costs.CostBreakdown, error)
-	CoveredCostBySession() ([]costs.CostBreakdown, error)
-	CoveredCostByRun() ([]costs.CostBreakdown, error)
-	CoveredTopSessionsByCost(int) ([]costs.SessionCost, error)
-	CoveredCostByGroup() ([]costs.GroupCost, error)
-	CoveredTotalBySession(string) (costs.CoveredSummary, error)
-	CoveredCostByDayForSession(string) ([]costs.CostBreakdown, error)
-	CoveredCostByModelForSession(string) ([]costs.CostBreakdown, error)
-	EventsByDateRange(time.Time, time.Time) ([]costs.CostEvent, error)
+	// inFlight counts requests inside a handler, excluding the event
+	// streams (see trackInFlight). It is what Idle reports for the
+	// headless self-restart.
+	inFlight atomic.Int64
 }
 
 // NewServer creates a new web server with base routes and middleware.
@@ -297,7 +269,6 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("/api/push/presence", s.handlePushPresence)
 	mux.HandleFunc("/events/menu", s.handleMenuEvents)
 	mux.HandleFunc("/ws/session/", s.handleSessionWS)
-	mux.HandleFunc("/ws/remote/", s.handleRemoteSessionWS)
 
 	// Command Center (the embedded live fleet god-view — see
 	// conductor/agent-deck/COMMAND-CENTER-DESIGN.md). Two read endpoints and
@@ -328,13 +299,7 @@ func NewServer(cfg Config) *Server {
 	mux.HandleFunc("DELETE /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 	mux.HandleFunc("PATCH /api/sessions/{id}/mcps/{name}", s.handleSessionMCPsRouter)
 
-	// Dedicated Streamable HTTP MCP endpoint (/mcp). Enabled only when a
-	// bearer token is configured: authorizeRequest short-circuits to allow
-	// when Token is empty, so tokenless MCP would otherwise be an open
-	// loopback surface. Keep /api/mcps catalog/session routes above separate.
-	s.registerMCPRoute(mux)
-
-	handler := withRecover(s.csrfProtect(mux))
+	handler := s.trackInFlight(withRecover(s.csrfProtect(mux)))
 
 	s.httpServer = &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -426,6 +391,46 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// streamPathPrefixes are the long-lived responses that never count as
+// in-flight work: the browser's EventSource reconnects on its own the
+// moment the connection drops, so an open event stream must not keep a
+// headless server from restarting into a new build. A terminal WebSocket
+// (/ws/session/) is not on this list: someone is typing into it.
+var streamPathPrefixes = []string{"/events/", "/api/costs/stream"}
+
+func isStreamPath(path string) bool {
+	for _, p := range streamPathPrefixes {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// trackInFlight counts requests from handler entry to exit so Idle can
+// tell when it is safe to hand the process over.
+func (s *Server) trackInFlight(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isStreamPath(r.URL.Path) {
+			s.inFlight.Add(1)
+			defer s.inFlight.Add(-1)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// InFlightRequests is the number of requests currently inside a handler,
+// event streams excluded.
+func (s *Server) InFlightRequests() int64 {
+	return s.inFlight.Load()
+}
+
+// Idle reports whether no request (event streams excluded) is being
+// served right now. `web --no-tui` uses it as the self-restart gate.
+func (s *Server) Idle() bool {
+	return s.inFlight.Load() == 0
 }
 
 func withRecover(next http.Handler) http.Handler {

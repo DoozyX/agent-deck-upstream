@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,9 +9,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
-
-	"github.com/asheshgoplani/agent-deck/internal/testutil"
 )
 
 // channelsCLIBuildOnce builds the agent-deck binary exactly once per test
@@ -20,81 +16,48 @@ import (
 // failing-test suite snappy while still catching real CLI regressions.
 var (
 	channelsCLIBinPath string
-	channelsCLIBinDir  string
 	channelsCLIBuildMu sync.Mutex
 	channelsCLIBuildOK bool
 )
 
-const (
-	agentDeckCLIBuildTimeout      = 2 * time.Minute
-	agentDeckCLISubprocessTimeout = 30 * time.Second
-)
-
-func channelsCLIBinary(t *testing.T) string {
-	t.Helper()
+// Helper test processes with deliberately sparse PATH reuse the parent process's
+// already-built fixture through AGENTDECK_TEST_CLI_BIN.
+func ensureChannelsCLIBinary() error {
 	channelsCLIBuildMu.Lock()
 	defer channelsCLIBuildMu.Unlock()
-
+	if inherited := os.Getenv("AGENTDECK_TEST_CLI_BIN"); inherited != "" {
+		if info, err := os.Stat(inherited); err == nil && !info.IsDir() {
+			channelsCLIBinPath = inherited
+			channelsCLIBuildOK = true
+			return nil
+		}
+	}
 	if channelsCLIBuildOK {
-		return channelsCLIBinPath
+		return nil
 	}
-
-	// A previous call that failed its build left channelsCLIBuildOK false, so the
-	// NEXT test to need the binary arrives here and builds again. Overwriting
-	// channelsCLIBinDir at that point would orphan the earlier directory — it
-	// would no longer be reachable by removeChannelsCLIBinDir and would leak for
-	// good. Release it before taking ownership of a new one.
-	if channelsCLIBinDir != "" {
-		if err := testutil.RemoveTempTree(channelsCLIBinDir); err != nil {
-			fmt.Fprintf(os.Stderr, "cmd/agent-deck: LEAKED failed-build dir: %v\n", err)
-		}
-		channelsCLIBinDir = ""
-	}
-
-	// Assign straight into the package-level var — no local alias — so the dir
-	// is owned by removeChannelsCLIBinDir from the instant it exists, including
-	// on the t.Fatalf paths below. Before this, the build dir had no owner at
-	// all: a failed build stranded an empty agent-deck-channels-bin-* dir and a
-	// successful one stranded a 45 MB dir, every run (2026-08-10 temp-leak
-	// incident).
-	var err error
-	channelsCLIBinDir, err = os.MkdirTemp("", "agent-deck-channels-bin-*")
+	binDir, err := os.MkdirTemp("", "agent-deck-channels-bin-*")
 	if err != nil {
-		t.Fatalf("mkdir bin tmp: %v", err)
+		return fmt.Errorf("mkdir bin tmp: %w", err)
 	}
-	bin := filepath.Join(channelsCLIBinDir, "agent-deck-test")
-
-	ctx, cancel := context.WithTimeout(context.Background(), agentDeckCLIBuildTimeout)
-	defer cancel()
-	build := exec.CommandContext(ctx, "go", "build", "-o", bin, ".")
-	build.WaitDelay = 5 * time.Second
+	bin := filepath.Join(binDir, "agent-deck-test")
+	build := exec.Command("go", "build", "-o", bin, ".")
 	if out, err := build.CombinedOutput(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			t.Fatalf("go build timed out after %s\noutput: %s", agentDeckCLIBuildTimeout, out)
-		}
-		t.Fatalf("go build: %v\noutput: %s", err, out)
+		return fmt.Errorf("go build: %w\noutput: %s", err, out)
 	}
 	channelsCLIBinPath = bin
 	channelsCLIBuildOK = true
-	return bin
+	if err := os.Setenv("AGENTDECK_TEST_CLI_BIN", bin); err != nil {
+		return err
+	}
+	return nil
 }
 
-// removeChannelsCLIBinDir deletes the shared CLI build dir. The binary is built
-// once per test binary and must outlive every individual test, so it cannot be
-// released with t.Cleanup; TestMain calls this after m.Run() instead. No-op
-// when no build was attempted.
-func removeChannelsCLIBinDir() {
-	channelsCLIBuildMu.Lock()
-	defer channelsCLIBuildMu.Unlock()
-	if channelsCLIBinDir == "" {
-		return
+func channelsCLIBinary(t *testing.T) string {
+	t.Helper()
+	if err := ensureChannelsCLIBinary(); err != nil {
+		t.Fatal(err)
 	}
-	if err := testutil.RemoveTempTree(channelsCLIBinDir); err != nil {
-		fmt.Fprintf(os.Stderr, "cmd/agent-deck: LEAKED channels CLI build dir: %v\n", err)
-	}
-	channelsCLIBinDir = ""
-	channelsCLIBinPath = ""
-	channelsCLIBuildOK = false
+	return channelsCLIBinPath
 }
 
 // runAgentDeck invokes the built binary with isolated HOME so each test
@@ -104,21 +67,10 @@ func runAgentDeck(
 	home string,
 	args ...string,
 ) (stdout, stderr string, exitCode int) {
-	return runAgentDeckWithEnv(t, home, nil, args...)
-}
-
-func runAgentDeckWithEnv(
-	t *testing.T,
-	home string,
-	extraEnv []string,
-	args ...string,
-) (stdout, stderr string, exitCode int) {
 	t.Helper()
 
 	bin := channelsCLIBinary(t)
-	ctx, cancel := context.WithTimeout(context.Background(), agentDeckCLISubprocessTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd := exec.Command(bin, args...)
 
 	// Strip TMUX*/AGENTDECK_*/HOME from parent so the test isolation is
 	// total — same pattern used by TestLogCgroupIsolationDecision_*
@@ -163,7 +115,6 @@ func runAgentDeckWithEnv(
 		"XDG_CONFIG_HOME="+filepath.Join(home, ".config"),
 		"XDG_DATA_HOME="+filepath.Join(home, ".local", "share"),
 	)
-	env = append(env, extraEnv...)
 	cmd.Env = env
 
 	var outBuf, errBuf strings.Builder
@@ -171,12 +122,6 @@ func runAgentDeckWithEnv(
 	cmd.Stderr = &errBuf
 
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			t.Fatalf(
-				"agent-deck %v timed out after %s\nstdout: %s\nstderr: %s",
-				args, agentDeckCLISubprocessTimeout, outBuf.String(), errBuf.String(),
-			)
-		}
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			exitCode = exitErr.ExitCode()
 		} else {
