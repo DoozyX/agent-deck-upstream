@@ -2,7 +2,7 @@
 name: debug
 description: Systematic root-cause debugging for any bug, test failure, or unexpected behavior — investigate before fixing, compare against a working example, test one hypothesis at a time, and stop to question the architecture after three failed fixes. Use as soon as something breaks and before proposing or applying any fix.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Debug

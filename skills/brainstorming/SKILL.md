@@ -1,8 +1,8 @@
 ---
 name: brainstorming
-description: Collaborative design and brainstorming before any code is written — explores project context, asks clarifying questions one frontier round at a time through the connector's native question tool, offers 2–3 approaches with trade-offs, and writes an approved design document to its repository-local `.agent-deck/DATE-SLUG/design/` directory (git-ignored, never committed). Use before building a feature, adding functionality, or changing behavior, and whenever the user says "let's build", "I want to add", "how should we do X", or asks for a design or spec. Hard-gates implementation until the design is approved.
+description: Collaborative design and brainstorming before any code is written — explores project context, asks clarifying questions one frontier round at a time through the connector's native question tool, offers 2–3 approaches with trade-offs, and writes and self-reviews a complete design file for the user to read before approving it. Designs live in the repository-local `.agent-deck/DATE-SLUG/design/` directory (git-ignored, never committed). Use before building a feature, adding functionality, or changing behavior, and whenever the user says "let's build", "I want to add", "how should we do X", or asks for a design or spec. Hard-gates implementation until the user explicitly approves the design file.
 metadata:
-  compatibility: "claude, opencode"
+  compatibility: "claude, codex, cursor"
 ---
 
 # Brainstorming
@@ -19,9 +19,11 @@ the task is genuinely wrong, say so in one line and stop.
 
 ## The hard gate
 
-No implementation — and no implementation skill — until the design has
-been presented and the user has approved it. This holds regardless of how
-simple the change looks. "It's a one-liner" is the most common way this
+No implementation — and no implementation skill — until the complete design
+file has been written, self-reviewed, linked for the user to read, and
+explicitly approved by the user. Never approve on the user's behalf or infer
+that they have read the file from silence or elapsed time. This holds
+regardless of how simple the change looks. "It's a one-liner" is the most common way this
 gate gets skipped, and a one-liner with the wrong requirement is still the
 wrong one-liner.
 
@@ -45,10 +47,13 @@ whose prerequisites are already settled; a question whose answer depends on
 another question still open belongs to a later round. Ask the whole frontier
 in one round, wait for the answers, then ask the next frontier.
 
-Deliver each round through the connector's native question tool — Claude:
-`AskUserQuestion` (up to four questions per call, each with 2–4 options, the
-recommended option first and labelled `(Recommended)`); Codex:
-`request_user_input`. The tool gives every question its own answer slot, so
+Deliver each round through an available native question tool permitted in
+the current mode — Claude: `AskUserQuestion`; Codex:
+`request_user_input_async` or `request_user_input` when available; Cursor:
+the question tool exposed by the current session, if any. Follow the tool's
+actual schema and limits, with the recommended option first and labelled
+`(Recommended)` where supported. Do not assume a tool exists from the
+connector name alone. The tool gives every question its own answer slot, so
 one merged reply can no longer swallow half the round. A frontier larger
 than one call is two calls, never a prose list. Without a native tool,
 number the questions in one message, put a recommended answer under each,
@@ -102,8 +107,8 @@ not state, and say what you cut.
 ## 4. Principles pass
 
 Before presenting the chosen architecture, check it against
-`${CLAUDE_PLUGIN_ROOT}/skills/review/references/principles.md` (that path is
-relative to the installed plugin, not to the repo you are working in). The
+`../review/references/principles.md`, resolved from the directory containing
+this loaded `SKILL.md`, not from the user's repository or shell cwd. The
 question to answer out loud:
 *does any component here exist for a requirement nobody stated?* Cut or
 justify each one.
@@ -117,18 +122,12 @@ interface was invented for the test; two real adapters mean the seam is real.
 Name the prior-art tests the new ones will be modelled on. Both answers go
 into `## Testing Decisions`.
 
-## 5. Present the complete design, approve once
+## 5. Prepare the complete design
 
 Present motivation, decisions, architecture, interfaces, testing decisions,
-and out-of-scope together in a skimmable document. Ask once: `Approve this
-design?` A single explicit approval covers all of those sections and the
-written document.
-
-For feature work the same approval turn carries the decomposition sketch's
-three checks, in the same native-tool call as the approval (or under it in
-prose): does the granularity feel right; does each unit depend only on units
-that genuinely gate it; should any unit be merged or split. An approval with
-no note on the checks approves the sketch as drawn.
+and out-of-scope together in a skimmable document. This is preparation for
+the file written in step 6, not an approval request in chat. Keep the design
+pending until the user reviews and explicitly approves the file in step 9.
 
 Every design, bug fix included, carries one section:
 
@@ -167,12 +166,6 @@ mini architecture plan, and three sections are mandatory, after Decisions:
   depends on every migrate unit. A unit that commits an ADR (step 8) says so.
 
 Bug fixes and one-file changes skip these three; say so in one line.
-
-Do not ask for per-section approvals. Ask again only if later self-review
-materially changes the approved scope: user-visible behavior, public
-interfaces, data handling, or an explicitly excluded item. State the change
-and why it needs confirmation; editorial fixes and clarifications do not need
-another approval.
 
 ## 6. Write the spec
 
@@ -222,8 +215,8 @@ The file must exist and `status` must print nothing (ignored ⇒ invisible).
 ## 7. Spec self-review
 
 Once written, read the document for placeholders (`TBD`, "etc.",
-"handle errors"), internal contradictions, scope creep past what was
-approved, and ambiguity a fresh reader would resolve differently than you
+"handle errors"), internal contradictions, scope creep past the user's
+requirements, and ambiguity a fresh reader would resolve differently than you
 meant. Check that `## Testing Decisions` names a seam and a prior-art test rather
 than "add tests". For feature work, check that `## Architecture`,
 `## Interfaces` and `## Decomposition sketch` exist, that every interface a
@@ -236,13 +229,8 @@ document for each name, and confirm every mention agrees on its behavior. A
 design once said in prose that a region does *not* repeat a countdown while
 its own table two paragraphs down defined that region's hero *as* the
 countdown; two full terminal review gates were spent re-deriving that from
-scratch before anyone could implement it. Make non-material fixes in place.
-The prior design approval covers
-that document; do not ask for a second document-review approval.
-
-If self-review makes a material change to scope, user-visible behavior,
-interfaces, data handling, or an explicitly excluded item, stop and obtain
-one approval for that change before handing the spec on.
+scratch before anyone could implement it. Fix the document in place before
+linking it for user review. Self-review is not user approval.
 
 ## 8. Durable decisions (ADR)
 
@@ -264,7 +252,33 @@ without a sketch, in one line under `## Decisions`. The implementer copies
 and commits it in its branch. Most designs produce zero ADRs; write none
 rather than one that fails a condition.
 
-## 9. Tiered exit
+## 9. Link the complete file, approve once
+
+After writing and self-reviewing the complete design, including any durable
+decisions from step 8, give the user a clickable link to the absolute
+`$SPEC_PATH`. Keep chat to a short summary; do not paste the whole design
+unless the user asks. The file is the design being approved.
+
+Ask once: `Read the complete design file, then approve it or request edits.`
+Wait for the user's explicit approval of that file. A summary, an earlier
+agreement on an approach, or the agent's self-review does not authorize
+implementation. Do not launch a planner, conductor, or implementer while
+approval is pending.
+
+For feature work, include the decomposition sketch's three review checks
+in the file: does the granularity feel right; does each unit depend only on
+units that genuinely gate it; should any unit be merged or split. Approval
+without notes on these checks approves the sketch as drawn.
+
+If the user requests edits, update and self-review the file, link it again
+with a short change summary, and wait for approval of the revised design.
+Do not ask for per-section approvals or a second approval of an unchanged
+file. After approval, ask again only for a material change to scope,
+user-visible behavior, public interfaces, data handling, or an explicitly
+excluded item. Explain that change in the file and the review request;
+editorial fixes and clarifications do not need another approval.
+
+## 10. Tiered exit
 
 After approval, size the work and take exactly one exit:
 
@@ -341,4 +355,5 @@ After approval, size the work and take exactly one exit:
 | "I'll ask all my questions at once to save time" | Ask the frontier, not the tree: a prose batch gets one merged answer that covers two of five; a native-tool round gives each question its own slot. |
 | "I'll just ask the user whether the API paginates" | That is a fact, not a decision. Look it up; ask only what the codebase cannot answer. |
 | "This trade-off is obvious, no ADR needed" | If it is obvious it fails the "surprising" condition and needs none. If a fresh reader would ask "why not the other way?", it passes, and the next brainstorm re-litigates it without one. |
-| "They said build it, so approval is implied" | "Build it" approved the idea, not the design. Present the complete design and get one explicit sign-off. |
+| "They said build it, so approval is implied" | "Build it" approved the idea, not the design. Link the complete, self-reviewed file and wait for the user's explicit sign-off. |
+| "They approved my summary; I'll write the file now" | Write and self-review the complete file first. The user approves that file after reading it, not a summary of a document that does not yet exist. |

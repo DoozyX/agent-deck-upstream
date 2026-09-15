@@ -129,7 +129,7 @@ func TestCoreSkillRoutingAndCompatibilityContracts(t *testing.T) {
 	if !strings.Contains(normalizedPlanning, "Run deterministic checks directly through shell/process execution") {
 		t.Error("planning route does not distinguish process-only deterministic checks")
 	}
-	if !strings.Contains(agentCore, "metadata:\n  compatibility: \"claude, opencode\"") {
+	if !strings.Contains(agentCore, "metadata:\n  compatibility: \"claude, codex, cursor\"") {
 		t.Error("agent-deck core lost compatibility metadata")
 	}
 }
