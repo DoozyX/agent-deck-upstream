@@ -763,3 +763,34 @@ func TestManagedCheckoutGitChildUsesSafePATH(t *testing.T) {
 		t.Fatalf("unsafe child PATH: %q %v", got, err)
 	}
 }
+
+func TestManagedCheckoutContextCallbackCarriesHostLock(t *testing.T) {
+	f := newFixture(t)
+	type callerKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), callerKey{}, "caller value"))
+	defer cancel()
+	if err := WithManagedCheckoutContext(ctx, f.home, func(locked context.Context, checkout Checkout) error {
+		if locked.Value(callerKey{}) != "caller value" || checkout.Path != f.path {
+			t.Fatal("callback lost caller context or checkout")
+		}
+		file, ok := locked.Value(gitLockKey{}).(*os.File)
+		if !ok {
+			t.Fatal("callback lacks lock descriptor")
+		}
+		got, err := file.Stat()
+		if err != nil {
+			t.Fatal(err)
+		}
+		want, err := os.Stat(filepath.Join(StateDir(f.home), "update.lock"))
+		if err != nil || !os.SameFile(got, want) {
+			t.Fatal("callback lock differs from host lock")
+		}
+		cancel()
+		if !errors.Is(locked.Err(), context.Canceled) {
+			t.Fatal("callback lost caller cancellation")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}

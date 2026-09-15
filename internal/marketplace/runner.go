@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 )
 
@@ -33,7 +34,11 @@ func Run(ctx context.Context, request Request) error {
 	if request.CodexHome == "" {
 		request.CodexHome = filepath.Join(home, ".codex")
 	}
-	_ = WithManagedCheckout(ctx, home, func(checkout Checkout) error {
+	_ = WithManagedCheckoutContext(ctx, home, func(ctx context.Context, checkout Checkout) error {
+		if !supportedRuntime(request.CodexArgv) {
+			logUnsupportedRuntime(StateDir(home))
+			return errors.New("marketplace: unsupported runtime")
+		}
 		if profileCurrent(ctx, home, request, checkout) {
 			return nil
 		}
@@ -52,7 +57,8 @@ func Run(ctx context.Context, request Request) error {
 }
 
 func saveProfileReceipt(home, codexHome string, argv []string, revision string) error {
-	if !validRevision(revision) || !supportedRuntime(argv) {
+	identity := runtimeIdentity(argv)
+	if !validRevision(revision) || identity == "" {
 		return nil
 	}
 	p, err := filepath.EvalSymlinks(codexHome)
@@ -63,7 +69,7 @@ func saveProfileReceipt(home, codexHome string, argv []string, revision string) 
 			return err
 		}
 	}
-	key := sha256.Sum256([]byte(p + "\x00" + runtimeIdentity(argv)))
+	key := sha256.Sum256([]byte(p + "\x00" + identity))
 	dir := filepath.Join(StateDir(home), "profiles")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return errors.New("marketplace: receipt unavailable")
@@ -71,7 +77,7 @@ func saveProfileReceipt(home, codexHome string, argv []string, revision string) 
 	if err := physicalPath(home, dir); err != nil {
 		return errors.New("marketplace: receipt unavailable")
 	}
-	b, err := json.Marshal(profileReceipt{1, revision, runtimeIdentity(argv), time.Now().UTC()})
+	b, err := json.Marshal(profileReceipt{1, revision, identity, time.Now().UTC()})
 	if err != nil {
 		return err
 	}
@@ -111,7 +117,8 @@ func fmtHex(v []byte) string {
 // Receipts coalesce only this canonical profile/runtime, and only while its
 // selected installed content still matches the current checkout.
 func profileCurrent(ctx context.Context, home string, request Request, checkout Checkout) bool {
-	if !supportedRuntime(request.CodexArgv) {
+	identity := runtimeIdentity(request.CodexArgv)
+	if identity == "" {
 		return false
 	}
 	profile, err := canonicalHome(request.CodexHome)
@@ -121,12 +128,12 @@ func profileCurrent(ctx context.Context, home string, request Request, checkout 
 	if _, err := os.Lstat(filepath.Join(profile, ".agent-deck-refresh/pending")); !os.IsNotExist(err) {
 		return false
 	}
-	key := sha256.Sum256([]byte(profile + "\x00" + runtimeIdentity(request.CodexArgv)))
+	key := sha256.Sum256([]byte(profile + "\x00" + identity))
 	var receipt profileReceipt
 	if err := readJSON(filepath.Join(StateDir(home), "profiles", fmtHex(key[:])+".json"), &receipt); err != nil {
 		return false
 	}
-	if receipt.SchemaVersion != 1 || receipt.Revision != checkout.Revision || receipt.Runtime != runtimeIdentity(request.CodexArgv) {
+	if receipt.SchemaVersion != 1 || receipt.Revision != checkout.Revision || receipt.Runtime != identity {
 		return false
 	}
 	config, err := readNativeConfig(profile)
@@ -144,4 +151,33 @@ func profileCurrent(ctx context.Context, home string, request Request, checkout 
 		}
 	}
 	return len(selectors) > 0 && verifyNativeContent(ctx, profile, checkout.Path, selectors) == nil
+}
+
+// Use the checkout logger's two-file/64 KiB contract under its host lock. The
+// fixed classification has no caller-controlled text. Returning a callback error
+// separately reserves the existing bounded retry and emits callback_failure.
+func logUnsupportedRuntime(dir string) {
+	line := time.Now().UTC().Format(time.RFC3339) + " unsupported_runtime\n"
+	path := filepath.Join(dir, "update.log")
+	if info, err := os.Lstat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return
+		}
+		if info.Size() > logLimit {
+			if err := os.Remove(path); err != nil {
+				return
+			}
+		} else if info.Size()+int64(len(line)) > logLimit {
+			if err := os.Rename(path, path+".1"); err != nil {
+				return
+			}
+		}
+	}
+	fd, err := syscall.Open(path, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_APPEND|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0600)
+	if err != nil {
+		return
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	_, _ = f.WriteString(line)
 }

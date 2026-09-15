@@ -29,6 +29,15 @@ var ErrBackoff = errors.New("marketplace: retry backoff")
 // CODEX_HOME (default hostHome/.codex) identifies its profile for callback backoff;
 // it never selects the managed clone or host lock. Callers must keep it stable.
 func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout) error) error {
+	return WithManagedCheckoutContext(ctx, hostHome, func(_ context.Context, checkout Checkout) error { return use(checkout) })
+}
+
+// WithManagedCheckoutContext passes the derived host-lock context to the
+// callback. Native subprocesses must use it to inherit the lock descriptor,
+// retaining serialization if the worker dies while a child is still active.
+// The context and its descriptor are valid only until the callback returns.
+// CODEX_HOME has the same stable callback-backoff identity contract as the wrapper.
+func WithManagedCheckoutContext(ctx context.Context, hostHome string, use func(context.Context, Checkout) error) error {
 	home, err := canonicalHome(hostHome)
 	if err != nil {
 		return err
@@ -141,7 +150,7 @@ func WithManagedCheckout(ctx context.Context, hostHome string, use func(Checkout
 	if err = saveState(dir, state); err != nil {
 		return err
 	}
-	if err = use(Checkout{Path: path, Revision: next, Updated: next != revision}); err != nil {
+	if err = use(ctx, Checkout{Path: path, Revision: next, Updated: next != revision}); err != nil {
 		retry.NextAttempt = time.Now().UTC().Add(retryDelay(retry.Failures))
 		state.CallbackRetries[profile] = retry
 		// A callback error must retain its original identity/classification.

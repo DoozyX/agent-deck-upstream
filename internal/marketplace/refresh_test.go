@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -42,6 +43,7 @@ func TestNativeRefreshUnprovenBasenameNeverExecutes(t *testing.T) {
 }
 
 func TestNativeRefreshAcceptsOnlyTaskOneRuntimeIdentities(t *testing.T) {
+	testProvenRuntime(t)
 	if !supportedRuntime([]string{"/Applications/ChatGPT.app/Contents/Resources/codex", "--disable", "apps"}) {
 		t.Fatal("approved ChatGPT runtime rejected")
 	}
@@ -83,6 +85,7 @@ func TestNativeRefreshStderrBound(t *testing.T) {
 var approvedTestArgv = []string{"/Applications/ChatGPT.app/Contents/Resources/codex", "--disable", "apps"}
 
 func nativeFixture(t *testing.T) (string, Checkout) {
+	testProvenRuntime(t)
 	t.Helper()
 	home, source := t.TempDir(), t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, "plugins/cache/agent-deck"), 0700); err != nil {
@@ -463,6 +466,7 @@ func TestNativeRefreshConcurrentDisableStopsSecondOperation(t *testing.T) {
 }
 
 func TestNativeRefreshCrashProcess(t *testing.T) {
+	testProvenRuntime(t)
 	home := os.Getenv("TASK03_CRASH_HOME")
 	if home == "" {
 		t.Skip("crash helper")
@@ -546,9 +550,37 @@ func TestNativeRefreshRollbackPreservesModesAndSymlinks(t *testing.T) {
 	if err := os.Symlink("skills/example/SKILL.md", filepath.Join(root, "link")); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(root, 0770); err != nil {
+		t.Fatal(err)
+	}
+	writeTest(t, filepath.Join(checkout.Path, "skills/example/SKILL.md"), "native mutation under restrictive umask")
+	_ = os.Remove(filepath.Join(home, "calls"))
+	previous := executeNative
+	mutated := false
+	executeNative = func(ctx context.Context, h string, argv []string, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[1] == "add" && args[2] == nativeSelectors[1] {
+			data, _ := os.ReadFile(path)
+			mutated = string(data) == "native mutation under restrictive umask"
+		}
+		return previous(ctx, h, argv, args...)
+	}
+	oldUmask := syscall.Umask(0077)
+	defer syscall.Umask(oldUmask)
 	writeTest(t, filepath.Join(home, "mode"), "fail-second")
-	if err := RefreshProfile(context.Background(), home, approvedTestArgv, checkout); err == nil {
+	refreshErr := RefreshProfile(context.Background(), home, approvedTestArgv, checkout)
+	if refreshErr == nil {
 		t.Fatal("failure missing")
+	}
+	if !mutated {
+		t.Fatalf("second native operation not reached after cache mutation: %v", refreshErr)
+	}
+	calls, _ := os.ReadFile(filepath.Join(home, "calls"))
+	if string(calls) != "agent-deck\nagent-deck-mcp\n" {
+		t.Fatalf("native operations: %q", calls)
+	}
+	dirInfo, err := os.Stat(root)
+	if err != nil || dirInfo.Mode().Perm() != 0770 {
+		t.Fatalf("directory mode: %v %v", dirInfo, err)
 	}
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0750 {
@@ -558,4 +590,114 @@ func TestNativeRefreshRollbackPreservesModesAndSymlinks(t *testing.T) {
 	if err != nil || link != "skills/example/SKILL.md" {
 		t.Fatalf("symlink: %q %v", link, err)
 	}
+}
+
+func TestNativeRefreshRollbackPreservesConcurrentSelectedRoot(t *testing.T) {
+	for _, drift := range []string{"edit", "remove", "symlink"} {
+		t.Run(drift, func(t *testing.T) {
+			home, checkout := nativeFixture(t)
+			if err := RefreshProfile(context.Background(), home, approvedTestArgv, checkout); err != nil {
+				t.Fatal(err)
+			}
+			writeTest(t, filepath.Join(checkout.Path, "skills/example/SKILL.md"), "new native content")
+			root := cacheRoot(home, nativeSelectors[0])
+			foreign := t.TempDir()
+			writeTest(t, filepath.Join(foreign, "keep"), "foreign")
+			previous := executeNative
+			executeNative = func(ctx context.Context, h string, argv []string, args ...string) ([]byte, error) {
+				if len(args) > 2 && args[1] == "add" && args[2] == nativeSelectors[1] {
+					switch drift {
+					case "edit":
+						writeTest(t, filepath.Join(root, "concurrent"), "preserve concurrent writer")
+					case "remove":
+						if err := os.RemoveAll(root); err != nil {
+							t.Fatal(err)
+						}
+					case "symlink":
+						if err := os.RemoveAll(root); err != nil {
+							t.Fatal(err)
+						}
+						if err := os.Symlink(foreign, root); err != nil {
+							t.Fatal(err)
+						}
+					}
+					return nil, errors.New("native second operation failed")
+				}
+				return previous(ctx, h, argv, args...)
+			}
+			err := RefreshProfile(context.Background(), home, approvedTestArgv, checkout)
+			if err == nil {
+				t.Fatal("failure missing")
+			}
+			switch drift {
+			case "edit":
+				data, _ := os.ReadFile(filepath.Join(root, "concurrent"))
+				if string(data) != "preserve concurrent writer" {
+					t.Fatal("rollback deleted concurrent selected-cache edit")
+				}
+			case "remove":
+				if _, err := os.Lstat(root); !os.IsNotExist(err) {
+					t.Fatal("rollback replaced concurrent selected-cache removal")
+				}
+			case "symlink":
+				if link, err := os.Readlink(root); err != nil || link != foreign {
+					t.Fatal("rollback replaced concurrent selected-cache symlink")
+				}
+			}
+			if _, err := os.Stat(filepath.Join(home, ".agent-deck-refresh/pending/transaction.json")); err != nil {
+				t.Fatal("uncertain recovery evidence not retained", err)
+			}
+		})
+	}
+}
+
+func TestNativeRefreshBindsEligibilityToBackup(t *testing.T) {
+	for _, change := range []string{"disable", "registration"} {
+		t.Run(change, func(t *testing.T) {
+			home, checkout := nativeFixture(t)
+			original := readNativeConfig
+			defer func() { readNativeConfig = original }()
+			reads := 0
+			readNativeConfig = func(h string) (nativeConfig, error) {
+				cfg, err := original(h)
+				reads++
+				if reads == 2 {
+					data, err := os.ReadFile(filepath.Join(home, "config.toml"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					replacement := strings.ReplaceAll(string(data), "enabled = true", "enabled = false")
+					if change == "registration" {
+						replacement = strings.ReplaceAll(string(data), checkout.Path, t.TempDir())
+					}
+					writeTest(t, filepath.Join(home, "config.toml"), replacement)
+				}
+				return cfg, err
+			}
+			err := RefreshProfile(context.Background(), home, approvedTestArgv, checkout)
+			if _, statErr := os.Stat(filepath.Join(home, "calls")); !os.IsNotExist(statErr) {
+				t.Fatalf("native add ran after eligibility changed: %v", err)
+			}
+			if reads < 2 || err == nil {
+				t.Fatalf("eligibility race not rejected: reads=%d error=%v", reads, err)
+			}
+		})
+	}
+}
+
+func TestNativeRefreshRuntimeIdentityIncludesProvenBinary(t *testing.T) {
+	testProvenRuntime(t)
+	id := runtimeIdentity(approvedTestArgv)
+	if !strings.Contains(id, "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb") || !strings.Contains(id, "codex-cli 0.154.0-alpha.6.2") {
+		t.Fatalf("runtime identity lacks proven fingerprint/version: %q", id)
+	}
+}
+
+func testProvenRuntime(t *testing.T) {
+	t.Helper()
+	previous := nativeBinaryHash
+	nativeBinaryHash = func(string) (string, error) {
+		return "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb", nil
+	}
+	t.Cleanup(func() { nativeBinaryHash = previous })
 }

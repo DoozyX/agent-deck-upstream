@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/BurntSushi/toml"
+	"golang.org/x/sys/unix"
 )
 
 const nativeRefreshTimeout = 60 * time.Second
@@ -63,7 +64,7 @@ func refreshProfile(ctx context.Context, codexHome string, codexArgv []string, c
 	if err != nil || !reflect.DeepEqual(config, latest) {
 		return false, errors.New("marketplace: native config changed")
 	}
-	transaction, err := backupNative(ctx, home, selectors)
+	transaction, err := backupNative(ctx, home, selectors, config)
 	if err != nil {
 		return false, err
 	}
@@ -76,6 +77,16 @@ func refreshProfile(ctx context.Context, codexHome string, codexArgv []string, c
 			if restoreErr := transaction.restore(); restoreErr != nil {
 				return false, restoreErr
 			}
+			return false, err
+		}
+		// A failed or unverifiable command cannot establish ownership of new bytes.
+		if err := verifyNativeContent(ctx, home, checkout.Path, []string{selector}); err != nil {
+			if restoreErr := transaction.restore(); restoreErr != nil {
+				return false, restoreErr
+			}
+			return false, err
+		}
+		if err := transaction.recordMutation(ctx, selector); err != nil {
 			return false, err
 		}
 	}
@@ -105,7 +116,10 @@ type nativeConfig struct {
 	} `toml:"plugins"`
 }
 
-func readNativeConfig(home string) (nativeConfig, error) {
+// Reading is a seam for deterministic concurrent-config regressions.
+var readNativeConfig = readNativeConfigFile
+
+func readNativeConfigFile(home string) (nativeConfig, error) {
 	var config nativeConfig
 	path := filepath.Join(home, "config.toml")
 	info, err := os.Lstat(path)
@@ -132,11 +146,28 @@ func registeredClone(config nativeConfig, clone string) bool {
 	return err == nil && ownedErr == nil && source == owned
 }
 
-func supportedRuntime(argv []string) bool {
-	// Task 01 proved these two exact runtime identities only. A basename is not
-	// an identity: standalone updates may change native plugin semantics.
-	return (len(argv) == 3 && argv[0] == "/Applications/ChatGPT.app/Contents/Resources/codex" && argv[1] == "--disable" && argv[2] == "apps") ||
-		(len(argv) == 1 && argv[0] == "/opt/homebrew/Caskroom/codex/0.154.0/bin/codex.real")
+func supportedRuntime(argv []string) bool { return runtimeIdentity(argv) != "" }
+
+// The SHA-256 binds the version string to the exact Task 01 executable, without
+// running an unproven binary to ask it for its own identity. Never cache by path.
+var nativeBinaryHash = hashNativeBinary
+
+func hashNativeBinary(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 1<<30 {
+		return "", errors.New("marketplace: unsupported runtime")
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, io.LimitReader(f, (1<<30)+1))
+	if err != nil || n != info.Size() {
+		return "", errors.New("marketplace: unsupported runtime")
+	}
+	return fmt.Sprintf("%x", hash.Sum(nil)), nil
 }
 
 func nativeList(ctx context.Context, home string, argv []string) (map[string]bool, error) {
@@ -221,7 +252,24 @@ func nativeOutput(ctx context.Context, home string, argv []string, args ...strin
 	return out.Bytes(), nil
 }
 
-func runtimeIdentity(argv []string) string { return strings.Join(argv, "\x00") }
+func runtimeIdentity(argv []string) string {
+	var fingerprint, version string
+	switch {
+	case len(argv) == 3 && argv[0] == "/Applications/ChatGPT.app/Contents/Resources/codex" && argv[1] == "--disable" && argv[2] == "apps":
+		fingerprint = "ecad78dbf98adb89ec475edac86630406cbe59d9f3070b17d88065f136b94bcb"
+		version = "codex-cli 0.154.0-alpha.6.2"
+	case len(argv) == 1 && argv[0] == "/opt/homebrew/Caskroom/codex/0.154.0/bin/codex.real":
+		fingerprint = "4f85982624b3898c8991cb80c0981b2aa71070e3537046c9a95950318a95afcc"
+		version = "codex-cli 0.154.0"
+	default:
+		return ""
+	}
+	actual, err := nativeBinaryHash(argv[0])
+	if err != nil || actual != fingerprint {
+		return ""
+	}
+	return strings.Join(argv, "\x00") + "\x00" + version + "\x00sha256:" + fingerprint
+}
 
 // Only selected cache roots belong to the rollback write set. Config is backed
 // up for inspection but never replaced: native add may race an unrelated writer
@@ -230,6 +278,7 @@ type nativeBackup struct {
 	home, dir string
 	selectors []string
 	config    []byte
+	expected  map[string]map[string]nativeEntry
 }
 
 func selectorName(selector string) string { name, _, _ := strings.Cut(selector, "@"); return name }
@@ -237,7 +286,7 @@ func cacheRoot(home, selector string) string {
 	return filepath.Join(home, "plugins/cache/agent-deck", selectorName(selector))
 }
 
-func backupNative(ctx context.Context, home string, selectors []string) (*nativeBackup, error) {
+func backupNative(ctx context.Context, home string, selectors []string, eligible nativeConfig) (*nativeBackup, error) {
 	root := filepath.Join(home, ".agent-deck-refresh")
 	if err := os.MkdirAll(root, 0700); err != nil {
 		return nil, errors.New("marketplace: native backup failed")
@@ -252,7 +301,7 @@ func backupNative(ctx context.Context, home string, selectors []string) (*native
 	if err := os.Mkdir(dir, 0700); err != nil {
 		return nil, errors.New("marketplace: native recovery required")
 	}
-	tx := &nativeBackup{home: home, dir: dir, selectors: selectors}
+	tx := &nativeBackup{home: home, dir: dir, selectors: selectors, expected: make(map[string]map[string]nativeEntry)}
 	fail := func() (*nativeBackup, error) {
 		_ = os.RemoveAll(dir)
 		return nil, errors.New("marketplace: native backup failed")
@@ -262,6 +311,12 @@ func backupNative(ctx context.Context, home string, selectors []string) (*native
 	if err != nil {
 		return fail()
 	}
+	var baseline nativeConfig
+	if _, err := toml.Decode(string(tx.config), &baseline); err != nil || !reflect.DeepEqual(eligible, baseline) {
+		_ = os.RemoveAll(dir)
+		return nil, errors.New("marketplace: native config changed")
+	}
+
 	if err := os.Mkdir(filepath.Join(dir, "before"), 0700); err != nil {
 		return fail()
 	}
@@ -292,6 +347,7 @@ func backupNative(ctx context.Context, home string, selectors []string) (*native
 		if err != nil || !reflect.DeepEqual(before, backup) {
 			return fail()
 		}
+		tx.expected[selector] = before
 	}
 	// Durable, exclusive journal precedes the first native write. A killed worker
 	// leaves this directory intact; later workers refuse to overwrite its evidence.
@@ -312,6 +368,35 @@ func backupNative(ctx context.Context, home string, selectors []string) (*native
 		return fail()
 	}
 	return tx, nil
+}
+
+// Record only the root written by the completed native operation. Never adopt
+// later changes to other roots as ours. Persist the observation for inspection;
+// interrupted transactions still require manual recovery.
+func (tx *nativeBackup) recordMutation(ctx context.Context, selector string) error {
+	observed, err := nativeTree(ctx, cacheRoot(tx.home, selector))
+	if err != nil {
+		return errors.New("marketplace: native recovery required")
+	}
+	data, err := json.Marshal(observed)
+	if err != nil {
+		return errors.New("marketplace: native recovery required")
+	}
+	path := filepath.Join(tx.dir, "after-"+selectorName(selector)+".json")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0600)
+	if err != nil {
+		return errors.New("marketplace: native recovery required")
+	}
+	_, err = f.Write(data)
+	if err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		return errors.New("marketplace: native recovery required")
+	}
+	tx.expected[selector] = observed
+	return nil
 }
 
 func (tx *nativeBackup) restore() error {
@@ -335,10 +420,24 @@ func (tx *nativeBackup) restore() error {
 		if err := physicalPath(tx.home, filepath.Dir(path)); err != nil {
 			return errors.New("marketplace: native rollback conflict")
 		}
+		current, err := nativeTree(ctx, path)
+		expected, recorded := tx.expected[selector]
+		if err != nil || !recorded || !reflect.DeepEqual(current, expected) {
+			conflict = true
+			continue
+		}
+		backup := filepath.Join(tx.dir, "before", selectorName(selector))
+		original, err := nativeTree(ctx, backup)
+		if err != nil {
+			return errors.New("marketplace: native rollback failed")
+		}
+		// Avoid touching a root that never changed, including read-only trees.
+		if reflect.DeepEqual(current, original) {
+			continue
+		}
 		if err := os.RemoveAll(path); err != nil {
 			return errors.New("marketplace: native rollback failed")
 		}
-		backup := filepath.Join(tx.dir, "before", selectorName(selector))
 		if err := copyNativeTree(ctx, backup, path); err != nil {
 			return errors.New("marketplace: native rollback failed")
 		}
@@ -346,8 +445,7 @@ func (tx *nativeBackup) restore() error {
 		if err != nil {
 			return errors.New("marketplace: native rollback failed")
 		}
-		original, err := nativeTree(ctx, backup)
-		if err != nil || !reflect.DeepEqual(restored, original) {
+		if !reflect.DeepEqual(restored, original) {
 			return errors.New("marketplace: native rollback failed")
 		}
 	}
@@ -444,7 +542,11 @@ func copyNativeTree(ctx context.Context, source, dest string) error {
 	}
 	var total int64
 	count := 0
-	return filepath.WalkDir(source, func(path string, d os.DirEntry, err error) error {
+	var directories []struct {
+		path string
+		mode os.FileMode
+	}
+	err := filepath.WalkDir(source, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -471,9 +573,27 @@ func copyNativeTree(ctx context.Context, source, dest string) error {
 			if err != nil {
 				return err
 			}
-			return os.Symlink(link, target)
+			if err := os.Symlink(link, target); err != nil {
+				return err
+			}
+			copied, err := os.Lstat(target)
+			if err != nil {
+				return err
+			}
+			if copied.Mode().Perm() != info.Mode().Perm() {
+				return unix.Fchmodat(unix.AT_FDCWD, target, uint32(info.Mode().Perm()), unix.AT_SYMLINK_NOFOLLOW)
+			}
+			return nil
 		case info.IsDir():
-			return os.Mkdir(target, info.Mode().Perm())
+			// Keep the new directory writable until its children are copied.
+			if err := os.Mkdir(target, 0700); err != nil {
+				return err
+			}
+			directories = append(directories, struct {
+				path string
+				mode os.FileMode
+			}{target, info.Mode()})
+			return nil
 		case info.Mode().IsRegular():
 			src, err := os.Open(path)
 			if err != nil {
@@ -489,6 +609,9 @@ func copyNativeTree(ctx context.Context, source, dest string) error {
 				err = errors.New("native file changed during backup")
 			}
 			if err == nil {
+				err = dst.Chmod(info.Mode())
+			}
+			if err == nil {
 				err = dst.Sync()
 			}
 			closeErr := dst.Close()
@@ -500,6 +623,15 @@ func copyNativeTree(ctx context.Context, source, dest string) error {
 			return errors.New("unsupported native file")
 		}
 	})
+	if err != nil {
+		return err
+	}
+	for i := len(directories) - 1; i >= 0; i-- {
+		if err := os.Chmod(directories[i].path, directories[i].mode); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func verifyNativeContent(ctx context.Context, home, clone string, selectors []string) error {
