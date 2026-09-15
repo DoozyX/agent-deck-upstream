@@ -181,7 +181,14 @@ func TestMarketplaceRunRejectsReplacedBinaryAndOldReceipt(t *testing.T) {
 	before, _ := os.ReadFile(receipts[0])
 	original := runtimeIdentity(req.CodexArgv)
 	replacement := filepath.Join(t.TempDir(), "replacement")
-	writeTest(t, replacement, "an unproven replacement at the same argv path")
+	writeTest(t, replacement, "#!/bin/sh\nprintf '%s\\n' 'codex-cli 0.154.0-alpha.6.2'\n")
+	if err := os.Chmod(replacement, 0700); err != nil {
+		t.Fatal(err)
+	}
+	version, err := exec.Command(replacement, "--version").Output()
+	if err != nil || strings.TrimSpace(string(version)) != "codex-cli 0.154.0-alpha.6.2" {
+		t.Fatal("replacement must report the same version", err)
+	}
 	// Keep the production argv unchanged while replacing the bytes its fingerprint
 	// reader sees. The changed bytes are hashed with the real file implementation.
 	nativeBinaryHash = func(string) (string, error) { return hashNativeBinary(replacement) }
@@ -374,5 +381,56 @@ func TestMarketplaceRunUnsupportedRuntimeDiagnosticIsBoundedAndBacksOff(t *testi
 	}
 	if !state.CallbackRetries[key].NextAttempt.After(time.Now()) {
 		t.Fatal("unsupported runtime did not reserve retry backoff")
+	}
+}
+
+func TestMarketplaceRunProvenSameVersionBinaryHasIndependentReceipt(t *testing.T) {
+	f, profile := managedNativeFixture(t)
+	t.Setenv("CODEX_HOME", profile)
+	req := Request{HostHome: f.home, CodexHome: profile, CodexArgv: approvedTestArgv}
+	if err := Run(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := filepath.Glob(filepath.Join(StateDir(f.home), "profiles", "*.json"))
+	if len(before) != 1 {
+		t.Fatal("original proven runtime did not publish receipt")
+	}
+	oldReceipt, err := os.ReadFile(before[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldIdentity := runtimeIdentity(req.CodexArgv)
+	const candidate = "a1d2f191e70023ed7afd619bc70530f26067a085926e03bae50cf5c0f8298bcf"
+	nativeBinaryHash = func(string) (string, error) { return candidate, nil }
+	if err := Run(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := filepath.Glob(filepath.Join(StateDir(f.home), "profiles", "*.json"))
+	if len(after) != 2 {
+		t.Fatalf("proven same-version binary must publish an independent receipt: got %d", len(after))
+	}
+	newIdentity := runtimeIdentity(req.CodexArgv)
+	if oldIdentity == newIdentity || !strings.Contains(newIdentity, candidate) || !strings.Contains(newIdentity, "codex-cli 0.154.0-alpha.6.2") {
+		t.Fatal("fingerprint missing from same-version identity")
+	}
+	for _, path := range after {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path == before[0] {
+			if string(data) != string(oldReceipt) {
+				t.Fatal("new binary overwrote old runtime receipt")
+			}
+			continue
+		}
+		var receipt profileReceipt
+		if err := json.Unmarshal(data, &receipt); err != nil || receipt.Runtime != newIdentity {
+			t.Fatal("new receipt lacks actual proven fingerprint", err)
+		}
+	}
+	calls, _ := os.ReadFile(filepath.Join(profile, "calls"))
+	if string(calls) != "agent-deck\nagent-deck-mcp\nagent-deck\nagent-deck-mcp\n" {
+		t.Fatalf("new binary incorrectly coalesced with old receipt: %q", calls)
 	}
 }
