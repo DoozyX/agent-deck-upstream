@@ -14,6 +14,35 @@ type ToolOptions interface {
 	ToArgs() []string
 }
 
+// CursorOptions holds Cursor Agent CLI launch options.
+type CursorOptions struct {
+	Model string `json:"model,omitempty"`
+}
+
+func (o *CursorOptions) ToolName() string { return "cursor" }
+
+func (o *CursorOptions) ToArgs() []string {
+	if o == nil || o.Model == "" {
+		return nil
+	}
+	return []string{"--model", o.Model}
+}
+
+func UnmarshalCursorOptions(data json.RawMessage) (*CursorOptions, error) {
+	if len(data) == 0 {
+		return nil, nil
+	}
+	var wrapper ToolOptionsWrapper
+	if err := json.Unmarshal(data, &wrapper); err != nil || wrapper.Tool != "cursor" {
+		return nil, err
+	}
+	var opts CursorOptions
+	if err := json.Unmarshal(wrapper.Options, &opts); err != nil {
+		return nil, err
+	}
+	return &opts, nil
+}
+
 // ClaudeOptions holds launch options for Claude Code sessions
 type ClaudeOptions struct {
 	// SessionMode: "new" (default), "continue" (-c), or "resume" (-r)

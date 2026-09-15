@@ -79,7 +79,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if !validOrchestrateRole(role) {
 		return (ResolvedLaunch{Role: role}).parked("unknown role")
 	}
-	if provider != "codex" && provider != "claude" {
+	if provider != "codex" && provider != "claude" && provider != "cursor" {
 		return (ResolvedLaunch{Role: role, Provider: provider}).parked("unsupported provider " + provider)
 	}
 
@@ -90,7 +90,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 	if explicit.Browser || explicit.MCPConfig || len(explicit.MCPs) > 0 {
 		result.LoadoutSource = "explicit"
 	}
-	if provider == "codex" && explicit.Browser {
+	if (provider == "codex" || provider == "cursor") && explicit.Browser {
 		return result.parked("browser loadout unsupported by codex connector")
 	}
 	result.Model, result.Effort = strings.TrimSpace(explicit.Model), strings.TrimSpace(explicit.Effort)
@@ -118,7 +118,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 			if result.Effort == "" && strings.TrimSpace(cfg.Codex.DefaultReasoningEffort) != "" {
 				result.Effort, result.EffortSource = strings.TrimSpace(cfg.Codex.DefaultReasoningEffort), "config:codex.default_reasoning_effort"
 			}
-		} else {
+		} else if provider == "claude" {
 			if result.Model == "" {
 				if model, group := cfg.findGroupClaudeSetting(strings.TrimSpace(explicit.GroupPath), func(s GroupClaudeSettings) string { return strings.TrimSpace(s.Model) }); model != "" {
 					result.Model, result.ModelSource = model, "group:"+group
@@ -127,6 +127,9 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 			if result.Model == "" && strings.TrimSpace(cfg.Claude.DefaultModel) != "" {
 				result.Model, result.ModelSource = strings.TrimSpace(cfg.Claude.DefaultModel), "config:claude.default_model"
 			}
+		}
+		if provider == "cursor" && result.Model == "" && strings.TrimSpace(cfg.Cursor.DefaultModel) != "" {
+			result.Model, result.ModelSource = strings.TrimSpace(cfg.Cursor.DefaultModel), "config:cursor.default_model"
 		}
 	}
 
@@ -140,7 +143,7 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 			result.Effort = defaults.CodexEffort
 			result.EffortSource = roleDefaultSource(cfg, role, provider, "effort")
 		}
-	} else {
+	} else if provider == "claude" {
 		if result.Model == "" {
 			result.Model = defaults.ClaudeModel
 			result.ModelSource = roleDefaultSource(cfg, role, provider, "model")
@@ -149,6 +152,9 @@ func ResolveOrchestrateLaunch(role OrchestrateRole, tool string, explicit Orches
 			result.Effort = defaults.ClaudeEffort
 			result.EffortSource = roleDefaultSource(cfg, role, provider, "effort")
 		}
+	} else if provider == "cursor" && result.Model == "" {
+		result.Model = defaults.CursorModel
+		result.ModelSource = roleDefaultSource(cfg, role, provider, "model")
 	}
 	result.ResolutionSource = result.ModelSource
 	if result.ResolutionSource == "" {
@@ -174,6 +180,9 @@ func orchestrateLoadout(provider string, explicit OrchestrateLaunchExplicit) Orc
 			return OrchestrateToolLoadout{Kind: "claude-task-mcp", MCPs: mcps}
 		}
 		return OrchestrateToolLoadout{Kind: "claude-strict-empty-mcp", StrictEmptyMCP: true}
+	}
+	if provider == "cursor" {
+		return OrchestrateToolLoadout{Kind: "cursor", MCPs: mcps}
 	}
 	return OrchestrateToolLoadout{Kind: "codex", MCPs: mcps}
 }
@@ -203,6 +212,9 @@ func roleDefaults(cfg *UserConfig, role OrchestrateRole) OrchestrateRoleDefault 
 			if override.ClaudeEffort != "" {
 				base.ClaudeEffort = override.ClaudeEffort
 			}
+			if override.CursorModel != "" {
+				base.CursorModel = override.CursorModel
+			}
 		}
 	}
 	return base
@@ -211,11 +223,11 @@ func roleDefaults(cfg *UserConfig, role OrchestrateRole) OrchestrateRoleDefault 
 func builtInRoleDefaults(role OrchestrateRole) OrchestrateRoleDefault {
 	switch role {
 	case OrchestrateRoleRouting:
-		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-luna", CodexEffort: "low", ClaudeModel: "haiku"}
+		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-luna", CodexEffort: "low", ClaudeModel: "haiku", CursorModel: "auto"}
 	case OrchestrateRoleArchitecture:
-		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-sol", CodexEffort: "high", ClaudeModel: "opus", ClaudeEffort: "medium"}
+		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-sol", CodexEffort: "high", ClaudeModel: "opus", ClaudeEffort: "medium", CursorModel: "auto"}
 	default:
-		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-terra", CodexEffort: "medium", ClaudeModel: "sonnet", ClaudeEffort: "medium"}
+		return OrchestrateRoleDefault{CodexModel: "gpt-5.6-terra", CodexEffort: "medium", ClaudeModel: "sonnet", ClaudeEffort: "medium", CursorModel: "auto"}
 	}
 }
 
@@ -240,6 +252,8 @@ func roleDefaultSource(cfg *UserConfig, role OrchestrateRole, provider, field st
 			configured = strings.TrimSpace(d.ClaudeModel) != ""
 		case "claude:effort":
 			configured = strings.TrimSpace(d.ClaudeEffort) != ""
+		case "cursor:model":
+			configured = strings.TrimSpace(d.CursorModel) != ""
 		}
 		if configured {
 			return "config:orchestrate." + string(role)
@@ -249,10 +263,13 @@ func roleDefaultSource(cfg *UserConfig, role OrchestrateRole, provider, field st
 }
 
 func (d OrchestrateRoleDefault) hasValues() bool {
-	return d.CodexModel != "" || d.CodexEffort != "" || d.ClaudeModel != "" || d.ClaudeEffort != ""
+	return d.CodexModel != "" || d.CodexEffort != "" || d.ClaudeModel != "" || d.ClaudeEffort != "" || d.CursorModel != ""
 }
 
 func supportedOrchestrateChoice(role OrchestrateRole, provider, model, effort, modelSource string, userSelected, justified bool) bool {
+	if provider == "cursor" {
+		return model != "" && effort == ""
+	}
 	if !supportsOrchestrateModelEffort(provider, model, effort) {
 		return false
 	}
@@ -289,7 +306,7 @@ func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit
 		i.OrchestrateLaunch = &resolved
 		return resolved, fmt.Errorf("deterministic role must run as a process, not an agent session")
 	}
-	if (resolved.Provider == "codex" && !IsCodexCompatible(i.Tool)) || (resolved.Provider == "claude" && !IsClaudeCompatible(i.Tool)) {
+	if (resolved.Provider == "codex" && !IsCodexCompatible(i.Tool)) || (resolved.Provider == "claude" && !IsClaudeCompatible(i.Tool)) || (resolved.Provider == "cursor" && i.Tool != "cursor") {
 		resolved, err = resolved.parked("explicit provider does not match session connector")
 		i.OrchestrateLaunch = &resolved
 		return resolved, err
@@ -313,6 +330,8 @@ func (i *Instance) ApplyResolvedOrchestrateLaunch(role OrchestrateRole, explicit
 			i.ExtraArgs = append(i.ExtraArgs, "--strict-mcp-config", "--mcp-config", "{}")
 		}
 		err = i.SetClaudeOptions(opts)
+	case "cursor":
+		err = i.SetCursorOptions(&CursorOptions{Model: resolved.Model})
 	}
 	if err == nil {
 		i.OrchestrateLaunch = &resolved

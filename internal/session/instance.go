@@ -311,6 +311,7 @@ type Instance struct {
 
 	// Codex CLI integration
 	CodexSessionID  string    `json:"codex_session_id,omitempty"`
+	CursorSessionID string    `json:"cursor_session_id,omitempty"`
 	CodexDetectedAt time.Time `json:"codex_detected_at,omitempty"`
 	CodexStartedAt  int64     `json:"-"` // Unix millis when we started Codex (for session matching, not persisted)
 	lastCodexScanAt time.Time // Rate-limits expensive ~/.codex/sessions scans
@@ -2906,7 +2907,14 @@ func (i *Instance) buildCursorCommand(baseCommand string, continuePrev bool) str
 	}
 
 	out := envPrefix + cmd
-	if continuePrev && !strings.Contains(strings.ToLower(cmd), "--continue") {
+	if opts := i.GetCursorOptions(); opts != nil {
+		for _, arg := range opts.ToArgs() {
+			out += " " + shellescape.Quote(arg)
+		}
+	}
+	if continuePrev && i.CursorSessionID != "" && !strings.Contains(strings.ToLower(cmd), "--resume") {
+		out += " --resume " + shellescape.Quote(i.CursorSessionID)
+	} else if continuePrev && i.CursorSessionID == "" && !strings.Contains(strings.ToLower(cmd), "--continue") {
 		out += " --continue"
 	}
 	return out
@@ -10399,7 +10407,7 @@ func (i *Instance) SetGeminiModel(model string) error {
 // SupportsLaunchModel reports whether a newly-created session can receive an
 // explicit model override through Agent Deck's generic session creation path.
 func SupportsLaunchModel(tool string) bool {
-	return IsClaudeCompatible(tool) || tool == "gemini" || tool == "opencode" || IsCodexCompatible(tool)
+	return IsClaudeCompatible(tool) || tool == "gemini" || tool == "opencode" || IsCodexCompatible(tool) || tool == "cursor"
 }
 
 // ApplyLaunchModel stores a per-session model override in the tool-specific
@@ -10438,6 +10446,13 @@ func (i *Instance) ApplyLaunchModel(model string) error {
 		}
 		opts.Model = model
 		return i.SetCodexOptions(opts)
+	case i.Tool == "cursor":
+		opts := i.GetCursorOptions()
+		if opts == nil {
+			opts = &CursorOptions{}
+		}
+		opts.Model = model
+		return i.SetCursorOptions(opts)
 	default:
 		return fmt.Errorf("model selection is not supported for tool %q", i.Tool)
 	}
@@ -10476,6 +10491,13 @@ func (i *Instance) ClearLaunchModel() error {
 		}
 		opts.Model = ""
 		return i.SetCodexOptions(opts)
+	case i.Tool == "cursor":
+		opts := i.GetCursorOptions()
+		if opts == nil {
+			return nil
+		}
+		opts.Model = ""
+		return i.SetCursorOptions(opts)
 	default:
 		return nil
 	}
@@ -11347,6 +11369,27 @@ func (i *Instance) GetCodexOptions() *CodexOptions {
 
 // SetCodexOptions stores Codex-specific options
 func (i *Instance) SetCodexOptions(opts *CodexOptions) error {
+	if opts == nil {
+		i.ToolOptionsJSON = nil
+		return nil
+	}
+	data, err := MarshalToolOptions(opts)
+	if err != nil {
+		return err
+	}
+	i.ToolOptionsJSON = data
+	return nil
+}
+
+func (i *Instance) GetCursorOptions() *CursorOptions {
+	opts, err := UnmarshalCursorOptions(i.ToolOptionsJSON)
+	if err != nil {
+		return nil
+	}
+	return opts
+}
+
+func (i *Instance) SetCursorOptions(opts *CursorOptions) error {
 	if opts == nil {
 		i.ToolOptionsJSON = nil
 		return nil
