@@ -7338,7 +7338,17 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return h, tea.Sequence(commands...)
 	}
 	defer h.recordFocusedSession()
+	clearStorageReload := false
+	if reload, ok := msg.(loadSessionsMsg); ok {
+		clearStorageReload = h.acceptsStorageReload(reload)
+	}
 	model, cmd := h.updateInner(msg)
+	if clearStorageReload {
+		// A registry snapshot can remove rows while the terminal's incremental
+		// renderer still has their old cells on screen. Unlike navigation, a
+		// background reload has no input event to force those cells to clear.
+		return model, appendClearScreen(cmd)
+	}
 	if !h.fullRepaint {
 		return model, cmd
 	}
@@ -7352,6 +7362,19 @@ func (h *Home) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return model, cmd
+}
+
+// acceptsStorageReload reports whether msg can replace the visible registry.
+// It mirrors the stale-load guards in updateInner so discarded and failed loads
+// do not cause an unnecessary terminal clear.
+func (h *Home) acceptsStorageReload(msg loadSessionsMsg) bool {
+	if msg.err != nil {
+		return false
+	}
+	if msg.loadSequence != 0 && (msg.loadSequence != h.sessionLoadSequence || msg.loadWatcher != h.storageWatcher) {
+		return false
+	}
+	return msg.watcherTicket == nil || h.storageWatcher == nil || h.storageWatcher.current(*msg.watcherTicket)
 }
 
 // uiInputLabel gives the performance log stable labels for the interactions
