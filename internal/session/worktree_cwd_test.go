@@ -7,10 +7,10 @@ import (
 
 func TestNormalizeWorktreeSessionCwd(t *testing.T) {
 	cases := map[string]string{
-		"":            WorktreeSessionCwdWorktree,
+		"":            WorktreeSessionCwdRepoRoot,
+		"nonsense":    WorktreeSessionCwdRepoRoot,
 		"worktree":    WorktreeSessionCwdWorktree,
 		"  WORKTREE ": WorktreeSessionCwdWorktree,
-		"nonsense":    WorktreeSessionCwdWorktree,
 		"repo-root":   WorktreeSessionCwdRepoRoot,
 		"repo_root":   WorktreeSessionCwdRepoRoot,
 		"Root":        WorktreeSessionCwdRepoRoot,
@@ -29,8 +29,14 @@ func TestResolveWorktreeSessionCwd(t *testing.T) {
 		root = "/repo"
 	)
 
-	t.Run("default mode keeps the worktree", func(t *testing.T) {
-		if got := ResolveWorktreeSessionCwd("", wt, root); got != wt {
+	t.Run("unset mode starts at the repository root", func(t *testing.T) {
+		if got := ResolveWorktreeSessionCwd("", wt, root); got != root {
+			t.Fatalf("got %q, want %q", got, root)
+		}
+	})
+
+	t.Run("explicit worktree mode keeps the worktree", func(t *testing.T) {
+		if got := ResolveWorktreeSessionCwd(WorktreeSessionCwdWorktree, wt, root); got != wt {
 			t.Fatalf("got %q, want %q", got, wt)
 		}
 	})

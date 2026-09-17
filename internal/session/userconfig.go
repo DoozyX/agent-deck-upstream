@@ -2623,13 +2623,14 @@ type WorktreeSettings struct {
 	// worktree gets its own resume history that is invisible from the repo
 	// root — one throwaway bucket per worktree.
 	//
-	//   "worktree"  (default) — start in the worktree, today's behaviour.
-	//   "repo-root"           — start in the base repository, so every
+	//   "repo-root" (default) — start in the base repository, so every
 	//                           session in the repo shares one resume
 	//                           history. The worktree is still created and
 	//                           is passed to the agent via --add-dir plus a
 	//                           system-prompt directive telling it to work
 	//                           there.
+	//   "worktree"            — start in the worktree (isolated resume
+	//                           history per worktree).
 	//
 	// The choice is applied at session creation and baked into the session's
 	// project path, so flipping it never moves an existing session's history.
@@ -5096,6 +5097,9 @@ default_tool = "claude"
 [worktree]
 # Where to create worktrees: "sibling" (next to repo) or "subdirectory" (inside repo)
 default_location = "sibling"
+# Working directory for NEW worktree sessions: "repo-root" (default, shared
+# resume history) or "worktree" (isolated per-worktree resume history).
+# session_cwd = "repo-root"
 # Pre-check "Create in worktree" in new-session and fork dialogs (default: false)
 # default_enabled = true
 # Automatically remove worktree when session is deleted

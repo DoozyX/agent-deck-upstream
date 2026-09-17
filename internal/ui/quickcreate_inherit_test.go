@@ -55,3 +55,43 @@ func TestQuickCreateTemplate(t *testing.T) {
 		}
 	})
 }
+
+// N must use the group default path even when the cursor sits on a legacy
+// worktree-cwd session whose ProjectPath is under .worktrees.
+func TestResolveQuickCreatePathPrefersGroupDefault(t *testing.T) {
+	const (
+		groupDefault = "/repo"
+		mostRecent   = "/repo/.worktrees/legacy"
+	)
+	if got := resolveQuickCreatePath(groupDefault, mostRecent); got != groupDefault {
+		t.Fatalf("got %q, want group default %q", got, groupDefault)
+	}
+	if got := resolveQuickCreatePath("", mostRecent); got != mostRecent {
+		t.Fatalf("empty group default should fall back to most-recent, got %q", got)
+	}
+	if got := resolveQuickCreatePath("  ", ""); got != "" {
+		t.Fatalf("blank inputs should yield empty, got %q", got)
+	}
+}
+
+func TestMostRecentPathAmongCollapsesWorktree(t *testing.T) {
+	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
+	legacy := &session.Instance{
+		Title:            "legacy-wt",
+		GroupPath:        "g",
+		ProjectPath:      "/repo/.worktrees/legacy",
+		WorktreeRepoRoot: "/repo",
+		CreatedAt:        at(200),
+	}
+	olderRoot := &session.Instance{
+		Title:       "older-root",
+		GroupPath:   "g",
+		ProjectPath: "/repo",
+		CreatedAt:   at(100),
+	}
+
+	got := mostRecentPathAmong([]*session.Instance{olderRoot, legacy}, "g")
+	if got != "/repo" {
+		t.Fatalf("got %q, want collapsed repo root /repo", got)
+	}
+}

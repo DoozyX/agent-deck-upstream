@@ -18,22 +18,26 @@ import (
 // through --add-dir plus a system-prompt directive (see WorktreeCwdDirective).
 const (
 	// WorktreeSessionCwdWorktree starts the session inside its worktree
-	// (historical behaviour, and the default).
+	// (opt-in via [worktree].session_cwd = "worktree").
 	WorktreeSessionCwdWorktree = "worktree"
 	// WorktreeSessionCwdRepoRoot starts the session in the base repository so
-	// its conversation joins the root project's resume history.
+	// its conversation joins the root project's resume history. This is the
+	// shipped default for unset / unknown config.
 	WorktreeSessionCwdRepoRoot = "repo-root"
 )
 
 // NormalizeWorktreeSessionCwd maps a configured [worktree].session_cwd value to
 // one of the two canonical modes. Unset, unknown and malformed values fall back
-// to WorktreeSessionCwdWorktree so a typo never silently relocates a session.
+// to WorktreeSessionCwdRepoRoot so a typo never silently isolates resume
+// history into a per-worktree bucket.
 func NormalizeWorktreeSessionCwd(mode string) string {
 	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "worktree", "wt":
+		return WorktreeSessionCwdWorktree
 	case "repo-root", "repo_root", "reporoot", "root":
 		return WorktreeSessionCwdRepoRoot
 	default:
-		return WorktreeSessionCwdWorktree
+		return WorktreeSessionCwdRepoRoot
 	}
 }
 
@@ -41,7 +45,7 @@ func NormalizeWorktreeSessionCwd(mode string) string {
 func GetWorktreeSessionCwd() string {
 	config, err := LoadUserConfig()
 	if err != nil || config == nil {
-		return WorktreeSessionCwdWorktree
+		return WorktreeSessionCwdRepoRoot
 	}
 	return NormalizeWorktreeSessionCwd(config.Worktree.SessionCwd)
 }
