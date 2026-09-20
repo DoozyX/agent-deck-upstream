@@ -115,6 +115,15 @@ type UserConfig struct {
 	// (`<name>@<source>`) plus per-plugin policy (auto-install, channel link).
 	Plugins map[string]PluginDef `toml:"plugins,omitempty"`
 
+	// SkillsPackages is the catalog of project-local skill packages installed
+	// with `npx skills` (vercel-labs/skills) into group default_path git repos.
+	// Groups attach entries via [groups.X].skills_packages.
+	SkillsPackages map[string]SkillsPackageDef `toml:"skills_packages,omitempty"`
+
+	// SkillsPackagesCheckIntervalHours is the global refresh cadence floor for
+	// skills packages (default 24). A package's own check_interval_hours wins.
+	SkillsPackagesCheckIntervalHours int `toml:"skills_packages_check_interval_hours,omitempty"`
+
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude,omitempty"`
 
@@ -948,6 +957,9 @@ type GroupSettings struct {
 	Create bool `toml:"create,omitempty"`
 	// DefaultPath sets the default working directory for new sessions in this group.
 	DefaultPath string `toml:"default_path,omitempty"`
+	// SkillsPackages lists [skills_packages.X] catalog keys installed into this
+	// group's default_path git repo; unioned along the group ancestry.
+	SkillsPackages []string `toml:"skills_packages,omitempty"`
 	// Claude defines Claude Code overrides for a specific group.
 	Claude GroupClaudeSettings `toml:"claude,omitempty"`
 	// Codex defines Codex CLI overrides for a specific group.

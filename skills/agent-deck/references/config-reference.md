@@ -32,6 +32,7 @@ All options for `$XDG_CONFIG_HOME/agent-deck/config.toml` (default `~/.config/ag
 - [[performance] Section](#performance-section)
 - [[desktop_notifications] Section](#desktop_notifications-section)
 - [Skills Registry (Outside config.toml)](#skills-registry-outside-configtoml)
+- [[skills_packages.*] Section](#skills_packages-section)
 - [[mcp_pool] Section](#mcp_pool-section)
 - [[mcps.*] Section](#mcps-section)
 - [[tools.*] Section](#tools-section)
@@ -1047,6 +1048,53 @@ the selected agent home; explicit attachments materialize in the project. SSH
 sessions are skipped because the local process cannot safely modify a remote
 home or project. See
 [Per-group / per-conductor Claude overrides](#per-group--per-conductor-claude-overrides).
+
+## [skills_packages.*] Section
+
+Project-local skill packages installed with [`npx skills`](https://github.com/vercel-labs/skills)
+into each group's `default_path` git repo. Separate from the home/pool registry
+above: `skill attach` and `sources.toml` are unaffected.
+
+```toml
+skills_packages_check_interval_hours = 24   # optional global cadence floor
+
+[skills_packages.tam-tools]
+source     = "ssh://forgejo@git.example.com/dev/tam-tools.git"
+full_depth = true                            # find nested plugin layouts
+auto_update = true                           # false => never refreshed
+agents     = ["claude-code", "codex", "cursor"]
+# skills = ["*"]                             # default: every discovered skill
+# check_interval_hours = 24                  # per-package override
+
+[groups.adaptam]
+skills_packages = ["tam-tools"]              # inherited by child groups
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `source` | string | Repo URL or path passed to `skills add`. Required. |
+| `full_depth` | bool | Pass `--full-depth` to discover nested skills. |
+| `auto_update` | bool | Must be `true` for the refresher to touch the package. |
+| `agents` | array | `-a` targets (`claude-code`, `codex`, `cursor`, ...). |
+| `skills` | array | `--skill` names; empty or `["*"]` installs all. |
+| `check_interval_hours` | int | Per-package cadence; falls back to `skills_packages_check_interval_hours`, then 24. |
+
+`[groups.X].skills_packages` is the deduplicated root-to-leaf union of catalog
+keys along the group ancestry. Unknown keys are skipped with a warning.
+
+**Refresh behavior.** Agent Deck refreshes at TUI / headless-web start and then
+re-checks hourly, running each target once its interval has elapsed. Targets
+are group `default_path` values (registry or config) that contain a `.git`
+entry; other paths are skipped. With `skills-lock.json` present it runs
+`npx skills update -p -y`, otherwise `npx skills add <source> ... -y`. Failures
+are logged per target and never block sessions or the TUI. Commit
+`skills-lock.json`; gitignore `.agents/` and the agent skill links.
+
+**Manual run / verification:**
+```bash
+agent-deck skills-packages refresh --group adaptam [--json]
+agent-deck group show adaptam --resolved     # lists resolved skills_packages
+```
 
 ## [mcp_pool] Section
 

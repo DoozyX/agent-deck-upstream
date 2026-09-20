@@ -109,7 +109,7 @@ func recordCLITelemetry(subcommand string, rest []string) {
 		"session", "fleet", "mcp", "plugin", "skill", "mcp-proxy", "group", "try", "launch",
 		"accounts", "conductor", "agents", "agent", "telegram-doctor", "watcher", "openclaw", "oc",
 		"remote", "worktree", "wt", "costs", "web", "uninstall", "migrate-paths", "hooks",
-		"codex-hooks", "gemini-hooks", "hermes-hooks", "cursor-hooks", "deepseek", "feedback", "creds-refresh":
+		"codex-hooks", "gemini-hooks", "hermes-hooks", "cursor-hooks", "deepseek", "feedback", "creds-refresh", "skills-packages":
 	default:
 		return
 	}
@@ -518,6 +518,9 @@ func main() {
 			return
 		case "creds-refresh":
 			handleCredsRefresh(args[1:])
+			return
+		case "skills-packages":
+			handleSkillsPackages(profile, args[1:])
 			return
 		case "debug-dump":
 			if helpRequested(args[1:]) {
@@ -998,6 +1001,9 @@ func main() {
 			// reads live data from storage on each request.
 			fmt.Println("Headless mode: TUI disabled")
 			fmt.Printf("Web server: http://%s\n", server.Addr())
+			skillsCtx, skillsCancel := context.WithCancel(context.Background())
+			defer skillsCancel()
+			session.StartSkillsPackageRefresher(skillsCtx)
 			defer func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 				defer cancel()
@@ -1091,6 +1097,8 @@ func main() {
 	session.StartMaintenanceWorker(maintenanceCtx, func(result session.MaintenanceResult) {
 		p.Send(ui.MaintenanceCompleteMsg{Result: result})
 	})
+	// Project-local skills packages: fail-open, never blocks TUI start.
+	session.StartSkillsPackageRefresher(maintenanceCtx)
 
 	_, runErr := p.Run()
 	// The TUI pins terminal autowrap off for the whole session (#607 drift
@@ -1129,7 +1137,7 @@ var commandRegistry = map[string]bool{
 	"codex-notify": true, "hooks": true, "codex-hooks": true, "gemini-hooks": true,
 	"hermes-hooks": true, "cursor-hooks": true, "deepseek": true, "notify-daemon": true,
 	"desktop-notifications": true,
-	"run-task":              true, "inbox": true, "feedback": true, "creds-refresh": true,
+	"run-task":              true, "inbox": true, "feedback": true, "creds-refresh": true, "skills-packages": true,
 	"debug-dump": true, "version": true, "help": true,
 	"artifacts": true, "config": true, "telemetry": true, "usage": true,
 	"--help": true, "-h": true, "--version": true, "-v": true,

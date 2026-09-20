@@ -525,6 +525,10 @@ func handleGroupShow(profile string, args []string) {
 		fmt.Fprintf(&b, "  marketplaces: %s\n", orNone(strings.Join(codex.Marketplaces, ", ")))
 		fmt.Fprintf(&b, "  plugins:    %s\n", orNone(strings.Join(codex.Plugins, ", ")))
 		fmt.Fprintf(&b, "  mcps:       %s\n", orNone(strings.Join(codex.MCPs, ", ")))
+
+		skillsPackages := session.ResolveGroupSkillsPackages(groupPath)
+		jsonData["skills_packages"] = skillsPackages
+		fmt.Fprintf(&b, "\nSkills packages (npx skills, installed into git default_path dirs):\n  packages:   %s\n", orNone(strings.Join(skillsPackages, ", ")))
 	}
 
 	out.Print(b.String(), jsonData)
