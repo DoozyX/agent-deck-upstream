@@ -1,0 +1,18 @@
+{
+  "target": "codex",
+  "path": "~/.codex/config.toml",
+  "owns": ["plugins.enabled"],
+  "plugins_disabled": [
+    "browser@openai-bundled",
+    "unified-computer-use@openai-bundled",
+    "computer-use@openai-bundled",
+    "computer-history@openai-bundled",
+    "chrome@openai-bundled",
+    "visualize@openai-bundled",
+    "documents@openai-primary-runtime",
+    "spreadsheets@openai-primary-runtime",
+    "template-creator@openai-primary-runtime",
+    "gmail@openai-curated"
+  ],
+  "_why": "Each of these plugins loads its tool schemas into every Codex session, including Go work in this repository. A scan of 6,120 Codex rollouts over 60 days (2026-07-23 to 2026-09-21) found zero calls to any tool from any of them. Re-enable one by removing it from this list and re-applying; nothing here is irreversible."
+}

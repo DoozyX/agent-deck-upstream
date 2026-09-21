@@ -51,6 +51,34 @@ var ErrRefusingConfigSectionDrop = fmt.Errorf("session: refusing to save config.
 // or omitzero (int/struct) so zero-value fields are not written to disk. Without
 // this, SaveUserConfig bloats the file with sections the user never configured.
 // TestSaveUserConfig_ZeroValueConfigProducesNoSections enforces this invariant.
+// ContextSettings controls the startup context a dispatched session carries.
+//
+// Startup context — the host agent's system prompt, tool schemas, instruction
+// files and memory index — is paid in full by every child a run spawns, before
+// the child reads its task. The lean profile trims it for leaf children.
+type ContextSettings struct {
+	// LeanChildren launches dispatched leaf children with Claude's
+	// --exclude-dynamic-system-prompt-sections, which moves the per-machine
+	// blocks (cwd, env, memory paths, git status) out of the cached system
+	// prompt. That shrinks each child's startup cost and, because the
+	// remaining prompt is then identical across children, lets them share
+	// prompt-cache entries instead of each paying a cold cache.
+	//
+	// Conductors are excluded: they are long-lived, a human attaches to them,
+	// and they read the dynamic blocks while supervising.
+	//
+	// A pointer so an absent [context] section is distinguishable from an
+	// explicit `false`. Absent means on — see LeanChildrenEnabled.
+	LeanChildren *bool `toml:"lean_children,omitempty"`
+}
+
+// LeanChildrenEnabled reports whether the lean child profile applies. It
+// defaults to true so a host that has never seen a [context] section still
+// gets the budget; only an explicit `lean_children = false` opts out.
+func (c ContextSettings) LeanChildrenEnabled() bool {
+	return c.LeanChildren == nil || *c.LeanChildren
+}
+
 type UserConfig struct {
 	// DefaultTool is the pre-selected AI tool when creating new sessions
 	// Valid values: "claude", "gemini", "opencode", "codex", "pi", or any custom tool name
@@ -117,6 +145,9 @@ type UserConfig struct {
 
 	// Claude defines Claude Code integration settings
 	Claude ClaudeSettings `toml:"claude,omitempty"`
+
+	// Context controls what dispatched sessions carry before they start work.
+	Context ContextSettings `toml:"context,omitempty"`
 
 	// Profiles defines optional per-profile overrides.
 	// Example:

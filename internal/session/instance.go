@@ -1917,6 +1917,26 @@ func extraArgsSupplyClaudeEffort(extraArgs []string) bool {
 	return selected.EffortSet
 }
 
+// leanChildProfileApplies reports whether this session is a dispatched leaf
+// child that should launch with the trimmed startup-context profile.
+//
+// The predicate is deliberately the same one publishRoleEnv uses to stamp
+// AGENTDECK_ROLE=child: parented, and not the conductor. Keeping the two in
+// step means a session's advertised role and its launch profile can never
+// disagree.
+func (i *Instance) leanChildProfileApplies() bool {
+	if i.ParentSessionID == "" || i.IsConductor {
+		return false
+	}
+	cfg, err := LoadUserConfig()
+	if err != nil || cfg == nil {
+		// An unreadable config must not silently disable the budget; the
+		// documented default is on.
+		return true
+	}
+	return cfg.Context.LeanChildrenEnabled()
+}
+
 // buildClaudeExtraFlags builds extra command-line flags string from ClaudeOptions
 // Also handles instance-level flags like --add-dir for subagent access
 func (i *Instance) buildClaudeExtraFlags(opts *ClaudeOptions) string {
@@ -1942,6 +1962,20 @@ func (i *Instance) buildClaudeExtraFlagsWithName(opts *ClaudeOptions, launchName
 	if runtimeGOOS() == "darwin" && i.WorkerScratchConfigDir != "" {
 		settingsPath := filepath.Join(i.WorkerScratchConfigDir, "settings.json")
 		flags = append(flags, "--settings "+shellescape.Quote(settingsPath))
+	}
+
+	// Lean child profile: a dispatched leaf child pays the host agent's full
+	// startup context — system prompt, tool schemas, instruction files, memory
+	// index — before it reads its task, and an orchestrate run pays it once per
+	// child and again on every rotation.
+	// --exclude-dynamic-system-prompt-sections moves the per-machine blocks
+	// (cwd, env, memory paths, git status) into the first user message, which
+	// both shrinks the prompt and makes what remains identical across children
+	// so they share prompt-cache entries.
+	// Conductors keep the full profile: they are long-lived, a human attaches
+	// to them, and they read those blocks while supervising.
+	if i.leanChildProfileApplies() {
+		flags = append(flags, "--exclude-dynamic-system-prompt-sections")
 	}
 
 	// Instance-level flags (not from ClaudeOptions)

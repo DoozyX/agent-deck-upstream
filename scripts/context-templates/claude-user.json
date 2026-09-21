@@ -1,0 +1,18 @@
+{
+  "target": "claude",
+  "path": "~/.claude/settings.json",
+  "owns": ["claudeMdExcludes"],
+  "expand_home": ["claudeMdExcludes"],
+  "settings": {
+    "claudeMdExcludes": ["~/AGENTS.md"]
+  },
+  "_why": {
+    "claudeMdExcludes": "~/AGENTS.md is byte-identical to ~/.claude/CLAUDE.md (6,491 B each) and Claude concatenates instruction files rather than deduplicating them, so both are loaded into every session. Codex reads ~/.codex/AGENTS.md and is unaffected. Verified: excluding a loaded instruction file drops it from the /context Memory Files table and reduces the total by its token count.",
+    "expand_home": "Claude does not expand '~' in claudeMdExcludes; a literal '~/AGENTS.md' silently matches nothing. The two hosts have different usernames, so the template cannot hardcode an absolute path."
+  },
+  "_rejected": {
+    "skillOverrides": "Tested and does not work in the form {\"<skill>\": \"hidden\"} — the skill is still listed at its full token cost. The whole skills listing is ~2k tokens, so this lever is low value even once the correct format is known.",
+    "enableArtifact": "Setting it false produced no measurable change in a /context probe (26.2k both ways), and the setting is one-way with no undo. Not worth spending an irreversible setting for an unmeasured saving.",
+    "deniedMcpServers/disabledMcpjsonServers": "Per-project MCP scoping is unverified: it is not established that a denied server costs zero prompt tokens rather than being loaded and then blocked. Verify with a before/after /context probe before adding it here."
+  }
+}

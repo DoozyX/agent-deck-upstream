@@ -1,0 +1,7 @@
+{
+  "print": 22000,
+  "codex": 15000,
+  "interactive": 30000,
+  "child": 25000,
+  "memory_index": 3000
+}
