@@ -15356,9 +15356,12 @@ func resolveAlternateQuickCreateTool(contextualTool, defaultTool string) (string
 }
 
 // quickCreateSession creates a session instantly with auto-generated name and smart defaults.
-// When the cursor is on a session, it inherits that session's path and tool settings
-// (duplicate-like behavior per community feedback). When on a group header, it uses
-// the group's default path and most recently created session's settings.
+// When the cursor is on a session, it inherits that session's tool settings
+// (duplicate-like behavior per community feedback) but always takes the path
+// from the group default / collapsed most-recent path — never the selected
+// session's ProjectPath — so conversation history stays on the repo root.
+// When on a group header, it uses the group's default path and most recently
+// created session's settings.
 func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 	groupPath := ""
 	var sourceSession *session.Instance
@@ -15381,15 +15384,13 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 		}
 	}
 
-	projectPath := ""
 	tool := ""
 	command := ""
 	var toolOptionsJSON json.RawMessage
 	geminiYoloMode := false
 
 	if sourceSession != nil {
-		// Cursor on a session: inherit from THAT session (duplicate-like)
-		projectPath = sourceSession.ProjectPath
+		// Cursor on a session: inherit tool/options only (not path).
 		tool = sourceSession.Tool
 		command = inheritableQuickCreateCommand(sourceSession.Command)
 		if len(sourceSession.ToolOptionsJSON) > 0 {
@@ -15399,12 +15400,7 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 			geminiYoloMode = true
 		}
 	} else {
-		// Cursor on a group header: use group defaults + most recent session
-		projectPath = h.getDefaultPathForGroup(groupPath)
-		if projectPath == "" {
-			projectPath = h.mostRecentPathInGroup(groupPath)
-		}
-
+		// Cursor on a group header: inherit tool/options from most recent session.
 		h.instancesMu.RLock()
 		mostRecent := quickCreateTemplate(h.instances, groupPath)
 		if mostRecent != nil {
@@ -15419,6 +15415,13 @@ func (h *Home) quickCreateSession(alternate bool) tea.Cmd {
 		}
 		h.instancesMu.RUnlock()
 	}
+
+	// Path always comes from group default / collapsed most-recent, never from
+	// the selected session's ProjectPath (which may be a legacy .worktrees cwd).
+	projectPath := resolveQuickCreatePath(
+		h.getDefaultPathForGroup(groupPath),
+		h.mostRecentPathInGroup(groupPath),
+	)
 
 	// Fallback for path
 	if projectPath == "" {
@@ -15498,6 +15501,47 @@ func quickCreateTemplate(instances []*session.Instance, groupPath string) *sessi
 		}
 	}
 	return mostRecent
+}
+
+// resolveQuickCreatePath picks the project path for a new N-created session.
+// The selected session never contributes a path — only the group default or
+// the group's collapsed most-recent path — so a cursor on a legacy
+// worktree-cwd session cannot seed .worktrees into the new session.
+func resolveQuickCreatePath(groupDefaultPath, mostRecentGroupPath string) string {
+	if p := strings.TrimSpace(groupDefaultPath); p != "" {
+		return p
+	}
+	return strings.TrimSpace(mostRecentGroupPath)
+}
+
+// collapsedSessionProjectPath prefers WorktreeRepoRoot so callers that fall
+// back to "most recent session path" share the repo's resume history bucket.
+func collapsedSessionProjectPath(inst *session.Instance) string {
+	if inst == nil {
+		return ""
+	}
+	if root := strings.TrimSpace(inst.WorktreeRepoRoot); root != "" {
+		return root
+	}
+	return strings.TrimSpace(inst.ProjectPath)
+}
+
+// mostRecentPathAmong returns the collapsed project path of the most recently
+// created session in groupPath.
+func mostRecentPathAmong(instances []*session.Instance, groupPath string) string {
+	var mostRecent *session.Instance
+	for _, inst := range instances {
+		if inst == nil || inst.GroupPath != groupPath {
+			continue
+		}
+		if collapsedSessionProjectPath(inst) == "" {
+			continue
+		}
+		if mostRecent == nil || inst.CreatedAt.After(mostRecent.CreatedAt) {
+			mostRecent = inst
+		}
+	}
+	return collapsedSessionProjectPath(mostRecent)
 }
 
 // inheritableQuickCreateCommand returns the part of a template session's
@@ -15690,24 +15734,12 @@ func (h *Home) activeConductorSessions() []*session.Instance {
 	return out
 }
 
-// mostRecentPathInGroup returns the project path of the most recently created
-// session in the given group, or empty string if no sessions exist.
+// mostRecentPathInGroup returns the collapsed project path of the most recently
+// created session in the given group, or empty string if no sessions exist.
 func (h *Home) mostRecentPathInGroup(groupPath string) string {
 	h.instancesMu.RLock()
 	defer h.instancesMu.RUnlock()
-
-	var mostRecent *session.Instance
-	for _, inst := range h.instances {
-		if inst.GroupPath == groupPath && inst.ProjectPath != "" {
-			if mostRecent == nil || inst.CreatedAt.After(mostRecent.CreatedAt) {
-				mostRecent = inst
-			}
-		}
-	}
-	if mostRecent != nil {
-		return mostRecent.ProjectPath
-	}
-	return ""
+	return mostRecentPathAmong(h.instances, groupPath)
 }
 
 // forkSessionWithDialog opens the fork dialog to customize title and group
