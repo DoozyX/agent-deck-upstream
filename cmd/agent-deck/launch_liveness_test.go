@@ -284,23 +284,29 @@ func TestResolveLaunchAliveWindow(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		confirm bool
+		disable bool
 		window  string
 		want    time.Duration
 		wantErr string
 	}{
-		{name: "off by default", want: 0},
-		{name: "flag alone takes the default", confirm: true, want: defaultLaunchAliveWindow},
+		// The default is the contract: `launch` looks, unless told not to.
+		{name: "on by default", want: defaultLaunchAliveWindow},
+		{name: "the explicit flag is still accepted", confirm: true, want: defaultLaunchAliveWindow},
 		{name: "explicit window", confirm: true, window: "12s", want: 12 * time.Second},
-		{name: "surrounding space is not a value", confirm: true, window: "  2s ", want: 2 * time.Second},
-		// Ignoring a flag the caller set is how this class of bug starts, so an
-		// orphaned --alive-window is refused rather than silently dropped.
-		{name: "window without the flag is refused", window: "5s", wantErr: "requires --confirm-alive"},
-		{name: "unparseable window", confirm: true, window: "soon", wantErr: "invalid --alive-window"},
-		{name: "zero window", confirm: true, window: "0s", wantErr: "must be positive"},
-		{name: "negative window", confirm: true, window: "-1s", wantErr: "must be positive"},
+		{name: "a bare window is now just the budget", window: "12s", want: 12 * time.Second},
+		{name: "surrounding space is not a value", window: "  2s ", want: 2 * time.Second},
+		{name: "opt-out disables the check", disable: true, want: 0},
+		// Ignoring a flag the caller set is how this class of bug starts, so
+		// asking for a window and opting out in the same breath is refused
+		// rather than resolved in one flag's favour.
+		{name: "a window against the opt-out is refused", disable: true, window: "5s", wantErr: "--alive-window cannot be used with --no-confirm-alive"},
+		{name: "both flags at once is refused", confirm: true, disable: true, wantErr: "cannot be used together"},
+		{name: "unparseable window", window: "soon", wantErr: "invalid --alive-window"},
+		{name: "zero window", window: "0s", wantErr: "must be positive"},
+		{name: "negative window", window: "-1s", wantErr: "must be positive"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := resolveLaunchAliveWindow(tc.confirm, tc.window)
+			got, err := resolveLaunchAliveWindow(tc.confirm, tc.disable, tc.window)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("err = %v, want one containing %q", err, tc.wantErr)

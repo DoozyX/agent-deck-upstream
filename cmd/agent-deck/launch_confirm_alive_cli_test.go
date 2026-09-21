@@ -25,11 +25,12 @@ import (
 // what the launch CLI has to notice.
 //
 // Two halves are pinned here and both matter:
-//   - WITHOUT the flag, the output is exactly what it has always been. Other
-//     scripts and skills parse this JSON; the fix is worth nothing if adopting
-//     the binary breaks them.
-//   - WITH the flag, the same launch exits 1 with success:false, alive:false,
-//     the session id still in hand, and the tool's OWN words in doa_detail.
+//   - BY DEFAULT, and with the flag, a dying launch exits 1 with success:false,
+//     alive:false, the session id still in hand, and the tool's OWN words in
+//     doa_detail. The default is the half that matters: it is what every caller
+//     that never heard of this flag gets.
+//   - WITH --no-confirm-alive, the output is exactly what it has always been,
+//     for the caller that deliberately wants accepted-don't-look.
 
 // fakeToolBinDir writes an executable named `name` whose body is `script` into
 // a fresh directory, and returns that directory for prepending to PATH.
@@ -182,12 +183,70 @@ func TestLaunchConfirmAlive_DyingToolIsReportedDeadOnArrival(t *testing.T) {
 	}
 }
 
-// TestLaunchConfirmAlive_WithoutTheFlagTheOutputIsUnchanged pins the
-// compatibility half. The very same dying launch must still look exactly as it
-// did before this flag existed — including reporting success, which is the bug
-// the flag exists to let a caller opt out of. A silent default-on would break
-// every script and skill that reads this JSON.
-func TestLaunchConfirmAlive_WithoutTheFlagTheOutputIsUnchanged(t *testing.T) {
+// TestLaunchDefault_DyingToolIsReportedDeadWithNoFlag is the defect this
+// branch exists for, and it deliberately reverses the assertion that stood
+// here before (TestLaunchConfirmAlive_WithoutTheFlagTheOutputIsUnchanged,
+// cf2e3b2c).
+//
+// That test pinned the *old* default as a compatibility guarantee: the same
+// dying launch reported success, and carried none of the liveness keys. The
+// reasoning was that a silent default-on would break every script that reads
+// this JSON. Six occurrences on 2026-09-11 showed what the guarantee actually
+// bought: every caller that had not heard of the flag — including the
+// orchestrate conductor, which used a plain `launch --json` — was told
+// success:true about a session that was already dead, and had to grow its own
+// external poll-and-retry loop to learn otherwise.
+//
+// So the default moves. `success: true` now means "this session was observed
+// running", and a caller that genuinely wants fire-and-forget says so with
+// --no-confirm-alive (pinned in the test below).
+func TestLaunchDefault_DyingToolIsReportedDeadWithNoFlag(t *testing.T) {
+	requireTmuxForLaunchCLI(t)
+
+	home := t.TempDir()
+	socket := isolatedTmuxSocket1031(t)
+	binDir := fakeToolBinDir(t, "codex", dyingCodexScript)
+	project := filepath.Join(home, "proj")
+	if err := os.MkdirAll(project, 0o755); err != nil {
+		t.Fatalf("mkdir project: %v", err)
+	}
+
+	payload, exitCode, stderr := runLaunchCLI(t, home, binDir,
+		project, "-t", "default-codex", "--no-parent", "--tmux-socket", socket,
+		"-c", "codex", "-m", "rotate the conductor", "--json")
+
+	if exitCode != 1 {
+		t.Fatalf("exit = %d, want 1 with NO flag at all: the default launch is what "+
+			"every existing caller uses\npayload: %v\nstderr: %s", exitCode, payload, stderr)
+	}
+	if payload["success"] != false {
+		t.Errorf("success = %v, want false — this is the field the conductor acted on", payload["success"])
+	}
+	if payload["alive"] != false {
+		t.Errorf("alive = %v, want false", payload["alive"])
+	}
+	if payload["code"] != ErrCodeSessionDOA {
+		t.Errorf("code = %v, want %q", payload["code"], ErrCodeSessionDOA)
+	}
+	// The handle still has to survive the failure on the default path, for the
+	// same reason it does under the explicit flag: the caller must be able to
+	// remove the row it was just told about.
+	for _, key := range []string{"id", "session_id", "title"} {
+		if v, _ := payload[key].(string); v == "" {
+			t.Errorf("payload[%q] is missing: the caller cannot clean up a session it cannot name", key)
+		}
+	}
+	if payload["liveness_window_ms"] != float64(defaultLaunchAliveWindow.Milliseconds()) {
+		t.Errorf("liveness_window_ms = %v, want the default %d",
+			payload["liveness_window_ms"], defaultLaunchAliveWindow.Milliseconds())
+	}
+}
+
+// TestLaunchNoConfirmAlive_OptsOutOfTheCheck keeps the compatibility half the
+// previous default provided, now behind an explicit flag. A caller that really
+// does want "accepted, don't look" still gets exactly the payload it always
+// had — no liveness keys, exit 0 — but has to ask for it.
+func TestLaunchNoConfirmAlive_OptsOutOfTheCheck(t *testing.T) {
 	requireTmuxForLaunchCLI(t)
 
 	home := t.TempDir()
@@ -200,15 +259,15 @@ func TestLaunchConfirmAlive_WithoutTheFlagTheOutputIsUnchanged(t *testing.T) {
 
 	payload, exitCode, stderr := runLaunchCLI(t, home, binDir,
 		project, "-t", "legacy-codex", "--no-parent", "--tmux-socket", socket,
-		"-c", "codex", "-m", "rotate the conductor", "--json")
+		"-c", "codex", "-m", "rotate the conductor", "--no-confirm-alive", "--json")
 
 	if exitCode != 0 || payload["success"] != true {
-		t.Fatalf("the default launch contract changed: exit = %d, success = %v\nstderr: %s",
+		t.Fatalf("--no-confirm-alive must restore the fire-and-forget contract: exit = %d, success = %v\nstderr: %s",
 			exitCode, payload["success"], stderr)
 	}
 	for _, key := range []string{"alive", "liveness_window_ms", "liveness_observed_ms", "doa_reason", "doa_detail"} {
 		if _, ok := payload[key]; ok {
-			t.Errorf("payload carries %q without --confirm-alive: a caller that never opted in "+
+			t.Errorf("payload carries %q under --no-confirm-alive: a caller that opted out "+
 				"must see the keys it has always seen, and no others", key)
 		}
 	}
@@ -250,10 +309,12 @@ func TestLaunchConfirmAlive_LiveToolReportsAlive(t *testing.T) {
 	}
 }
 
-// TestLaunchConfirmAlive_RejectsAWindowWithoutTheFlag: an --alive-window that
-// silently does nothing is the same class of quiet failure this whole change is
-// about, and the refusal must land before anything is spawned.
-func TestLaunchConfirmAlive_RejectsAWindowWithoutTheFlag(t *testing.T) {
+// TestLaunchAliveWindow_RefusedOnlyAgainstTheOptOut: with the check on by
+// default, a bare --alive-window is simply the budget and is accepted. What is
+// still refused — and refused BEFORE anything is spawned — is asking for a
+// window and opting out of the check in the same breath, because one of the two
+// flags would have to be silently ignored.
+func TestLaunchAliveWindow_RefusedOnlyAgainstTheOptOut(t *testing.T) {
 	requireTmuxForLaunchCLI(t)
 
 	home := t.TempDir()
@@ -265,10 +326,10 @@ func TestLaunchConfirmAlive_RejectsAWindowWithoutTheFlag(t *testing.T) {
 
 	payload, exitCode, stderr := runLaunchCLI(t, home, binDir,
 		project, "-t", "orphan-window", "--no-parent", "-c", "codex",
-		"--alive-window", "5s", "--json")
+		"--alive-window", "5s", "--no-confirm-alive", "--json")
 
 	if exitCode == 0 {
-		t.Fatalf("exit = 0 for --alive-window without --confirm-alive\npayload: %v", payload)
+		t.Fatalf("exit = 0 for --alive-window together with --no-confirm-alive\npayload: %v", payload)
 	}
 	if payload["success"] != false || payload["code"] != ErrCodeInvalidOperation {
 		t.Errorf("success = %v, code = %v; want false / %s\nstderr: %s",
